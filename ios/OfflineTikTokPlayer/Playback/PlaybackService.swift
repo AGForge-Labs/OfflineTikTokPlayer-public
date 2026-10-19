@@ -5,6 +5,7 @@ import MediaPlayer
 import Observation
 import PlayerCore
 import UIKit
+import os
 
 @MainActor @Observable
 final class PlaybackClock {
@@ -22,6 +23,17 @@ final class PlaybackClock {
 
 @MainActor @Observable
 final class PlaybackService: NSObject {
+    struct PlaybackEvent {
+        let name: String
+        let uptime: Double
+        let generation: Int
+        let position: Double
+        let retainedItems: Int
+    }
+    typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
+    private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
+    @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
+    @ObservationIgnored private var firstProgressGeneration: Int?
     var player: AVQueuePlayer { buffer.player }
     let clock = PlaybackClock()
     private(set) var queue = PlaybackQueue(ids: [])
@@ -55,7 +67,9 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var itemObservation: NSKeyValueObservation?
     @ObservationIgnored private let frameMonitor = PlaybackFrameMonitor()
-    @ObservationIgnored private let speakerAudio = SpeakerAudioController()
+    @ObservationIgnored private let speakerAudio: SpeakerAudioController
+    @ObservationIgnored private let audioRoutes: () -> [AVAudioSession.Port]
+    @ObservationIgnored private let seekPlayer: SeekPlayer
     @ObservationIgnored private var audioCheckTask: Task<Void, Never>?
     @ObservationIgnored private var timeControlObservation: NSKeyValueObservation?
     @ObservationIgnored private var stallTask: Task<Void, Never>?
@@ -77,10 +91,16 @@ final class PlaybackService: NSObject {
     init(library: LibraryRepository, downloads: OfflineDownloads, cloud: OneDriveClient,
          bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
          activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) },
-         buffer: PlaybackBuffer? = nil) {
+         buffer: PlaybackBuffer? = nil, speakerAudio: SpeakerAudioController? = nil,
+         audioRoutes: @escaping () -> [AVAudioSession.Port] = { AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType) },
+         seekPlayer: @escaping SeekPlayer = { player, time, completion in
+             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
+         }) {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
         self.buffer = buffer ?? PlaybackBuffer()
+        self.speakerAudio = speakerAudio ?? SpeakerAudioController()
+        self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
         mediaCache = PlaybackCacheLoader.make(cloud: cloud)
         automaticPiP = UserDefaults.standard.bool(forKey: "automaticPiP")
         speakerSound = UserDefaults.standard.object(forKey: "speakerSound") as? Bool ?? true
@@ -104,6 +124,9 @@ final class PlaybackService: NSObject {
                 guard let self, let item = self.observedItem, self.player.currentItem === item else { return }
                 // Read the current item now: an already queued callback can belong to the old item.
                 self.clock.sample(position: item.currentTime().seconds)
+                if self.firstProgressGeneration != self.generation, item.currentTime().seconds >= 0.05 {
+                    self.firstProgressGeneration = self.generation; self.recordPlaybackEvent("clock50ms")
+                }
                 if Date().timeIntervalSince(self.lastBookmark) > 5 { self.persist(); self.updateNowPlaying() }
             }
         }
@@ -117,6 +140,7 @@ final class PlaybackService: NSObject {
     }
 
     func start(playlistIDs: [String], at mediaID: String? = nil, shuffle: Bool = false, offlineOnly: Bool = false) {
+        recordPlaybackEvent("start")
         let ids = library.catalog.queue(playlistIDs: playlistIDs, localIDs: downloads.readyIDs,
             offlineOnly: offlineOnly || !downloads.network.isConnected)
         guard !ids.isEmpty else { message = "No playable videos here yet. Download this playlist or import local videos."; return }
@@ -133,7 +157,7 @@ final class PlaybackService: NSObject {
         intent.requestPlay(); activateAudio()
         if player.currentItem == nil { loadCurrent(position: clock.position) }
         else {
-            if clock.duration > 0, clock.position >= clock.duration { seek(0, resumeWhenFinished: true) }
+            if clock.duration > 0, clock.position >= clock.duration { seek(0) }
             else if intent.canPlay { player.play() }
             prepareUpcoming()
             if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { armStallRecovery() }
@@ -147,6 +171,7 @@ final class PlaybackService: NSObject {
     }
 
     func next(explicit: Bool = true) {
+        recordPlaybackEvent("next")
         buffer.synchronize()
         endedDuringScroll = false
         let previous = queue.currentID
@@ -154,13 +179,14 @@ final class PlaybackService: NSObject {
         if explicit { intent.requestPlay(); activateAudio() }
         if next == previous, player.currentItem != nil {
             if let prepared = buffer.advance(to: next) { loadCurrent(adopting: prepared) }
-            else { seek(0, resumeWhenFinished: true) }
+            else { seek(0) }
             return
         }
         loadCurrent()
     }
 
     func previous() {
+        recordPlaybackEvent("previous")
         buffer.synchronize()
         endedDuringScroll = false
         guard queue.previous() != nil else { seek(0); return }
@@ -176,16 +202,20 @@ final class PlaybackService: NSObject {
 
     func setShuffle(_ enabled: Bool) { buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
-    func seek(_ seconds: Double, resumeWhenFinished: Bool = false) {
+    func seek(_ seconds: Double) {
         guard let item = player.currentItem, item === observedItem,
               let seek = clock.beginSeek(to: seconds) else { return }
         let request = generation
-        player.seek(to: CMTime(seconds: seek.target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] _ in
+        recordPlaybackEvent("seekRequested")
+        seekPlayer(player, CMTime(seconds: seek.target, preferredTimescale: 600)) { [weak self, weak item] finished in
             Task { @MainActor in
-                guard let self, let item, self.generation == request, self.player.currentItem === item,
+                guard let self, let item, finished, self.generation == request, self.player.currentItem === item,
                       self.clock.completeSeek(seek, actualPosition: item.currentTime().seconds) else { return }
                 if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
-                if resumeWhenFinished && self.intent.canPlay { self.player.play() }
+                self.recordPlaybackEvent("seekCompleted")
+                // The latest seek inherits playback intent when it supersedes a
+                // paused startup rewind. Explicit Pause/interruption still wins.
+                if self.intent.canPlay { self.player.playImmediately(atRate: 1) }
                 self.persist(); self.updateNowPlaying()
             }
         }
@@ -196,6 +226,7 @@ final class PlaybackService: NSObject {
         endedDuringScroll = false
         let resume = MediaResumePosition(mediaID: queue.currentID, seconds: position)
         generation += 1; let request = generation
+        recordPlaybackEvent("loadRequested")
         cancelStallRecovery()
         loadTask?.cancel(); itemObservation = nil; frameMonitor.cancel(); observedItem = nil; readyGeneration = nil
         audioCheckTask?.cancel(); hasAudioTrack = nil
@@ -210,6 +241,7 @@ final class PlaybackService: NSObject {
         if !forceRemote, position == 0, let id = queue.currentID,
            let prepared = eligibleAdoption ?? buffer.advance(to: id, allowRemote: allowRemote) {
             currentIsLocal = prepared.isLocal
+            recordPlaybackEvent("preparedAdoption")
             observeCurrent(prepared.item, position: 0, request: request, rewind: prepared.needsRewind)
             prepareUpcoming()
             return
@@ -240,6 +272,7 @@ final class PlaybackService: NSObject {
                     // An explicit cold selection must not wait half a second for
                     // optional EQ metadata. Readiness provides one safe retry.
                     await self.speakerAudio.prepare(playerItem, within: .milliseconds(100))
+                    self.recordPlaybackEvent("coldAudioPrepared")
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
@@ -281,19 +314,12 @@ final class PlaybackService: NSObject {
                     self.refreshAudioProcessing()
                     self.clock.updateDuration(playerItem.duration.seconds)
                     self.isLoading = false
+                    self.recordPlaybackEvent("itemReady")
                     // A new or prebuffered item is already at zero; an exact zero seek discards that benefit.
                     if position > 0 || rewind {
                         // Reused history items must finish rewinding before any audio is played.
                         self.player.pause()
-                        guard let seek = self.clock.beginSeek(to: position) else { return }
-                        self.player.seek(to: CMTime(seconds: seek.target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak playerItem] finished in
-                            Task { @MainActor in
-                                guard let self, let playerItem, finished, self.generation == request, self.player.currentItem === playerItem,
-                                      self.clock.completeSeek(seek, actualPosition: playerItem.currentTime().seconds) else { return }
-                                self.monitorFirstFrame(playerItem, request: request)
-                                if self.intent.canPlay { self.player.playImmediately(atRate: 1) }
-                            }
-                        }
+                        self.seek(position)
                     } else if self.intent.canPlay { self.player.playImmediately(atRate: 1) }
                     self.updateNowPlaying()
                 } else if playerItem.status == .failed { self.handlePlaybackFailure() }
@@ -305,6 +331,7 @@ final class PlaybackService: NSObject {
         frameMonitor.start(item: playerItem, layer: surface.playerLayer) { [weak self, weak playerItem] in
             guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
             self.isVideoReady = true
+            self.recordPlaybackEvent("firstFrame")
         }
     }
 
@@ -449,12 +476,15 @@ final class PlaybackService: NSObject {
     }
     private func activateAudio() {
         guard !intent.isInterrupted else { return }
+        recordPlaybackEvent("activationRequested")
         do {
             try activateSession()
             intent.activationCompleted(succeeded: true); refreshAudioProcessing()
+            recordPlaybackEvent("activationCompleted")
         } catch {
             intent.activationCompleted(succeeded: false); player.pause(); cancelStallRecovery()
             message = "Audio is in use. Tap Play after the camera or call finishes."
+            recordPlaybackEvent("activationFailed")
         }
     }
 
@@ -465,6 +495,7 @@ final class PlaybackService: NSObject {
     }
 
     func handleInterruption(began: Bool, shouldResume: Bool = false) {
+        recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
             intent.interruptionBegan(); cancelStallRecovery()
             player.pause(); persist()
@@ -476,8 +507,14 @@ final class PlaybackService: NSObject {
     }
 
     private func refreshAudioProcessing() {
-        let routes = AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType)
-        speakerAudio.update(items: player.items(), enabled: SpeakerAudioMix.shouldEnhance(enabled: speakerSound, routes: routes))
+        speakerAudio.update(items: buffer.retainedItems, enabled: SpeakerAudioMix.shouldEnhance(enabled: speakerSound, routes: audioRoutes()))
+    }
+
+    private func recordPlaybackEvent(_ name: StaticString) {
+        // Fixed phase names and numerical state only: no media IDs, URLs or titles.
+        os_signpost(.event, log: Self.playbackLog, name: name, "generation=%d retained=%d", generation, buffer.retainedItemCount)
+        onPlaybackEvent?(PlaybackEvent(name: String(describing: name), uptime: ProcessInfo.processInfo.systemUptime,
+            generation: generation, position: player.currentTime().seconds, retainedItems: buffer.retainedItemCount))
     }
 
     private func installObservers() {
@@ -486,6 +523,7 @@ final class PlaybackService: NSObject {
                 guard let self else { return }
                 if self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
                 else if self.player.timeControlStatus == .playing { self.cancelStallRecovery() }
+                self.recordPlaybackEvent(self.player.timeControlStatus == .playing ? "playing" : "waitingOrPaused")
             }
         }
         let center = NotificationCenter.default
@@ -537,6 +575,7 @@ final class PlaybackService: NSObject {
                 self?.buffer.synchronize()
                 self?.warmTask?.cancel(); self?.warmRevision += 1
                 self?.buffer.discardNext(); self?.buffer.discardPrevious()
+                self?.refreshAudioProcessing()
             }
         })
     }

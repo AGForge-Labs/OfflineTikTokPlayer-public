@@ -19,9 +19,12 @@ final class PlaybackBuffer {
     var didAdvance: ((Prepared) -> Void)?
     var automaticAdvancementEnabled = true { didSet { updateEndAction() } }
     var previousMediaID: String? { previous?.mediaID }
-    var retainedItemCount: Int {
-        Set((player.items() + [active?.item, next?.item, loopReserve?.item, previous?.item].compactMap { $0 }).map(ObjectIdentifier.init)).count
+    var retainedItems: [AVPlayerItem] {
+        var ids = Set<ObjectIdentifier>()
+        return (player.items() + [active?.item, next?.item, loopReserve?.item, previous?.item].compactMap { $0 })
+            .filter { ids.insert(ObjectIdentifier($0)).inserted }
     }
+    var retainedItemCount: Int { retainedItems.count }
     var nextMediaID: String? { next?.mediaID }
     var hasLoopReserve: Bool { loopReserve != nil }
     func hasPrepared(_ mediaID: String) -> Bool {
@@ -44,8 +47,8 @@ final class PlaybackBuffer {
         player.automaticallyWaitsToMinimizeStalling = !localWindow
     }
 
-    private func retainPrevious() {
-        if let active, active.mediaID != next?.mediaID {
+    private func retainPrevious(before prepared: Prepared) {
+        if let active, active.mediaID != prepared.mediaID {
             previous?.item.cancelPendingSeeks()
             previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal, needsRewind: true)
         }
@@ -68,8 +71,25 @@ final class PlaybackBuffer {
 
     /// KVO may be delivered after a swipe. Always reconcile actual object identity.
     func synchronize() {
-        guard let prepared = next, player.currentItem === prepared.item else { return }
-        retainPrevious(); active = prepared; next = loopReserve; loopReserve = nil; updateEndAction()
+        let prepared: Prepared
+        if let next, player.currentItem === next.item {
+            prepared = next
+            retainPrevious(before: prepared)
+            self.next = loopReserve
+        } else if let reserve = loopReserve, player.currentItem === reserve.item {
+            // Multiple currentItem changes can coalesce before MainActor KVO runs.
+            prepared = reserve
+            next = nil
+        } else if player.currentItem == nil, let reserve = loopReserve,
+                  reserve.mediaID == active?.mediaID, reserve.mediaID == next?.mediaID {
+            // A suspended main actor can miss all three loop boundaries. Recover
+            // the complete source through the service's guarded rewind, not a tail trim.
+            prepared = Prepared(mediaID: reserve.mediaID, item: reserve.item, isLocal: reserve.isLocal, needsRewind: true)
+            next = nil
+            player.pause()
+            player.insert(reserve.item, after: nil)
+        } else { return }
+        active = prepared; loopReserve = nil; updateEndAction()
         preparePreviousStart()
         didAdvance?(prepared)
     }
@@ -138,7 +158,7 @@ final class PlaybackBuffer {
         guard let prepared = next, prepared.mediaID == mediaID, prepared.item.status != .failed,
               prepared.isLocal || allowRemote,
               player.currentItem === prepared.item || player.items().dropFirst().first === prepared.item else { return nil }
-        retainPrevious(); next = loopReserve; loopReserve = nil; active = prepared
+        retainPrevious(before: prepared); next = loopReserve; loopReserve = nil; active = prepared
         if player.currentItem !== prepared.item { player.advanceToNextItem() }
         updateEndAction()
         preparePreviousStart()

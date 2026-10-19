@@ -6,6 +6,151 @@ import PlayerCore
 
 @MainActor
 final class PlaybackContinuityTests: XCTestCase {
+    func testSupersedingStartupSeekResumesOnlyTheLatestSeekWithPlayIntent() async throws {
+        let fixture = try await ServiceFixture()
+        defer { fixture.remove() }
+        let bookmark = PlaybackBookmark(queue: PlaybackQueue(ids: fixture.ids, startAt: fixture.ids[0]), position: 0.4)
+        try JSONEncoder().encode(bookmark).write(to: fixture.bookmark)
+        var seeks: [(CMTime, (Bool) -> Void)] = []
+        let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {}, seekPlayer: { _, time, completion in seeks.append((time, completion)) })
+        defer { service.pause() }
+        service.restore(); service.play()
+        try await until { !seeks.isEmpty }
+        XCTAssertEqual(service.player.rate, 0, "The restored-position seek must gate startup")
+        service.seek(0.2)
+        XCTAssertEqual(seeks.count, 2)
+        seeks[0].1(false)
+        let latest = seeks[1]
+        let finished = await service.player.seek(to: latest.0, toleranceBefore: .zero, toleranceAfter: .zero)
+        latest.1(finished)
+        try await until { service.player.rate > 0 }
+        XCTAssertTrue(service.wantsToPlay)
+        // A new scrub followed by explicit Pause must never resurrect playback.
+        service.seek(0.3); service.pause()
+        let paused = seeks[2]
+        let pausedFinished = await service.player.seek(to: paused.0, toleranceBefore: .zero, toleranceAfter: .zero)
+        paused.1(pausedFinished)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(service.wantsToPlay); XCTAssertEqual(service.player.rate, 0)
+    }
+
+    func testCoalescedAndDrainedLoopBoundariesReconcileActualCurrentItem() throws {
+        for drain in [false, true] {
+            let buffer = PlaybackBuffer(), original = try item(), reserve = try item()
+            defer { buffer.replace(with: nil); buffer.discardPrevious() }
+            buffer.replace(with: original, mediaID: "loop")
+            buffer.stage(.init(mediaID: "loop", item: try item(), isLocal: true))
+            buffer.stageLoopReserve(.init(mediaID: "loop", item: reserve, isLocal: true))
+            var adopted: PlaybackBuffer.Prepared?
+            buffer.didAdvance = { adopted = $0 }
+            buffer.player.advanceToNextItem(); buffer.player.advanceToNextItem()
+            if drain { buffer.player.advanceToNextItem() }
+            buffer.synchronize()
+            XCTAssertTrue(adopted?.item === reserve)
+            XCTAssertEqual(adopted?.needsRewind, drain)
+            XCTAssertTrue(buffer.player.currentItem === reserve)
+            XCTAssertNil(buffer.nextMediaID); XCTAssertFalse(buffer.hasLoopReserve)
+            XCTAssertEqual(buffer.player.items().count, 1)
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 2)
+            buffer.stage(.init(mediaID: "loop", item: try item(), isLocal: true), after: "loop")
+            XCTAssertTrue(buffer.hasPrepared("loop"))
+        }
+    }
+
+    func testProductionServiceMeasuresIdenticalColdNextPreviousAndRetainsPreviousMix() async throws {
+        let fixture = try await ServiceFixture()
+        defer { fixture.remove() }
+        let oldSpeakerPreference = UserDefaults.standard.object(forKey: "speakerSound")
+        defer { UserDefaults.standard.set(oldSpeakerPreference, forKey: "speakerSound") }
+        var trials: [[String: Any]] = []
+        // Serial, bounded trials of the same local source, route and 50 ms clock threshold.
+        for trial in 0..<3 {
+            let buffer = PlaybackBuffer()
+            var loads: [ObjectIdentifier: Int] = [:]
+            let audio = SpeakerAudioController { item in
+                loads[ObjectIdentifier(item), default: 0] += 1
+                return try? await item.asset.loadTracks(withMediaType: .audio)
+            }
+            let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+                bookmarkURL: fixture.bookmark, activateSession: { try AVAudioSession.sharedInstance().setActive(true) },
+                buffer: buffer, speakerAudio: audio, audioRoutes: { [.builtInSpeaker] })
+            service.speakerSound = true; service.isInteractingWithFeed = true
+            var events: [[String: Any]] = []
+            service.onPlaybackEvent = { event in
+                events.append(["phase": event.name, "uptime": event.uptime, "generation": event.generation,
+                               "position": event.position.isFinite ? event.position : -1, "retainedItems": event.retainedItems])
+            }
+            defer { service.onPlaybackEvent = nil; service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+            let coldStart = ProcessInfo.processInfo.systemUptime
+            service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+            try await until { service.player.currentTime().seconds >= 0.05 }
+            let cold = ProcessInfo.processInfo.systemUptime - coldStart
+            service.pause()
+            let first = try XCTUnwrap(service.player.currentItem)
+            try await until { first.audioMix != nil }
+            let firstMix = try XCTUnwrap(first.audioMix)
+            let firstLoads = loads[ObjectIdentifier(first)]
+            try await until { buffer.hasPrepared(fixture.ids[1]) }
+            try await Task.sleep(for: .milliseconds(500))
+            let queuedReady = buffer.player.items().last?.status == .readyToPlay
+            let nextStart = ProcessInfo.processInfo.systemUptime
+            service.next()
+            try await until { service.queue.currentID == fixture.ids[1] && service.player.currentTime().seconds >= 0.05 }
+            let next = ProcessInfo.processInfo.systemUptime - nextStart
+            service.pause()
+            try await Task.sleep(for: .milliseconds(500))
+            XCTAssertTrue(first.audioMix === firstMix, "Retained Previous must keep its configured mix")
+            XCTAssertEqual(loads[ObjectIdentifier(first)], firstLoads)
+            let previousStart = ProcessInfo.processInfo.systemUptime
+            service.previous()
+            try await until { service.queue.currentID == fixture.ids[0] && service.player.currentTime().seconds >= 0.05 }
+            let previous = ProcessInfo.processInfo.systemUptime - previousStart
+            XCTAssertTrue(service.player.currentItem === first)
+            XCTAssertTrue(first.audioMix === firstMix, "Previous must not rebuild its audio path on handoff")
+            XCTAssertEqual(loads[ObjectIdentifier(first)], firstLoads, "Previous must not reload its audio-track metadata")
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 4)
+            XCTAssertLessThan(max(cold, next, previous), 2, "Synthetic local startup stalled; this is not an immediate-play acceptance threshold")
+            let result: [String: Any] = ["trial": trial, "coldClock50msSeconds": cold, "nextClock50msSeconds": next,
+                "previousClock50msSeconds": previous, "queuedReadyBeforeHandoff": queuedReady,
+                "previousMixReused": first.audioMix === firstMix, "previousTrackLoads": loads[ObjectIdentifier(first)] ?? 0,
+                "retainedItems": buffer.retainedItemCount, "events": events]
+            trials.append(result)
+            print("Production service timing: trial=\(trial), cold=\(cold), next=\(next), previous=\(previous), queuedReady=\(queuedReady), previousMixReused=\(first.audioMix === firstMix)")
+        }
+        let attachment = XCTAttachment(data: try JSONSerialization.data(withJSONObject: trials, options: [.sortedKeys]), uniformTypeIdentifier: "public.json")
+        attachment.name = "Production-service-identical-startup-phases"; attachment.lifetime = .keepAlways; add(attachment)
+        print("Production service phase trace: \(String(data: try JSONSerialization.data(withJSONObject: trials, options: [.sortedKeys]), encoding: .utf8)!)")
+    }
+
+    private func until(_ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(condition(), "Playback condition did not complete in five seconds")
+    }
+
+    @MainActor private struct ServiceFixture {
+        let temporary: URL
+        let cloud: OneDriveClient
+        let downloads: OfflineDownloads
+        let library: LibraryRepository
+        let ids: [String]
+        let playlist = "local:service-timing"
+        var bookmark: URL { temporary.appendingPathComponent("playback.json") }
+        init() async throws {
+            temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+            cloud = OneDriveClient(account: MicrosoftAccount())
+            downloads = OfflineDownloads(cloud: cloud, network: NetworkStatus())
+            library = LibraryRepository(cloud: cloud, catalogURL: temporary.appendingPathComponent("catalog.json"))
+            ids = (0..<2).map { "local:service-\($0)-" + UUID().uuidString }
+            let source = try XCTUnwrap(Bundle(for: PlaybackContinuityTests.self).url(forResource: "test-video", withExtension: "mp4"))
+            for id in ids { _ = try await downloads.importLocal(source, mediaID: id) }
+            try library.install(LibraryCatalog(libraryID: "local:test", media: ids.map { MediaRecord(id: $0, title: "Synthetic", creator: "Fixture", duration: 1.2) },
+                playlists: [PlaylistRecord(id: playlist, name: "Synthetic", itemIDs: ids)]))
+        }
+        func remove() { for id in ids { downloads.remove(id) }; try? FileManager.default.removeItem(at: temporary) }
+    }
     func testAutomaticHandoffReResolvesRemotePreparationWhenASavedCopyIsAvailable() async throws {
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
