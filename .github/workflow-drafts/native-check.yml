@@ -1,0 +1,35 @@
+name: Unsigned production review (inactive draft)
+on:
+  workflow_dispatch:
+    inputs:
+      approve_runner:
+        description: Start one separately authorized unsigned native review
+        required: true
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  ios:
+    if: ${{ inputs.approve_runner }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Existing core and simulator checks
+        run: bash scripts/check-ios.sh
+      - name: Unsigned production device archive
+        run: |
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/OfflineTikTokPlayer.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO archive
+      - name: Retain unsigned archive briefly
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: production-unsigned
+          path: ${{ runner.temp }}/OfflineTikTokPlayer.xcarchive
+          if-no-files-found: error
+          retention-days: 1
