@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "offline-tiktok-helper"
+version = "0.1.0"
+description = "Private TikTok collection importer for an offline iPhone library"
+requires-python = ">=3.12"
+dependencies = ["playwright", "yt-dlp", "curl-cffi", "gallery-dl", "msal", "msal-extensions", "httpx", "Pillow"]
+
+[project.optional-dependencies]
+test = ["pytest", "jsonschema>=4.25,<5", "PyYAML>=6,<7"]
+
+[project.scripts]
+offline-tiktok-helper = "offline_tiktok.gui:main"
+offline-tiktok-probe = "offline_tiktok.probe:main"
+
+[tool.setuptools.packages.find]
+where = ["pc-helper"]
+
+[tool.pytest.ini_options]
+pythonpath = ["pc-helper"]
+testpaths = ["pc-helper/tests"]

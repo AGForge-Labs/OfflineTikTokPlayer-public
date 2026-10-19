@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.superpowers/
+local-data/
+artifacts/
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+.env
+config.local.json
+
+# Private inputs and generated distributions.
+*.p8
+*.p12
+*.pem
+*.key
+*.mobileprovision
+*.ipa
+*.xcarchive/
+*.xcresult/
+private-data/
+private-baselines/
