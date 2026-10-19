@@ -17,7 +17,10 @@ struct OfflineTikTokPlayerApp: App {
                     await model.library.refresh(silently: true)
                 }
                 .onOpenURL { url in _ = MSALPublicClientApplication.handleMSALResponse(url, sourceApplication: nil) }
-                .onChange(of: scenePhase) { _, phase in if phase != .active { model.playback.persist() } }
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active { model.playback.enteredForeground() }
+                    else { model.playback.persist() }
+                }
         }
     }
 }

@@ -22,6 +22,21 @@ def workflow():
     return yaml.load((ROOT / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
+def test_public_playback_validation_is_standard_unsigned_and_private_guarded(preflight):
+    config = yaml.load((ROOT / ".github/workflows/playback-validation.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    preflight.validate_public_workflow(config)
+    for change in ["private_guard", "runner", "secret", "write", "command", "extra_step"]:
+        altered = copy.deepcopy(config)
+        job = altered["jobs"]["ios"]
+        if change == "private_guard": job["if"] = "true"
+        elif change == "runner": job["runs-on"] = "macos-26-xlarge"
+        elif change == "secret": job["steps"][1]["env"] = {"KEY": "${{ secrets.KEY }}"}
+        elif change == "write": altered["permissions"]["contents"] = "write"
+        elif change == "command": job["steps"][1]["run"] += " --upload"
+        elif change == "extra_step": job["steps"].append({"run": "unexpected command"})
+        with pytest.raises(ValueError): preflight.validate_public_workflow(altered)
+
+
 def test_inactive_unsigned_draft_requires_a_deliberate_capped_run(preflight):
     preflight.validate_workflow(workflow())
 

@@ -70,11 +70,38 @@ def validate_workflow(config):
         raise ValueError("The native workflow is missing a required cost control.") from error
 
 
+def validate_public_workflow(config):
+    """Allow only this task's standard, public, unsigned simulator validation."""
+    expected_trigger = {"push": {"branches": ["fix/playback-continuity"]}}
+    public_guard = "${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}"
+    job = config.get("jobs", {}).get("ios", {})
+    if set(config) != {"name", "on", "permissions", "jobs"} or config.get("on") != expected_trigger:
+        raise ValueError("Public playback validation must be scoped to its reviewed branch.")
+    if config["permissions"] != {"contents": "read"} or set(config["jobs"]) != {"ios"}:
+        raise ValueError("Public playback validation needs one read-only job.")
+    if set(job) != {"if", "runs-on", "timeout-minutes", "steps"} or job["if"] != public_guard:
+        raise ValueError("Public playback validation must never run against a private repository.")
+    if job["runs-on"] != "macos-26" or not 1 <= int(job["timeout-minutes"]) <= 20:
+        raise ValueError("Public playback validation requires one capped standard runner.")
+    if any(re.search(r"\bsecrets\s*(?:\.|\[)", value, re.I) for value in _values(config)):
+        raise ValueError("Public playback validation cannot use secrets.")
+    steps = job["steps"]
+    if len(steps) != 2:
+        raise ValueError("Public playback validation has unreviewed steps.")
+    if steps[0] != {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with": {"persist-credentials": "false"}}:
+        raise ValueError("Public checkout must be pinned and discard credentials.")
+    if set(steps[1]) != {"name", "run"} or steps[1]["run"] != "bash scripts/check-ios.sh":
+        raise ValueError("Only unsigned source and simulator checks are approved.")
+
+
 def run_checks(root, *, runner=subprocess.run, platform=sys.platform):
     root = Path(root)
     directory = root / ".github/workflows"
-    if directory.exists() and any(path.suffix.lower() in {".yaml", ".yml"} for path in directory.iterdir()):
-        raise ValueError("Initial publication requires every workflow to remain inactive.")
+    active = [path for path in directory.iterdir() if path.suffix.lower() in {".yaml", ".yml"}] if directory.exists() else []
+    if active:
+        if len(active) != 1 or active[0].name != "playback-validation.yml":
+            raise ValueError("Only the reviewed free public playback validation workflow may be active.")
+        validate_public_workflow(yaml.load(active[0].read_text(encoding="utf-8"), Loader=yaml.BaseLoader))
     workflow = yaml.load((root / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     validate_workflow(workflow)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -87,7 +114,7 @@ def run_checks(root, *, runner=subprocess.run, platform=sys.platform):
         ("Native OneDrive adapter HTTP regressions", shell + ["scripts/test-native-cloud.sh"]),
         ("Native Swift syntax", shell + ["scripts/check-swift-syntax.sh"]),
     ]
-    complete = ["Inactive unsigned Mac workflow controls"]
+    complete = ["Unsigned workflow controls (public playback CI allowed)"]
     for name, command in commands:
         print("Checking: " + name, flush=True)
         runner(command, cwd=root, check=True, timeout=300)

@@ -13,4 +13,4 @@ cp "$repo_root/ios/OfflineTikTokPlayer/Services/LibraryRepository.swift" "$task_
 cp "$repo_root/tests/cloud-adapter/Support.swift" "$task_package/Sources/CloudAdapter/Support.swift"
 cp "$repo_root/tests/cloud-adapter/OneDriveClientTests.swift" "$task_package/Tests/CloudAdapterTests/OneDriveClientTests.swift"
 cp "$repo_root/ios/OfflineTikTokPlayerTests/LibraryRefreshTests.swift" "$task_package/Tests/CloudAdapterTests/LibraryRefreshTests.swift"
-PLAYER_CORE_PATH="$repo_root/ios/PlayerCore" "$swift_bin" test --package-path "$task_package" --scratch-path "$repo_root/artifacts/native-cloud-build"
+PLAYER_CORE_PATH="$repo_root/ios/PlayerCore" "$swift_bin" test --jobs 1 --package-path "$task_package" --scratch-path "$repo_root/artifacts/native-cloud-build"

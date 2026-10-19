@@ -2,6 +2,17 @@ import XCTest
 @testable import PlayerCore
 
 final class SpeakerAudioProcessorTests: XCTestCase {
+    func testQuietMusicAndAudibleMidBassReceiveAdditionalHeadroomLimitedBoost() {
+        for rate in [44100.0, 48000.0] {
+            let dryRMS = 0.04 / sqrt(2)
+            let middle = response(frequency: 1000, amplitude: 0.04, rate: rate)
+            let midBass = response(frequency: 180, amplitude: 0.04, rate: rate)
+            XCTAssertGreaterThan(middle / dryRMS, 2.5, "Quiet music needs more than the former 6dB ceiling")
+            XCTAssertGreaterThan(midBass / middle, 1.4, "Bass support must extend into the phone's mid-bass range")
+            print("Speaker response rate=\(rate) midGainDB=\(20 * log10(middle / dryRMS)) bass180RelativeDB=\(20 * log10(midBass / middle))")
+        }
+    }
+
     func testTransientPeakDoesNotKeepFollowingQuietMusicTurnedDown() {
         let processor = SpeakerAudioProcessor(sampleRate: 48000, channels: 1, enabled: true)
         var frame: [Float] = [1.8]
@@ -58,6 +69,7 @@ final class SpeakerAudioProcessorTests: XCTestCase {
         }
         let fundamental = 2 * (real * real + imaginary * imaginary) / Double(count * count)
         let distortion = sqrt(max(0, power / Double(count) - fundamental) / fundamental)
+        print("Speaker 100Hz sustained THD+N=\(distortion)")
         XCTAssertLessThan(distortion, 0.01, "A louder 100Hz bass tone must remain below 1% THD+N")
     }
 

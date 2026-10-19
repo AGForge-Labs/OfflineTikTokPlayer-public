@@ -43,7 +43,7 @@ struct SettingsView: View {
                 }
                 Section("Playback") {
                     Toggle("Speaker sound", isOn: $playback.speakerSound)
-                    Text("Adds bass, clarity and controlled volume through the iPhone speakers. Turn off for Original sound. Headphones use the original audio.")
+                    Text("Boosts quieter music and adds fuller bass through the iPhone speakers, with peak protection. Turn off for Original sound. Headphones and Bluetooth use the original audio. Your iPhone volume stays under your control.")
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("Automatic Picture in Picture", isOn: $playback.automaticPiP)
                     Text("Audio keeps playing when you lock your phone. Your queue and position return paused when you reopen the app.")

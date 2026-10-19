@@ -40,6 +40,8 @@ public final class SpeakerAudioProcessor {
     private let compressionAttack: Double
     private let compressionRecovery: Double
     private let rampStep: Double
+    private let peakHoldFrames: Int
+    private let makeupGain: Double
     private var bass: [Shelf]
     private var presence: [Shelf]
     private var signal: [Double]
@@ -47,6 +49,8 @@ public final class SpeakerAudioProcessor {
     private var levelPower = 0.0
     private var compression = 1.0
     private var wet = 0.0
+    private var heldPeak = 0.0
+    private var peakHoldRemaining = 0
 
     public init(sampleRate: Double, channels: Int, enabled: Bool) {
         let valid = sampleRate.isFinite && sampleRate >= 16000 && sampleRate <= 192000 && (1...8).contains(channels)
@@ -58,7 +62,9 @@ public final class SpeakerAudioProcessor {
         compressionAttack = exp(-1 / (rate * 0.005))
         compressionRecovery = exp(-1 / (rate * 0.040))
         rampStep = 1 / (rate * 0.030)
-        bass = (0..<count).map { _ in Shelf(rate: rate, frequency: 160, gainDB: 4, high: false) }
+        peakHoldFrames = Int(rate * 0.012)
+        makeupGain = pow(10, 9.0 / 20)
+        bass = (0..<count).map { _ in Shelf(rate: rate, frequency: 220, gainDB: 5, high: false) }
         presence = (0..<count).map { _ in Shelf(rate: rate, frequency: 3500, gainDB: 2, high: true) }
         signal = Array(repeating: 0, count: count)
     }
@@ -75,19 +81,29 @@ public final class SpeakerAudioProcessor {
             peak = max(peak, abs(value))
         }
         // Shape music by its average level, rather than holding it down after every transient.
-        // 2:1 compression above 0.18 RMS, with up to 6dB gain on quieter material.
+        // 2:1 compression above 0.18 RMS, with up to 9dB gain on quieter material.
+        // Extend bass support to 180-220Hz instead of spending most gain on deep bass.
         levelPower = levelCoefficient * levelPower + (1 - levelCoefficient) * peak * peak
         let level = sqrt(levelPower)
         let targetCompression = level > 0.18 ? sqrt(0.18 / level) : 1
         let coefficient = targetCompression < compression ? compressionAttack : compressionRecovery
         compression = targetCompression + (compression - targetCompression) * coefficient
-        let gain = 1 + wet * (2 * compression - 1)
+        let gain = 1 + wet * (makeupGain * compression - 1)
         peak *= gain
         // Peak protection shares gain across channels and recovers quickly. No sample delay.
-        let target = peak > 0.98 ? 0.98 / peak : 1
+        // About 1dB of sample headroom. This is not a true-peak limiter.
+        let ceiling = 0.89
+        // Hold a crest across the next bass half-cycle. Releasing on each sample
+        // flattens loud bass peaks and creates distortion when gain is increased.
+        if peak >= heldPeak * 0.9999 {
+            heldPeak = max(peak, heldPeak); peakHoldRemaining = peakHoldFrames
+        } else if peakHoldRemaining > 0 {
+            peakHoldRemaining -= 1
+        } else { heldPeak = max(peak, heldPeak * limiterRelease) }
+        let target = heldPeak > ceiling ? ceiling / heldPeak : 1
         limiter = min(target, 1 - (1 - limiter) * limiterRelease)
         for channel in frame.indices {
-            frame[channel] = Float(max(-0.98, min(0.98, signal[channel] * gain * limiter)))
+            frame[channel] = Float(max(-ceiling, min(ceiling, signal[channel] * gain * limiter)))
         }
     }
 
@@ -98,5 +114,6 @@ public final class SpeakerAudioProcessor {
             signal[channel] = 0
         }
         limiter = 1; wet = 0; levelPower = 0; compression = 1
+        heldPeak = 0; peakHoldRemaining = 0
     }
 }

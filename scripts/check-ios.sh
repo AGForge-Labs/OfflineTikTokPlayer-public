@@ -9,4 +9,5 @@ mkdir -p artifacts/native
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
   -destination "${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro Max}" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Tests-$(date +%Y%m%d-%H%M%S).xcresult" \
+  -jobs 1 -parallel-testing-enabled NO \
   CODE_SIGNING_ALLOWED=NO test

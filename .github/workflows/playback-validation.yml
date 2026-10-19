@@ -1,0 +1,17 @@
+name: Public playback validation
+on:
+  push:
+    branches: [fix/playback-continuity]
+permissions:
+  contents: read
+jobs:
+  ios:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Unsigned core and simulator tests with one build job
+        run: bash scripts/check-ios.sh
