@@ -15,6 +15,8 @@
 - [x] Record cold/next/previous clock timing and natural-boundary scheduling separately from physical audible/visible output. Decode synthetic source audio to distinguish encoded silence from scheduling gaps. Preserve all source samples and source duration.
 - [x] Run one-job Swift core/adapter/syntax checks, Python/project checks, and free unsigned public native CI. Review the diff and record physical iPhone/camera acceptance requirements before release coordination.
 
-Implementation and automated validation are complete. Independent review and physical iPhone acceptance remain pending; manual next/previous speedup and audible seamlessness are not established by the simulator timing checks.
+Independent read-only review is complete. Its startup-seek, retained-mix and coalesced-boundary findings are fixed, including the two-item replenishment window and longer-playlist continuation. Production source `2dc6625` passes 69 core, 40 native and one UI test in public run 39326804950. The final diagnostic comparison uses identical service/route/source/50 ms conditions with Speaker sound and Original sound, three serial trials per mode.
+
+Physical iPhone acceptance and immediate next/previous playback remain open. Callback/clock timing does not establish first audible output or audible seamlessness. The validation report contains phase instrumentation and the concrete device/recording plan; no signing or release is performed here.
 
 Review focus: stale end callbacks after swipes; interruption during asynchronous item readiness; pause during recovery; repeat-one explicit skip; memory pressure while preparing. These require regression coverage, with real iPhone audio-route/background/camera behavior explicitly pending.

@@ -2,7 +2,39 @@
 
 Baseline: public `112b1cc4cbf350a9bd914fa28b9b3f3d2b7b8564`.
 
-## Final reviewed source and result
+## Independent review follow-up
+
+Read-only independent review found three concrete defects: a user scrub could supersede the paused startup seek without inheriting its resume intent; the controller evicted the retained Previous item's mix bookkeeping; and coalesced queue callbacks could miss the loop reserve. The follow-up shares one generation/timeline/intent-guarded seek completion, supplies all bounded retained items to the audio controller, and reconciles the actual current or drained prepared item. Review also caught the two-item replenishment window and the distinction between draining prepared items and exhausting the metadata playlist. Recovery now continues a longer playlist only with playback permission and preserves explicit Pause/interruption across deferred continuation. A final focused static review found no further concrete regression.
+
+Reviewed production source `2dc6625a332980aabdf2c88c9c8b1fe32ffa46c0` passes [native run 39326804950](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39326804950): **69 Mac core, 40 native and one UI test**, plus the actual Apple-framework previous/coalesced-boundary check. The coalesced-boundary reproduction first failed on unchanged production code in [run 39324775936](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39324775936), then passed after correction. The new longer-queue integration regression covers normal continuation, interrupted continuation with resume permission, and explicit Pause followed by Play.
+
+**Final validated head:** `f82492795c100cfc27e2faa0c1444a53d6f36c5f`, [native run 39327742516](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39327742516). Production source is identical to `2dc6625`; the test-only follow-up adds a counterbalanced Original/speaker comparison. The Apple-framework checks, **69 core, 40 native and one UI test pass** on Xcode 26.6 / iOS 26.5 Simulator.
+
+The original Previous timing fixture bypassed the service/session/controller and waited for 100 ms of clock progress, while the original Next fixture waited for 50 ms and marked its local URL remote. Those historical values are not a controlled comparison. The final service benchmark uses three serial trials **per mode** of the same Saved source, built-in-speaker policy, session activation and 50 ms threshold for cold/Next/Previous. Mode order alternates; mix identity and per-item track-load counts are recorded across reversal. A two-second fixture watchdog detects a stall; passing it does **not** accept immediate playback performance.
+
+| Final production-service clock timing | Speaker sound median (range) | Original median (range) |
+| --- | ---: | ---: |
+| Cold, until 50 ms progress | 506 ms (498–660) | 299 ms (283–321) |
+| Prepared Next, same threshold | 571 ms (524–583) | 390 ms (328–410) |
+| Retained Previous, same threshold | 533 ms (502–721) | 325 ms (308–357) |
+
+Speaker processing adds roughly 180–210 ms to these median **simulator clock** results. This comparison isolates the presence of the processing mix; it does not isolate DSP CPU cost from AVFoundation's processing/output path, and it does not establish hardware audible latency. Original sound also retains startup delay. No consistent immediate manual transition is demonstrated, and this issue remains open. No automatic preference change hides the tradeoff.
+
+Across the final manual transitions, session activation takes 0.15–3.28 ms, prepared-item adoption 1.94–8.67 ms, and first-frame callbacks 96–177 ms. The clock threshold arrives substantially later. Previous reuses the same mix in all enhanced trials, with exactly one track load for that retained item; Original uses no mix or track load. Each measured handoff retains two items; the separate stress/loop regressions enforce the four-item maximum. These phases narrow the remaining question to the platform playback/output path rather than repeated URL lookup or mix construction. A phone trace is the next evidence needed before changing the audio architecture.
+
+Final complete 1.2-second loop ends are 1.2010/1.2018/1.2015 seconds, with corrected clock-gap estimates +0.024/-6.106/+3.859 ms. The decoded source still has 1 ms leading below -60 dB and no measured trailing interval. All source content is retained; this is not a physical audible-gap measurement.
+
+## Instrumented device plan and remaining acceptance
+
+The service emits fixed OS signpost phase names for Instruments: subsystem `OfflineTikTokPlayer`, category `Playback`. Events include `start`, `next`, `previous`, activation request/completion/failure, load request, cold audio prepared, prepared adoption, item ready, seek request/completion, first frame, playing/waiting, clock reaching 50 ms, and interruption begin/end permission. Only generation and retained-item count are logged; no media identifiers, URLs, titles, cookies or credentials. There is no persistent event array or new access permission. The native benchmark additionally collects bounded, numerical per-trial phase traces in its test result.
+
+These are callback observations, not hardware output timestamps. A playing event or clock progress does not prove the first PCM sample reached the speaker. A restored/nonzero seek can already exceed 50 ms; use that milestone only for the zero-start trials. Do not interpret delayed observer delivery as silence or subtract 50 ms and call the result audible startup.
+
+The next useful experiment requires an actual iPhone and an authorized device candidate; Windows and the unsigned simulator cannot exercise a competing camera app's session or measure phone speaker output. No signing or candidate release is performed here. Minimal handoff: coordinate the validated commit through the existing device build process, then run one Saved-clip sequence (cold, Next, Previous, ten loops) and a competing scan/photo interruption. Record iPhone model/iOS version, route, Speaker sound choice and source privately.
+
+For a developer-assisted measurement, capture those OS signposts plus Time Profiler/Allocations on that phone while recording the screen/touch and physical speaker with an external recorder. Align action and frame timestamps to the trace; compare the captured waveform with a decoded copy of the exact source, reporting its leading/trailing silence separately. Report action-to-first-frame, action-to-first-audible-source, added loop silence, interruption position/resume and memory before/after 100 reversals. Repeat with Original sound and headphones/Bluetooth. Keep source media and work-app screen data private. Physical output, route effects, RSS and immediate-transition acceptance remain open until this evidence exists.
+
+## Earlier validated implementation and historical measurements
 
 **Validated implementation:** `12dcdf45d830984d07b6b379bf06b59ef75c019d`, [public native run 39321683428](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39321683428). The real Apple-framework previous-preparation check, **69 Mac core, 35 native and one UI test all pass** on Xcode 26.6 / iOS 26.5 Simulator. The final Saved-copy automatic-handoff integration regression passes. Local Python/adapter/project/syntax/workflow evidence is below. No private signing or release occurred.
 
