@@ -8,11 +8,13 @@
 
 ## Tasks
 
-- [ ] Pin playback intent with core tests: duplicate interruption begins, user pause, missing shouldResume, failed activation, missing end, normal foreground and explicit recovery. Integrate an activation gate and `.playback` / `.mixWithOthers` without attempting to take an exclusive camera session.
-- [ ] Pin native buffer behavior: automatic prepared advancement, complete repeat-one items, explicit skip, previous reuse, rapid reversals, queue exhaustion and bounded retained items. Use a persistent queue player, two queued items and at most one retained predecessor; observe actual current-item changes instead of waiting to restart at the boundary.
-- [ ] Prepare natural successors (including full-duration duplicates) and previous items, retain revision/cancellation gates, remove preparation on memory pressure, and keep feed interaction/end-of-queue behavior deterministic.
-- [ ] Recover speaker processing after optional cold-metadata timeouts. Measure quiet music gain, mid-bass response, native-tap PCM, sample headroom and bass distortion. Preserve Original sound and headphones/Bluetooth bypass without changing system volume.
-- [ ] Record cold/next/previous clock timing and natural-boundary scheduling separately from physical audible/visible output. Decode synthetic source audio to distinguish encoded silence from scheduling gaps. Preserve all source samples and source duration.
-- [ ] Run one-job Swift core/adapter/syntax checks, Python/project checks, and free unsigned public native CI. Review the diff and record physical iPhone/OnTrac acceptance requirements before release coordination.
+- [x] Pin playback intent with core tests: duplicate interruption begins, user pause, missing shouldResume, failed activation, missing end, normal foreground and explicit recovery. Integrate an activation gate and `.playback` / `.mixWithOthers` without attempting to take an exclusive camera session.
+- [x] Pin native buffer behavior: automatic prepared advancement, complete repeat-one items, explicit skip, previous reuse, rapid reversals, queue exhaustion and bounded retained items. Use one persistent queue player, normally two queued items (three for repeat-one), and at most one retained predecessor; observe actual current-item changes instead of waiting to restart at the boundary.
+- [x] Prepare natural successors (including full-duration duplicates) and previous items, retain revision/cancellation gates, remove preparation on memory pressure, and keep feed interaction/end-of-queue behavior deterministic. Automatic handoffs honor Saved/offline eligibility.
+- [x] Recover speaker processing after optional cold-metadata timeouts. Measure quiet music gain, mid-bass response, native-tap PCM, sample headroom and bass distortion. Preserve Original sound and headphones/Bluetooth bypass without changing system volume.
+- [x] Record cold/next/previous clock timing and natural-boundary scheduling separately from physical audible/visible output. Decode synthetic source audio to distinguish encoded silence from scheduling gaps. Preserve all source samples and source duration.
+- [x] Run one-job Swift core/adapter/syntax checks, Python/project checks, and free unsigned public native CI. Review the diff and record physical iPhone/camera acceptance requirements before release coordination.
+
+Implementation and automated validation are complete. Independent review and physical iPhone acceptance remain pending; manual next/previous speedup and audible seamlessness are not established by the simulator timing checks.
 
 Review focus: stale end callbacks after swipes; interruption during asynchronous item readiness; pause during recovery; repeat-one explicit skip; memory pressure while preparing. These require regression coverage, with real iPhone audio-route/background/camera behavior explicitly pending.
