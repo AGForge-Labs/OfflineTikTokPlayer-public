@@ -36,16 +36,16 @@ final class PlaybackContinuityTests: XCTestCase {
     }
 
     func testCoalescedAndDrainedLoopBoundariesReconcileActualCurrentItem() throws {
-        for drain in [false, true] {
+        for (hasReserve, drain) in [(true, false), (true, true), (false, true)] {
             let buffer = PlaybackBuffer(), original = try item(), reserve = try item()
             defer { buffer.replace(with: nil); buffer.discardPrevious() }
             buffer.replace(with: original, mediaID: "loop")
-            buffer.stage(.init(mediaID: "loop", item: try item(), isLocal: true))
-            buffer.stageLoopReserve(.init(mediaID: "loop", item: reserve, isLocal: true))
+            buffer.stage(.init(mediaID: "loop", item: hasReserve ? try item() : reserve, isLocal: true))
+            if hasReserve { buffer.stageLoopReserve(.init(mediaID: "loop", item: reserve, isLocal: true)) }
             var adopted: PlaybackBuffer.Prepared?
             buffer.didAdvance = { adopted = $0 }
             buffer.player.advanceToNextItem(); buffer.player.advanceToNextItem()
-            if drain { buffer.player.advanceToNextItem() }
+            if hasReserve && drain { buffer.player.advanceToNextItem() }
             buffer.synchronize()
             XCTAssertTrue(adopted?.item === reserve)
             XCTAssertEqual(adopted?.needsRewind, drain)
@@ -55,6 +55,55 @@ final class PlaybackContinuityTests: XCTestCase {
             XCTAssertLessThanOrEqual(buffer.retainedItemCount, 2)
             buffer.stage(.init(mediaID: "loop", item: try item(), isLocal: true), after: "loop")
             XCTAssertTrue(buffer.hasPrepared("loop"))
+        }
+    }
+
+    func testDrainedFinalBoundaryAdoptsFinalMetadataAndPausesWithoutRewind() async throws {
+        let fixture = try await ServiceFixture()
+        defer { fixture.remove() }
+        let buffer = PlaybackBuffer()
+        let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {}, buffer: buffer)
+        defer { service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+        service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+        try await until { buffer.hasPrepared(fixture.ids[1]) }
+        buffer.player.pause()
+        // Emulate both boundaries passing before queued KVO can reconcile them.
+        let final = try XCTUnwrap(buffer.player.items().last)
+        buffer.player.advanceToNextItem(); buffer.player.advanceToNextItem(); buffer.synchronize()
+        try await until { !service.isLoading }
+        XCTAssertEqual(service.queue.currentID, fixture.ids[1])
+        XCTAssertTrue(service.player.currentItem === final)
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertEqual(service.player.rate, 0)
+        XCTAssertNil(buffer.nextMediaID)
+    }
+
+    func testDrainedPreparedWindowContinuesLongerQueueOnlyWhenPlaybackIsPermitted() async throws {
+        for mode in 0..<3 { // normal, interruption with resume, interruption plus user pause
+            let fixture = try await ServiceFixture(count: 3)
+            defer { fixture.remove() }
+            let buffer = PlaybackBuffer()
+            let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+                bookmarkURL: fixture.bookmark, activateSession: {}, buffer: buffer)
+            defer { service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+            service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+            try await until { buffer.hasPrepared(fixture.ids[1]) }
+            buffer.player.pause()
+            if mode > 0 { service.handleInterruption(began: true) }
+            buffer.player.advanceToNextItem(); buffer.player.advanceToNextItem(); buffer.synchronize()
+            if mode > 0 {
+                try await until { !service.isLoading }
+                XCTAssertEqual(service.queue.currentID, fixture.ids[1]); XCTAssertEqual(service.player.rate, 0)
+                if mode == 2 { service.pause() }
+                service.handleInterruption(began: false, shouldResume: true)
+                if mode == 2 {
+                    XCTAssertEqual(service.queue.currentID, fixture.ids[1]); XCTAssertEqual(service.player.rate, 0)
+                    service.play()
+                }
+            }
+            try await until { service.queue.currentID == fixture.ids[2] && !service.isLoading }
+            XCTAssertTrue(service.wantsToPlay)
         }
     }
 
@@ -137,13 +186,13 @@ final class PlaybackContinuityTests: XCTestCase {
         let ids: [String]
         let playlist = "local:service-timing"
         var bookmark: URL { temporary.appendingPathComponent("playback.json") }
-        init() async throws {
+        init(count: Int = 2) async throws {
             temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
             cloud = OneDriveClient(account: MicrosoftAccount())
             downloads = OfflineDownloads(cloud: cloud, network: NetworkStatus())
             library = LibraryRepository(cloud: cloud, catalogURL: temporary.appendingPathComponent("catalog.json"))
-            ids = (0..<2).map { "local:service-\($0)-" + UUID().uuidString }
+            ids = (0..<count).map { "local:service-\($0)-" + UUID().uuidString }
             let source = try XCTUnwrap(Bundle(for: PlaybackContinuityTests.self).url(forResource: "test-video", withExtension: "mp4"))
             for id in ids { _ = try await downloads.importLocal(source, mediaID: id) }
             try library.install(LibraryCatalog(libraryID: "local:test", media: ids.map { MediaRecord(id: $0, title: "Synthetic", creator: "Fixture", duration: 1.2) },

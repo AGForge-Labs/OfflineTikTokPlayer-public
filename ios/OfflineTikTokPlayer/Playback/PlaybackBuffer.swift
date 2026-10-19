@@ -9,6 +9,7 @@ final class PlaybackBuffer {
         let item: AVPlayerItem
         let isLocal: Bool
         var needsRewind = false
+        var reachedEnd = false
     }
     let player = AVQueuePlayer()
     private var next: Prepared?
@@ -80,14 +81,15 @@ final class PlaybackBuffer {
             // Multiple currentItem changes can coalesce before MainActor KVO runs.
             prepared = reserve
             next = nil
-        } else if player.currentItem == nil, let reserve = loopReserve,
-                  reserve.mediaID == active?.mediaID, reserve.mediaID == next?.mediaID {
-            // A suspended main actor can miss all three loop boundaries. Recover
+        } else if player.currentItem == nil, let last = loopReserve ?? next {
+            // A suspended main actor can miss two or three loop boundaries. Recover
             // the complete source through the service's guarded rewind, not a tail trim.
-            prepared = Prepared(mediaID: reserve.mediaID, item: reserve.item, isLocal: reserve.isLocal, needsRewind: true)
+            let repeating = last.mediaID == active?.mediaID && last.mediaID == next?.mediaID
+            prepared = Prepared(mediaID: last.mediaID, item: last.item, isLocal: last.isLocal,
+                                needsRewind: repeating, reachedEnd: !repeating)
             next = nil
             player.pause()
-            player.insert(reserve.item, after: nil)
+            player.insert(last.item, after: nil)
         } else { return }
         active = prepared; loopReserve = nil; updateEndAction()
         preparePreviousStart()

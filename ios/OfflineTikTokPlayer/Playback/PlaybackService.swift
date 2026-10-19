@@ -80,6 +80,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var remoteRetries = Set<String>()
     @ObservationIgnored private var currentIsLocal = false
     @ObservationIgnored private var endedDuringScroll = false
+    @ObservationIgnored private var reachedPreparedEnd = false
     @ObservationIgnored private var lastBookmark = Date.distantPast
     private let bookmarkURL: URL
     @ObservationIgnored private let activateSession: () throws -> Void
@@ -155,6 +156,7 @@ final class PlaybackService: NSObject {
     func play() {
         guard current != nil else { return }
         intent.requestPlay(); activateAudio()
+        if intent.canPlay, resumeAfterPreparedEnd() { return }
         if player.currentItem == nil { loadCurrent(position: clock.position) }
         else {
             if clock.duration > 0, clock.position >= clock.duration { seek(0) }
@@ -223,6 +225,13 @@ final class PlaybackService: NSObject {
     }
 
     private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil) {
+        reachedPreparedEnd = adopting?.reachedEnd ?? false
+        if reachedPreparedEnd {
+            var following = queue
+            if following.next(explicit: false) != nil {
+                if intent.canPlay { queue = following; loadCurrent(); return }
+            } else { intent.pause(); player.pause() }
+        }
         endedDuringScroll = false
         let resume = MediaResumePosition(mediaID: queue.currentID, seconds: position)
         generation += 1; let request = generation
@@ -272,9 +281,9 @@ final class PlaybackService: NSObject {
                     // An explicit cold selection must not wait half a second for
                     // optional EQ metadata. Readiness provides one safe retry.
                     await self.speakerAudio.prepare(playerItem, within: .milliseconds(100))
-                    self.recordPlaybackEvent("coldAudioPrepared")
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
+                    self.recordPlaybackEvent("coldAudioPrepared")
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
                     self.observeCurrent(playerItem, position: itemPosition, request: request)
                     self.prepareUpcoming()
@@ -501,9 +510,18 @@ final class PlaybackService: NSObject {
             player.pause(); persist()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
             activateAudio()
-            if intent.canPlay { player.play() }
+            if intent.canPlay, !resumeAfterPreparedEnd() { player.play() }
         }
         updateNowPlaying()
+    }
+
+    private func resumeAfterPreparedEnd() -> Bool {
+        guard reachedPreparedEnd else { return false }
+        reachedPreparedEnd = false
+        var following = queue
+        if following.next(explicit: false) != nil { queue = following }
+        loadCurrent()
+        return true
     }
 
     private func refreshAudioProcessing() {
