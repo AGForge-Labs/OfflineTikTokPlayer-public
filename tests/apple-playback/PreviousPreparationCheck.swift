@@ -25,6 +25,18 @@ struct PreviousPreparationCheck {
             throw failure("Previous did not rewind silently during preparation: position=\(preparedPosition)")
         }
         print("Apple framework previous preparation: sourceOffset=0.4, preparedOffset=\(preparedPosition), rewindReadyBeforeHandoff=true, retainedItems=\(buffer.retainedItemCount)")
+        buffer.replace(with: AVPlayerItem(url: url), mediaID: "loop")
+        buffer.stage(.init(mediaID: "loop", item: AVPlayerItem(url: url), isLocal: true))
+        let reserve = AVPlayerItem(url: url)
+        buffer.stageLoopReserve(.init(mediaID: "loop", item: reserve, isLocal: true))
+        var adopted: AVPlayerItem?
+        buffer.didAdvance = { adopted = $0.item }
+        buffer.player.advanceToNextItem(); buffer.player.advanceToNextItem()
+        buffer.synchronize()
+        guard adopted === reserve, buffer.nextMediaID == nil, !buffer.hasLoopReserve else {
+            throw failure("Coalesced loop advances left stale active/prepared identities")
+        }
+        print("Apple framework coalesced loop advancement: reserve adopted, stale slots cleared")
     }
 
     private static func failure(_ text: String) -> NSError {
