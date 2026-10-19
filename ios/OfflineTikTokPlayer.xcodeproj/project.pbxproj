@@ -1,0 +1,975 @@
+// !$*UTF8*$!
+{
+	"archiveVersion" = 1;
+	"classes" = {
+	};
+	"objectVersion" = 56;
+	"objects" = {
+		"42FC8297BC59048C5AF1798F" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "AppModel.swift";
+			"sourceTree" = "<group>";
+		};
+		"2B8D11686BCBA11A0C8E30C9" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "42FC8297BC59048C5AF1798F";
+		};
+		"1FC97AEE59D3BB5869F9ED53" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "OfflineTikTokPlayerApp.swift";
+			"sourceTree" = "<group>";
+		};
+		"FF30C863E1FFC378425D493D" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "1FC97AEE59D3BB5869F9ED53";
+		};
+		"9EEB79FB2C720E129AD3219F" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"42FC8297BC59048C5AF1798F",
+				"1FC97AEE59D3BB5869F9ED53",
+			);
+			"path" = "App";
+			"sourceTree" = "<group>";
+		};
+		"F3A9E5C30F05D5E573356577" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "folder.assetcatalog";
+			"path" = "Assets.xcassets";
+			"sourceTree" = "<group>";
+		};
+		"A36C6DCA7C0687090E3C9A85" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "F3A9E5C30F05D5E573356577";
+		};
+		"87E1981BE1FB8B221F125524" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "PlaybackBuffer.swift";
+			"sourceTree" = "<group>";
+		};
+		"427DE18C6458A73FB4C3C80D" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "87E1981BE1FB8B221F125524";
+		};
+		"3D0DD937117DBCAA9A3A3EBC" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "PlaybackCacheLoader.swift";
+			"sourceTree" = "<group>";
+		};
+		"5DD7CD176855D4BFA02C1608" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "3D0DD937117DBCAA9A3A3EBC";
+		};
+		"74946FD5DD5EB7B482600861" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "PlaybackFrameMonitor.swift";
+			"sourceTree" = "<group>";
+		};
+		"C4F87A522573E2DB2A9F5B99" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "74946FD5DD5EB7B482600861";
+		};
+		"AED828E74DF2EC7C0479AFCB" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "PlaybackService.swift";
+			"sourceTree" = "<group>";
+		};
+		"3AFAAFD0628155B32DB4D14A" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "AED828E74DF2EC7C0479AFCB";
+		};
+		"CD833F274AAA50E4B41544A6" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "PlayerSurface.swift";
+			"sourceTree" = "<group>";
+		};
+		"B98ED432316E6018B7E3169B" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "CD833F274AAA50E4B41544A6";
+		};
+		"081AC78D51311C3DE43D15DF" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "SpeakerAudioMix.swift";
+			"sourceTree" = "<group>";
+		};
+		"97B026111981730A6F236F34" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "081AC78D51311C3DE43D15DF";
+		};
+		"35871139E1498B258B422A4D" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"87E1981BE1FB8B221F125524",
+				"3D0DD937117DBCAA9A3A3EBC",
+				"74946FD5DD5EB7B482600861",
+				"AED828E74DF2EC7C0479AFCB",
+				"CD833F274AAA50E4B41544A6",
+				"081AC78D51311C3DE43D15DF",
+			);
+			"path" = "Playback";
+			"sourceTree" = "<group>";
+		};
+		"DB5DCFED7042255C799ADFC2" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "ArtworkStore.swift";
+			"sourceTree" = "<group>";
+		};
+		"D41A0E82A5FB1DE7A04E7833" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "DB5DCFED7042255C799ADFC2";
+		};
+		"5884FA238698BAEE32DA9FA1" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "LibraryRepository.swift";
+			"sourceTree" = "<group>";
+		};
+		"A7B618251C47D841074E8476" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "5884FA238698BAEE32DA9FA1";
+		};
+		"AA62A42A2C76CF296DFF66FD" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "MicrosoftAccount.swift";
+			"sourceTree" = "<group>";
+		};
+		"BD94960CE2EDD344355A3142" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "AA62A42A2C76CF296DFF66FD";
+		};
+		"FAF636847D6527BDC0873AA8" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "NetworkStatus.swift";
+			"sourceTree" = "<group>";
+		};
+		"C49BA6CA7F9CB6F3ECC7370D" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "FAF636847D6527BDC0873AA8";
+		};
+		"6355CB252BCDFCA846933559" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "OfflineDownloads.swift";
+			"sourceTree" = "<group>";
+		};
+		"D9CAE77498C93C677A6405CC" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "6355CB252BCDFCA846933559";
+		};
+		"78D5CD339D632830248FC3B1" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "OneDriveClient.swift";
+			"sourceTree" = "<group>";
+		};
+		"BF3AD7B782B5E996B1119B0D" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "78D5CD339D632830248FC3B1";
+		};
+		"3E0D74DDED8DD57C5BF3DBC1" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"DB5DCFED7042255C799ADFC2",
+				"5884FA238698BAEE32DA9FA1",
+				"AA62A42A2C76CF296DFF66FD",
+				"FAF636847D6527BDC0873AA8",
+				"6355CB252BCDFCA846933559",
+				"78D5CD339D632830248FC3B1",
+			);
+			"path" = "Services";
+			"sourceTree" = "<group>";
+		};
+		"9EF49727AED4B630263AF18D" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "AppFiles.swift";
+			"sourceTree" = "<group>";
+		};
+		"72D41270D5C7ABEDDC14BA4C" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "9EF49727AED4B630263AF18D";
+		};
+		"CBBC1E3337D628DD699FBC00" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "image.svg";
+			"path" = "AppIcon.svg";
+			"sourceTree" = "<group>";
+		};
+		"97D86F53B4B2CDDF7A3A510F" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "text.plist.xml";
+			"path" = "Info.plist";
+			"sourceTree" = "<group>";
+		};
+		"FEB99E5754244808F79ED606" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "text.plist.entitlements";
+			"path" = "OfflineTikTokPlayer.entitlements";
+			"sourceTree" = "<group>";
+		};
+		"DEA77D0E24F24B75339EA41B" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "text.xml";
+			"path" = "PrivacyInfo.xcprivacy";
+			"sourceTree" = "<group>";
+		};
+		"17E733A1E6BC0E6C7E5DADBC" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "DEA77D0E24F24B75339EA41B";
+		};
+		"A67DCC98EEDCD7A059B8176D" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"9EF49727AED4B630263AF18D",
+				"CBBC1E3337D628DD699FBC00",
+				"97D86F53B4B2CDDF7A3A510F",
+				"FEB99E5754244808F79ED606",
+				"DEA77D0E24F24B75339EA41B",
+			);
+			"path" = "Support";
+			"sourceTree" = "<group>";
+		};
+		"72148EB81E78C685B01C4116" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "DownloadsView.swift";
+			"sourceTree" = "<group>";
+		};
+		"59BFE10E1BE924649828A6AC" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "72148EB81E78C685B01C4116";
+		};
+		"03265476E7A3D627A6FD0465" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "FeedPager.swift";
+			"sourceTree" = "<group>";
+		};
+		"85735AC6F73B8D9843DDA070" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "03265476E7A3D627A6FD0465";
+		};
+		"92C6F7242D0967558060CEA1" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "FeedView.swift";
+			"sourceTree" = "<group>";
+		};
+		"F1A1834DB90B9D6156AFE0F9" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "92C6F7242D0967558060CEA1";
+		};
+		"705166F72F31746A92FEDDED" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "LibraryView.swift";
+			"sourceTree" = "<group>";
+		};
+		"04EDC6621DBC417FE6D8B7EE" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "705166F72F31746A92FEDDED";
+		};
+		"B98B81ED76F79DDFD9E016C6" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "MediaThumbnail.swift";
+			"sourceTree" = "<group>";
+		};
+		"587E54F5BB5AE7616D10FBE2" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "B98B81ED76F79DDFD9E016C6";
+		};
+		"B2C249223EFE61BE952F8248" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "MiniPlayer.swift";
+			"sourceTree" = "<group>";
+		};
+		"F6A0A876235C30C5A7B1B400" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "B2C249223EFE61BE952F8248";
+		};
+		"4C8FEF91513B9B666B0C486E" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "RootView.swift";
+			"sourceTree" = "<group>";
+		};
+		"2960B00304F148E8758AB2A2" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "4C8FEF91513B9B666B0C486E";
+		};
+		"8D5A1B2CE41B15928A26BB02" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "SettingsView.swift";
+			"sourceTree" = "<group>";
+		};
+		"2A9F8F38846FCD50DC4F65CA" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "8D5A1B2CE41B15928A26BB02";
+		};
+		"3562D90DCD3514BD3ACD5124" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"72148EB81E78C685B01C4116",
+				"03265476E7A3D627A6FD0465",
+				"92C6F7242D0967558060CEA1",
+				"705166F72F31746A92FEDDED",
+				"B98B81ED76F79DDFD9E016C6",
+				"B2C249223EFE61BE952F8248",
+				"4C8FEF91513B9B666B0C486E",
+				"8D5A1B2CE41B15928A26BB02",
+			);
+			"path" = "UI";
+			"sourceTree" = "<group>";
+		};
+		"6049B505AF0F48DDD08E02CB" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"9EEB79FB2C720E129AD3219F",
+				"F3A9E5C30F05D5E573356577",
+				"35871139E1498B258B422A4D",
+				"3E0D74DDED8DD57C5BF3DBC1",
+				"A67DCC98EEDCD7A059B8176D",
+				"3562D90DCD3514BD3ACD5124",
+			);
+			"path" = "OfflineTikTokPlayer";
+			"sourceTree" = "<group>";
+		};
+		"823D92756EFEACD3CFB746BD" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "FeedPresentationTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"4B2F657C42D6DE6915A9FEC0" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "823D92756EFEACD3CFB746BD";
+		};
+		"6C96D7A2B9170F5FC49BE09D" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "LibraryRefreshTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"60D2911A177E91F7302481E0" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "6C96D7A2B9170F5FC49BE09D";
+		};
+		"53C1ED56AEF2C6C2F6604F5E" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "NativeMediaTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"54DB7842B82D98E59C46610A" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "53C1ED56AEF2C6C2F6604F5E";
+		};
+		"9E6443E89957939B7475C36B" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "SpeakerAudioTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"55ED0563DA5CDECEA34A3877" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "9E6443E89957939B7475C36B";
+		};
+		"752FC7F8D7C0757784F13C76" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-slideshow-mp3.iphone.mp4";
+			"sourceTree" = "<group>";
+		};
+		"911E24FB09AD366501E79934" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "752FC7F8D7C0757784F13C76";
+		};
+		"0738E822CA97616F6E5DC8F9" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-slideshow-mp3.mp4";
+			"sourceTree" = "<group>";
+		};
+		"BB25FB65101CB3C0DC7A87DA" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "0738E822CA97616F6E5DC8F9";
+		};
+		"5FC8AFE1EF84ED8F701F9F07" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-slideshow.mp4";
+			"sourceTree" = "<group>";
+		};
+		"4D50E451668A30F67EDC6256" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "5FC8AFE1EF84ED8F701F9F07";
+		};
+		"755E32E3A2AF2197C8E50246" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-video.mp4";
+			"sourceTree" = "<group>";
+		};
+		"CEE7386398DBFC5A00B5E40E" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "755E32E3A2AF2197C8E50246";
+		};
+		"843D8AE50F397108A8B1285E" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"823D92756EFEACD3CFB746BD",
+				"6C96D7A2B9170F5FC49BE09D",
+				"53C1ED56AEF2C6C2F6604F5E",
+				"9E6443E89957939B7475C36B",
+				"752FC7F8D7C0757784F13C76",
+				"0738E822CA97616F6E5DC8F9",
+				"5FC8AFE1EF84ED8F701F9F07",
+				"755E32E3A2AF2197C8E50246",
+			);
+			"path" = "OfflineTikTokPlayerTests";
+			"sourceTree" = "<group>";
+		};
+		"31DB2F7D45323D62A7CD6A5D" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "PlayerShellTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"F34B770076F468050A561172" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "31DB2F7D45323D62A7CD6A5D";
+		};
+		"0569CC9A160C753CFC9A5D3E" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"31DB2F7D45323D62A7CD6A5D",
+			);
+			"path" = "OfflineTikTokPlayerUITests";
+			"sourceTree" = "<group>";
+		};
+		"C09E744275686D1BC2471594" = {
+			"isa" = "PBXFileReference";
+			"explicitFileType" = "wrapper.application";
+			"includeInIndex" = 0;
+			"path" = "OfflineTikTokPlayer.app";
+			"sourceTree" = "BUILT_PRODUCTS_DIR";
+		};
+		"7BF889F8781854EBDBF96EB1" = {
+			"isa" = "PBXFileReference";
+			"explicitFileType" = "wrapper.cfbundle";
+			"includeInIndex" = 0;
+			"path" = "OfflineTikTokPlayerTests.xctest";
+			"sourceTree" = "BUILT_PRODUCTS_DIR";
+		};
+		"23D9944AE28FA3E0D0F3BF54" = {
+			"isa" = "PBXFileReference";
+			"explicitFileType" = "wrapper.cfbundle";
+			"includeInIndex" = 0;
+			"path" = "OfflineTikTokPlayerUITests.xctest";
+			"sourceTree" = "BUILT_PRODUCTS_DIR";
+		};
+		"0A3E27B8CA818264D75C8D81" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"C09E744275686D1BC2471594",
+				"7BF889F8781854EBDBF96EB1",
+				"23D9944AE28FA3E0D0F3BF54",
+			);
+			"name" = "Products";
+			"sourceTree" = "<group>";
+		};
+		"0D6E4079E36703EBD37C0072" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"6049B505AF0F48DDD08E02CB",
+				"843D8AE50F397108A8B1285E",
+				"0569CC9A160C753CFC9A5D3E",
+				"0A3E27B8CA818264D75C8D81",
+			);
+			"sourceTree" = "<group>";
+		};
+		"8F4D0C97288DF3C168790D91" = {
+			"isa" = "XCLocalSwiftPackageReference";
+			"relativePath" = "PlayerCore";
+		};
+		"91EEDEEDC272355225815E36" = {
+			"isa" = "XCRemoteSwiftPackageReference";
+			"repositoryURL" = "https://github.com/AzureAD/microsoft-authentication-library-for-objc";
+			"requirement" = {
+				"kind" = "exactVersion";
+				"version" = "2.16.0";
+			};
+		};
+		"EBF77FA8E11685D013DA1694" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "8F4D0C97288DF3C168790D91";
+			"productName" = "PlayerCore";
+		};
+		"3DEC23871528DBD5ADAF3E84" = {
+			"isa" = "XCSwiftPackageProductDependency";
+			"package" = "91EEDEEDC272355225815E36";
+			"productName" = "MSAL";
+		};
+		"55E5F325EE0DA9DCDAD6897C" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "EBF77FA8E11685D013DA1694";
+		};
+		"AD09B9C7ED2507ACE4859BE4" = {
+			"isa" = "PBXBuildFile";
+			"productRef" = "3DEC23871528DBD5ADAF3E84";
+		};
+		"FDD3EA28A0B1309668A442B2" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"IPHONEOS_DEPLOYMENT_TARGET" = "26.0";
+				"SWIFT_VERSION" = "5.0";
+				"SDKROOT" = "iphoneos";
+				"CLANG_ENABLE_MODULES" = "YES";
+				"SWIFT_STRICT_CONCURRENCY" = "complete";
+				"ENABLE_USER_SCRIPT_SANDBOXING" = "YES";
+				"DEVELOPMENT_TEAM" = "";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
+				"ONLY_ACTIVE_ARCH" = "YES";
+				"ENABLE_TESTABILITY" = "YES";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS" = "DEBUG $(inherited)";
+			};
+			"name" = "Debug";
+		};
+		"8DB23D5B0AA80A48AA651830" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"IPHONEOS_DEPLOYMENT_TARGET" = "26.0";
+				"SWIFT_VERSION" = "5.0";
+				"SDKROOT" = "iphoneos";
+				"CLANG_ENABLE_MODULES" = "YES";
+				"SWIFT_STRICT_CONCURRENCY" = "complete";
+				"ENABLE_USER_SCRIPT_SANDBOXING" = "YES";
+				"DEVELOPMENT_TEAM" = "";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-O";
+				"ONLY_ACTIVE_ARCH" = "NO";
+			};
+			"name" = "Release";
+		};
+		"1922B098E983995960BE56B0" = {
+			"isa" = "XCConfigurationList";
+			"buildConfigurations" = (
+				"FDD3EA28A0B1309668A442B2",
+				"8DB23D5B0AA80A48AA651830",
+			);
+			"defaultConfigurationIsVisible" = 0;
+			"defaultConfigurationName" = "Release";
+		};
+		"977A4FBB8D80DAAA36DA3742" = {
+			"isa" = "PBXSourcesBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+				"2B8D11686BCBA11A0C8E30C9",
+				"FF30C863E1FFC378425D493D",
+				"427DE18C6458A73FB4C3C80D",
+				"5DD7CD176855D4BFA02C1608",
+				"C4F87A522573E2DB2A9F5B99",
+				"3AFAAFD0628155B32DB4D14A",
+				"B98ED432316E6018B7E3169B",
+				"97B026111981730A6F236F34",
+				"D41A0E82A5FB1DE7A04E7833",
+				"A7B618251C47D841074E8476",
+				"BD94960CE2EDD344355A3142",
+				"C49BA6CA7F9CB6F3ECC7370D",
+				"D9CAE77498C93C677A6405CC",
+				"BF3AD7B782B5E996B1119B0D",
+				"72D41270D5C7ABEDDC14BA4C",
+				"59BFE10E1BE924649828A6AC",
+				"85735AC6F73B8D9843DDA070",
+				"F1A1834DB90B9D6156AFE0F9",
+				"04EDC6621DBC417FE6D8B7EE",
+				"587E54F5BB5AE7616D10FBE2",
+				"F6A0A876235C30C5A7B1B400",
+				"2960B00304F148E8758AB2A2",
+				"2A9F8F38846FCD50DC4F65CA",
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"4F1AC1C3ADA5DAE352038E6E" = {
+			"isa" = "PBXFrameworksBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+				"55E5F325EE0DA9DCDAD6897C",
+				"AD09B9C7ED2507ACE4859BE4",
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"9A0791D6E5D0E2443155F952" = {
+			"isa" = "PBXResourcesBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+				"A36C6DCA7C0687090E3C9A85",
+				"17E733A1E6BC0E6C7E5DADBC",
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"2026E01120CF950D949EAB4B" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"PRODUCT_NAME" = "$(TARGET_NAME)";
+				"PRODUCT_BUNDLE_IDENTIFIER" = "dev.galaxybigbird.OfflineTikTokPlayer";
+				"TARGETED_DEVICE_FAMILY" = "1";
+				"SUPPORTED_PLATFORMS" = "iphoneos iphonesimulator";
+				"CODE_SIGN_STYLE" = "Automatic";
+				"MARKETING_VERSION" = "1.0";
+				"CURRENT_PROJECT_VERSION" = "1";
+				"LD_RUNPATH_SEARCH_PATHS" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"GENERATE_INFOPLIST_FILE" = "NO";
+				"INFOPLIST_FILE" = "OfflineTikTokPlayer/Support/Info.plist";
+				"CODE_SIGN_ENTITLEMENTS" = "OfflineTikTokPlayer/Support/OfflineTikTokPlayer.entitlements";
+				"ASSETCATALOG_COMPILER_APPICON_NAME" = "AppIcon";
+				"ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME" = "AccentColor";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
+				"ONLY_ACTIVE_ARCH" = "YES";
+				"ENABLE_TESTABILITY" = "YES";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS" = "DEBUG $(inherited)";
+			};
+			"name" = "Debug";
+		};
+		"B07A0CB80BBAA9267C12EFDC" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"PRODUCT_NAME" = "$(TARGET_NAME)";
+				"PRODUCT_BUNDLE_IDENTIFIER" = "dev.galaxybigbird.OfflineTikTokPlayer";
+				"TARGETED_DEVICE_FAMILY" = "1";
+				"SUPPORTED_PLATFORMS" = "iphoneos iphonesimulator";
+				"CODE_SIGN_STYLE" = "Automatic";
+				"MARKETING_VERSION" = "1.0";
+				"CURRENT_PROJECT_VERSION" = "1";
+				"LD_RUNPATH_SEARCH_PATHS" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"GENERATE_INFOPLIST_FILE" = "NO";
+				"INFOPLIST_FILE" = "OfflineTikTokPlayer/Support/Info.plist";
+				"CODE_SIGN_ENTITLEMENTS" = "OfflineTikTokPlayer/Support/OfflineTikTokPlayer.entitlements";
+				"ASSETCATALOG_COMPILER_APPICON_NAME" = "AppIcon";
+				"ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME" = "AccentColor";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-O";
+				"ONLY_ACTIVE_ARCH" = "NO";
+			};
+			"name" = "Release";
+		};
+		"E0F0B8D9550DAD4AE35E3966" = {
+			"isa" = "XCConfigurationList";
+			"buildConfigurations" = (
+				"2026E01120CF950D949EAB4B",
+				"B07A0CB80BBAA9267C12EFDC",
+			);
+			"defaultConfigurationIsVisible" = 0;
+			"defaultConfigurationName" = "Release";
+		};
+		"190C03A0807DB0128A71E667" = {
+			"isa" = "PBXNativeTarget";
+			"buildConfigurationList" = "E0F0B8D9550DAD4AE35E3966";
+			"buildPhases" = (
+				"977A4FBB8D80DAAA36DA3742",
+				"4F1AC1C3ADA5DAE352038E6E",
+				"9A0791D6E5D0E2443155F952",
+			);
+			"buildRules" = (
+			);
+			"dependencies" = (
+			);
+			"name" = "OfflineTikTokPlayer";
+			"productName" = "OfflineTikTokPlayer";
+			"productReference" = "C09E744275686D1BC2471594";
+			"packageProductDependencies" = (
+				"EBF77FA8E11685D013DA1694",
+				"3DEC23871528DBD5ADAF3E84",
+			);
+			"productType" = "com.apple.product-type.application";
+		};
+		"FBCCBBF93160B1462BED5166" = {
+			"isa" = "PBXContainerItemProxy";
+			"containerPortal" = "244210E48437B6556980A702";
+			"proxyType" = 1;
+			"remoteGlobalIDString" = "190C03A0807DB0128A71E667";
+			"remoteInfo" = "OfflineTikTokPlayer";
+		};
+		"A5FAC770E0327AE0ADA244B2" = {
+			"isa" = "PBXTargetDependency";
+			"target" = "190C03A0807DB0128A71E667";
+			"targetProxy" = "FBCCBBF93160B1462BED5166";
+		};
+		"D8792BA99261151BC67CF9B9" = {
+			"isa" = "PBXSourcesBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+				"4B2F657C42D6DE6915A9FEC0",
+				"60D2911A177E91F7302481E0",
+				"54DB7842B82D98E59C46610A",
+				"55ED0563DA5CDECEA34A3877",
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"572F97AAE7509EA433794C98" = {
+			"isa" = "PBXFrameworksBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"220C5D70D0FD64D699B97D22" = {
+			"isa" = "PBXResourcesBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+				"911E24FB09AD366501E79934",
+				"BB25FB65101CB3C0DC7A87DA",
+				"4D50E451668A30F67EDC6256",
+				"CEE7386398DBFC5A00B5E40E",
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"D42ABC21B22D2EDF8AF74EA1" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"PRODUCT_NAME" = "$(TARGET_NAME)";
+				"PRODUCT_BUNDLE_IDENTIFIER" = "dev.galaxybigbird.OfflineTikTokPlayerTests";
+				"TARGETED_DEVICE_FAMILY" = "1";
+				"SUPPORTED_PLATFORMS" = "iphoneos iphonesimulator";
+				"CODE_SIGN_STYLE" = "Automatic";
+				"MARKETING_VERSION" = "1.0";
+				"CURRENT_PROJECT_VERSION" = "1";
+				"LD_RUNPATH_SEARCH_PATHS" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"GENERATE_INFOPLIST_FILE" = "YES";
+				"TEST_HOST" = "$(BUILT_PRODUCTS_DIR)/OfflineTikTokPlayer.app/OfflineTikTokPlayer";
+				"BUNDLE_LOADER" = "$(TEST_HOST)";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
+				"ONLY_ACTIVE_ARCH" = "YES";
+				"ENABLE_TESTABILITY" = "YES";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS" = "DEBUG $(inherited)";
+			};
+			"name" = "Debug";
+		};
+		"AE87CCF61CEC0850DF236BB8" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"PRODUCT_NAME" = "$(TARGET_NAME)";
+				"PRODUCT_BUNDLE_IDENTIFIER" = "dev.galaxybigbird.OfflineTikTokPlayerTests";
+				"TARGETED_DEVICE_FAMILY" = "1";
+				"SUPPORTED_PLATFORMS" = "iphoneos iphonesimulator";
+				"CODE_SIGN_STYLE" = "Automatic";
+				"MARKETING_VERSION" = "1.0";
+				"CURRENT_PROJECT_VERSION" = "1";
+				"LD_RUNPATH_SEARCH_PATHS" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"GENERATE_INFOPLIST_FILE" = "YES";
+				"TEST_HOST" = "$(BUILT_PRODUCTS_DIR)/OfflineTikTokPlayer.app/OfflineTikTokPlayer";
+				"BUNDLE_LOADER" = "$(TEST_HOST)";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-O";
+				"ONLY_ACTIVE_ARCH" = "NO";
+			};
+			"name" = "Release";
+		};
+		"3D0A2124F6473E70235634B0" = {
+			"isa" = "XCConfigurationList";
+			"buildConfigurations" = (
+				"D42ABC21B22D2EDF8AF74EA1",
+				"AE87CCF61CEC0850DF236BB8",
+			);
+			"defaultConfigurationIsVisible" = 0;
+			"defaultConfigurationName" = "Release";
+		};
+		"D9DC1A2469A9370BEF853B26" = {
+			"isa" = "PBXNativeTarget";
+			"buildConfigurationList" = "3D0A2124F6473E70235634B0";
+			"buildPhases" = (
+				"D8792BA99261151BC67CF9B9",
+				"572F97AAE7509EA433794C98",
+				"220C5D70D0FD64D699B97D22",
+			);
+			"buildRules" = (
+			);
+			"dependencies" = (
+				"A5FAC770E0327AE0ADA244B2",
+			);
+			"name" = "OfflineTikTokPlayerTests";
+			"productName" = "OfflineTikTokPlayerTests";
+			"productReference" = "7BF889F8781854EBDBF96EB1";
+			"packageProductDependencies" = (
+			);
+			"productType" = "com.apple.product-type.bundle.unit-test";
+		};
+		"EDE85C8DC63DA7311C991C96" = {
+			"isa" = "PBXContainerItemProxy";
+			"containerPortal" = "244210E48437B6556980A702";
+			"proxyType" = 1;
+			"remoteGlobalIDString" = "190C03A0807DB0128A71E667";
+			"remoteInfo" = "OfflineTikTokPlayer";
+		};
+		"A71522AB9B252CADC9D256F8" = {
+			"isa" = "PBXTargetDependency";
+			"target" = "190C03A0807DB0128A71E667";
+			"targetProxy" = "EDE85C8DC63DA7311C991C96";
+		};
+		"CB1A91E5DF1170D2EB38D9CE" = {
+			"isa" = "PBXSourcesBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+				"F34B770076F468050A561172",
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"05EF34354F2FE669D894686B" = {
+			"isa" = "PBXFrameworksBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"651ABB274AE17223F3A42D1B" = {
+			"isa" = "PBXResourcesBuildPhase";
+			"buildActionMask" = 2147483647;
+			"files" = (
+			);
+			"runOnlyForDeploymentPostprocessing" = 0;
+		};
+		"D0EBA7EBB89D18AD1BAD2437" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"PRODUCT_NAME" = "$(TARGET_NAME)";
+				"PRODUCT_BUNDLE_IDENTIFIER" = "dev.galaxybigbird.OfflineTikTokPlayerUITests";
+				"TARGETED_DEVICE_FAMILY" = "1";
+				"SUPPORTED_PLATFORMS" = "iphoneos iphonesimulator";
+				"CODE_SIGN_STYLE" = "Automatic";
+				"MARKETING_VERSION" = "1.0";
+				"CURRENT_PROJECT_VERSION" = "1";
+				"LD_RUNPATH_SEARCH_PATHS" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"GENERATE_INFOPLIST_FILE" = "YES";
+				"TEST_TARGET_NAME" = "OfflineTikTokPlayer";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
+				"ONLY_ACTIVE_ARCH" = "YES";
+				"ENABLE_TESTABILITY" = "YES";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS" = "DEBUG $(inherited)";
+			};
+			"name" = "Debug";
+		};
+		"DA00C5F980B4AA9A1DA19383" = {
+			"isa" = "XCBuildConfiguration";
+			"buildSettings" = {
+				"PRODUCT_NAME" = "$(TARGET_NAME)";
+				"PRODUCT_BUNDLE_IDENTIFIER" = "dev.galaxybigbird.OfflineTikTokPlayerUITests";
+				"TARGETED_DEVICE_FAMILY" = "1";
+				"SUPPORTED_PLATFORMS" = "iphoneos iphonesimulator";
+				"CODE_SIGN_STYLE" = "Automatic";
+				"MARKETING_VERSION" = "1.0";
+				"CURRENT_PROJECT_VERSION" = "1";
+				"LD_RUNPATH_SEARCH_PATHS" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"GENERATE_INFOPLIST_FILE" = "YES";
+				"TEST_TARGET_NAME" = "OfflineTikTokPlayer";
+				"SWIFT_OPTIMIZATION_LEVEL" = "-O";
+				"ONLY_ACTIVE_ARCH" = "NO";
+			};
+			"name" = "Release";
+		};
+		"A0ABCD373A980A7913C1164A" = {
+			"isa" = "XCConfigurationList";
+			"buildConfigurations" = (
+				"D0EBA7EBB89D18AD1BAD2437",
+				"DA00C5F980B4AA9A1DA19383",
+			);
+			"defaultConfigurationIsVisible" = 0;
+			"defaultConfigurationName" = "Release";
+		};
+		"D7C3FB95C034EE223F69C6AC" = {
+			"isa" = "PBXNativeTarget";
+			"buildConfigurationList" = "A0ABCD373A980A7913C1164A";
+			"buildPhases" = (
+				"CB1A91E5DF1170D2EB38D9CE",
+				"05EF34354F2FE669D894686B",
+				"651ABB274AE17223F3A42D1B",
+			);
+			"buildRules" = (
+			);
+			"dependencies" = (
+				"A71522AB9B252CADC9D256F8",
+			);
+			"name" = "OfflineTikTokPlayerUITests";
+			"productName" = "OfflineTikTokPlayerUITests";
+			"productReference" = "23D9944AE28FA3E0D0F3BF54";
+			"packageProductDependencies" = (
+			);
+			"productType" = "com.apple.product-type.bundle.ui-testing";
+		};
+		"244210E48437B6556980A702" = {
+			"isa" = "PBXProject";
+			"attributes" = {
+				"LastUpgradeCheck" = "2600";
+				"BuildIndependentTargetsInParallel" = "YES";
+				"TargetAttributes" = {
+					"190C03A0807DB0128A71E667" = {
+						"SystemCapabilities" = {
+							"com.apple.BackgroundModes" = {
+								"enabled" = 1;
+							};
+							"com.apple.Keychain" = {
+								"enabled" = 1;
+							};
+						};
+					};
+					"D9DC1A2469A9370BEF853B26" = {
+						"TestTargetID" = "190C03A0807DB0128A71E667";
+					};
+					"D7C3FB95C034EE223F69C6AC" = {
+						"TestTargetID" = "190C03A0807DB0128A71E667";
+					};
+				};
+			};
+			"buildConfigurationList" = "1922B098E983995960BE56B0";
+			"compatibilityVersion" = "Xcode 14.0";
+			"developmentRegion" = "en";
+			"hasScannedForEncodings" = 0;
+			"knownRegions" = (
+				"en",
+				"Base",
+			);
+			"mainGroup" = "0D6E4079E36703EBD37C0072";
+			"productRefGroup" = "0A3E27B8CA818264D75C8D81";
+			"projectDirPath" = "";
+			"projectRoot" = "";
+			"targets" = (
+				"190C03A0807DB0128A71E667",
+				"D9DC1A2469A9370BEF853B26",
+				"D7C3FB95C034EE223F69C6AC",
+			);
+			"packageReferences" = (
+				"8F4D0C97288DF3C168790D91",
+				"91EEDEEDC272355225815E36",
+			);
+		};
+	};
+	"rootObject" = "244210E48437B6556980A702";
+}
