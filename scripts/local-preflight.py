@@ -1,0 +1,115 @@
+"""Run free local gates before deliberately starting a native Mac check. Never dispatches CI."""
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+import yaml
+
+
+def _values(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield str(key)
+            yield from _values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _values(child)
+    else:
+        yield str(value)
+
+
+def validate_workflow(config):
+    try:
+        if set(config) - {"name", "on", "permissions", "jobs"}:
+            raise ValueError("The unsigned draft contains an unreviewed workflow setting.")
+        if config.get("permissions") != {"contents": "read"}:
+            raise ValueError("The unsigned draft needs only read access to its source.")
+        if any(re.search(r"\bsecrets\s*(?:\.|\[)", value, re.IGNORECASE) for value in _values(config)):
+            raise ValueError("The unsigned draft cannot use repository or environment secrets.")
+        triggers = config["on"]
+        if set(triggers) != {"workflow_dispatch"}:
+            raise ValueError("Mac checks must only run by manual dispatch, never on pushes or schedules.")
+        inputs = triggers["workflow_dispatch"]["inputs"]
+        if set(inputs) != {"approve_runner"}:
+            raise ValueError("The unsigned draft may request only a runner review.")
+        approval = inputs["approve_runner"]
+        if approval["type"] != "boolean" or str(approval["default"]).lower() != "false" or str(approval["required"]).lower() != "true":
+            raise ValueError("Mac runner approval must be an explicit boolean, defaulting to false.")
+        if set(config["jobs"]) != {"ios"}:
+            raise ValueError("Only one Mac job is allowed per approved run.")
+        job = config["jobs"]["ios"]
+        if set(job) - {"if", "runs-on", "timeout-minutes", "steps"}:
+            raise ValueError("The unsigned draft contains an unreviewed job setting.")
+        if job.get("if") != "${{ inputs.approve_runner }}":
+            raise ValueError("The Mac job must require the approval input.")
+        if job["runs-on"] != "macos-26" or "strategy" in job:
+            raise ValueError("Use one standard macos-26 runner without a matrix.")
+        if not 1 <= int(job["timeout-minutes"]) <= 20:
+            raise ValueError("Mac checks need a timeout of at most 20 minutes.")
+        for step in job["steps"]:
+            if set(step) - {"name", "uses", "with", "run"}:
+                raise ValueError("The unsigned draft contains an unreviewed step setting.")
+            action = step.get("uses", "")
+            if action and not re.fullmatch(r"actions/(?:checkout|upload-artifact)@[0-9a-f]{40}", action):
+                raise ValueError("Use only reviewed checkout and artifact actions pinned to a commit.")
+            if action.startswith("actions/checkout@") and str(step.get("with", {}).get("persist-credentials")).lower() != "false":
+                raise ValueError("Checkout must not persist its access credential.")
+            if action.startswith("actions/upload-artifact@"):
+                if int(step["with"]["retention-days"]) != 1:
+                    raise ValueError("Retain native evidence for one day to limit storage usage.")
+            command = step.get("run", "")
+            if re.search(r"\bcodesign\b|\bsecurity\s+(?:import|create-keychain)|-exportArchive|\btestflight\b", command, re.IGNORECASE):
+                raise ValueError("Signing and delivery are outside the unsigned draft.")
+            if "xcodebuild" in command and "CODE_SIGNING_ALLOWED=NO" not in command:
+                raise ValueError("Every device archive must explicitly disable code signing.")
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("The native workflow is missing a required cost control.") from error
+
+
+def run_checks(root, *, runner=subprocess.run, platform=sys.platform):
+    root = Path(root)
+    directory = root / ".github/workflows"
+    if directory.exists() and any(path.suffix.lower() in {".yaml", ".yml"} for path in directory.iterdir()):
+        raise ValueError("Initial publication requires every workflow to remain inactive.")
+    workflow = yaml.load((root / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    validate_workflow(workflow)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    shell = ["wsl", "--distribution", os.environ.get("PLAYER_WSL_DISTRO", "Ubuntu"), "--", "bash"] if platform == "win32" else ["bash"]
+    commands = [
+        ("Xcode project references", [sys.executable, "scripts/generate-ios-project.py", "--check"]),
+        ("Python importer and workflow regressions", [sys.executable, "-m", "pytest", "-q", "--basetemp=artifacts/preflight-" + stamp,
+                                                       "-o", "cache_dir=artifacts/pytest-cache", "--tb=short"]),
+        ("Compiled Swift core tests", shell + ["scripts/test-core.sh"]),
+        ("Native OneDrive adapter HTTP regressions", shell + ["scripts/test-native-cloud.sh"]),
+        ("Native Swift syntax", shell + ["scripts/check-swift-syntax.sh"]),
+    ]
+    complete = ["Inactive unsigned Mac workflow controls"]
+    for name, command in commands:
+        print("Checking: " + name, flush=True)
+        runner(command, cwd=root, check=True, timeout=300)
+        complete.append(name)
+    return complete
+
+
+def main():
+    root = Path(__file__).resolve().parents[1]
+    report = dict(checkedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  nativeSDKChecked=False, remoteBuildStarted=False)
+    try:
+        report["checks"] = run_checks(root)
+        report["passed"] = True
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        report.update(passed=False, error=str(error))
+    destination = root / "artifacts/local-preflight.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(report), flush=True)
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
