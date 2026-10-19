@@ -87,7 +87,7 @@ final class PlaybackService: NSObject {
         super.init()
         surface = PlayerSurface(player: player)
         player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
-        buffer.didAdvance = { [weak self] prepared in
+        self.buffer.didAdvance = { [weak self] prepared in
             guard let self else { return }
             var advanced = self.queue
             guard advanced.next(explicit: false) == prepared.mediaID else {
