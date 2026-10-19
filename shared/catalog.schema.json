@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Offline TikTok Player catalog version 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "libraryId",
+    "updatedAt",
+    "media",
+    "playlists"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "libraryId": {
+      "$ref": "#/$defs/identity"
+    },
+    "updatedAt": {
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "media": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/media"
+      }
+    },
+    "playlists": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/playlist"
+      }
+    }
+  },
+  "$defs": {
+    "identity": {
+      "type": "string",
+      "minLength": 1
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "driveId",
+        "itemId",
+        "fileName",
+        "byteSize",
+        "sha256",
+        "contentType"
+      ],
+      "properties": {
+        "driveId": {
+          "$ref": "#/$defs/identity"
+        },
+        "itemId": {
+          "$ref": "#/$defs/identity"
+        },
+        "fileName": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^/\\\\]+$"
+        },
+        "byteSize": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "contentType": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "optionalAsset": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/asset"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "media": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "creator",
+        "sourceURL",
+        "duration",
+        "kind",
+        "status",
+        "asset",
+        "original",
+        "artwork"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identity"
+        },
+        "title": {
+          "type": "string"
+        },
+        "creator": {
+          "type": "string"
+        },
+        "sourceURL": {
+          "type": "string"
+        },
+        "duration": {
+          "type": "number",
+          "minimum": 0
+        },
+        "kind": {
+          "enum": [
+            "video",
+            "slideshow"
+          ]
+        },
+        "status": {
+          "enum": [
+            "ready",
+            "pending",
+            "unavailable"
+          ]
+        },
+        "asset": {
+          "$ref": "#/$defs/optionalAsset"
+        },
+        "original": {
+          "$ref": "#/$defs/optionalAsset"
+        },
+        "artwork": {
+          "$ref": "#/$defs/optionalAsset"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ready"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "asset": {
+                "$ref": "#/$defs/asset"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "playlist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "itemIds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identity"
+        },
+        "name": {
+          "type": "string"
+        },
+        "itemIds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identity"
+          }
+        }
+      }
+    }
+  }
+}
