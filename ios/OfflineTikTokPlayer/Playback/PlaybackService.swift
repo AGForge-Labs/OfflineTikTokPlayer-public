@@ -343,6 +343,18 @@ final class PlaybackService: NSObject {
                     self.refreshAudioProcessing()
                 }
             }
+            if naturalID == active?.id, !self.buffer.hasLoopReserve,
+               let asset = self.player.currentItem?.asset, let id = naturalID {
+                // Apple's looper similarly maintains at least three replicas. We own
+                // this bounded queue so each item receives an independent speaker tap.
+                let reserve = AVPlayerItem(asset: asset)
+                reserve.preferredForwardBufferDuration = 8
+                await self.speakerAudio.prepare(reserve)
+                self.buffer.synchronize()
+                guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+                self.buffer.stageLoopReserve(.init(mediaID: id, item: reserve, isLocal: self.currentIsLocal))
+                self.refreshAudioProcessing()
+            }
             if let previous, self.buffer.previousMediaID != previous.id {
                 let saved = await self.downloads.localURL(for: previous)
                 let cached = if let asset = previous.asset { await self.mediaCache?.file(for: asset) } else { nil as URL? }
@@ -513,6 +525,8 @@ final class PlaybackService: NSObject {
         })
         notifications.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
+                // Adopt a boundary that already happened before dropping its metadata.
+                self?.buffer.synchronize()
                 self?.warmTask?.cancel(); self?.warmRevision += 1
                 self?.buffer.discardNext(); self?.buffer.discardPrevious()
             }

@@ -159,6 +159,36 @@ final class PlaybackContinuityTests: XCTestCase {
         XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
     }
 
+    func testLoopReserveHasAFixedBoundAndExplicitSkipRemovesIt() throws {
+        let buffer = PlaybackBuffer()
+        defer { buffer.replace(with: nil); buffer.discardPrevious() }
+        buffer.replace(with: try item(), mediaID: "a")
+        buffer.stagePrevious(.init(mediaID: "history", item: try item(), isLocal: true))
+        buffer.stage(.init(mediaID: "a", item: try item(), isLocal: true))
+        for _ in 0..<50 { buffer.stageLoopReserve(.init(mediaID: "a", item: try item(), isLocal: true)) }
+        XCTAssertEqual(buffer.player.items().count, 3)
+        XCTAssertEqual(buffer.retainedItemCount, 4)
+        XCTAssertFalse(buffer.player.automaticallyWaitsToMinimizeStalling)
+        buffer.stage(.init(mediaID: "b", item: try item(), isLocal: true))
+        XCTAssertFalse(buffer.hasLoopReserve)
+        XCTAssertEqual(buffer.player.items().count, 2)
+        XCTAssertNotNil(buffer.advance(to: "b"))
+        XCTAssertFalse(buffer.hasLoopReserve)
+        XCTAssertEqual(buffer.player.actionAtItemEnd, .pause)
+        XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
+    }
+
+    func testHTTPPreparationKeepsAutomaticStallRecoveryUntilLocalHandoff() throws {
+        let buffer = PlaybackBuffer()
+        defer { buffer.replace(with: nil); buffer.discardPrevious() }
+        buffer.replace(with: try item(), mediaID: "a", isLocal: false)
+        buffer.stage(.init(mediaID: "b", item: try item(), isLocal: false))
+        XCTAssertTrue(buffer.player.automaticallyWaitsToMinimizeStalling)
+        buffer.stage(.init(mediaID: "b", item: try item(), isLocal: true), requireLocal: true)
+        XCTAssertNotNil(buffer.advance(to: "b", allowRemote: false))
+        XCTAssertFalse(buffer.player.automaticallyWaitsToMinimizeStalling)
+    }
+
     func testFullDurationLoopsRecordBoundarySchedulingAndEncodedSourceSilence() async throws {
         let first = try item(), asset = first.asset
         let duration = try await asset.load(.duration).seconds
@@ -195,9 +225,14 @@ final class PlaybackContinuityTests: XCTestCase {
             departed = prepared.item
             anchorHost = ProcessInfo.processInfo.systemUptime
             anchorPosition = prepared.item.currentTime().seconds
-            if completeTimes.count < 3 { buffer.stage(.init(mediaID: "loop", item: AVPlayerItem(asset: asset), isLocal: true)) }
+            if completeTimes.count < 3 {
+                buffer.stageLoopReserve(.init(mediaID: "loop", item: AVPlayerItem(asset: asset), isLocal: true))
+                XCTAssertLessThanOrEqual(buffer.retainedItemCount, 4)
+            }
         }
         buffer.stage(.init(mediaID: "loop", item: AVPlayerItem(asset: asset), isLocal: true))
+        buffer.stageLoopReserve(.init(mediaID: "loop", item: AVPlayerItem(asset: asset), isLocal: true))
+        XCTAssertEqual(buffer.player.items().count, 3)
         buffer.player.playImmediately(atRate: 1)
         let deadline = Date().addingTimeInterval(10)
         while first.currentTime().seconds < 0.1, Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }

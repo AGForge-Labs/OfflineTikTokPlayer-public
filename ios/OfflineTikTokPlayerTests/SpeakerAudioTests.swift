@@ -5,6 +5,24 @@ import AudioToolbox
 
 @MainActor
 final class SpeakerAudioTests: XCTestCase {
+    func testLoopReplicasKeepIndependentSpeakerProcessingState() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let asset = AVURLAsset(url: url), buffer = PlaybackBuffer(), audio = SpeakerAudioController()
+        audio.update(items: [], enabled: true)
+        let first = AVPlayerItem(asset: asset), next = AVPlayerItem(asset: asset), reserve = AVPlayerItem(asset: asset)
+        await audio.prepare(first); await audio.prepare(next); await audio.prepare(reserve)
+        let firstMix = try XCTUnwrap(first.audioMix), nextMix = try XCTUnwrap(next.audioMix), reserveMix = try XCTUnwrap(reserve.audioMix)
+        XCTAssertFalse(firstMix === nextMix); XCTAssertFalse(nextMix === reserveMix)
+        buffer.replace(with: first, mediaID: "loop")
+        defer { buffer.replace(with: nil); buffer.discardPrevious() }
+        buffer.stage(.init(mediaID: "loop", item: next, isLocal: true))
+        buffer.stageLoopReserve(.init(mediaID: "loop", item: reserve, isLocal: true))
+        audio.update(items: buffer.player.items(), enabled: true)
+        XCTAssertTrue(first.audioMix === firstMix); XCTAssertTrue(next.audioMix === nextMix); XCTAssertTrue(reserve.audioMix === reserveMix)
+        audio.update(items: buffer.player.items(), enabled: false)
+        XCTAssertTrue(buffer.player.items().allSatisfy { $0.audioMix == nil })
+    }
+
     func testTimedOutOptionalPreparationRetriesWhenTheItemBecomesReady() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
         let item = AVPlayerItem(url: url)
