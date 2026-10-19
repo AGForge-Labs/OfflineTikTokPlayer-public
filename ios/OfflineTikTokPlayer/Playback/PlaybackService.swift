@@ -4,6 +4,7 @@ import AVKit
 import MediaPlayer
 import Observation
 import PlayerCore
+import UIKit
 
 @MainActor @Observable
 final class PlaybackClock {
@@ -130,8 +131,8 @@ final class PlaybackService: NSObject {
         intent.requestPlay(); activateAudio()
         if player.currentItem == nil { loadCurrent(position: clock.position) }
         else {
-            if clock.duration > 0, clock.position >= clock.duration { seek(0) }
-            if intent.canPlay { player.play() }
+            if clock.duration > 0, clock.position >= clock.duration { seek(0, resumeWhenFinished: true) }
+            else if intent.canPlay { player.play() }
             prepareUpcoming()
             if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { armStallRecovery() }
         }
@@ -144,19 +145,21 @@ final class PlaybackService: NSObject {
     }
 
     func next(explicit: Bool = true) {
+        buffer.synchronize()
         endedDuringScroll = false
         let previous = queue.currentID
         guard let next = queue.next(explicit: explicit) else { pause(); return }
+        if explicit { intent.requestPlay(); activateAudio() }
         if next == previous, player.currentItem != nil {
             if let prepared = buffer.advance(to: next) { loadCurrent(adopting: prepared) }
-            else { seek(0); if intent.canPlay { player.play() } }
+            else { seek(0, resumeWhenFinished: true) }
             return
         }
-        if explicit { intent.requestPlay(); activateAudio() }
         loadCurrent()
     }
 
     func previous() {
+        buffer.synchronize()
         endedDuringScroll = false
         guard queue.previous() != nil else { seek(0); return }
         intent.requestPlay(); activateAudio(); loadCurrent()
@@ -169,9 +172,9 @@ final class PlaybackService: NSObject {
         else if endedDuringScroll { next(explicit: false) }
     }
 
-    func setShuffle(_ enabled: Bool) { queue.setShuffle(enabled); prepareUpcoming(); persist() }
-    func cycleRepeat() { queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
-    func seek(_ seconds: Double) {
+    func setShuffle(_ enabled: Bool) { buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
+    func cycleRepeat() { buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
+    func seek(_ seconds: Double, resumeWhenFinished: Bool = false) {
         guard let item = player.currentItem, item === observedItem,
               let seek = clock.beginSeek(to: seconds) else { return }
         let request = generation
@@ -180,6 +183,7 @@ final class PlaybackService: NSObject {
                 guard let self, let item, self.generation == request, self.player.currentItem === item,
                       self.clock.completeSeek(seek, actualPosition: item.currentTime().seconds) else { return }
                 if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
+                if resumeWhenFinished && self.intent.canPlay { self.player.play() }
                 self.persist(); self.updateNowPlaying()
             }
         }
@@ -273,9 +277,11 @@ final class PlaybackService: NSObject {
                     if position > 0 || rewind {
                         // Reused history items must finish rewinding before any audio is played.
                         self.player.pause()
-                        self.player.seek(to: CMTime(seconds: position, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak playerItem] finished in
+                        guard let seek = self.clock.beginSeek(to: position) else { return }
+                        self.player.seek(to: CMTime(seconds: seek.target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak playerItem] finished in
                             Task { @MainActor in
-                                guard let self, let playerItem, finished, self.generation == request, self.player.currentItem === playerItem else { return }
+                                guard let self, let playerItem, finished, self.generation == request, self.player.currentItem === playerItem,
+                                      self.clock.completeSeek(seek, actualPosition: playerItem.currentTime().seconds) else { return }
                                 self.monitorFirstFrame(playerItem, request: request)
                                 if self.intent.canPlay { self.player.playImmediately(atRate: 1) }
                             }
@@ -333,7 +339,7 @@ final class PlaybackService: NSObject {
                     playerItem.preferredForwardBufferDuration = 8
                     await self.speakerAudio.prepare(playerItem)
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
-                    self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil))
+                    self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil), after: active?.id)
                     self.refreshAudioProcessing()
                 }
             }
@@ -369,7 +375,7 @@ final class PlaybackService: NSObject {
                         let playerItem = AVPlayerItem(url: url)
                         await self.speakerAudio.prepare(playerItem)
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
-                        self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal)
+                        self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal, after: active?.id)
                         self.refreshAudioProcessing()
                     }
                 }

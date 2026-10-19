@@ -34,6 +34,9 @@ final class PlaybackContinuityTests: XCTestCase {
         service.enteredForeground()
         service.handleInterruption(began: false, shouldResume: true)
         XCTAssertEqual(activations, 2)
+        service.persist(); service.enteredForeground()
+        XCTAssertTrue(service.wantsToPlay, "A normal background/foreground cycle must preserve playback")
+        XCTAssertEqual(activations, 2)
         service.handleInterruption(began: true); service.pause()
         service.handleInterruption(began: false, shouldResume: true)
         XCTAssertEqual(activations, 2, "An explicit pause must cancel automatic reactivation")
@@ -65,6 +68,11 @@ final class PlaybackContinuityTests: XCTestCase {
         XCTAssertEqual(transitions, 1)
         XCTAssertTrue(buffer.player.currentItem === second)
         XCTAssertEqual(buffer.player.actionAtItemEnd, .pause, "The final item must remain visible at queue end")
+        let end = Date().addingTimeInterval(4)
+        while buffer.player.rate != 0, Date() < end { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(buffer.player.rate, 0)
+        XCTAssertTrue(buffer.player.currentItem === second)
+        XCTAssertEqual(transitions, 1)
     }
 
     func testRepeatUsesCompletePreparedItemAndExplicitNextCanReplaceIt() throws {
@@ -105,6 +113,50 @@ final class PlaybackContinuityTests: XCTestCase {
         XCTAssertEqual(buffer.player.rate, 0)
         XCTAssertTrue(buffer.player.currentItem === original)
         XCTAssertEqual(buffer.player.actionAtItemEnd, .advance)
+    }
+
+    func testPreparedPreviousRewindsBeforePlaybackAndMeasuresClockLatency() async throws {
+        let buffer = PlaybackBuffer(), first = try item(), second = try item()
+        defer { buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+        buffer.replace(with: first, mediaID: "a")
+        let coldStart = ProcessInfo.processInfo.systemUptime
+        buffer.player.playImmediately(atRate: 1)
+        var deadline = Date().addingTimeInterval(5)
+        while first.currentTime().seconds < 0.1, Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertGreaterThanOrEqual(first.currentTime().seconds, 0.1)
+        let cold = ProcessInfo.processInfo.systemUptime - coldStart
+        buffer.stage(.init(mediaID: "b", item: second, isLocal: true))
+        XCTAssertNotNil(buffer.advance(to: "b"))
+        let start = ProcessInfo.processInfo.systemUptime
+        let previous = try XCTUnwrap(buffer.advance(to: "a"))
+        XCTAssertTrue(previous.item === first)
+        XCTAssertTrue(previous.needsRewind)
+        XCTAssertEqual(buffer.player.rate, 0, "History must not briefly play its former offset")
+        let finished = await withCheckedContinuation { continuation in
+            buffer.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { continuation.resume(returning: $0) }
+        }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(first.currentTime().seconds, 0, accuracy: 0.005)
+        buffer.player.playImmediately(atRate: 1)
+        deadline = Date().addingTimeInterval(5)
+        while first.currentTime().seconds < 0.1, Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertGreaterThanOrEqual(first.currentTime().seconds, 0.1)
+        let previousLatency = ProcessInfo.processInfo.systemUptime - start
+        XCTAssertLessThan(previousLatency, 2, "Reusing history must not repeatedly resolve the asset URL or metadata")
+        print("Previous clock timing fixture: cold=\(cold), retainedPreviousIncludingRewind=\(previousLatency), retainedItems=\(buffer.retainedItemCount)")
+    }
+
+    func testStalePreparationCannotAttachAfterAnAlreadyAdvancedBoundary() throws {
+        let buffer = PlaybackBuffer(), first = try item(), second = try item()
+        defer { buffer.replace(with: nil); buffer.discardPrevious() }
+        buffer.replace(with: first, mediaID: "a")
+        buffer.stage(.init(mediaID: "b", item: second, isLocal: true), after: "a")
+        buffer.player.advanceToNextItem() // KVO is queued, as with a boundary racing a swipe.
+        buffer.stage(.init(mediaID: "stale", item: try item(), isLocal: true), after: "a")
+        XCTAssertTrue(buffer.player.currentItem === second)
+        XCTAssertNil(buffer.nextMediaID)
+        XCTAssertEqual(buffer.player.items().count, 1)
+        XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
     }
 
     func testFullDurationLoopsRecordBoundarySchedulingAndEncodedSourceSilence() async throws {

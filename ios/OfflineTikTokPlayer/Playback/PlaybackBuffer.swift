@@ -18,7 +18,9 @@ final class PlaybackBuffer {
     var didAdvance: ((Prepared) -> Void)?
     var automaticAdvancementEnabled = true { didSet { updateEndAction() } }
     var previousMediaID: String? { previous?.mediaID }
-    var retainedItemCount: Int { player.items().count + (previous == nil ? 0 : 1) }
+    var retainedItemCount: Int {
+        Set((player.items() + [active?.item, next?.item, previous?.item].compactMap { $0 }).map(ObjectIdentifier.init)).count
+    }
     var nextMediaID: String? { next?.mediaID }
     func hasPrepared(_ mediaID: String) -> Bool {
         guard let next else { return false }
@@ -72,7 +74,9 @@ final class PlaybackBuffer {
         previous = prepared
     }
 
-    func stage(_ prepared: Prepared, requireLocal: Bool = false) {
+    func stage(_ prepared: Prepared, requireLocal: Bool = false, after mediaID: String? = nil) {
+        synchronize()
+        if let mediaID, active?.mediaID != mediaID { return }
         guard let current = player.currentItem else { return }
         guard !requireLocal || prepared.isLocal else { return }
         if let next, next.mediaID == prepared.mediaID, next.item.status != .failed,
