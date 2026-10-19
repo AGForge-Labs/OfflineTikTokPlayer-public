@@ -113,8 +113,9 @@ final class PlaybackContinuityTests: XCTestCase {
         let oldSpeakerPreference = UserDefaults.standard.object(forKey: "speakerSound")
         defer { UserDefaults.standard.set(oldSpeakerPreference, forKey: "speakerSound") }
         var trials: [[String: Any]] = []
-        // Serial, bounded trials of the same local source, route and 50 ms clock threshold.
-        for trial in 0..<3 {
+        // Three serial trials per mode, alternating order to expose tap setup cost.
+        for (index, enhance) in [true, false, false, true, true, false].enumerated() {
+            let trial = index / 2
             let buffer = PlaybackBuffer()
             var loads: [ObjectIdentifier: Int] = [:]
             let audio = SpeakerAudioController { item in
@@ -124,7 +125,7 @@ final class PlaybackContinuityTests: XCTestCase {
             let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
                 bookmarkURL: fixture.bookmark, activateSession: { try AVAudioSession.sharedInstance().setActive(true) },
                 buffer: buffer, speakerAudio: audio, audioRoutes: { [.builtInSpeaker] })
-            service.speakerSound = true; service.isInteractingWithFeed = true
+            service.speakerSound = enhance; service.isInteractingWithFeed = true
             var events: [[String: Any]] = []
             service.onPlaybackEvent = { event in
                 events.append(["phase": event.name, "uptime": event.uptime, "generation": event.generation,
@@ -137,9 +138,10 @@ final class PlaybackContinuityTests: XCTestCase {
             let cold = ProcessInfo.processInfo.systemUptime - coldStart
             service.pause()
             let first = try XCTUnwrap(service.player.currentItem)
-            try await until { first.audioMix != nil }
-            let firstMix = try XCTUnwrap(first.audioMix)
-            let firstLoads = loads[ObjectIdentifier(first)]
+            if enhance { try await until { first.audioMix != nil } }
+            else { XCTAssertNil(first.audioMix) }
+            let firstMix = first.audioMix
+            let firstLoads = loads[ObjectIdentifier(first)] ?? 0
             try await until { buffer.hasPrepared(fixture.ids[1]) }
             try await Task.sleep(for: .milliseconds(500))
             let queuedReady = buffer.player.items().last?.status == .readyToPlay
@@ -150,22 +152,22 @@ final class PlaybackContinuityTests: XCTestCase {
             service.pause()
             try await Task.sleep(for: .milliseconds(500))
             XCTAssertTrue(first.audioMix === firstMix, "Retained Previous must keep its configured mix")
-            XCTAssertEqual(loads[ObjectIdentifier(first)], firstLoads)
+            XCTAssertEqual(loads[ObjectIdentifier(first)] ?? 0, firstLoads)
             let previousStart = ProcessInfo.processInfo.systemUptime
             service.previous()
             try await until { service.queue.currentID == fixture.ids[0] && service.player.currentTime().seconds >= 0.05 }
             let previous = ProcessInfo.processInfo.systemUptime - previousStart
             XCTAssertTrue(service.player.currentItem === first)
             XCTAssertTrue(first.audioMix === firstMix, "Previous must not rebuild its audio path on handoff")
-            XCTAssertEqual(loads[ObjectIdentifier(first)], firstLoads, "Previous must not reload its audio-track metadata")
+            XCTAssertEqual(loads[ObjectIdentifier(first)] ?? 0, firstLoads, "Previous must not reload its audio-track metadata")
             XCTAssertLessThanOrEqual(buffer.retainedItemCount, 4)
             XCTAssertLessThan(max(cold, next, previous), 2, "Synthetic local startup stalled; this is not an immediate-play acceptance threshold")
-            let result: [String: Any] = ["trial": trial, "coldClock50msSeconds": cold, "nextClock50msSeconds": next,
+            let result: [String: Any] = ["trial": trial, "speakerSound": enhance, "coldClock50msSeconds": cold, "nextClock50msSeconds": next,
                 "previousClock50msSeconds": previous, "queuedReadyBeforeHandoff": queuedReady,
                 "previousMixReused": first.audioMix === firstMix, "previousTrackLoads": loads[ObjectIdentifier(first)] ?? 0,
                 "retainedItems": buffer.retainedItemCount, "events": events]
             trials.append(result)
-            print("Production service timing: trial=\(trial), cold=\(cold), next=\(next), previous=\(previous), queuedReady=\(queuedReady), previousMixReused=\(first.audioMix === firstMix)")
+            print("Production service timing: trial=\(trial), speakerSound=\(enhance), cold=\(cold), next=\(next), previous=\(previous), queuedReady=\(queuedReady), previousMixReused=\(first.audioMix === firstMix)")
         }
         let attachment = XCTAttachment(data: try JSONSerialization.data(withJSONObject: trials, options: [.sortedKeys]), uniformTypeIdentifier: "public.json")
         attachment.name = "Production-service-identical-startup-phases"; attachment.lifetime = .keepAlways; add(attachment)
