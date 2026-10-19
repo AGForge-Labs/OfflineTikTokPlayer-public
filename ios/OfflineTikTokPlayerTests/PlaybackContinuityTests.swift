@@ -73,7 +73,7 @@ final class PlaybackContinuityTests: XCTestCase {
         buffer.replace(with: original, mediaID: "a")
         buffer.stage(.init(mediaID: "a", item: repeated, isLocal: true))
         XCTAssertEqual(repeated.forwardPlaybackEndTime, .invalid)
-        XCTAssertEqual(repeated.reversePlaybackEndTime, .invalid)
+        XCTAssertEqual(repeated.reversePlaybackEndTime, original.reversePlaybackEndTime)
         buffer.stage(.init(mediaID: "b", item: skipped, isLocal: true))
         XCTAssertTrue(buffer.advance(to: "b")?.item === skipped)
     }
