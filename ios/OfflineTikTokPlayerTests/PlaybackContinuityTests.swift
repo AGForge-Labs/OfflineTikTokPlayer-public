@@ -127,15 +127,20 @@ final class PlaybackContinuityTests: XCTestCase {
         let cold = ProcessInfo.processInfo.systemUptime - coldStart
         buffer.stage(.init(mediaID: "b", item: second, isLocal: true))
         XCTAssertNotNil(buffer.advance(to: "b"))
+        // Give the same preparation window as an ordinary prepared swipe.
+        try await Task.sleep(for: .milliseconds(500))
         let start = ProcessInfo.processInfo.systemUptime
         let previous = try XCTUnwrap(buffer.advance(to: "a"))
         XCTAssertTrue(previous.item === first)
-        XCTAssertTrue(previous.needsRewind)
+        let rewoundBeforeHandoff = !previous.needsRewind
+        XCTAssertTrue(rewoundBeforeHandoff, "The local ready history item should rewind during preparation")
         XCTAssertEqual(buffer.player.rate, 0, "History must not briefly play its former offset")
-        let finished = await withCheckedContinuation { continuation in
-            buffer.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { continuation.resume(returning: $0) }
+        if previous.needsRewind {
+            let finished = await withCheckedContinuation { continuation in
+                buffer.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { continuation.resume(returning: $0) }
+            }
+            XCTAssertTrue(finished)
         }
-        XCTAssertTrue(finished)
         XCTAssertEqual(first.currentTime().seconds, 0, accuracy: 0.005)
         buffer.player.playImmediately(atRate: 1)
         deadline = Date().addingTimeInterval(5)
@@ -143,7 +148,7 @@ final class PlaybackContinuityTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(first.currentTime().seconds, 0.1)
         let previousLatency = ProcessInfo.processInfo.systemUptime - start
         XCTAssertLessThan(previousLatency, 2, "Reusing history must not repeatedly resolve the asset URL or metadata")
-        print("Previous clock timing fixture: cold=\(cold), retainedPreviousIncludingRewind=\(previousLatency), retainedItems=\(buffer.retainedItemCount)")
+        print("Previous clock timing fixture: cold=\(cold), retainedPreviousIncludingRewind=\(previousLatency), rewindPreparedBeforeHandoff=\(rewoundBeforeHandoff), retainedItems=\(buffer.retainedItemCount)")
     }
 
     func testStalePreparationCannotAttachAfterAnAlreadyAdvancedBoundary() throws {
@@ -218,13 +223,24 @@ final class PlaybackContinuityTests: XCTestCase {
         defer { buffer.player.pause(); buffer.didAdvance = nil; buffer.replace(with: nil); buffer.discardPrevious() }
         buffer.replace(with: first, mediaID: "loop")
         var departed = first, completeTimes: [Double] = [], schedulingGaps: [Double] = []
+        var callbackOffsets: [Double] = [], arrivingPositions: [Double] = []
         var anchorHost: Double?, anchorPosition = 0.0
         buffer.didAdvance = { prepared in
             completeTimes.append(departed.currentTime().seconds)
-            if let anchorHost { schedulingGaps.append(ProcessInfo.processInfo.systemUptime - anchorHost - (duration - anchorPosition)) }
+            let host = ProcessInfo.processInfo.systemUptime
+            let arrived = prepared.item.currentTime().seconds
+            XCTAssertTrue(arrived.isFinite)
+            if let anchorHost {
+                let callbackOffset = host - anchorHost - (duration - anchorPosition)
+                callbackOffsets.append(callbackOffset)
+                // KVO delivery may lag while the incoming item is already playing.
+                // Subtract that progress instead of reporting it as a player gap.
+                schedulingGaps.append(callbackOffset - arrived)
+                arrivingPositions.append(arrived)
+            }
             departed = prepared.item
-            anchorHost = ProcessInfo.processInfo.systemUptime
-            anchorPosition = prepared.item.currentTime().seconds
+            anchorHost = host
+            anchorPosition = arrived
             if completeTimes.count < 3 {
                 buffer.stageLoopReserve(.init(mediaID: "loop", item: AVPlayerItem(asset: asset), isLocal: true))
                 XCTAssertLessThanOrEqual(buffer.retainedItemCount, 4)
@@ -244,7 +260,8 @@ final class PlaybackContinuityTests: XCTestCase {
         let metrics: [String: Any] = ["durationSeconds": duration, "decodedSourceSamples48000Hz": samples,
             "sourceLeadingBelowMinus60dBSeconds": Double(firstAudible ?? samples) / 48000,
             "sourceTrailingBelowMinus60dBSeconds": Double(samples - 1 - (lastAudible ?? -1)) / 48000,
-            "completedItemTimes": completeTimes, "boundarySchedulingOffsetsSeconds": schedulingGaps]
+            "completedItemTimes": completeTimes, "boundaryClockGapEstimatesSeconds": schedulingGaps,
+            "rawCallbackOffsetsSeconds": callbackOffsets, "arrivingItemPositionsSeconds": arrivingPositions]
         let attachment = XCTAttachment(data: try JSONSerialization.data(withJSONObject: metrics, options: .sortedKeys), uniformTypeIdentifier: "public.json")
         attachment.name = "Full-source-loop-boundaries"; attachment.lifetime = .keepAlways; add(attachment)
         print("Full source loop metrics: \(metrics)")

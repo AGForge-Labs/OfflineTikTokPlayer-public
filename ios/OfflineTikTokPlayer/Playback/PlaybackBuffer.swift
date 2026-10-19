@@ -46,7 +46,23 @@ final class PlaybackBuffer {
 
     private func retainPrevious() {
         if let active, active.mediaID != next?.mediaID {
+            previous?.item.cancelPendingSeeks()
             previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal, needsRewind: true)
+        }
+    }
+
+    private func preparePreviousStart() {
+        guard let previous, previous.needsRewind, previous.item.status == .readyToPlay,
+              previous.item !== player.currentItem else { return }
+        let item = previous.item
+        // Rewind off-screen, not on the Previous button's critical path. Weak
+        // captures and cancellation on eviction bound preparation to one item.
+        item.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
+            Task { @MainActor in
+                guard let self, let item, finished, self.previous?.item === item,
+                      self.player.currentItem !== item, abs(item.currentTime().seconds) < 0.005 else { return }
+                self.previous?.needsRewind = false
+            }
         }
     }
 
@@ -54,11 +70,13 @@ final class PlaybackBuffer {
     func synchronize() {
         guard let prepared = next, player.currentItem === prepared.item else { return }
         retainPrevious(); active = prepared; next = loopReserve; loopReserve = nil; updateEndAction()
+        preparePreviousStart()
         didAdvance?(prepared)
     }
 
     func replace(with item: AVPlayerItem?, mediaID: String? = nil, isLocal: Bool = true) {
         if let active, active.item !== item {
+            previous?.item.cancelPendingSeeks()
             previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal, needsRewind: true)
         }
         active = item.flatMap { item in mediaID.map { Prepared(mediaID: $0, item: item, isLocal: isLocal) } }
@@ -66,6 +84,7 @@ final class PlaybackBuffer {
         player.removeAllItems()
         if let item { player.insert(item, after: nil) }
         updateEndAction()
+        preparePreviousStart()
     }
 
     func discardNext() {
@@ -74,9 +93,10 @@ final class PlaybackBuffer {
         updateEndAction()
     }
 
-    func discardPrevious() { previous = nil }
+    func discardPrevious() { previous?.item.cancelPendingSeeks(); previous = nil }
     func stagePrevious(_ prepared: Prepared) {
         guard previous?.mediaID != prepared.mediaID else { return }
+        previous?.item.cancelPendingSeeks()
         previous = prepared
     }
 
@@ -121,6 +141,7 @@ final class PlaybackBuffer {
         retainPrevious(); next = loopReserve; loopReserve = nil; active = prepared
         if player.currentItem !== prepared.item { player.advanceToNextItem() }
         updateEndAction()
+        preparePreviousStart()
         return prepared
     }
 }

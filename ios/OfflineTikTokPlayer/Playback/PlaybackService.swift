@@ -231,7 +231,9 @@ final class PlaybackService: NSObject {
                     self.currentIsLocal = local != nil
                     let playerItem = AVPlayerItem(url: url)
                     playerItem.preferredForwardBufferDuration = 8
-                    await self.speakerAudio.prepare(playerItem)
+                    // An explicit cold selection must not wait half a second for
+                    // optional EQ metadata. Readiness provides one safe retry.
+                    await self.speakerAudio.prepare(playerItem, within: .milliseconds(100))
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)

@@ -5,6 +5,21 @@ import AudioToolbox
 
 @MainActor
 final class SpeakerAudioTests: XCTestCase {
+    func testColdSelectionUsesTheShortOptionalPreparationBudget() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let item = AVPlayerItem(url: url)
+        let audio = SpeakerAudioController { _ in
+            try? await Task.sleep(for: .seconds(2)); return nil
+        }
+        audio.update(items: [], enabled: true)
+        let start = ContinuousClock.now
+        await audio.prepare(item, within: .milliseconds(100))
+        let elapsed = start.duration(to: .now)
+        XCTAssertLessThan(elapsed, .milliseconds(300))
+        XCTAssertNil(item.audioMix)
+        print("Cold optional speaker preparation elapsed: \(elapsed)")
+    }
+
     func testLoopReplicasKeepIndependentSpeakerProcessingState() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
         let asset = AVURLAsset(url: url), buffer = PlaybackBuffer(), audio = SpeakerAudioController()

@@ -111,12 +111,12 @@ final class SpeakerAudioController {
     }
 
     /// Configure before the item enters AVQueuePlayer, so play doesn't rebuild its audio path.
-    func prepare(_ item: AVPlayerItem) async {
+    func prepare(_ item: AVPlayerItem, within budget: Duration? = nil) async {
         let id = ObjectIdentifier(item), token = UUID()
         entries[id]?.task?.cancel()
         entries[id] = Entry(item: item, enabled: enabled, token: token, task: nil, awaitingEnqueue: true)
         let loader = loadTracks
-        let tracks = enabled ? await PlaybackPreparation.value(within: preparationBudget) { await loader(item) } : nil
+        let tracks = enabled ? await PlaybackPreparation.value(within: budget ?? preparationBudget) { await loader(item) } : nil
         guard !Task.isCancelled, entries[id]?.token == token else {
             if entries[id]?.token == token { entries.removeValue(forKey: id) }
             return
