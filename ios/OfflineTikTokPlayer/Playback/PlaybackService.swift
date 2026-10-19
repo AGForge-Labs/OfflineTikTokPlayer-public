@@ -46,7 +46,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let library: LibraryRepository
     @ObservationIgnored private let downloads: OfflineDownloads
     @ObservationIgnored private let cloud: OneDriveClient
-    @ObservationIgnored private let buffer = PlaybackBuffer()
+    @ObservationIgnored private let buffer: PlaybackBuffer
     @ObservationIgnored private let mediaCache: PlaybackMediaCache?
     @ObservationIgnored private var warmTask: Task<Void, Never>?
     @ObservationIgnored private var warmRevision = 0
@@ -76,9 +76,11 @@ final class PlaybackService: NSObject {
 
     init(library: LibraryRepository, downloads: OfflineDownloads, cloud: OneDriveClient,
          bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
-         activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) }) {
+         activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) },
+         buffer: PlaybackBuffer? = nil) {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
+        self.buffer = buffer ?? PlaybackBuffer()
         mediaCache = PlaybackCacheLoader.make(cloud: cloud)
         automaticPiP = UserDefaults.standard.bool(forKey: "automaticPiP")
         speakerSound = UserDefaults.standard.object(forKey: "speakerSound") as? Bool ?? true
@@ -201,8 +203,12 @@ final class PlaybackService: NSObject {
         warmTask?.cancel()
         clock.reset(position: position, duration: current?.duration ?? 0)
         isLoading = true
+        let allowRemote = downloads.network.isConnected && !downloads.readyIDs.contains(queue.currentID ?? "")
+        // An automatic AVQueuePlayer advance must obey the same Saved/offline
+        // eligibility as an explicit handoff. Re-resolve a rejected remote stage.
+        let eligibleAdoption = adopting.flatMap { $0.isLocal || allowRemote ? $0 : nil }
         if !forceRemote, position == 0, let id = queue.currentID,
-           let prepared = adopting ?? buffer.advance(to: id, allowRemote: downloads.network.isConnected && !downloads.readyIDs.contains(id)) {
+           let prepared = eligibleAdoption ?? buffer.advance(to: id, allowRemote: allowRemote) {
             currentIsLocal = prepared.isLocal
             observeCurrent(prepared.item, position: 0, request: request, rewind: prepared.needsRewind)
             prepareUpcoming()

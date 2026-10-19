@@ -6,6 +6,44 @@ import PlayerCore
 
 @MainActor
 final class PlaybackContinuityTests: XCTestCase {
+    func testAutomaticHandoffReResolvesRemotePreparationWhenASavedCopyIsAvailable() async throws {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let cloud = OneDriveClient(account: MicrosoftAccount()), network = NetworkStatus()
+        let downloads = OfflineDownloads(cloud: cloud, network: network)
+        let library = LibraryRepository(cloud: cloud, catalogURL: temporary.appendingPathComponent("catalog.json"))
+        let source = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let ids = (0..<2).map { "local:handoff-\($0)-" + UUID().uuidString }
+        let records = ids.map { MediaRecord(id: $0, title: "Synthetic tone", creator: "Fixture", duration: 1.2) }
+        for id in ids { _ = try await downloads.importLocal(source, mediaID: id) }
+        defer { for id in ids { downloads.remove(id) } }
+        try library.install(LibraryCatalog(libraryID: "local:test", media: records,
+            playlists: [PlaylistRecord(id: "local:handoff", name: "Synthetic", itemIDs: ids)]))
+        let buffer = PlaybackBuffer()
+        let service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
+            bookmarkURL: temporary.appendingPathComponent("playback.json"), activateSession: {}, buffer: buffer)
+        defer { service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+        service.start(playlistIDs: ["local:handoff"], at: ids[0])
+        let preparedDeadline = Date().addingTimeInterval(5)
+        while !buffer.hasPrepared(ids[1]), Date() < preparedDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(buffer.hasPrepared(ids[1]))
+        buffer.player.pause(); buffer.discardNext()
+        // Emulate a stage resolved before its Saved download finished.
+        let remote = AVPlayerItem(url: source)
+        buffer.stage(.init(mediaID: ids[1], item: remote, isLocal: false))
+        buffer.player.advanceToNextItem(); buffer.synchronize()
+        let deadline = Date().addingTimeInterval(5)
+        while service.isLoading, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(service.isLoading)
+        XCTAssertEqual(service.queue.currentID, ids[1])
+        XCTAssertFalse(service.player.currentItem === remote, "Automatic handoff must not bypass Saved eligibility")
+        let savedCandidate = await downloads.localURL(for: records[1])
+        let saved = try XCTUnwrap(savedCandidate)
+        let current = try XCTUnwrap(service.player.currentItem)
+        XCTAssertEqual((current.asset as? AVURLAsset)?.url, saved)
+    }
+
     func testServiceReadinessAndForegroundRespectInterruptionPauseAndActivationFailure() async throws {
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
