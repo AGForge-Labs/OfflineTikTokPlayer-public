@@ -623,7 +623,17 @@ final class PlaybackService: NSObject {
         // A natural boundary can publish an older visit after a selection is
         // requested. It must not replace the requested source/queue before that
         // exact command has been consumed by the audio thread.
-        guard !continuousAudio.isSelectionPending(in: sample) else { return }
+        guard !continuousAudio.isSelectionPending(in: sample) else {
+            // A paused restore does not start the engine to acknowledge selection.
+            // Keep fetching its requested video frame as decoding becomes ready,
+            // without adopting the old audio snapshot or changing playback intent.
+            if !intent.canPlay, continuousAudio.selectedID != nil,
+               continuousAudio.selectedID == queue.currentID {
+                continuousPiP.updatePlayback(positionSeconds: continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock())),
+                    durationSeconds: clock.duration, isPlaying: false)
+            }
+            return
+        }
         guard let entry = continuousAudio.entry(forToken: sample.token) else { return }
         if let pending = pendingAudioSeek, sample.selectionVersion == pending.version {
             _ = clock.completeSeek(pending.seek, actualPosition: Double(sample.frame) / 48_000)
@@ -685,12 +695,19 @@ final class PlaybackService: NSObject {
                       self.player.currentItem === item, self.videoAllowed else { return }
                 let host = CMClockGetTime(CMClockGetHostTimeClock())
                 let desired = self.continuousAudio.presentationPosition(at: host)
-                if !self.intent.canPlay, abs(item.currentTime().seconds - desired) > 0.080 {
+                // A newer paused request must win even within the drift threshold;
+                // compare requested targets rather than native seek quantization.
+                let requestedFrameChanged = abs(position - desired) > 0.5 / 48_000
+                if !self.intent.canPlay,
+                   requestedFrameChanged || abs(item.currentTime().seconds - desired) > 0.080 {
                     self.synchronizeVideoToAudio(force: true)
                     return
                 }
                 // The display layer also needs the requested paused/restored position,
                 // even before the engine has acknowledged its first selection command.
+                // Every completed seek starts a new frame epoch, including short
+                // backwards seeks below the ordinary drift-correction threshold.
+                self.continuousPiP.flushForSeek()
                 self.continuousPiP.updatePlayback(positionSeconds: desired, durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay)
                 if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
                 guard self.intent.canPlay else { return }
@@ -842,7 +859,10 @@ final class PlaybackService: NSObject {
         case .userPauseRequested: phase = .pauseRequested
         case .userSkipRequested: phase = .seekRequested
         case .frameFailed: phase = .sampled
-        case .sourcePrepared: phase = .sourcePreparationCompleted
+        case .sourcePrepared:
+            // Composition/output attachment can finish after an initial paused seek.
+            if !intent.canPlay { synchronizeVideoToAudio(force: true) }
+            phase = .sourcePreparationCompleted
         case .sourcePreparationFailed: phase = .sourcePreparationFailed
         }
         recordDiagnostic(phase, error: code.map { PlaybackDiagnosticError(family: .avKit, code: $0) })

@@ -59,6 +59,45 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         XCTAssertFalse(service.wantsToPlay)
         XCTAssertEqual(service.player.rate, 0)
+        XCTAssertFalse(service.audioEngineRunning)
+        XCTAssertEqual(service.audioSnapshot.selectionVersion, 0,
+                       "A paused restore must not start audio to acknowledge its requested position")
+
+        // A short backwards seek must reset the custom display's frame epoch,
+        // even though its distance is below the ordinary 80 ms drift threshold.
+        service.seek(0.35)
+        try await require({ abs(service.player.currentTime().seconds - 0.35) < 0.04 },
+                          "The selected paused item must complete the backwards seek")
+        if let earlier = await assertVisibleFrame(service, screen: screen, identity: .b, label: "paused-B-backwards-to-0.35") {
+            let center = try XCTUnwrap(earlier.blueBarCenter)
+            let normalized = center / Double(earlier.width)
+            print("SelectionPausedBackward position=0.35 blueNormalized=\(normalized) expected=\(30.0 / 160.0)")
+            XCTAssertEqual(normalized, 30.0 / 160.0, accuracy: 0.04,
+                           "The actual paused composite must replace the later frame after a short backwards seek")
+        }
+        assertSelection(service, fixture: fixture, id: fixture.bID)
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertFalse(service.audioEngineRunning)
+        XCTAssertEqual(service.audioSnapshot.selectionVersion, 0)
+        XCTAssertEqual(service.player.rate, 0)
+
+        // Both requests share one actor turn, so the first native completion must
+        // converge on the latest target even though they differ by only 50 ms.
+        service.seek(0.50)
+        service.seek(0.45)
+        try await require({ abs(service.player.currentTime().seconds - 0.45) < 0.04 },
+                          "The latest paused seek must supersede the in-flight target")
+        if let newest = await assertVisibleFrame(service, screen: screen, identity: .b, label: "paused-B-latest-0.45") {
+            let center = try XCTUnwrap(newest.blueBarCenter)
+            let normalized = center / Double(newest.width)
+            print("SelectionPausedLatest position=0.45 blueNormalized=\(normalized) expected=\(41.0 / 160.0)")
+            XCTAssertEqual(normalized, 41.0 / 160.0, accuracy: 0.04,
+                           "The actual paused composite must show the latest coalesced seek target")
+        }
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertFalse(service.audioEngineRunning)
+        XCTAssertEqual(service.audioSnapshot.selectionVersion, 0)
+        XCTAssertEqual(service.player.rate, 0)
 
         service.play()
         try await require({ service.audioSnapshot.token != 0 && service.audioSnapshot.frame > 2_400 },
@@ -142,14 +181,33 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 },
                           "Both complete Saved sources must be ready")
         let aToken = service.audioSnapshot.token
-        service.seek(SelectionVideoFixture.duration - 0.5)
-        try await require({ service.audioSnapshot.token == aToken
-            && service.audioSnapshot.frame > Int64((SelectionVideoFixture.duration - 0.25) * 48_000) },
-                          "A must approach its natural boundary without an explicit Next")
+        let seekPosition = SelectionVideoFixture.duration - 2
+        service.seek(seekPosition)
+        // A far seek rebuilds the decoder's original history. Observe real progress with
+        // two seconds of runway instead of requiring the main actor to catch A's final
+        // 250 ms. A completed natural transition is also valid if scheduling skipped A.
+        // This is cold far-seek setup, not a prepared-transition latency limit.
+        let reachedRunway = await waitUntil(timeout: 10) {
+            let sample = service.audioSnapshot
+            return sample.token == aToken && sample.frame >= Int64((seekPosition + 0.05) * 48_000)
+                || sample.token != 0 && sample.token != aToken && sample.frame > 0
+        }
+        let sample = service.audioSnapshot
+        print("SelectionBoundary phase=runway reached=\(reachedRunway) sourceA=\(sample.token == aToken) frame=\(sample.frame) visit=\(sample.visit) underrunFrames=\(sample.underrunFrames) engineRunning=\(service.audioEngineRunning) wantsToPlay=\(service.wantsToPlay) position=\(service.clock.position) duration=\(service.clock.duration)")
+        guard reachedRunway else {
+            // Keep this an assertion failure, with the original numeric evidence,
+            // instead of throwing a setup error through deferred fixture cleanup.
+            XCTFail("The real renderer must reach the seek runway or naturally enter B")
+            return
+        }
         // The audio thread continues through the boundary while the main actor is briefly busy.
         // This deterministically exercises an arriving frame offset greater than zero.
-        stallMainActorForBoundary()
-        try await require({ service.queue.currentID == fixture.bID && service.audioSnapshot.token != aToken
+        if sample.token == aToken {
+            let remaining = max(0, SelectionVideoFixture.duration - Double(sample.frame) / 48_000)
+            stallMainActorForBoundary(seconds: min(2.2, remaining + 0.2))
+        }
+        try await require({ service.queue.currentID == fixture.bID && service.audioSnapshot.token != 0
+            && service.audioSnapshot.token != aToken
             && service.clock.position > 0 }, "The service must adopt naturally rendered B at a positive offset")
         assertSelection(service, fixture: fixture, id: fixture.bID)
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "natural-B-positive-offset")
@@ -223,7 +281,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertEqual(service.player.rate, 0)
     }
 
-    private func stallMainActorForBoundary() { Thread.sleep(forTimeInterval: 0.4) }
+    private func stallMainActorForBoundary(seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
 
     private func assertSelection(_ service: PlaybackService, fixture: SelectionVideoFixture, id: String,
                                  file: StaticString = #filePath, line: UInt = #line) {
@@ -387,7 +445,18 @@ final class SelectionVideoFixture {
 
     func remove() {
         for id in ids { downloads.remove(id) }
-        try? FileManager.default.removeItem(at: temporary)
+        let manager = FileManager.default
+        let parent = manager.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let owned = temporary.standardizedFileURL
+        // Only this fixture's UUID directory is recursively removed. Cleanup is
+        // idempotent when initialization failed or a prior cleanup already ran.
+        if UUID(uuidString: owned.lastPathComponent) != nil,
+           owned.deletingLastPathComponent().resolvingSymlinksInPath() == parent,
+           owned.resolvingSymlinksInPath().deletingLastPathComponent() == parent,
+           manager.fileExists(atPath: owned.path) {
+            do { try manager.removeItem(at: owned) }
+            catch { print("SelectionFixture cleanupErrorCode=\((error as NSError).code)") }
+        }
         if let previousSpeakerSound { UserDefaults.standard.set(previousSpeakerSound, forKey: "speakerSound") }
         else { UserDefaults.standard.removeObject(forKey: "speakerSound") }
         if let previousAutomaticPiP { UserDefaults.standard.set(previousAutomaticPiP, forKey: "automaticPiP") }

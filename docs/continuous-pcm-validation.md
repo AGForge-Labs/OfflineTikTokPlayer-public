@@ -31,6 +31,31 @@ before `xcodebuild`. Only its 81 core tests and Apple buffer harness ran. It is
 explicitly preserves exit status during helper cleanup. Isolated launcher tests
 check full/focused native arguments, failure propagation and helper termination.
 
+The actual full run [39390046275](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39390046275)
+at `a8eec0d50e9660f5740f7c6eebd427f5894fb7c0` passed 81 core tests and one UI
+test, but reported three failures across two of 88 native tests. Cold-selection
+retry/pause, waiting policy, A/B/A, rewound video, rapid final-selection
+acknowledgement and foreground restoration passed. Actual compositor movie-color
+fractions were about 0.898 with zero magenta poster coverage; independent AAC
+tones had RMS about 0.141 and the correct 440/880 Hz energy.
+The paused restored B frame still showed time zero. Natural-boundary setup timed
+out before video assertions while waiting to observe A's final 250 ms; that log
+cannot distinguish a missed window from cold far-seek refill time. This is a
+failed candidate.
+
+The next repair refreshes a paused requested frame through the existing service
+poll while audio selection remains unacknowledged, re-synchronizes after late
+output attachment and resets the display epoch after completed native seeks.
+Its regression also checks short backward and coalesced paused seeks without
+starting audio; completion converges on the latest requested PCM-frame target.
+Natural-boundary setup observes real progress with two seconds of runway or an
+already-rendered B, then retains strict identity/positive-offset/moving-pixel
+checks. Cold far-seek setup is not a prepared-transition latency measurement.
+Full acceptance now requires exactly all 88 native and one UI identities plus
+`TEST SUCCEEDED`, independently of job status. Five launcher and eleven evidence
+guard regressions cover missing UI, partial/skipped/failed/retried results, first
+error propagation, stale-log clearing and cleanup. Native acceptance is pending.
+
 ## Reviewed scope
 
 Base: `5ae95b42d89cbdbd5a6b93ef3202f9ed57603881`.
