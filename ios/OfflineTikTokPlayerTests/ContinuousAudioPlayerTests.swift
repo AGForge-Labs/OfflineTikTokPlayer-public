@@ -4,6 +4,30 @@ import AVFoundation
 
 @MainActor
 final class ContinuousAudioPlayerTests: XCTestCase {
+    func testObsoleteFailureCannotRemoveTheCurrentPreparedLoop() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let audio = ContinuousAudioPlayer()
+        defer { audio.suspend(); audio.graph.engine.stop() }
+        audio.setWindow(["a", "b"])
+        let a = try await audio.prepare(id: "a", url: url)
+        let b = try await audio.prepare(id: "b", url: url, currentPriority: true)
+        try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+        XCTAssertTrue(audio.select(id: "b", position: Double(b.frames - 1) / 48_000))
+        try audio.setPlaying(true)
+        let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+        XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+        audio.setWindow(["b"])
+        XCTAssertNil(audio.entry(forToken: a.token))
+        audio.follow(from: "b", to: "b")
+        XCTAssertFalse(audio.invalidateForRetry(token: a.token), "A callback queued before retirement is obsolete")
+        let visit = audio.snapshot.visit
+        XCTAssertEqual(try audio.graph.engine.renderOffline(3, to: output), .success)
+        XCTAssertGreaterThan(audio.snapshot.visit, visit)
+        XCTAssertFalse(audio.snapshot.ended)
+        XCTAssertEqual(audio.snapshot.token, b.token)
+        XCTAssertEqual(audio.snapshot.underrunFrames, 0)
+    }
+
     func testDecodeFailureUsesPendingSelectionOrActualNaturalSuccessor() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
         for explicitSelection in [true, false] {

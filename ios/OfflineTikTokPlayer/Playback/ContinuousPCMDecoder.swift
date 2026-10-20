@@ -201,8 +201,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                     }
                     do { try fill(slot, chunks: isCurrent ? 8 : 2) }
                     catch {
-                        if (error as? Failure) == .cancelled, slot.source.token == slot.token,
-                           !slot.cancellation.value.load(ordering: .acquiring) { continue }
+                        if (error as? Failure) == .cancelled {
+                            if slot.source.token != slot.token || slot.cancellation.value.load(ordering: .acquiring) {
+                                slots[index] = nil
+                            }
+                            // Retirement/task cancellation is normal cleanup.
+                            // An epoch change retains this slot for the next pump.
+                            continue
+                        }
                         // A failed reader must not publish fabricated success/EOF.
                         // Its source will report an underrun if it is selected.
                         slots[index] = nil

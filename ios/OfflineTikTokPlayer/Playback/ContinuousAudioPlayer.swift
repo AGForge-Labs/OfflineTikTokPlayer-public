@@ -99,12 +99,16 @@ final class ContinuousAudioPlayer {
         preparing[id] = task
         do {
             let entry = try await task.value
+            // The worker can report a stream failure after publishing the
+            // prefix but before this actor receives the prepared Entry.
+            guard !failedTokens.contains(token) else { throw ContinuousPCMDecoder.Failure.cannotDecode }
             preparing[id] = nil; reservedSlots.remove(slot); reservedTokens.remove(token)
             entries[id] = entry
             evictUnused()
             return entry
         } catch {
             preparing[id] = nil; reservedSlots.remove(slot); reservedTokens.remove(token)
+            failedTokens.remove(token)
             _ = renderer.retireSource(at: slot)
             decoder.retain(tokens: Set(entries.values.map(\.token)).union(reservedTokens))
             throw error
@@ -159,7 +163,11 @@ final class ContinuousAudioPlayer {
     }
     @discardableResult
     func invalidateForRetry(token: Int) -> Bool {
+        let knownEntry = entries.values.contains { $0.token == token }
+        guard knownEntry || reservedTokens.contains(token) else { return false }
         failedTokens.insert(token)
+        // Reservations must fail publication, but cannot own current playback.
+        guard knownEntry else { return false }
         for entry in entries.values { renderer.setSuccessor(token: 0, for: entry.token) }
         successors.removeAll()
         let sample = renderer.snapshot
