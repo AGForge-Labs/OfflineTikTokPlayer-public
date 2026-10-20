@@ -25,10 +25,11 @@ def workflow():
 def test_public_playback_validation_is_standard_unsigned_and_private_guarded(preflight):
     config = yaml.load((ROOT / ".github/workflows/playback-validation.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     preflight.validate_public_workflow(config)
-    for change in ["private_guard", "runner", "secret", "write", "command", "extra_step", "evidence_guard", "launcher_regressions"]:
+    for change in ["extra_branch", "private_guard", "runner", "secret", "write", "command", "extra_step", "evidence_guard", "launcher_regressions"]:
         altered = copy.deepcopy(config)
         job = altered["jobs"]["ios"]
-        if change == "private_guard": job["if"] = "true"
+        if change == "extra_branch": altered["on"]["push"]["branches"].append("unreviewed/additional-branch")
+        elif change == "private_guard": job["if"] = "true"
         elif change == "runner": job["runs-on"] = "macos-26-xlarge"
         elif change == "secret": job["steps"][1]["env"] = {"KEY": "${{ secrets.KEY }}"}
         elif change == "write": altered["permissions"]["contents"] = "write"
