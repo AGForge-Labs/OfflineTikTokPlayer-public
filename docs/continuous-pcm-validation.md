@@ -162,6 +162,35 @@ require a native exit of 23 to propagate even when its output contains all 90
 passing case identities and `TEST SUCCEEDED`. Production, native tests and media
 are unchanged from the run above. Overall native acceptance remains pending.
 
+Run [39407132688](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39407132688)
+at `6edad4d7f1f5d320844f1832b45b631a0e4d3087` passed 81 core tests, eight
+macOS Bash 3 launcher regressions, sixteen evidence regressions and the UI test.
+Of 89 native tests, one failed: returning from B to retained A accumulated 49,408
+PCM underrun frames, about 1.03 seconds, during its first capture. Ownership stayed
+fixed and video advanced; this is a real audio starvation result, not a capture
+or parser failure. Xcode returned 65. The zero-new-underrun assertion is retained.
+
+Review found that selecting a previously played source invalidated its ring only
+on return, then rebuilt converter history while its two-second pinned prefix
+played. It missed the preceding 3.8 seconds in which B was current. The next
+repair rearms an outgoing retained source while its neighbour plays and consumes
+that prepared frame-zero epoch once on return. Nonzero seeks still request fresh
+history; self-loops retain their existing behavior. Preparation/retirement claims
+and epoch checks protect both sources. No storage, source frames or silence are
+added or removed. This removes a concrete cold-return path; the exact blocking
+framework operation in the failed run was not instrumented and is not inferred.
+
+Two deterministic portable regressions first failed on the old behavior, exposing
+discarded prepared frames on explicit and natural A/B/A transitions. All 83 core
+tests then passed with the repair. A native regression uses the real 30-second
+AAC fixtures, plays beyond the prefix, waits for the actual offscreen decoder's
+committed head, and returns without producer waits. It requires exact nonzero
+samples across three seconds, zero added underruns, the preserved epoch and the
+same 6,912,000 PCM bytes. The far-seek regression now checks cancellation of the
+outgoing obsolete seek and retained head preparation while preserving exact fresh
+far-seek validation. Full native acceptance expects 90 native and one UI test;
+the software fix remains pending that run. Physical iPhone gates remain separate.
+
 Unsigned validation keeps Xcode's build queue at one job and disables parallel
 tests. It now also exports `SWIFTC_MAXIMUM_DETERMINISM=1`, confirms the selected
 Swift driver's one-job override with a print-only plan before compilation, and
