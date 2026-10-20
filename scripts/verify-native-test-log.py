@@ -32,6 +32,16 @@ SPLIT_CASE = re.compile(
     r"Test Case '([^']+)'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[\] <<<< VRP >>>> signalled err=-?\d+ at <>:\d+")
 RESULT_SUFFIX = re.compile(r" (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+# A second observed interleave interrupts the class identifier itself. Keep its
+# exact diagnostic and require the remaining identifier/result on the next line.
+SPLIT_IDENTITY_CASE = re.compile(
+    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.[A-Za-z_]\w*)"
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215 {2}"
+    r"IsHardwareSupported: no plist loaded, returning false", re.ASCII)
+IDENTITY_RESULT_SUFFIX = re.compile(
+    r"([A-Za-z0-9_]+ [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+NATIVE_HEADER_PREFIX = re.compile(r"\bTest Case '-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 FAILURE = re.compile(r"\*\* TEST(?: [A-Z]+)* FAILED \*\*")
 
@@ -217,26 +227,35 @@ def verify_log(text, expected):
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
         if pending is not None:
-            raw, header_line = pending
+            raw, header_line, identity_split = pending
             pending = None
-            suffix = RESULT_SUFFIX.fullmatch(clean)
+            suffix = (IDENTITY_RESULT_SUFFIX if identity_split else RESULT_SUFFIX).fullmatch(clean)
             if suffix:
-                event, reconstructed = (raw, suffix.group(1)), True
+                event = (raw + suffix.group(1), suffix.group(2)) if identity_split else (raw, suffix.group(1))
+                reconstructed = True
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
             match = CASE.search(line)
             if match:
+                prefix = NATIVE_HEADER_PREFIX.search(line)
+                if prefix and prefix.start() != match.start():
+                    problems.append(f"Malformed native/UI case prefix at line {number}")
                 event = match.groups()
             else:
                 header = CASE_HEADER.search(line)
-                if header and any(target + "." in header.group(1) for target in TARGETS):
+                identity_split = SPLIT_IDENTITY_CASE.fullmatch(clean)
+                if identity_split:
+                    pending = (identity_split.group(1), number, True)
+                elif header and any(target + "." in header.group(1) for target in TARGETS):
                     split = SPLIT_CASE.fullmatch(clean)
                     if split:
-                        pending = (split.group(1), number)
+                        pending = (split.group(1), number, False)
                     else:
                         problems.append(f"Malformed native/UI case at line {number}: {header.group(1)}")
-                elif RESULT_SUFFIX.fullmatch(clean):
+                elif NATIVE_HEADER_PREFIX.search(line):
+                    problems.append(f"Malformed native/UI case prefix at line {number}")
+                elif RESULT_SUFFIX.fullmatch(clean) or IDENTITY_RESULT_SUFFIX.fullmatch(clean):
                     problems.append(f"Orphan case result suffix at line {number}")
                 continue
         raw, status = event
@@ -262,7 +281,7 @@ def verify_log(text, expected):
         else:
             problems.append(f"Unsupported native/UI case status at line {number}: {status} {identity}")
     if pending is not None:
-        raw, header_line = pending
+        raw, header_line, _ = pending
         problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
     if len(successes) != 1:
         problems.append(f"Expected exactly one TEST SUCCEEDED marker; found {len(successes)}")

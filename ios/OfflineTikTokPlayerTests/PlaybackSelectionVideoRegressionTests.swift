@@ -72,12 +72,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         seeks.phase = phase; seeks.origin = origin
         command()
         var cursor = firstFrame
+        var outgoing: SelectionOutputTap.Window?
         var tone: SelectionOutputTap.Window?
         var visible: Double?
         let deadline = ProcessInfo.processInfo.systemUptime + (prepared ? 1 : 5)
         while ProcessInfo.processInfo.systemUptime < deadline {
             while tone == nil, let window = tap.window(at: cursor) {
                 cursor += max(1, Int(window.rate * 0.01))
+                if prepared, outgoing == nil,
+                   SelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: frequency == 440 ? 880 : 440) {
+                    outgoing = window
+                }
                 if window.end >= origin, SelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: frequency) {
                     tone = window
                 }
@@ -105,6 +110,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertNotNil(tone, "The independently classified target tone must reach the real engine mixer tap")
         XCTAssertNotNil(visible, "A fresh selected custom frame must become ready within the phase watchdog")
         if prepared {
+            XCTAssertEqual(seeks.alignedPreparedSeekCount[phase] ?? 0, 0,
+                           "An already aligned prepared selection must not discard its frame through an exact seek")
+            XCTAssertNotNil(outgoing, "Prepared measurement must capture the outgoing tone before the incoming source")
+            if let outgoing, let tone { XCTAssertLessThanOrEqual(outgoing.end, tone.start) }
             if let toneMs { XCTAssertLessThanOrEqual(toneMs, 100, "Prepared engine output must begin within 100 ms of the command") }
             if let visibleMs { XCTAssertLessThanOrEqual(visibleMs, 250, "Prepared selected custom video must become ready within 250 ms") }
             XCTAssertEqual(underrunDelta, 0, "Prepared output must introduce no renderer underruns")
@@ -113,6 +122,77 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertLessThanOrEqual(timelineHole, 0.5 / max(1, recorded.rate),
                                      "Prepared output timestamps must remain continuous to half a frame; missing callbacks cannot disappear from silence accounting")
         }
+    }
+
+    func testNaturalPreparedBoundaryKeepsOutputTimelineAndRevealsSelectedVideo() async throws {
+        let fixture = try await SelectionVideoFixture()
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        let tap = SelectionOutputTap()
+        let service = fixture.service(continuousAudio: audio)
+        let screen = try SelectionVideoScreen(service: service)
+        audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
+            tap.append(buffer, time: time)
+        }
+        defer {
+            tap.stop(); service.pause()
+            audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
+            audio.graph.engine.stop(); screen.close()
+        }
+        for id in fixture.ids {
+            let source = try await fixture.decodedTone(id: id, startSeconds: 0)
+            XCTAssertEqual(SelectionOutputTap.quietRun(source, rate: 48_000), 0)
+        }
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await require({ service.audioSnapshot.token > 0 && service.preparedAudioCount == 2 },
+                          "Both complete synthetic sources must prepare before the natural boundary")
+        let aToken = service.audioSnapshot.token
+        // Play the complete presentation. A far seek could introduce unrelated
+        // reader reconstruction and cannot stand in for a prepared natural end.
+        let runway = await waitUntil(timeout: SelectionVideoFixture.duration + 2) {
+            service.audioSnapshot.token == aToken
+                && Double(service.audioSnapshot.frame) / 48_000 >= SelectionVideoFixture.duration - 0.5
+        }
+        XCTAssertTrue(runway, "The complete A presentation must reach its final half second")
+        guard runway else { return }
+        let first = tap.begin(), submitted = service.submittedVideoFrameCount
+        let underruns = service.audioSnapshot.underrunFrames
+        var cursor = first
+        var outgoing: SelectionOutputTap.Window?
+        var incoming: SelectionOutputTap.Window?
+        var ready: Double?
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            while incoming == nil, let window = tap.window(at: cursor) {
+                cursor += max(1, Int(window.rate * 0.01))
+                if outgoing == nil, SelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: 440) { outgoing = window }
+                if SelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: 880) { incoming = window }
+            }
+            if ready == nil, service.queue.currentID == fixture.bID, service.isVideoReady,
+               service.customVideoReadyForDisplay, service.submittedVideoFrameCount > submitted,
+               let position = service.videoFramePositionSeconds, position < 2 { ready = SelectionOutputTap.hostSeconds() }
+            if incoming != nil, ready != nil, service.audioSnapshot.token != aToken,
+               service.audioSnapshot.frame >= 24_000 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        tap.stop()
+        let captured = tap.samples(since: first)
+        let quiet = SelectionOutputTap.quietRun(captured.values, rate: captured.rate)
+        let hole = SelectionOutputTap.maximumTimelineHole(captured.hosts, rate: captured.rate)
+        let visibleMs = incoming.flatMap { tone in ready.map { ($0 - tone.start) * 1_000 } }
+        print("SelectionNaturalOutput completeSourceSeconds=\(SelectionVideoFixture.duration) outgoingTone=\(outgoing != nil) incomingTone=\(incoming != nil) customReadyFromIncomingWindowMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) timelineHoleMs=\(hole * 1_000) underrunDelta=\(service.audioSnapshot.underrunFrames - underruns) tapFrames=\(captured.values.count)")
+        XCTAssertNotNil(outgoing, "The captured output must include A before B, rather than starting after the boundary")
+        XCTAssertNotNil(incoming, "B's independent tone must reach the real mixer after complete A")
+        if let outgoing, let incoming { XCTAssertLessThanOrEqual(outgoing.end, incoming.start) }
+        XCTAssertNotNil(ready)
+        if let visibleMs { XCTAssertLessThanOrEqual(visibleMs, 250) }
+        XCTAssertEqual(quiet, 0, "Continuous source tones must add no detected 10 ms RMS-silence window")
+        XCTAssertLessThanOrEqual(hole, 0.5 / max(1, captured.rate))
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, underruns)
+        XCTAssertEqual(tap.validity().invalidTimestamps, 0)
+        XCTAssertEqual(tap.validity().droppedFrames, 0)
+        assertSelection(service, fixture: fixture, id: fixture.bID)
+        await assertVisibleFrame(service, screen: screen, identity: .b, label: "latency-natural-complete-A-to-B")
     }
 
     func testGeneratedSavedFixturesDecodeToExpectedDistinctTones() async throws {
@@ -764,10 +844,14 @@ private final class SelectionLatencySeekProbe {
     weak var service: PlaybackService?
     var phase = -1
     var origin = 0.0
+    private(set) var alignedPreparedSeekCount: [Int: Int] = [:]
     func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
         let started = SelectionOutputTap.hostSeconds()
         let phase = self.phase, origin = self.origin, requested = time.seconds
         let current = player.currentTime().seconds
+        if phase > 0, abs(current - requested) <= 0.080, player.rate > 0.999 {
+            alignedPreparedSeekCount[phase, default: 0] += 1
+        }
         print("SelectionLatencySeek phase=\(phase) event=start commandMs=\((started - origin) * 1_000) requested=\(requested) playerPosition=\(current) drift=\(current - requested) playerRate=\(player.rate)")
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             let completed = SelectionOutputTap.hostSeconds()

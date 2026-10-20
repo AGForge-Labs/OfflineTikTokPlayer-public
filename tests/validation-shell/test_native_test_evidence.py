@@ -47,6 +47,15 @@ def split_case(identity, status="passed", timestamp=False):
             prefix + f" {status} (1.774 seconds)."]
 
 
+def split_identifier_case(identity, status="passed", timestamp=False):
+    owner, method = identity.split("/")
+    target, name = owner.split(".", 1)
+    prefix = "2026-10-20T22:03:36.3966460Z " if timestamp else ""
+    return [prefix + f"Test Case '-[{target}.{name[:2]}"
+            "2026-10-20 22:03:28.182264+0000 OfflineTikTokPlayer[18188:61328] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false",
+            prefix + f"{name[2:]} {method}]' {status} (0.645 seconds)."]
+
+
 class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -187,6 +196,88 @@ class NativeTestEvidenceTests(unittest.TestCase):
         checked = self.check_log([" passed (1.774 seconds)."] + self.full_log())
         self.assertNotEqual(checked.returncode, 0)
         self.assertIn("Orphan", checked.stderr)
+
+    def test_accepts_adjacent_identity_split_by_the_observed_loudness_diagnostic(self):
+        identity = TARGETS[0] + ".PlaybackSelectionFailureTests/testFailedChosenSavedClipStopsOldAudioAndRetriesTheSameSelection"
+        self.assertIn(identity, self.expected)
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                others = [case_line(x) for x in self.expected if x != identity]
+                lines = others + [case_line(identity, "started")] + split_identifier_case(identity, timestamp=timestamp)
+                result = self.check_log(lines + ["** TEST SUCCEEDED **"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PASS " + identity + "\n", result.stdout)
+
+    def test_identity_split_failures_skips_retries_and_duplicates_still_fail(self):
+        identity = self.expected[0]
+        others = [case_line(x) for x in self.expected if x != identity]
+        started = [case_line(identity, "started")]
+        for status in ("failed", "skipped"):
+            with self.subTest(status=status):
+                result = self.check_log(others + started + split_identifier_case(identity, status) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(status, result.stderr.lower())
+        for status in ("failed", "passed"):
+            with self.subTest(retry_or_duplicate=status):
+                result = self.check_log(others + started + split_identifier_case(identity, status)
+                                        + [case_line(identity), "** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("duplicate", result.stderr.lower())
+
+    def test_identity_split_cannot_borrow_a_tail_across_another_record(self):
+        identity = self.expected[0]
+        header, tail = split_identifier_case(identity)
+        others = [case_line(x) for x in self.expected if x != identity]
+        for intervening in ("unrelated output", case_line(self.expected[1], "started"),
+                            "** TEST SUCCEEDED **", "** TEST FAILED **", ""):
+            with self.subTest(intervening=intervening):
+                result = self.check_log(others + [case_line(identity, "started"), header,
+                                                 intervening, tail, "** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(identity, result.stderr)
+
+    def test_identity_split_rejects_malformed_noise_orphan_tails_and_missing_tails(self):
+        identity = self.expected[0]
+        header, tail = split_identifier_case(identity)
+        fragments = ([header], [tail],
+                     [header.replace("LoudnessManager.mm:1215", "OtherManager.mm:1215"), tail],
+                     [header.replace("returning false", "returning true"), tail],
+                     [header.replace("2026-10-20 22:03:28.182264+0000", "unknown-time"), tail],
+                     [header.replace("OfflineTikTokPlayer[18188:61328]", "OtherPlayer[18188:61328]"), tail],
+                     [header + " ** TEST FAILED **", tail],
+                     [header, tail.replace(" passed ", " passed-with-noise ")],
+                     [header, tail + " unrelated output"],
+                     [header, tail + " " + case_line(self.expected[1])])
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                # Include an otherwise complete pass: malformed extra records
+                # must not disappear merely because another result exists.
+                result = self.check_log(self.full_log()[:-1] + list(fragment) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_identity_split_requires_one_prior_start_and_an_expected_identity(self):
+        identity = self.expected[0]
+        others = [case_line(x) for x in self.expected if x != identity]
+        for before, after in (([], []), ([case_line(identity, "started")] * 2, []),
+                              ([], [case_line(identity, "started")])):
+            with self.subTest(before=before, after=after):
+                result = self.check_log(others + before + split_identifier_case(identity) + after + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Ambiguous", result.stderr)
+        for target in TARGETS:
+            unexpected = target + ".NewTests/testUnexpected"
+            result = self.check_log([case_line(unexpected, "started")] + split_identifier_case(unexpected) + self.full_log())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unexpected", result.stderr.lower())
+
+    def test_identity_split_does_not_hide_another_real_case_failure(self):
+        identity, failed = self.expected[:2]
+        others = [case_line(x) for x in self.expected if x not in (identity, failed)]
+        lines = others + [case_line(identity, "started")] + split_identifier_case(identity)
+        result = self.check_log(lines + [case_line(failed, "failed"), "** TEST FAILED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(failed, result.stderr)
+        self.assertIn("TEST FAILED", result.stderr)
 
     def test_selection_only_requires_exactly_the_four_focused_classes_and_no_ui(self):
         focused = [x for x in self.expected if x.split(".", 1)[1].split("/")[0] in FOCUSED_CLASSES]

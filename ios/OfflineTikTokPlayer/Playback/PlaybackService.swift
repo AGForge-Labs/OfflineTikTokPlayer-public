@@ -427,6 +427,11 @@ final class PlaybackService: NSObject {
                     if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
                     self.resumeContinuousAudio()
                     self.recordPlaybackEvent("coldAudioPrepared")
+                    // Keep normalization part of this item's prepared state. It
+                    // must not invalidate an already loading video on selection.
+                    await self.prepareVideoForPlayback(playerItem)
+                    try Task.checkCancellation()
+                    guard self.generation == request else { return }
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
                     self.observeCurrent(playerItem, position: itemPosition, request: request)
                     self.prepareUpcoming()
@@ -457,6 +462,15 @@ final class PlaybackService: NSObject {
             guard self.generation == request else { return }
             self.isLoading = false; self.pause()
             self.message = "No available videos in this queue. Connect to your library or choose downloaded videos."
+        }
+    }
+
+    private func prepareVideoForPlayback(_ item: AVPlayerItem) async {
+        guard item.videoComposition == nil, let asset = item.asset as? AVURLAsset,
+              asset.url.isFileURL else { return }
+        if let composition = try? await ContinuousPictureInPicture.makeVideoComposition(for: asset),
+           !Task.isCancelled {
+            item.videoComposition = composition
         }
     }
 
@@ -559,6 +573,11 @@ final class PlaybackService: NSObject {
                     playerItem.preferredForwardBufferDuration = 8
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+                    // Link ready PCM before awaiting video-only metadata so an
+                    // approaching audible boundary never waits for orientation.
+                    self.updateAudioSuccessor()
+                    await self.prepareVideoForPlayback(playerItem)
+                    guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil), after: active?.id)
                     self.updateAudioSuccessor()
                     self.refreshAudioProcessing()
@@ -577,6 +596,7 @@ final class PlaybackService: NSObject {
                     item.preferredForwardBufferDuration = 8
                     _ = await PlaybackPreparation.value(within: .milliseconds(500)) { try? await item.asset.load(.isPlayable) }
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
+                    await self.prepareVideoForPlayback(item)
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stagePrevious(.init(mediaID: previous.id, item: item, isLocal: saved != nil || cached != nil))
                     self.refreshAudioProcessing()
@@ -596,6 +616,7 @@ final class PlaybackService: NSObject {
                     let requireLocal = !self.downloads.network.isConnected
                     if requireLocal || !self.buffer.hasPrepared(item.id) {
                         let playerItem = AVPlayerItem(url: url)
+                        await self.prepareVideoForPlayback(playerItem)
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
                         self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal, after: active?.id)
                         self.updateAudioSuccessor()
@@ -662,7 +683,6 @@ final class PlaybackService: NSObject {
         if sample.visit != audioVisit {
             let changedSource = sample.token != audioToken
             audioVisit = sample.visit; audioToken = sample.token
-            continuousPiP.flushForSeek()
             continuousAudio.adoptRendered(id: entry.id)
             if changedSource, entry.id != queue.currentID {
                 var following = queue
@@ -672,7 +692,12 @@ final class PlaybackService: NSObject {
                 queue = following
                 let video = buffer.advance(to: entry.id)
                 loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
-            } else { synchronizeVideoToAudio(force: true) }
+            } else {
+                // The new selected item's video is already prepared at zero.
+                // Preserve it when aligned; actual loop/seek visits still force
+                // a new frame epoch, and ordinary drift still triggers a seek.
+                synchronizeVideoToAudio(force: !changedSource)
+            }
             prepareUpcoming()
         }
         clock.sample(position: Double(sample.frame) / 48_000)
