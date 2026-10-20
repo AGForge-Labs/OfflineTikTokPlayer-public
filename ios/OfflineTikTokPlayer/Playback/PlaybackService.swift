@@ -427,6 +427,9 @@ final class PlaybackService: NSObject {
                     if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
                     self.resumeContinuousAudio()
                     self.recordPlaybackEvent("coldAudioPrepared")
+                    // Begin successor PCM preparation as soon as audio plays.
+                    // Video metadata must not postpone a short clip's boundary.
+                    self.prepareUpcoming()
                     // Keep normalization part of this item's prepared state. It
                     // must not invalidate an already loading video on selection.
                     await self.prepareVideoForPlayback(playerItem)
@@ -434,6 +437,8 @@ final class PlaybackService: NSObject {
                     guard self.generation == request else { return }
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
                     self.observeCurrent(playerItem, position: itemPosition, request: request)
+                    // A warm video could not be staged while the buffer was
+                    // empty; reconcile it now without discarding prepared PCM.
                     self.prepareUpcoming()
                     self.persist(); return
                 } catch is CancellationError { return }
