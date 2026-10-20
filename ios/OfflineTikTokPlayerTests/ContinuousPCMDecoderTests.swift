@@ -110,11 +110,12 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         var lastFrame = [Float](repeating: .nan, count: 2)
         // Publish the seek request to the worker; the unprepared seek may underrun.
         lastFrame.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+        let epoch = renderer.source(at: 0).streamRequest.epoch
         let deadline = Date().addingTimeInterval(2)
-        while renderer.source(at: 0).availableStreamFrames != 1, Date() < deadline {
+        while renderer.source(at: 0).availableStreamFrames(for: epoch) != 1, Date() < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
-        XCTAssertEqual(renderer.source(at: 0).availableStreamFrames, 1)
+        XCTAssertEqual(renderer.source(at: 0).availableStreamFrames(for: epoch), 1)
         lastFrame.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
         XCTAssertEqual(lastFrame, [0.25, 0.25])
         XCTAssertEqual(reports.withLock { $0 }, 0, "A tail-only reader cannot know source leading/trailing quiet frames")
@@ -150,6 +151,44 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         // A prepared Previous changes only the source cursor inside the same graph.
         renderer.select(token: 1, frame: 0)
         assertSamples(try render(graph, frames: min(401, first.count / 2)), equal: Array(first.prefix(802)))
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+
+    func testStandaloneMP3KeepsCompleteDecodedSamplesThroughGraphLoopsNextAndPrevious() async throws {
+        let mp3 = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-tone", withExtension: "mp3"))
+        let expectedMP3 = try await independentlyDecode(AVURLAsset(url: mp3), diagnosticName: "standalone-mp3")
+        XCTAssertGreaterThan(expectedMP3.count, 48_000, "The real MP3 decoder must return the complete synthetic tone")
+        XCTAssertLessThan(expectedMP3.count, 192_000)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let following = directory.appendingPathComponent("following.caf")
+        let expectedFollowing: [Float] = [0.25, -0.25, 0.125, -0.125, 0, 0, 0.5, -0.5, 0, 0]
+        try writePCM(expectedFollowing, to: following)
+        let renderer = ContinuousPCMRenderer(prefixFrames: expectedMP3.count / 2 + 2_048, ringFrames: 512)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        defer { decoder.shutdown() }
+        let prepared = try await decoder.prepare(url: mp3, token: 1, slot: 0)
+        _ = try await decoder.prepare(url: following, token: 2, slot: 1)
+        XCTAssertEqual(prepared.totalFrames, Int64(expectedMP3.count / 2), "MP3 loops must use its own decoded presentation, not the source MP4 edit duration")
+        renderer.setSuccessor(token: 1, for: 1)
+        renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+        let graph = ContinuousAudioGraph(renderer: renderer)
+        try graph.engine.enableManualRenderingMode(.offline, format: graph.format, maximumFrameCount: 257)
+        graph.engine.prepare()
+        try graph.engine.start()
+        defer { graph.engine.stop() }
+        assertSamples(try render(graph, frames: expectedMP3.count / 2 * 3), equal: expectedMP3 + expectedMP3 + expectedMP3)
+        renderer.setSuccessor(token: 2, for: 1)
+        renderer.select(token: 1, frame: 0)
+        assertSamples(try render(graph, frames: (expectedMP3.count + expectedFollowing.count) / 2), equal: expectedMP3 + expectedFollowing)
+        // Repeated prepared Previous/Next commands keep the same running graph.
+        for _ in 0..<8 {
+            renderer.select(token: 1, frame: 0)
+            assertSamples(try render(graph, frames: 193), equal: Array(expectedMP3.prefix(386)))
+            renderer.select(token: 2, frame: 0)
+            assertSamples(try render(graph, frames: expectedFollowing.count / 2), equal: expectedFollowing)
+        }
         XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
     }
 
@@ -195,14 +234,108 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         var actual: [Float] = []
         while actual.count < expected.count * 2 {
             let count = min(127, (expected.count * 2 - actual.count) / 2)
+            try await waitForPreparedFrames(renderer, count: count, totalFrames: 4_097)
             var block = [Float](repeating: .nan, count: count * 2)
             block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: count) }
             actual.append(contentsOf: block)
-            // Give the one production worker time to refill; there is no test-only
-            // synchronous decode path and no decoder call from the render thread.
-            try await Task.sleep(for: .milliseconds(10))
         }
         assertSamples(actual, equal: expected + expected)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+
+    func testResampledStreamingLoopAndSeekRebuildTheOriginalConverterHistory() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("stream-44100.caf")
+        let native = (0..<9_801).flatMap { frame -> [Float] in
+            let value = frame < 42 || frame >= 9_784 ? 0 : Float(sin(Double(frame) * 0.071)) * 0.2
+            return [value, -value]
+        }
+        try writePCM(native, to: url, sampleRate: 44_100)
+        let expected = try await independentlyDecode(AVURLAsset(url: url), diagnosticName: "streamed-44100-to-48000")
+        XCTAssertEqual(expected.count, 10_668 * 2)
+        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        defer { decoder.shutdown() }
+        _ = try await decoder.prepare(url: url, token: 1, slot: 0)
+        renderer.setSuccessor(token: 1, for: 1)
+        renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+        var actual: [Float] = []
+        while actual.count < expected.count * 3 {
+            let count = min(127, (expected.count * 3 - actual.count) / 2)
+            try await waitForPreparedFrames(renderer, count: count, totalFrames: 10_668)
+            var block = [Float](repeating: .nan, count: count * 2)
+            block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: count) }
+            actual.append(contentsOf: block)
+        }
+        assertSamples(actual, equal: expected + expected + expected)
+        // A paused render acknowledges the seek without consuming/starving it.
+        renderer.setPlaying(false); renderer.select(token: 1, frame: 7_891)
+        var block = [Float](repeating: .nan, count: 386)
+        block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 193) }
+        try await waitForPreparedFrames(renderer, count: 193, totalFrames: 10_668)
+        renderer.setPlaying(true)
+        block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 193) }
+        assertSamples(block, equal: Array(expected[(7_891 * 2)..<((7_891 + 193) * 2)]))
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+
+    func testRetainedFarSeekYieldsSoPreparedCurrentSourceCanRefillFirst() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let far = directory.appendingPathComponent("far.caf"), current = directory.appendingPathComponent("current.caf")
+        // The two-minute low-rate file is written with one fixed-size buffer.
+        // No complete long-source PCM array is retained by this test or decoder.
+        try writeConstantPCM(frames: 120 * 8_000, sampleRate: 8_000, value: 0.125, to: far)
+        try writePCM([Float](repeating: 0.375, count: 4_097 * 2), to: current)
+        let renderer = ContinuousPCMRenderer(prefixFrames: 64, ringFrames: 128)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        defer { decoder.shutdown() }
+        _ = try await decoder.prepare(url: far, token: 1, slot: 0)
+        _ = try await decoder.prepare(url: current, token: 2, slot: 1)
+        renderer.select(token: 1, frame: 119 * 48_000)
+        var acknowledged = [Float](repeating: .nan, count: 2)
+        acknowledged.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+        let farEpoch = renderer.source(at: 0).streamRequest.epoch
+        let firstYield = Date().addingTimeInterval(3)
+        while decoder.cooperativeYieldCount == 0, Date() < firstYield {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertGreaterThan(decoder.cooperativeYieldCount, 0, "A far seek must return the serial worker between bounded discard steps")
+        // Retain A's valid seek request while B becomes active and consumes all
+        // its prepared PCM. B must refill before A finishes rebuilding history.
+        renderer.select(token: 2, frame: 0); renderer.setPlaying(true)
+        var initial = [Float](repeating: .nan, count: 192 * 2)
+        initial.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 192) }
+        XCTAssertTrue(initial.allSatisfy { $0 == 0.375 })
+        let currentSource = renderer.source(at: 1), currentEpoch = currentSource.streamRequest.epoch
+        let refill = Date().addingTimeInterval(3)
+        while currentSource.availableStreamFrames(for: currentEpoch) < 128, Date() < refill {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(currentSource.availableStreamFrames(for: currentEpoch), 128)
+        XCTAssertEqual(renderer.source(at: 0).availableStreamFrames(for: farEpoch), 0,
+            "Current playback must refill before the retained distant seek completes")
+        var next = [Float](repeating: .nan, count: 128 * 2)
+        next.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 128) }
+        XCTAssertTrue(next.allSatisfy { $0 == 0.375 })
+        let retainedReady = Date().addingTimeInterval(12)
+        while renderer.source(at: 0).availableStreamFrames(for: farEpoch) < 16, Date() < retainedReady {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertGreaterThanOrEqual(renderer.source(at: 0).availableStreamFrames(for: farEpoch), 16,
+            "Yielding must preserve the retained converter's progress, not repeatedly restart or poison it")
+        // A fresh selection requests a fresh epoch; verify it also eventually
+        // reaches the exact steady-state PCM after rebuilding the same history.
+        renderer.setPlaying(false); renderer.select(token: 1, frame: 119 * 48_000)
+        acknowledged.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+        try await waitForPreparedFrames(renderer, count: 16, totalFrames: 120 * 48_000, timeout: 12)
+        renderer.setPlaying(true)
+        var resumed = [Float](repeating: .nan, count: 16 * 2)
+        resumed.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 16) }
+        for sample in resumed { XCTAssertEqual(sample, 0.125, accuracy: 0.00001) }
         XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
     }
 
@@ -255,6 +388,18 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         try file.write(from: buffer)
     }
 
+    private func writeConstantPCM(frames: Int, sampleRate: Double, value: Float, to url: URL) throws {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 2, interleaved: false))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 8_192))
+        for channel in 0..<2 { buffer.floatChannelData![channel].update(repeating: value, count: Int(buffer.frameCapacity)) }
+        let file = try AVAudioFile(forWriting: url, settings: format.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        var remaining = frames
+        while remaining > 0 {
+            buffer.frameLength = AVAudioFrameCount(min(remaining, Int(buffer.frameCapacity)))
+            try file.write(from: buffer); remaining -= Int(buffer.frameLength)
+        }
+    }
+
     private func render(_ graph: ContinuousAudioGraph, frames: Int) throws -> [Float] {
         let buffer = AVAudioPCMBuffer(pcmFormat: graph.engine.manualRenderingFormat, frameCapacity: 257)!
         var result: [Float] = []
@@ -273,19 +418,44 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         return result
     }
 
+    private func waitForPreparedFrames(_ renderer: ContinuousPCMRenderer, count: Int, totalFrames: Int64, timeout: Double = 3) async throws {
+        let source = renderer.source(at: 0)
+        let frame = renderer.snapshot.frame
+        let streamedStart = max(frame, Int64(source.prefixCapacityFrames))
+        let streamedEnd = min(frame + Int64(count), totalFrames)
+        let needed = max(0, Int(streamedEnd - streamedStart))
+        guard needed > 0 else { return }
+        let epoch = source.streamRequest.epoch
+        let deadline = Date().addingTimeInterval(timeout)
+        while source.availableStreamFrames(for: epoch) < needed {
+            guard Date() < deadline else {
+                XCTFail("Prepared decoder epoch did not supply the exact next sample span")
+                throw ContinuousPCMDecoder.Failure.cannotDecode
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+    }
+
     private func assertSamples(_ actual: [Float], equal expected: [Float], file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(actual.count, expected.count, file: file, line: line)
         let mismatch = zip(actual, expected).enumerated().first { $0.element.0 != $0.element.1 }
         XCTAssertNil(mismatch.map(\.offset), "First changed/inserted/dropped sample: \(String(describing: mismatch))", file: file, line: line)
     }
 
-    /// Independent decoder comparison deliberately avoids the production timestamp/chunk helpers.
+    /// Array-backed reference: native PCM first, then a separate converter driver
+    /// using 113-frame input and 257-frame output blocks (production uses 4096).
+    /// This avoids the implicit AudioMixOutput converter that lost its tail.
     private func independentlyDecode(_ asset: AVAsset, diagnosticName: String? = nil) async throws -> [Float] {
         let tracks = try await asset.loadTracks(withMediaType: .audio)
         let track = try XCTUnwrap(tracks.first, "Synthetic fixture needs an iOS-readable audio track")
+        let descriptions = try await track.load(.formatDescriptions)
+        let description = try XCTUnwrap(descriptions.first)
+        let sourceASBD = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(description))
+        let rate = sourceASBD.pointee.mSampleRate
+        let channels = Int(sourceASBD.pointee.mChannelsPerFrame)
         let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderAudioMixOutput(audioTracks: [track], audioSettings: [
-            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM,
             AVLinearPCMIsFloatKey: true, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false
         ])
         reader.add(output)
@@ -300,15 +470,30 @@ final class ContinuousPCMDecoderTests: XCTestCase {
                 CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
             }
             XCTAssertEqual(status, kCMBlockBufferNoErr)
-            bytes.withUnsafeBytes { samples.append(contentsOf: $0.bindMemory(to: Float.self)) }
-            if diagnosticName != nil {
-                func trimSeconds(_ key: CFString) -> Double {
-                    guard let dictionary = CMGetAttachment(sample, key: key, attachmentModeOut: nil) as? [String: Any] else { return 0 }
-                    return CMTimeMakeFromDictionary(dictionary as CFDictionary).seconds
+            func trimSeconds(_ key: CFString) -> Double {
+                guard let dictionary = CMGetAttachment(sample, key: key, attachmentModeOut: nil) as? [String: Any] else { return 0 }
+                return CMTimeMakeFromDictionary(dictionary as CFDictionary).seconds
+            }
+            let trimStart = Int((trimSeconds(kCMSampleBufferAttachmentKey_TrimDurationAtStart) * rate).rounded())
+            let trimEnd = Int((trimSeconds(kCMSampleBufferAttachmentKey_TrimDurationAtEnd) * rate).rounded())
+            let packetFrames = bytes.count / (channels * 4)
+            let packetStart = Int((CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds * rate).rounded())
+            let validFrames = packetFrames - trimStart - trimEnd
+            XCTAssertGreaterThanOrEqual(validFrames, 0)
+            guard validFrames >= 0 else { throw ContinuousPCMDecoder.Failure.invalidTimeline }
+            let oldFrames = samples.count / channels
+            if packetStart > oldFrames { samples.append(contentsOf: repeatElement(0, count: (packetStart - oldFrames) * channels)) }
+            let skipped = max(0, samples.count / channels - packetStart)
+            if skipped < validFrames {
+                bytes.withUnsafeBytes {
+                    let values = $0.bindMemory(to: Float.self)
+                    samples.append(contentsOf: values[((trimStart + skipped) * channels)..<((trimStart + validFrames) * channels)])
                 }
+            }
+            if diagnosticName != nil {
                 let asbd = CMSampleBufferGetFormatDescription(sample).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0) }
                 let packet: [String: Double] = [
-                    "packet": Double(packets), "byteFrames": Double(bytes.count / 8),
+                    "packet": Double(packets), "byteFrames": Double(packetFrames),
                     "numSamples": Double(CMSampleBufferGetNumSamples(sample)),
                     "sampleRate": asbd?.pointee.mSampleRate ?? -1,
                     "rawPTS": CMSampleBufferGetPresentationTimeStamp(sample).seconds,
@@ -325,16 +510,50 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             }
         }
         XCTAssertEqual(reader.status, .completed)
+        let duration = try await asset.load(.duration)
+        let range = try await track.load(.timeRange)
+        let seconds = max(duration.seconds, range.end.seconds)
+        let nativeFrames = max(samples.count / channels, Int((seconds * rate).rounded()))
+        samples.append(contentsOf: repeatElement(0, count: nativeFrames * channels - samples.count))
+        let inputFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate,
+            channels: UInt32(channels), interleaved: true))
+        let outputFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true))
+        let converter = try XCTUnwrap(AVAudioConverter(from: inputFormat, to: outputFormat))
+        if channels == 1 { converter.channelMap = [0, 0] }
+        let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 113))
+        let outputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 257))
+        var inputOffset = 0, converted: [Float] = [], iterations = 0
+        while true {
+            iterations += 1
+            guard iterations < 100_000 else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+            outputBuffer.frameLength = 0
+            var conversionError: NSError?
+            let status = converter.convert(to: outputBuffer, error: &conversionError) { requested, status in
+                let count = min(Int(requested), 113, nativeFrames - inputOffset)
+                guard count > 0 else { status.pointee = .endOfStream; return nil }
+                samples.withUnsafeBufferPointer {
+                    inputBuffer.floatChannelData![0].update(from: $0.baseAddress!.advanced(by: inputOffset * channels), count: count * channels)
+                }
+                inputBuffer.frameLength = AVAudioFrameCount(count); inputOffset += count
+                status.pointee = .haveData; return inputBuffer
+            }
+            XCTAssertNil(conversionError)
+            XCTAssertNotEqual(status, .error)
+            guard status != .error else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+            converted.append(contentsOf: UnsafeBufferPointer(start: outputBuffer.floatChannelData![0], count: Int(outputBuffer.frameLength) * 2))
+            if status == .endOfStream { break }
+        }
+        let presentationFrames = max(Int((seconds * 48_000).rounded()), Int((Double(nativeFrames) * 48_000 / rate).rounded()))
+        XCTAssertEqual(converted.count, presentationFrames * 2, "Explicit end-of-stream flushing must return the complete presentation without fabricated silence")
         if let diagnosticName {
-            let duration = try await asset.load(.duration)
-            let range = try await track.load(.timeRange)
             let metrics: [String: Any] = ["fixture": diagnosticName, "assetSeconds": duration.seconds,
                 "trackStartSeconds": range.start.seconds, "trackEndSeconds": range.end.seconds,
-                "decodedFrames": samples.count / 2, "packets": packets,
+                "nativeDecodedFrames": samples.count / channels, "convertedFrames": converted.count / 2,
+                "presentationFrames": presentationFrames, "packets": packets,
                 "first": firstPacket ?? [:], "last": lastPackets]
             let data = try JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys])
             print("PCM_PACKET_DIAGNOSTICS " + String(decoding: data, as: UTF8.self))
         }
-        return samples
+        return converted
     }
 }

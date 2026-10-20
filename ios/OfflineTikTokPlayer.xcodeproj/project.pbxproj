@@ -464,6 +464,24 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "823D92756EFEACD3CFB746BD";
 		};
+		"1F42C7A72E48159A7F757E9D" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "audio.mp3";
+			"path" = "test-tone.mp3";
+			"sourceTree" = "<group>";
+		};
+		"2D6F617377A1E9DB15C50254" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "1F42C7A72E48159A7F757E9D";
+		};
+		"49D98E474BBBDF405BABEA93" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"1F42C7A72E48159A7F757E9D",
+			);
+			"path" = "Fixtures";
+			"sourceTree" = "<group>";
+		};
 		"6C96D7A2B9170F5FC49BE09D" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -572,6 +590,7 @@
 				"657E5F20B00C53BE564A746D",
 				"B20DD8F524202FCC149D08C5",
 				"823D92756EFEACD3CFB746BD",
+				"49D98E474BBBDF405BABEA93",
 				"6C96D7A2B9170F5FC49BE09D",
 				"53C1ED56AEF2C6C2F6604F5E",
 				"7EFE51A1CA89F2639A388D75",
@@ -891,6 +910,7 @@
 			"isa" = "PBXResourcesBuildPhase";
 			"buildActionMask" = 2147483647;
 			"files" = (
+				"2D6F617377A1E9DB15C50254",
 				"911E24FB09AD366501E79934",
 				"BB25FB65101CB3C0DC7A87DA",
 				"4D50E451668A30F67EDC6256",

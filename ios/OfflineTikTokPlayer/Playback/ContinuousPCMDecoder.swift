@@ -31,12 +31,19 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let value = Atomic<Bool>(false)
     }
 
+    private enum ReadControl: Error { case deferred }
+
     private final class Description: @unchecked Sendable {
         let asset: AVURLAsset
         let track: AVAssetTrack?
         let totalFrames: Int64
-        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64) {
+        let endTime: CMTime
+        let nativeRate: Double
+        let nativeChannels: UInt32
+        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32) {
             self.asset = asset; self.track = track; self.totalFrames = totalFrames
+            self.endTime = endTime
+            self.nativeRate = nativeRate; self.nativeChannels = nativeChannels
         }
     }
 
@@ -62,6 +69,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private var stopped = false
     private var failureHandler: (@Sendable (Int, Failure) -> Void)?
     private var sourceSilenceHandler: (@Sendable (Int, SourceSilence) -> Void)?
+    private let yieldCount = Atomic<Int64>(0)
+
+    /// Numeric cooperative scheduling evidence; never includes source identity.
+    var cooperativeYieldCount: Int64 { yieldCount.load(ordering: .acquiring) }
 
     init(renderer: ContinuousPCMRenderer) {
         self.renderer = renderer
@@ -94,7 +105,16 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
         let frames = try Self.frame(end)
         guard frames > 0 else { throw Failure.invalidTimeline }
-        let description = Description(asset: asset, track: selected, totalFrames: frames)
+        var nativeRate = 48_000.0, nativeChannels: UInt32 = 2
+        if let selected {
+            let formats = try await selected.load(.formatDescriptions)
+            guard let format = formats.first, let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format),
+                  asbd.pointee.mSampleRate.isFinite, asbd.pointee.mSampleRate > 0,
+                  (1...8).contains(asbd.pointee.mChannelsPerFrame) else { throw Failure.unsupportedPCM }
+            nativeRate = asbd.pointee.mSampleRate; nativeChannels = asbd.pointee.mChannelsPerFrame
+        }
+        let description = Description(asset: asset, track: selected, totalFrames: frames, endTime: end,
+            nativeRate: nativeRate, nativeChannels: nativeChannels)
         let hasAudio = selected != nil
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler {
@@ -105,7 +125,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         do {
                             guard !stopped, !cancellation.value.load(ordering: .acquiring) else { throw Failure.cancelled }
                             let source = renderer.source(at: index)
-                            let stream = try Stream(description: description, startFrame: 0)
+                            let stream = try Stream(description: description, startFrame: 0,
+                                shouldCancel: { cancellation.value.load(ordering: .acquiring) })
                             var prefix = [Float](repeating: 0, count: source.prefixCapacityFrames * 2)
                             let count = try prefix.withUnsafeMutableBufferPointer {
                                 try stream.read(into: $0, maximumFrames: source.prefixCapacityFrames)
@@ -180,6 +201,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                     }
                     do { try fill(slot, chunks: isCurrent ? 8 : 2) }
                     catch {
+                        if (error as? Failure) == .cancelled, slot.source.token == slot.token,
+                           !slot.cancellation.value.load(ordering: .acquiring) { continue }
                         // A failed reader must not publish fabricated success/EOF.
                         // Its source will report an underrun if it is selected.
                         slots[index] = nil
@@ -202,7 +225,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 slot.source.finishStream(totalFrames: slot.source.totalFrames, epoch: slot.epoch)
                 return
             }
-            let stream = try Stream(description: slot.description, startFrame: request.startFrame)
+            let source = slot.source, token = slot.token, cancellation = slot.cancellation
+            let stream = try Stream(description: slot.description, startFrame: request.startFrame,
+                shouldCancel: {
+                    cancellation.value.load(ordering: .acquiring) || source.token != token || source.streamRequest.epoch != request.epoch
+                })
             guard slot.source.beginStream(epoch: request.epoch) else { return }
             slot.stream = stream; slot.epoch = request.epoch; slot.finished = false
         }
@@ -211,8 +238,17 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             guard slot.source.token == slot.token, slot.source.streamRequest.epoch == slot.epoch else { return }
             let capacity = min(8_192, slot.source.writableStreamFrames)
             guard capacity > 0 else { return }
-            let count = try scratch.withUnsafeMutableBufferPointer {
-                try slot.stream.read(into: $0, maximumFrames: capacity)
+            let count: Int
+            do {
+                count = try scratch.withUnsafeMutableBufferPointer {
+                    try slot.stream.read(into: $0, maximumFrames: capacity)
+                }
+            } catch ReadControl.deferred {
+                yieldCount.store(yieldCount.load(ordering: .relaxed) &+ 1, ordering: .releasing)
+                // Stream keeps its converter and generated-frame cursor. Returning
+                // to the pump lets the current source refill before the next
+                // bounded discard step of a retained, far-away seek.
+                return
             }
             if let analysis = slot.stream.takeSourceSilence() {
                 sourceSilenceHandler?(slot.token, analysis)
@@ -230,21 +266,26 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
     }
 
-    private static func frame(_ time: CMTime) throws -> Int64 {
+    private static func frame(_ time: CMTime, rate: Double = 48_000) throws -> Int64 {
         guard time.isNumeric, time.seconds.isFinite, abs(time.seconds) < 86_400 else { throw Failure.invalidTimeline }
-        return CMTimeConvertScale(time, timescale: 48_000, method: .roundHalfAwayFromZero).value
+        guard rate.isFinite, rate > 0, rate.rounded() == rate, rate <= 384_000 else { throw Failure.unsupportedPCM }
+        return CMTimeConvertScale(time, timescale: CMTimeScale(rate), method: .roundHalfAwayFromZero).value
     }
 
-    /// Bounded sequential decoding on the complete presentation timeline.
-    /// AVAssetReader applies container edits and the codec's declared trimming.
-    /// Remaining trim attachments are applied from timestamps, never amplitude.
+    /// Native-rate demux/decode followed by an explicit, flushed converter. The
+    /// reader's implicit sample-rate conversion is deliberately avoided: native
+    /// regression runs found that it could omit buffered resampler tail samples.
     private final class Stream {
-        private let reader: AVAssetReader?
-        private let output: AVAssetReaderAudioMixOutput?
-        private var samples: [Float] = []
-        private var sampleOffset = 0
-        private var sampleCount = 0
-        private var sampleStart: Int64 = 0
+        private let native: NativeReader?
+        private let converter: AVAudioConverter?
+        private let input: AVAudioPCMBuffer?
+        private let output: AVAudioPCMBuffer?
+        private let nativeRate: Double
+        private let shouldCancel: () -> Bool
+        private var outputStart: Int64 = 0
+        private var outputCount = 0
+        private var generatedFrames: Int64 = 0
+        private var converterFinished = false
         private var cursor: Int64
         private var eof = false
         private(set) var totalFrames: Int64
@@ -254,54 +295,65 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private var lastAboveThreshold: Int64?
         private var peak: Float = 0
 
-        init(description: Description, startFrame: Int64) throws {
+        init(description: Description, startFrame: Int64, shouldCancel: @escaping () -> Bool) throws {
             totalFrames = description.totalFrames; cursor = max(0, startFrame)
+            nativeRate = description.nativeRate
+            self.shouldCancel = shouldCancel
             analysisValid = startFrame == 0
-            guard let track = description.track else { reader = nil; output = nil; eof = true; return }
-            let reader = try AVAssetReader(asset: description.asset)
-            let output = AVAssetReaderAudioMixOutput(audioTracks: [track], audioSettings: [
-                AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
-                AVLinearPCMIsFloatKey: true, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false
-            ])
-            output.alwaysCopiesSampleData = false
-            guard reader.canAdd(output) else { throw Failure.cannotDecode }
-            reader.add(output)
-            if startFrame > 0 {
-                let start = CMTime(value: startFrame, timescale: 48_000)
-                reader.timeRange = CMTimeRange(start: start, duration: .positiveInfinity)
+            guard description.track != nil else {
+                native = nil; converter = nil; input = nil; output = nil; return
             }
-            guard reader.startReading() else { throw Failure.cannotDecode }
-            self.reader = reader; self.output = output
+            let native = try NativeReader(description: description)
+            guard let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: description.nativeRate,
+                    channels: description.nativeChannels, interleaved: true),
+                  let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true),
+                  let converter = AVAudioConverter(from: inputFormat, to: outputFormat),
+                  let input = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 4_096),
+                  let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4_096) else { throw Failure.unsupportedPCM }
+            if description.nativeChannels == 1 { converter.channelMap = [0, 0] }
+            self.native = native; self.converter = converter; self.input = input; self.output = output
+            // A reopen starts from the source's beginning and discards converted
+            // output up to the requested frame. This retains exactly the original
+            // SRC phase/history with bounded storage. Ordinary loop/reversal
+            // refills only need to rebuild the fixed two-second pinned prefix.
         }
-
-        deinit { reader?.cancelReading() }
 
         func read(into destination: UnsafeMutableBufferPointer<Float>, maximumFrames: Int) throws -> Int {
             let maximum = min(maximumFrames, destination.count / 2)
             let firstFrame = cursor
             var written = 0
+            var skippedBuffers = 0
             while written < maximum {
-                if sampleCount == 0, !eof { try nextSample() }
-                if sampleCount == 0, eof {
+                if shouldCancel() { throw Failure.cancelled }
+                if native == nil {
                     let count = min(maximum - written, Int(max(0, totalFrames - cursor)))
-                    guard count > 0 else { break }
-                    destination.baseAddress!.advanced(by: written * 2).initialize(repeating: 0, count: count * 2)
+                    guard count > 0 else { eof = true; break }
+                    destination.baseAddress!.advanced(by: written * 2).update(repeating: 0, count: count * 2)
                     cursor += Int64(count); written += count; continue
                 }
-                let end = sampleStart + Int64(sampleCount)
-                if end <= cursor { sampleCount = 0; continue }
-                if sampleStart > cursor {
-                    let count = min(maximum - written, Int(sampleStart - cursor))
-                    destination.baseAddress!.advanced(by: written * 2).initialize(repeating: 0, count: count * 2)
-                    cursor += Int64(count); written += count; continue
+                if outputCount == 0, !eof { try convertNext() }
+                if eof {
+                    // No synthetic zeros may conceal an unflushed/short converter.
+                    guard cursor >= totalFrames else { throw Failure.cannotDecode }
+                    break
                 }
-                let offset = Int(cursor - sampleStart)
-                let count = min(maximum - written, sampleCount - offset)
-                samples.withUnsafeBufferPointer {
-                    destination.baseAddress!.advanced(by: written * 2).update(from: $0.baseAddress!.advanced(by: (sampleOffset + offset) * 2), count: count * 2)
+                let end = outputStart + Int64(outputCount)
+                if end <= cursor {
+                    outputCount = 0
+                    skippedBuffers += 1
+                    // Yield only before emitting anything. No copied frames can
+                    // be lost, and initial prefix preparation is unaffected.
+                    if written == 0, skippedBuffers >= 8 { throw ReadControl.deferred }
+                    continue
                 }
+                if outputStart >= totalFrames { outputCount = 0; continue }
+                guard outputStart <= cursor, let samples = output?.floatChannelData?[0] else { throw Failure.invalidTimeline }
+                let offset = Int(cursor - outputStart)
+                let count = min(maximum - written, outputCount - offset, Int(max(0, totalFrames - cursor)))
+                guard count > 0 else { outputCount = 0; continue }
+                destination.baseAddress!.advanced(by: written * 2).update(from: samples.advanced(by: offset * 2), count: count * 2)
                 cursor += Int64(count); written += count
-                if cursor >= end { sampleCount = 0 }
+                if cursor >= end { outputCount = 0 }
             }
             if analysisValid {
                 // Inspect only the PCM already copied by this read. This adds no
@@ -321,7 +373,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
 
         func takeSourceSilence() -> SourceSilence? {
-            guard analysisValid, !analysisReported, eof, sampleCount == 0, cursor >= totalFrames else { return nil }
+            guard analysisValid, !analysisReported, eof, cursor >= totalFrames else { return nil }
             analysisReported = true
             return SourceSilence(totalFrames: totalFrames,
                 leadingFrames: firstAboveThreshold ?? totalFrames,
@@ -329,8 +381,101 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 peak: peak)
         }
 
+        private func convertNext() throws {
+            guard !converterFinished else { eof = true; return }
+            guard let native, let converter, let input, let output else { throw Failure.cannotDecode }
+            for _ in 0..<8 {
+                if shouldCancel() { throw Failure.cancelled }
+                output.frameLength = 0
+                var inputFailure: Failure?
+                var conversionError: NSError?
+                let status = converter.convert(to: output, error: &conversionError) { requested, status in
+                    do {
+                        let count = try native.read(into: input, maximumFrames: min(Int(requested), Int(input.frameCapacity)))
+                        if count == 0 { status.pointee = .endOfStream; return nil }
+                        status.pointee = .haveData; return input
+                    } catch {
+                        inputFailure = (error as? Failure) ?? .cannotDecode
+                        status.pointee = .endOfStream; return nil
+                    }
+                }
+                if let inputFailure { throw inputFailure }
+                guard status != .error, conversionError == nil else { throw Failure.cannotDecode }
+                totalFrames = max(totalFrames, Int64((Double(native.totalFrames) * 48_000 / nativeRate).rounded()))
+                if status == .endOfStream { converterFinished = true }
+                outputStart = generatedFrames; outputCount = Int(output.frameLength)
+                generatedFrames += Int64(outputCount)
+                if outputCount > 0 { return }
+                if converterFinished { eof = true; return }
+            }
+            throw Failure.cannotDecode
+        }
+    }
+
+    /// Preserve native PCM sample counts; only explicit codec trim attachments
+    /// may remove samples. Timestamps place edits/gaps on the source timeline.
+    private final class NativeReader {
+        private let reader: AVAssetReader
+        private let output: AVAssetReaderTrackOutput
+        private let rate: Double
+        private let channels: Int
+        private var samples: [Float] = []
+        private var sampleOffset = 0
+        private var sampleCount = 0
+        private var sampleStart: Int64 = 0
+        private var cursor: Int64 = 0
+        private var eof = false
+        private(set) var totalFrames: Int64
+
+        init(description: Description) throws {
+            guard let track = description.track else { throw Failure.cannotDecode }
+            rate = description.nativeRate; channels = Int(description.nativeChannels)
+            totalFrames = try ContinuousPCMDecoder.frame(description.endTime, rate: rate)
+            reader = try AVAssetReader(asset: description.asset)
+            output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true,
+                AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false
+            ])
+            output.alwaysCopiesSampleData = false
+            guard reader.canAdd(output) else { throw Failure.cannotDecode }
+            reader.add(output)
+            guard reader.startReading() else { throw Failure.cannotDecode }
+        }
+
+        deinit { reader.cancelReading() }
+
+        func read(into destination: AVAudioPCMBuffer, maximumFrames: Int) throws -> Int {
+            guard let target = destination.floatChannelData?[0] else { throw Failure.unsupportedPCM }
+            let maximum = min(maximumFrames, Int(destination.frameCapacity))
+            var written = 0
+            while written < maximum {
+                if sampleCount == 0, !eof { try nextSample() }
+                if sampleCount == 0, eof {
+                    let count = min(maximum - written, Int(max(0, totalFrames - cursor)))
+                    guard count > 0 else { break }
+                    target.advanced(by: written * channels).update(repeating: 0, count: count * channels)
+                    cursor += Int64(count); written += count; continue
+                }
+                let end = sampleStart + Int64(sampleCount)
+                if end <= cursor { sampleCount = 0; continue }
+                if sampleStart > cursor {
+                    let count = min(maximum - written, Int(sampleStart - cursor))
+                    target.advanced(by: written * channels).update(repeating: 0, count: count * channels)
+                    cursor += Int64(count); written += count; continue
+                }
+                let offset = Int(cursor - sampleStart)
+                let count = min(maximum - written, sampleCount - offset)
+                samples.withUnsafeBufferPointer {
+                    target.advanced(by: written * channels).update(from: $0.baseAddress!.advanced(by: (sampleOffset + offset) * channels), count: count * channels)
+                }
+                cursor += Int64(count); written += count
+                if cursor >= end { sampleCount = 0 }
+            }
+            destination.frameLength = AVAudioFrameCount(written)
+            return written
+        }
+
         private func nextSample() throws {
-            guard let output, let reader else { eof = true; return }
             guard let buffer = output.copyNextSampleBuffer() else {
                 guard reader.status == .completed else { throw Failure.cannotDecode }
                 eof = true; return
@@ -338,37 +483,44 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             guard let format = CMSampleBufferGetFormatDescription(buffer),
                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format),
                   asbd.pointee.mFormatID == kAudioFormatLinearPCM,
-                  asbd.pointee.mSampleRate == 48_000,
-                  asbd.pointee.mChannelsPerFrame == 2,
-                  asbd.pointee.mBytesPerFrame == 8,
+                  asbd.pointee.mSampleRate == rate,
+                  asbd.pointee.mChannelsPerFrame == channels,
+                  asbd.pointee.mBytesPerFrame == channels * 4,
                   asbd.pointee.mFormatFlags & kAudioFormatFlagIsFloat != 0,
                   let block = CMSampleBufferGetDataBuffer(buffer) else { throw Failure.unsupportedPCM }
             let bytes = CMBlockBufferGetDataLength(block)
-            guard bytes > 0, bytes % 8 == 0 else { throw Failure.unsupportedPCM }
-            let frames = bytes / 8
+            guard bytes > 0, bytes % (channels * 4) == 0 else { throw Failure.unsupportedPCM }
+            let frames = bytes / (channels * 4)
             // Reject an unexpectedly huge demux packet rather than allowing one
             // source to defeat the fixed prefix/ring memory budget.
-            guard frames <= 131_072 else { throw Failure.oversizedPacket }
+            guard bytes <= 1_048_576 else { throw Failure.oversizedPacket }
             let outputPTS = CMSampleBufferGetOutputPresentationTimeStamp(buffer)
-            let outputDuration = CMSampleBufferGetOutputDuration(buffer)
-            let start = try ContinuousPCMDecoder.frame(outputPTS)
+            let start = try ContinuousPCMDecoder.frame(outputPTS, rate: rate)
             // Output PTS may also contain a track edit/offset. Only the explicit
             // trim attachment identifies samples to omit from the PCM buffer;
             // subtracting raw PTS would mistake a legitimate edit for priming.
-            let trim: Int64
-            if let dictionary = CMGetAttachment(buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
-                attachmentModeOut: nil) as? [String: Any] {
-                trim = max(0, try ContinuousPCMDecoder.frame(CMTimeMakeFromDictionary(dictionary as CFDictionary)))
-            } else { trim = 0 }
-            let valid = outputDuration.isNumeric ? try ContinuousPCMDecoder.frame(outputDuration) : Int64(frames) - trim
-            guard trim <= Int64(frames), valid >= 0, trim + valid <= Int64(frames) + 1 else { throw Failure.invalidTimeline }
-            let validFrames = min(Int64(frames) - trim, valid)
-            samples = [Float](repeating: 0, count: frames * 2)
+            func trim(_ key: CFString) throws -> Int64 {
+                guard let dictionary = CMGetAttachment(buffer, key: key, attachmentModeOut: nil) as? [String: Any] else { return 0 }
+                return max(0, try ContinuousPCMDecoder.frame(CMTimeMakeFromDictionary(dictionary as CFDictionary), rate: rate))
+            }
+            let trimStart = try trim(kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+            let trimEnd = try trim(kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+            guard trimStart + trimEnd <= Int64(frames) else { throw Failure.invalidTimeline }
+            let validFrames = Int64(frames) - trimStart - trimEnd
+            let outputDuration = CMSampleBufferGetOutputDuration(buffer)
+            if outputDuration.isNumeric {
+                let durationFrames = try ContinuousPCMDecoder.frame(outputDuration, rate: rate)
+                // The native-rate output has no SRC discrepancy. A scaled edit
+                // needs an explicit time-pitch implementation, not silent sample
+                // deletion or duplication to force it onto the timeline.
+                guard abs(durationFrames - validFrames) <= 1 else { throw Failure.unsupportedPCM }
+            }
+            samples = [Float](repeating: 0, count: frames * channels)
             let result = samples.withUnsafeMutableBytes {
                 CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes, destination: $0.baseAddress!)
             }
             guard result == kCMBlockBufferNoErr else { throw Failure.cannotDecode }
-            sampleStart = start; sampleOffset = Int(trim); sampleCount = Int(validFrames)
+            sampleStart = start; sampleOffset = Int(trimStart); sampleCount = Int(validFrames)
             totalFrames = max(totalFrames, sampleStart + validFrames)
         }
     }
