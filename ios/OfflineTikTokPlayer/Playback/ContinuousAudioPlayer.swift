@@ -29,6 +29,7 @@ final class ContinuousAudioPlayer {
     var isSelected: Bool { selectedID != nil }
     var preparedCount: Int { entries.count }
     var snapshot: ContinuousPCMRenderer.Snapshot { renderer.snapshot }
+    var producerProgressRecorder: ContinuousPCMDecoder.ProgressRecorder { decoder.progressRecorder }
     var currentEntry: Entry? { entries.values.first { $0.token == renderer.snapshot.token } }
     func entry(for id: String) -> Entry? {
         entries[id].flatMap { failedTokens.contains($0.token) ? nil : $0 }
