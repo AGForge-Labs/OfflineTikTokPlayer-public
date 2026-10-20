@@ -1,8 +1,8 @@
 name: Public playback validation
 on:
   push:
-    branches: [fix/playback-continuity, fix/continuous-pcm-playback]
-    paths: ['ios/**', 'scripts/**', 'tests/apple-playback/**', '.github/workflows/playback-validation.yml']
+    branches: [fix/playback-continuity, fix/continuous-pcm-playback, fix/selected-video-regression]
+    paths: ['ios/**', 'scripts/**', 'tests/apple-playback/**', 'tests/validation-shell/**', '.github/workflows/playback-validation.yml']
 permissions:
   contents: read
 jobs:
@@ -14,5 +14,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Unsigned core and simulator tests with one build job
-        run: bash scripts/check-ios.sh
+      - name: Unsigned full playback validation with one build job
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+          bash scripts/check-ios.sh
+      - name: Require every native and UI test identity
+        run: python3 scripts/verify-native-test-log.py --log artifacts/native/xcodebuild-test.log

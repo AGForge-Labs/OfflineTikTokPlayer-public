@@ -30,6 +30,9 @@ final class ContinuousPictureInPicture: NSObject {
     private(set) var controller: AVPictureInPictureController?
     private(set) var submittedFrameCount: UInt64 = 0
     private(set) var lastFramePositionSeconds: Double?
+    private(set) var lastCopiedFramePositionSeconds: Double?
+    private(set) var pausedFutureFrameRejectionCount: UInt64 = 0
+    private(set) var blockedFrameAcquisitionCount: UInt64 = 0
     private(set) var orientationPrepared = false
     var onSetPlaying: ((Bool) -> Void)?
     /// Complete after the service has applied or rejected the seek, including cancellation.
@@ -55,6 +58,8 @@ final class ContinuousPictureInPicture: NSObject {
     private var frameFeedEnabled = true
     private var preparationTask: Task<Void, Never>?
     private var itemGeneration = 0
+    private var seekTicket: UInt64 = 0
+    private var activeSeekTicket: UInt64?
     private var originalComposition: AVVideoComposition?
     private var installedComposition: AVVideoComposition?
 
@@ -62,6 +67,12 @@ final class ContinuousPictureInPicture: NSObject {
     var isFrameFeedSuspended: Bool { !frameFeedEnabled }
     var isFrameFeedRunning: Bool { frameTimer != nil }
     var isVideoReadyForDisplay: Bool { displayLayer.isReadyForDisplay }
+    var requestedPositionSeconds: Double { playbackState.read().position }
+    var timebasePositionSeconds: Double? {
+        guard let timebase else { return nil }
+        let seconds = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
+        return seconds.isFinite ? seconds : nil
+    }
 
     override init() {
         super.init()
@@ -104,6 +115,7 @@ final class ContinuousPictureInPicture: NSObject {
         preparationTask = nil
         stopFrameTimer()
         itemGeneration &+= 1
+        activeSeekTicket = nil
         let generation = itemGeneration
         if let videoOutput { currentItem?.remove(videoOutput) }
         restoreOriginalComposition()
@@ -115,6 +127,7 @@ final class ContinuousPictureInPicture: NSObject {
         displayLayer.flushAndRemoveImage()
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
+        lastCopiedFramePositionSeconds = nil
         guard let item else { stopFrameTimer(); return }
         originalComposition = item.videoComposition
         let existingComposition = item.videoComposition
@@ -218,12 +231,27 @@ final class ContinuousPictureInPicture: NSObject {
         renderFrame()
     }
 
-    /// Call before a seek/loop discontinuity; pending frames from the old position are discarded.
+    /// A seek starts a new frame epoch, including the image held by a paused timebase.
     func flushForSeek() {
-        displayLayer.flush()
+        displayLayer.flushAndRemoveImage()
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
+        lastCopiedFramePositionSeconds = nil
         hasReportedFrameFailure = false
+    }
+
+    /// Stop pulls before native seeking can make its target available. Acquiring it
+    /// before completion and then flushing would consume a paused one-shot frame.
+    func beginSeek() -> UInt64 {
+        seekTicket &+= 1
+        activeSeekTicket = seekTicket
+        flushForSeek()
+        return seekTicket
+    }
+
+    func completeSeek(_ ticket: UInt64) {
+        guard activeSeekTicket == ticket else { return }
+        activeSeekTicket = nil
     }
 
     /// Call when video is intentionally disabled, even if audio remains active.
@@ -243,6 +271,7 @@ final class ContinuousPictureInPicture: NSObject {
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true
+        activeSeekTicket = nil
         preparationTask?.cancel()
         preparationTask = nil
         stopFrameTimer()
@@ -283,6 +312,10 @@ final class ContinuousPictureInPicture: NSObject {
 
     private func renderFrame() {
         guard !invalidated, frameFeedEnabled, let videoOutput, let timebase else { return }
+        guard activeSeekTicket == nil else {
+            blockedFrameAcquisitionCount &+= 1
+            return
+        }
         if displayLayer.status == .failed {
             if !hasReportedFrameFailure {
                 onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)
@@ -299,6 +332,14 @@ final class ContinuousPictureInPicture: NSObject {
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
         if !displayTime.isNumeric { displayTime = requestedTime }
+        lastCopiedFramePositionSeconds = CMTimeGetSeconds(displayTime)
+        // A stopped clock cannot advance to a future sample. Do not let an output
+        // replay from before a backwards seek pin this epoch ahead of its target.
+        // Past samples remain valid for sources with long or variable frame durations.
+        if !playbackState.read().isPlaying && CMTimeCompare(displayTime, requestedTime) > 0 {
+            pausedFutureFrameRejectionCount &+= 1
+            return
+        }
         guard !lastEnqueuedTime.isNumeric || CMTimeCompare(displayTime, lastEnqueuedTime) > 0 else { return }
         // Never build a future presentation backlog if the video decoder runs ahead of audio.
         let lead = CMTimeGetSeconds(CMTimeSubtract(displayTime, requestedTime))

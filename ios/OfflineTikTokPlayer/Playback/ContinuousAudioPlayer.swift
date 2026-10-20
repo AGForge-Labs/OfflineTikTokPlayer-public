@@ -198,7 +198,13 @@ final class ContinuousAudioPlayer {
         guard let selectedID, select(id: selectedID, position: position) else { return nil }
         return pendingPosition?.version
     }
-    func clearSelection() { suspend(); selectedID = nil; pendingPosition = nil }
+    func clearSelection() {
+        suspend(); selectedID = nil
+        // Keep the old slot pinned until the render callback acknowledges silence.
+        // A delayed failure for that old token no longer owns this pending selection.
+        let version = renderer.select(token: 0)
+        pendingPosition = (version, 0)
+    }
     func rebuildAfterMediaServicesReset() {
         suspend()
         graph.engine.stop()

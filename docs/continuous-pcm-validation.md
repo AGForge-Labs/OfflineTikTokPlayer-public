@@ -3,6 +3,208 @@
 This candidate replaces item-owned audio with a persistent AVAudioEngine and
 AVAudioSourceNode. It is a draft, not a device acceptance or release claim.
 
+**Device acceptance failed for build 13.1.** Selected videos did not reliably
+appear or match the playing source on the owner's iPhone. The historical passing
+run below did not cover those visible-frame regressions and does not establish
+release readiness. The selected-video repair is undergoing full unsigned
+validation; no repaired signed build has been accepted.
+
+The repair preserves a cold selection on preparation failure and stops the old
+audio source before waiting. It publishes deselection acknowledgement, scopes
+video synchronization to its selection generation, re-arms first-frame readiness
+after seeks and updates paused/restored display time. Host-clock video scheduling
+always disables automatic stall waiting, as required by Apple's `setRate` API.
+It does not change the PCM timeline, source samples or three-slot allocation.
+
+Pre-fix runs [39384290017](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39384290017)
+and [39386077449](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39386077449)
+reproduced cold selection skipping, stale audio and invalid external-clock waiting.
+The latter also showed actual compositor images containing only the opaque poster
+after restored and natural positive-offset selections; baseline A/B/A movie pixels
+and independently decoded tones worked. Failed runtime fixture setup is separate
+from that evidence. Fixed synthetic moving/tone resources now avoid runtime encoding.
+
+Run [39389451153](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39389451153)
+reported success, but its log contains a macOS Bash 3 empty-array expansion error
+before `xcodebuild`. Only its 81 core tests and Apple buffer harness ran. It is
+**not native validation**. The launcher now uses safe positional arguments and
+explicitly preserves exit status during helper cleanup. Isolated launcher tests
+check full/focused native arguments, failure propagation and helper termination.
+
+The actual full run [39390046275](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39390046275)
+at `a8eec0d50e9660f5740f7c6eebd427f5894fb7c0` passed 81 core tests and one UI
+test, but reported three failures across two of 88 native tests. Cold-selection
+retry/pause, waiting policy, A/B/A, rewound video, rapid final-selection
+acknowledgement and foreground restoration passed. Actual compositor movie-color
+fractions were about 0.898 with zero magenta poster coverage; independent AAC
+tones had RMS about 0.141 and the correct 440/880 Hz energy.
+The paused restored B frame still showed time zero. Natural-boundary setup timed
+out before video assertions while waiting to observe A's final 250 ms; that log
+cannot distinguish a missed window from cold far-seek refill time. This is a
+failed candidate.
+
+The next repair refreshes a paused requested frame through the existing service
+poll while audio selection remains unacknowledged, re-synchronizes after late
+output attachment and resets the display epoch after completed native seeks.
+Its regression also checks short backward and coalesced paused seeks without
+starting audio; completion converges on the latest requested PCM-frame target.
+Natural-boundary setup observes real progress with two seconds of runway or an
+already-rendered B, then retains strict identity/positive-offset/moving-pixel
+checks. Cold far-seek setup is not a prepared-transition latency measurement.
+Full acceptance now requires exactly all 88 native and one UI identities plus
+`TEST SUCCEEDED`, independently of job status. Five launcher and eleven evidence
+guard regressions cover missing UI, partial/skipped/failed/retried results, first
+error propagation, stale-log clearing and cleanup.
+
+Run [39393470199](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39393470199)
+at `57b5f92b6494da906c6096f690bcaf4aea109700` passed 81 core tests, 87 of
+88 native tests, the UI test, all five launcher regressions on macOS Bash 3.2,
+and all eleven evidence-guard regressions. It failed the paused backward `.40`
+to `.35` visible-marker assertion: the old `.375` frame remained visible.
+Paused restoration and the natural positive-offset boundary now passed actual
+compositor checks. This is still a failed candidate; the native process returned
+65 and the separate acceptance step did not run.
+
+The next candidate removes the held display image at a seek epoch and rejects
+future presentation timestamps while paused. It retains valid past frames for
+long or variable-duration source samples. Paused regressions require a fresh
+custom-video submission at the requested position as well as the compositor
+marker; `.65` then `.60` uses distinct markers from both the earlier `.40` frame
+and the superseded `.65` request. Numeric requested/timebase/submitted positions
+and submission counts distinguish output replay from retained display content.
+Native acceptance is pending.
+
+Run [39397007052](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39397007052)
+at `5ecb45dfff792b33929ff6e5ea3eca05969767a8` passed 81 core tests, the UI
+test, all seven macOS Bash 3 launcher regressions and eleven evidence regressions.
+It executed all 88 native tests with three failures. Paused `.40`, backward `.35`
+and coalesced `.60` had correct actual compositor markers and fresh custom
+submissions `2 → 3 → 4`; copied/submitted/requested/timebase values matched each
+target, and the superseded future frame was rejected. The selected Mac driver
+confirmed the one-job override, including integrated build targets.
+
+Two moving-frame pairs had identical marker positions. The YUV420 overlay rounds
+x to an even pixel: marker steps 3/16 render at x32 and steps 15/28 at x20, exactly
+matching those pairs. This creates equal images 1.625 seconds apart even though
+the expression's full period is 18 seconds. Buffered log timestamps do not identify
+the acquisition phase, so those pairs neither prove motion nor a production stall.
+See FFmpeg's [overlay coordinate normalization](https://github.com/FFmpeg/FFmpeg/blob/master/libavfilter/vf_overlay.c).
+The third failure was specifically the host `simctl screenshot` subprocess's
+20-second timeout, separate from player readiness.
+
+The next test records monotonic capture timing and audio/player/custom-frame
+state around every real compositor capture. A valid identical pair permits one
+additional capture, with a maximum of three images; an unchanged display still
+fails the same greater-than-three-pixel motion requirement. Custom submissions
+must also advance. Capture errors fail immediately, without retry; one screenshot
+command has a 30-second bound and its native response wait a 45-second bound.
+The corrected fixture uses an even ten-pixel step, with unique marker positions
+for nine seconds. Motion acceptance requires both capture and media windows to
+stay below eight seconds, alongside stable audio ownership and progressing
+audio/video clocks. A clock hold or underrun is reported separately from stale
+visible output; none is accepted as motion.
+
+Review also identified a separate acquisition/reset ordering risk. A paused
+target could become available before the native seek's completion reached the
+main actor; pulling it and then flushing could leave no new output to reacquire.
+The next candidate resets the frame epoch and gates pulls before seeking, then
+releases only the matching seek ticket at completion, without flushing afterward.
+A deterministic native regression holds the real seek completion while polls
+attempt acquisition, then releases it and requires a fresh custom frame and the
+correct actual compositor marker. This is not claimed as the explanation for
+the earlier playing-frame pairs. The PCM timeline, source silence and audio
+intent remain unchanged. Full acceptance now expects 89 native tests and one UI
+test; the new candidate is pending validation.
+
+Run [39401227236](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39401227236)
+at `ead31bcb7ee0fafd432beb48317676579f71a1ce` passed 81 core tests, the UI
+test, seven macOS Bash 3 launcher regressions and eleven evidence regressions.
+All 89 native tests executed, with six assertions failing across two cases.
+Those assertions rejected capture windows of 11.05 and 11.29 seconds against
+the fixture's eight-second limit. The host screenshot commands consumed 10.63
+and 10.98 seconds respectively. During both waits, player and PCM time advanced
+about eleven seconds, ownership stayed fixed, no new underruns appeared, and
+custom submissions advanced from 0 to 261 and 72 to 338. These are capture-window
+eligibility failures, not evidence of a frame-feed stall. The run is failed,
+returned 65, and its separate acceptance step correctly did not run.
+
+The deterministic held-completion seek regression passed: at least two attempted
+pulls were blocked while the real native seek completion was held, with no copied
+or submitted frame. Releasing it produced the correct actual compositor marker
+and fresh custom frame while audio remained paused. All other moving-frame
+phases and the `.40`, `.35` and `.60` paused-marker checks passed.
+
+The next change affects only tests and synthetic fixtures. A 16 by 24 pixel marker
+has 240 distinct two-dimensional positions throughout the 30-second clip;
+decoded source pixels verify every position. The tests still require actual
+visible motion greater than three pixels, fresh custom submissions, progressing
+audio/video clocks, fixed ownership, no loop and no new underruns. The entire
+capture window must remain below 29 seconds of wall, media and PCM time. Capture
+errors still fail immediately. Native acceptance of this revision is pending.
+
+Run [39404404737](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39404404737)
+at `b319d1c261ac1ea5575401f783cf6715922b1a49` passed all 81 core, 89 native
+and one UI test with zero failures. All eight selected-video regressions passed,
+including the actual two-dimensional moving marker and held-completion seek.
+Xcode printed `TEST SUCCEEDED` at 10:10:48 UTC. The overall workflow still failed:
+a timestamped VRP framework diagnostic split one case's terminal record between
+the complete identity and its `passed` suffix. The strict identity guard rejected
+that record and returned 1; the separate acceptance step correctly did not run.
+This run remains failed and unaccepted.
+
+The next change affects only the validation harness and this record. It accepts
+that exact two-line interleaving only when the suffix is immediately adjacent and
+the case has one prior start and no outcome. Unmatched native fragments and
+orphan suffixes fail. Original failure/success markers are still checked before
+reconstruction; failed, skipped, duplicate and unexpected cases still fail.
+Sixteen evidence regressions cover these cases. Eight launcher regressions also
+require a native exit of 23 to propagate even when its output contains all 90
+passing case identities and `TEST SUCCEEDED`. Production, native tests and media
+are unchanged from the run above. Overall native acceptance remains pending.
+
+Run [39407132688](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39407132688)
+at `6edad4d7f1f5d320844f1832b45b631a0e4d3087` passed 81 core tests, eight
+macOS Bash 3 launcher regressions, sixteen evidence regressions and the UI test.
+Of 89 native tests, one failed: returning from B to retained A accumulated 49,408
+PCM underrun frames, about 1.03 seconds, during its first capture. Ownership stayed
+fixed and video advanced; this is a real audio starvation result, not a capture
+or parser failure. Xcode returned 65. The zero-new-underrun assertion is retained.
+
+Review found that selecting a previously played source invalidated its ring only
+on return, then rebuilt converter history while its two-second pinned prefix
+played. It missed the preceding 3.8 seconds in which B was current. The next
+repair rearms an outgoing retained source while its neighbour plays and consumes
+that prepared frame-zero epoch once on return. Nonzero seeks still request fresh
+history; self-loops retain their existing behavior. Preparation/retirement claims
+and epoch checks protect both sources. No storage, source frames or silence are
+added or removed. This removes a concrete cold-return path; the exact blocking
+framework operation in the failed run was not instrumented and is not inferred.
+
+Two deterministic portable regressions first failed on the old behavior, exposing
+discarded prepared frames on explicit and natural A/B/A transitions. All 83 core
+tests then passed with the repair. A native regression uses the real 30-second
+AAC fixtures, plays beyond the prefix, waits for the actual offscreen decoder's
+committed head, and returns without producer waits. It requires exact nonzero
+samples across three seconds, zero added underruns, the preserved epoch and the
+same 6,912,000 PCM bytes. The far-seek regression now checks cancellation of the
+outgoing obsolete seek and retained head preparation while preserving exact fresh
+far-seek validation. Full native acceptance expects 90 native and one UI test;
+the software fix remains pending that run. Physical iPhone gates remain separate.
+
+Unsigned validation keeps Xcode's build queue at one job and disables parallel
+tests. It now also exports `SWIFTC_MAXIMUM_DETERMINISM=1`, confirms the selected
+Swift driver's one-job override with a print-only plan before compilation, and
+disables parallel whole-module frontend optimization. Xcode's generated `-j3`
+appeared in an earlier log despite `-jobs 1`; that argument alone does not prove
+three concurrent compiler processes. These explicit caps close that configuration
+gap. The override was confirmed with the existing local Swift 6.2.3 driver;
+selected macOS toolchain confirmation remains part of the next run.
+Seven launcher regressions now include both failed-driver and missing-override
+preflights; both must prevent helper/native launch and clear stale evidence.
+See the official [Swift driver override](https://github.com/swiftlang/swift-driver/blob/swift-6.2.3-RELEASE/Sources/SwiftDriver/Driver/Driver.swift#L2353-L2369),
+[whole-module thread setting](https://github.com/swiftlang/swift-build/blob/main/Sources/SWBCore/SpecImplementations/Tools/SwiftCompiler.swift#L1333-L1346),
+and [integrated driver environment](https://github.com/swiftlang/swift-build/blob/main/Sources/SWBTaskExecution/TaskActions/SwiftDriverTaskAction.swift#L47-L63).
+
 ## Reviewed scope
 
 Base: `5ae95b42d89cbdbd5a6b93ef3202f9ed57603881`.
@@ -197,9 +399,11 @@ Repeat while explicitly paused, pause during the interruption, and foreground
 the player afterward: none may override the user's Pause. If the camera takes
 an exclusive session, record that limitation rather than claiming to defeat it.
 
-The previously shipped 12.1 candidate remains untouched. No new private signed
-build, archive, upload or TestFlight distribution ran for this change. A separate
-release approval is required before another signed candidate/device test build.
+Build 13.1 was withdrawn from the owner testing offer after device acceptance
+failed. The private source was reverted normally to the shipped 12.1 tree while
+the failed source was preserved separately. No repaired signed build, archive,
+upload or TestFlight distribution has run. A separate release approval is
+required before another signed candidate/device test build.
 
 ## Apple references
 
@@ -210,4 +414,6 @@ release approval is required before another signed candidate/device test build.
 - [Declared codec priming/remainder, QA1636](https://developer.apple.com/library/archive/qa/qa1636/_index.html)
 - [Asset-reader presentation range](https://developer.apple.com/documentation/avfoundation/avassetreader/timerange)
 - [Precise media timing](https://developer.apple.com/documentation/avfoundation/avurlassetpreferprecisedurationandtimingkey)
+- [Host-clock scheduling and automatic waiting](https://developer.apple.com/documentation/avfoundation/avplayer/setrate(_:time:athosttime:))
+- [Removing a held display image on flush](https://developer.apple.com/documentation/avfoundation/avsamplebufferdisplaylayer/flushandremoveimage())
 - [Sample-buffer PiP playback commands](https://developer.apple.com/documentation/avkit/avpictureinpicturesamplebufferplaybackdelegate/pictureinpicturecontroller(_:setplaying:))

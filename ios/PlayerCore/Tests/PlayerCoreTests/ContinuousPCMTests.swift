@@ -94,6 +94,66 @@ final class ContinuousPCMTests: XCTestCase {
         XCTAssertEqual(source.availableStreamFrames(for: initial.epoch), 0)
     }
 
+    func testExplicitReturnUsesOutgoingSourceRearmedBeforeTheSwitchBack() {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
+        let allocatedBytes = renderer.retainedPCMMemoryBytes
+        let sourceA = renderer.source(at: 0)
+        XCTAssertTrue([Float(1), 2].withUnsafeBufferPointer { sourceA.prepare(token: 1, totalFrames: 5, prefix: $0) })
+        prepare(renderer, slot: 1, token: 2, samples: [21, 22])
+        let initialA = sourceA.streamRequest
+        XCTAssertTrue(sourceA.beginStream(epoch: initialA.epoch))
+        XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer { sourceA.append(interleaved: $0, epoch: initialA.epoch) }, 3)
+        renderer.select(token: 1); renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 4), [1, 2, 3, 4])
+
+        renderer.select(token: 2)
+        XCTAssertEqual(render(renderer, frames: 1), [21])
+        XCTAssertEqual(renderer.snapshot.token, 2)
+        let warmedA = sourceA.streamRequest
+        XCTAssertNotEqual(warmedA.epoch, initialA.epoch, "Leaving A must request its next visit while B is current")
+        XCTAssertEqual(warmedA.startFrame, 2)
+        XCTAssertTrue(sourceA.beginStream(epoch: warmedA.epoch))
+        XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer { sourceA.append(interleaved: $0, epoch: warmedA.epoch) }, 3)
+        XCTAssertEqual(sourceA.availableStreamFrames(for: warmedA.epoch), 3)
+        XCTAssertEqual(renderer.snapshot.token, 2, "Preparation must happen before returning to A")
+
+        renderer.select(token: 1)
+        XCTAssertEqual(render(renderer, frames: 5), [1, 2, 3, 4, 5], "The return must consume the prepared head and stream in one request")
+        XCTAssertEqual(sourceA.streamRequest.epoch, warmedA.epoch, "Returning must preserve the prewarmed stream epoch")
+        XCTAssertEqual(renderer.snapshot.token, 1)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        XCTAssertEqual(renderer.retainedPCMMemoryBytes, allocatedBytes)
+    }
+
+    func testNaturalAdvanceRearmsPreviousBeforeReturningWithoutDiscardingPreparedPCM() {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
+        let allocatedBytes = renderer.retainedPCMMemoryBytes
+        let sourceA = renderer.source(at: 0)
+        XCTAssertTrue([Float(31), 0].withUnsafeBufferPointer { sourceA.prepare(token: 1, totalFrames: 5, prefix: $0) })
+        prepare(renderer, slot: 1, token: 2, samples: [51, 52])
+        let initialA = sourceA.streamRequest
+        XCTAssertTrue(sourceA.beginStream(epoch: initialA.epoch))
+        XCTAssertEqual([Float(33), 34, 0].withUnsafeBufferPointer { sourceA.append(interleaved: $0, epoch: initialA.epoch) }, 3)
+        renderer.setSuccessor(token: 2, for: 1)
+        renderer.select(token: 1); renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 6), [31, 0, 33, 34, 0, 51])
+        XCTAssertEqual(renderer.snapshot.token, 2)
+        let warmedA = sourceA.streamRequest
+        XCTAssertNotEqual(warmedA.epoch, initialA.epoch, "A natural boundary must rearm its outgoing source for Previous")
+        XCTAssertEqual(warmedA.startFrame, 2)
+        XCTAssertTrue(sourceA.beginStream(epoch: warmedA.epoch))
+        XCTAssertEqual([Float(33), 34, 0].withUnsafeBufferPointer { sourceA.append(interleaved: $0, epoch: warmedA.epoch) }, 3)
+        XCTAssertEqual(sourceA.availableStreamFrames(for: warmedA.epoch), 3)
+        XCTAssertEqual(renderer.snapshot.token, 2)
+
+        renderer.select(token: 1)
+        XCTAssertEqual(render(renderer, frames: 5), [31, 0, 33, 34, 0], "Previous must preserve every prepared frame, including source silence")
+        XCTAssertEqual(sourceA.streamRequest.epoch, warmedA.epoch)
+        XCTAssertEqual(renderer.snapshot.token, 1)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        XCTAssertEqual(renderer.retainedPCMMemoryBytes, allocatedBytes)
+    }
+
     func testUnderrunIsCountedWithoutSkippingUnrenderedContent() {
         let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
         let source = renderer.source(at: 0)

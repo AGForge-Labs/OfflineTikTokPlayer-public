@@ -4,6 +4,38 @@ import AVFoundation
 
 @MainActor
 final class ContinuousAudioPlayerTests: XCTestCase {
+    func testColdDeselectionRejectsDelayedOldFailureAndPublishesSilenceBeforeRetry() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let audio = ContinuousAudioPlayer()
+        defer { audio.suspend(); audio.graph.engine.stop() }
+        audio.setWindow(["a", "b"])
+        let a = try await audio.prepare(id: "a", url: url)
+        XCTAssertTrue(audio.select(id: "a", position: 0.1))
+        audio.renderer.setPlaying(true)
+        var samples = [Float](repeating: 0, count: 64)
+        samples.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 32) }
+        XCTAssertEqual(audio.snapshot.token, a.token)
+
+        audio.clearSelection()
+        XCTAssertFalse(audio.isSelected)
+        XCTAssertTrue(audio.isSelectionPending(in: audio.snapshot), "The render thread must acknowledge deselection")
+        XCTAssertFalse(audio.invalidateForRetry(token: a.token), "A delayed A failure cannot own the requested cold selection")
+        samples.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 32) }
+        XCTAssertEqual(audio.snapshot.token, 0)
+        XCTAssertFalse(audio.isSelectionPending(in: audio.snapshot))
+        XCTAssertTrue(samples.allSatisfy { $0 == 0 })
+        audio.settlePausedState()
+        XCTAssertFalse(audio.graph.engine.isRunning)
+
+        let b = try await audio.prepare(id: "b", url: url)
+        XCTAssertTrue(audio.select(id: "b", position: 0.1))
+        audio.renderer.setPlaying(true)
+        samples.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 32) }
+        XCTAssertEqual(audio.snapshot.token, b.token)
+        XCTAssertNotEqual(audio.snapshot.token, a.token)
+        XCTAssertTrue(samples.contains { abs($0) > 0.001 })
+    }
+
     func testObsoleteFailureCannotRemoveTheCurrentPreparedLoop() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
         let audio = ContinuousAudioPlayer()

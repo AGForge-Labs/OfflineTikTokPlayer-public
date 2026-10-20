@@ -25,9 +25,11 @@ public final class ContinuousPCMSource: @unchecked Sendable {
     private let committedEpoch = Atomic<Int>(0)
     private let readPosition = Atomic<Int64>(0)
     private let writePosition = Atomic<Int64>(0)
-    // Render-thread owned; the slot's storage outlives every render request.
+    // Render-thread owned after publication; exclusive preparation/retirement
+    // clears the one-shot warm token. Storage outlives every render request.
     fileprivate var renderedToken = 0
     fileprivate var renderedEpoch = 0
+    private var warmNextVisitToken = 0
 
     fileprivate init(channels: Int, prefixFrames: Int, ringFrames: Int) {
         self.channels = channels
@@ -84,6 +86,7 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         guard access.compareExchange(expected: 0, desired: 2, ordering: .acquiringAndReleasing).exchanged else { return false }
         defer { access.store(0, ordering: .releasing) }
         let frames = samples.count / channels
+        warmNextVisitToken = 0
         if let base = samples.baseAddress { prefix.update(from: base, count: samples.count) }
         count.store(totalFrames, ordering: .releasing)
         prefixCount.store(frames, ordering: .releasing)
@@ -149,6 +152,7 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         // Retired storage is outside the prepared graph. Its old outgoing edge
         // must not pin another slot after the owner drops this slot's metadata.
         successor.store(0, ordering: .releasing)
+        warmNextVisitToken = 0
         readyToken.store(0, ordering: .sequentiallyConsistent)
         access.store(0, ordering: .releasing)
         return true
@@ -166,12 +170,28 @@ public final class ContinuousPCMSource: @unchecked Sendable {
 
     fileprivate func restart(token: Int, frame: Int64) {
         // A brand-new source may already have a full decode-ahead ring. Preserve it
-        // for the initial visit, rather than throwing away preparation at selection.
-        if renderedToken != token, frame == 0 {
+        // for the initial visit. An outgoing retained source can prepare this same
+        // head while its neighbour plays; consume that preparation once on return.
+        if frame == 0, renderedToken != token || warmNextVisitToken == token {
             renderedToken = token; renderedEpoch = requestEpoch.load(ordering: .sequentiallyConsistent)
+            warmNextVisitToken = 0
             return
         }
+        warmNextVisitToken = 0
         renderedToken = token
+        requestStream(from: frame)
+    }
+
+    /// Called under the outgoing source's render claim, before another token is
+    /// published as current. The existing worker can rebuild this fixed head now,
+    /// rather than starting a cold reader when Previous consumes its prefix.
+    fileprivate func prepareNextVisit(token: Int) {
+        renderedToken = token
+        requestStream(from: 0)
+        warmNextVisitToken = token
+    }
+
+    private func requestStream(from frame: Int64) {
         renderedEpoch = requestEpoch.load(ordering: .sequentiallyConsistent) &+ 2
         committedEpoch.store(0, ordering: .releasing)
         requestEpoch.store(renderedEpoch - 1, ordering: .sequentiallyConsistent)
@@ -324,13 +344,24 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                 let total = source.totalFrames
                 if cursor >= total {
                     let next = source.successor.load(ordering: .acquiring)
-                    source.release()
-                    guard next > 0, let nextSource = find(next), nextSource.acquire(token: next) else { ended = true; break }
-                    guard nextSource.totalFrames > 0 else { nextSource.release(); ended = true; break }
+                    if next == activeToken {
+                        cursor = 0; visit &+= 1; ended = false
+                        source.restart(token: next, frame: 0)
+                        source.release()
+                        continue
+                    }
+                    guard next > 0, let nextSource = find(next), nextSource.acquire(token: next) else {
+                        source.release(); ended = true; break
+                    }
+                    guard nextSource.totalFrames > 0 else {
+                        nextSource.release(); source.release(); ended = true; break
+                    }
+                    source.prepareNextVisit(token: activeToken)
                     activeToken = next; cursor = 0; visit &+= 1; ended = false
                     liveToken.store(next, ordering: .sequentiallyConsistent)
                     nextSource.restart(token: next, frame: 0)
                     nextSource.release()
+                    source.release()
                     continue
                 }
                 var starved = false
@@ -366,6 +397,10 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         guard token > 0, let source = find(token), source.acquire(token: token) else {
             if token == 0 { activeToken = 0; liveToken.store(0, ordering: .sequentiallyConsistent); cursor = 0; ended = false }
             return
+        }
+        if token != activeToken, let previous = find(activeToken), previous.acquire(token: activeToken) {
+            previous.prepareNextVisit(token: activeToken)
+            previous.release()
         }
         activeToken = token; cursor = min(frame, source.totalFrames); visit &+= 1; ended = false
         liveToken.store(token, ordering: .sequentiallyConsistent)
