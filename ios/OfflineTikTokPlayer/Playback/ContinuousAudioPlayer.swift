@@ -122,17 +122,22 @@ final class ContinuousAudioPlayer {
     }
 
     func follow(from id: String, to successor: String?) {
-        guard let entry = entries[id] else { return }
+        guard let source = entries[id] else { return }
         let next = successor.flatMap { entry(for: $0)?.token } ?? 0
-        renderer.setSuccessor(token: next, for: entry.token)
-        successors[entry.token] = next
+        renderer.setSuccessor(token: next, for: source.token)
+        successors[source.token] = next
     }
     func setPlaying(_ playing: Bool) throws {
         // An engine that iOS stopped during interruption/configuration must be
         // started again only after the service has reactivated its session.
-        if playing, !graph.engine.isRunning { try graph.engine.start() }
-        renderingPermitted = playing
         renderer.setPlaying(playing)
+        do {
+            if playing, !graph.engine.isRunning { try graph.engine.start() }
+            renderingPermitted = playing
+        } catch {
+            renderer.setPlaying(false); renderingPermitted = false
+            throw error
+        }
     }
     func setSpeakerEnabled(_ enabled: Bool) { renderer.setSpeakerEnabled(enabled) }
     func adoptRendered(id: String) { selectedID = id }
@@ -162,6 +167,16 @@ final class ContinuousAudioPlayer {
         return selected
     }
     func suspend() { renderingPermitted = false; renderer.setPlaying(false) }
+    func settlePausedState() {
+        guard !renderingPermitted, graph.engine.isRunning else { return }
+        let sample = renderer.snapshot
+        if let selectedID, entries[selectedID]?.token != sample.token { return }
+        if selectedID == nil, sample.token != 0 { return }
+        if let pendingPosition, pendingPosition.visit == sample.visit { return }
+        pendingPosition = nil
+        graph.engine.pause()
+        evictUnused()
+    }
     func seek(_ position: Double) { if let selectedID { _ = select(id: selectedID, position: position) } }
     func clearSelection() { suspend(); selectedID = nil; pendingPosition = nil }
     func rebuildAfterMediaServicesReset() {

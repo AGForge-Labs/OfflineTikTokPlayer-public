@@ -603,6 +603,7 @@ final class PlaybackService: NSObject {
     }
 
     private func sampleContinuousAudio(handleEnd: Bool = true) {
+        continuousAudio.settlePausedState()
         guard audioLoadingID == nil else { return }
         let sample = continuousAudio.snapshot
         guard let entry = continuousAudio.entry(forToken: sample.token) else { return }
@@ -778,6 +779,7 @@ final class PlaybackService: NSObject {
     }
 
     private func applyPresentation(_ actions: PlaybackPresentationPolicy.Actions) {
+        surface.isHidden = audioOnly
         pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
         if !videoAllowed { player.pause(); continuousPiP.suspendFrameFeed() }

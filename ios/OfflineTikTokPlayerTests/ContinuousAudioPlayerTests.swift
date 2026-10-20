@@ -34,5 +34,15 @@ final class ContinuousAudioPlayerTests: XCTestCase {
         XCTAssertEqual(audio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock())), 0.001, accuracy: 0.000001)
         audio.trimWindow(preserving: "d")
         XCTAssertNotNil(audio.entry(for: "d"))
+        try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+        try audio.setPlaying(true)
+        let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+        XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+        audio.suspend()
+        let pausedFrame = audio.snapshot.frame
+        XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+        audio.settlePausedState()
+        XCTAssertFalse(audio.graph.engine.isRunning, "Explicit Pause must not leave a silent background engine running")
+        XCTAssertEqual(audio.snapshot.frame, pausedFrame)
     }
 }
