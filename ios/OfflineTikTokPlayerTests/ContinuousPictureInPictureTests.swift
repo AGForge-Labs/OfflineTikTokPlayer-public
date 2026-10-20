@@ -66,7 +66,8 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             let tracks = try await asset.loadTracks(withMediaType: .video)
             let track = try XCTUnwrap(tracks.first)
             let duration = try await asset.load(.duration)
-            let composition = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
+            let preparedComposition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset)
+            let composition = try XCTUnwrap(preparedComposition)
             XCTAssertEqual(composition.renderSize, expectedSize)
             XCTAssertEqual(composition.sourceTrackIDForFrameTiming, track.trackID)
             XCTAssertEqual(CMTimeCompare(try XCTUnwrap(composition.instructions.first).timeRange.duration, duration), 0)
@@ -107,7 +108,33 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertNil(item.videoComposition)
     }
 
-    private func makeAsymmetricVideo(transform: CGAffineTransform) async throws -> URL {
+    func testIdentityGeometryKeepsNativeOutputWithoutInstallingACompositor() async throws {
+        let url = try await makeAsymmetricVideo(transform: .identity)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        let composition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset)
+        XCTAssertNil(composition, "Ordinary identity geometry must not add a video compositor")
+        let item = AVPlayerItem(asset: asset)
+        let bridge = ContinuousPictureInPicture()
+        defer { bridge.invalidate() }
+        bridge.setCurrentItem(item)
+        for _ in 0..<100 where !bridge.orientationPrepared { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(bridge.orientationPrepared)
+        XCTAssertFalse(item.outputs.isEmpty)
+        XCTAssertNil(item.videoComposition)
+        let unchangedDuration = try await asset.load(.duration)
+        XCTAssertEqual(CMTimeCompare(unchangedDuration, duration), 0)
+    }
+
+    func testIdentityTransformWithNonSquarePixelsStillUsesNormalization() async throws {
+        let url = try await makeAsymmetricVideo(transform: .identity, nonSquarePixels: true)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let composition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: AVURLAsset(url: url))
+        XCTAssertNotNil(composition, "Identity transform alone cannot bypass pixel-aspect normalization")
+    }
+
+    private func makeAsymmetricVideo(transform: CGAffineTransform, nonSquarePixels: Bool = false) async throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("mov")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         var completed = false
@@ -117,9 +144,14 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                 try? FileManager.default.removeItem(at: url)
             }
         }
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+        var settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 32, AVVideoHeightKey: 16
-        ])
+        ]
+        if nonSquarePixels {
+            settings[AVVideoPixelAspectRatioKey] = [AVVideoPixelAspectRatioHorizontalSpacingKey: 2,
+                                                   AVVideoPixelAspectRatioVerticalSpacingKey: 1]
+        }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.transform = transform
         let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: 32, kCVPixelBufferHeightKey as String: 16,

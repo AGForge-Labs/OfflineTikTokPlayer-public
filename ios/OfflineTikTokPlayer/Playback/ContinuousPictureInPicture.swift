@@ -134,13 +134,13 @@ final class ContinuousPictureInPicture: NSObject {
         preparationTask = Task { [weak self, weak item] in
             guard let item else { return }
             do {
-                let composition: AVVideoComposition
+                let composition: AVVideoComposition?
                 if let existingComposition { composition = existingComposition }
-                else { composition = try await Self.makeVideoComposition(for: item.asset) }
+                else { composition = try await Self.videoCompositionIfNeeded(for: item.asset) }
                 try Task.checkCancellation()
                 guard let self, !self.invalidated, self.itemGeneration == generation,
                       self.currentItem === item else { return }
-                if existingComposition == nil {
+                if existingComposition == nil, let composition {
                     item.videoComposition = composition
                     self.installedComposition = composition
                 }
@@ -166,6 +166,32 @@ final class ContinuousPictureInPicture: NSObject {
         videoOutput = output
         renderFrame()
         if frameFeedEnabled && playbackState.read().isPlaying { startFrameTimer() }
+    }
+
+    /// Avoid inserting a compositor when decoded pixels already have ordinary
+    /// presentation geometry. Conservatively normalize rotation, mirroring,
+    /// aperture changes and non-square pixels through the existing path.
+    static func videoCompositionIfNeeded(for asset: AVAsset) async throws -> AVVideoComposition? {
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw NSError(domain: AVFoundationErrorDomain, code: -1)
+        }
+        let transform = try await track.load(.preferredTransform)
+        if transform.isIdentity {
+            let size = try await track.load(.naturalSize)
+            let descriptions = try await track.load(.formatDescriptions)
+            let ordinary = !descriptions.isEmpty && descriptions.allSatisfy { description in
+                let coded = CMVideoFormatDescriptionGetDimensions(description)
+                let dimensions = CGSize(width: CGFloat(coded.width), height: CGFloat(coded.height))
+                let presented = CMVideoFormatDescriptionGetPresentationDimensions(description,
+                    usePixelAspectRatio: true, useCleanAperture: true)
+                let aperture = CMVideoFormatDescriptionGetCleanAperture(description, originIsAtTopLeft: true)
+                return coded.width > 0 && coded.height > 0 && size == dimensions && presented == dimensions
+                    && aperture == CGRect(origin: .zero, size: dimensions)
+            }
+            try Task.checkCancellation()
+            if ordinary { return nil }
+        }
+        return try await makeVideoComposition(for: asset)
     }
 
     /// Normalize the preferred source transform into actual output pixels. A layer-only transform

@@ -56,6 +56,15 @@ def split_identifier_case(identity, status="passed", timestamp=False):
             prefix + f"{name[2:]} {method}]' {status} (0.645 seconds)."]
 
 
+def split_method_case(identity, status="passed", timestamp=False):
+    owner, method = identity.split("/")
+    split_at = min(len("testSlowPreparationFallsBackWi"), len(method) - 1)
+    prefix = "2026-10-20T22:30:19.4370040Z " if timestamp else ""
+    return [prefix + f"Test Case '-[{owner} {method[:split_at]}"
+            "2026-10-20 22:30:19.057819+0000 OfflineTikTokPlayer[9066:53104] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false",
+            prefix + f"{method[split_at:]}]' {status} (0.050 seconds)."]
+
+
 class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -275,6 +284,69 @@ class NativeTestEvidenceTests(unittest.TestCase):
         others = [case_line(x) for x in self.expected if x not in (identity, failed)]
         lines = others + [case_line(identity, "started")] + split_identifier_case(identity)
         result = self.check_log(lines + [case_line(failed, "failed"), "** TEST FAILED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(failed, result.stderr)
+        self.assertIn("TEST FAILED", result.stderr)
+
+    def test_accepts_adjacent_method_split_by_the_observed_loudness_diagnostic(self):
+        identity = TARGETS[0] + ".SpeakerAudioTests/testSlowPreparationFallsBackWithoutInstallingAMixAfterEnqueue"
+        self.assertIn(identity, self.expected)
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                others = [case_line(x) for x in self.expected if x != identity]
+                lines = others + [case_line(identity, "started")] + split_method_case(identity, timestamp=timestamp)
+                result = self.check_log(lines + ["** TEST SUCCEEDED **"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PASS " + identity + "\n", result.stdout)
+
+    def test_method_split_preserves_status_unique_prior_start_and_expected_identity(self):
+        identity = self.expected[0]
+        others = [case_line(x) for x in self.expected if x != identity]
+        started = [case_line(identity, "started")]
+        for status in ("failed", "skipped"):
+            with self.subTest(status=status):
+                result = self.check_log(others + started + split_method_case(identity, status) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(status + " case", result.stderr)
+        for prior in ("passed", "failed"):
+            with self.subTest(prior=prior):
+                result = self.check_log(others + started + [case_line(identity, prior)]
+                                        + split_method_case(identity) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("duplicate", result.stderr.lower())
+        for before, after in (([], []), (started * 2, []), ([], started)):
+            with self.subTest(before=before, after=after):
+                result = self.check_log(others + before + split_method_case(identity) + after + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Ambiguous", result.stderr)
+        for target in TARGETS:
+            unexpected = target + ".NewTests/testUnexpected"
+            result = self.check_log([case_line(unexpected, "started")] + split_method_case(unexpected) + self.full_log())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unexpected", result.stderr.lower())
+
+    def test_method_split_rejects_malformed_nonadjacent_orphan_fragments_and_real_failure(self):
+        identity, failed = self.expected[:2]
+        header, tail = split_method_case(identity)
+        class_header, class_tail = split_identifier_case(identity)
+        fragments = ([header], [tail], [header, "unrelated output", tail],
+                     [class_header, tail], [header, class_tail],
+                     [header, case_line(failed, "started"), tail],
+                     [header, "** TEST SUCCEEDED **", tail],
+                     [header, "** TEST FAILED **", tail], [header, "", tail],
+                     [header.replace("LoudnessManager.mm:1215", "OtherManager.mm:1215"), tail],
+                     [header.replace("returning false", "returning true"), tail],
+                     [header.replace("2026-10-20 22:30:19.057819+0000", "unknown-time"), tail],
+                     [header.replace("OfflineTikTokPlayer[9066:53104]", "OtherPlayer[9066:53104]"), tail],
+                     [header + " ** TEST FAILED **", tail],
+                     [header, tail + " unrelated output"], [header, tail + " " + case_line(failed)])
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                result = self.check_log(self.full_log()[:-1] + list(fragment) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+        others = [case_line(x) for x in self.expected if x not in (identity, failed)]
+        result = self.check_log(others + [case_line(identity, "started")] + split_method_case(identity)
+                                + [case_line(failed, "failed"), "** TEST FAILED **"])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(failed, result.stderr)
         self.assertIn("TEST FAILED", result.stderr)

@@ -91,6 +91,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if visible == nil, service.queue.currentID == id,
                asset?.url.standardizedFileURL == fixture.savedURLs[id]?.standardizedFileURL,
                service.submittedVideoFrameCount > submitted, service.customVideoReadyForDisplay,
+               let frame = service.videoFramePositionSeconds,
+               abs(frame - service.videoRequestedPositionSeconds) <= 0.080,
                service.isVideoReady, !service.isLoading {
                 visible = SelectionOutputTap.hostSeconds()
             }
@@ -170,7 +172,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             if ready == nil, service.queue.currentID == fixture.bID, service.isVideoReady,
                service.customVideoReadyForDisplay, service.submittedVideoFrameCount > submitted,
-               let position = service.videoFramePositionSeconds, position < 2 { ready = SelectionOutputTap.hostSeconds() }
+               let position = service.videoFramePositionSeconds, position < 2,
+               abs(position - service.videoRequestedPositionSeconds) <= 0.080 { ready = SelectionOutputTap.hostSeconds() }
             if incoming != nil, ready != nil, service.audioSnapshot.token != aToken,
                service.audioSnapshot.frame >= 24_000 { break }
             try await Task.sleep(for: .milliseconds(5))

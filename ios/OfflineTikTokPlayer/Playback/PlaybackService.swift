@@ -473,7 +473,7 @@ final class PlaybackService: NSObject {
     private func prepareVideoForPlayback(_ item: AVPlayerItem) async {
         guard item.videoComposition == nil, let asset = item.asset as? AVURLAsset,
               asset.url.isFileURL else { return }
-        if let composition = try? await ContinuousPictureInPicture.makeVideoComposition(for: asset),
+        if let composition = try? await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset),
            !Task.isCancelled {
             item.videoComposition = composition
         }

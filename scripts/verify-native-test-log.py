@@ -32,15 +32,22 @@ SPLIT_CASE = re.compile(
     r"Test Case '([^']+)'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[\] <<<< VRP >>>> signalled err=-?\d+ at <>:\d+")
 RESULT_SUFFIX = re.compile(r" (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
-# A second observed interleave interrupts the class identifier itself. Keep its
-# exact diagnostic and require the remaining identifier/result on the next line.
-SPLIT_IDENTITY_CASE = re.compile(
-    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.[A-Za-z_]\w*)"
+# Observed AQ interleaves interrupt a class or method identifier. Keep the exact
+# diagnostic and require that identifier's remaining tail on the next line.
+LOUDNESS_DIAGNOSTIC = (
     r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215 {2}"
-    r"IsHardwareSupported: no plist loaded, returning false", re.ASCII)
+    r"IsHardwareSupported: no plist loaded, returning false")
+SPLIT_IDENTITY_CASE = re.compile(
+    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.[A-Za-z_]\w*)"
+    + LOUDNESS_DIAGNOSTIC, re.ASCII)
+SPLIT_METHOD_CASE = re.compile(
+    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.[A-Za-z_]\w* [A-Za-z_]\w*)"
+    + LOUDNESS_DIAGNOSTIC, re.ASCII)
 IDENTITY_RESULT_SUFFIX = re.compile(
     r"([A-Za-z0-9_]+ [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+METHOD_RESULT_SUFFIX = re.compile(
+    r"([A-Za-z0-9_]+\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
 NATIVE_HEADER_PREFIX = re.compile(r"\bTest Case '-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 FAILURE = re.compile(r"\*\* TEST(?: [A-Z]+)* FAILED \*\*")
@@ -227,11 +234,11 @@ def verify_log(text, expected):
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
         if pending is not None:
-            raw, header_line, identity_split = pending
+            raw, header_line, tail_pattern = pending
             pending = None
-            suffix = (IDENTITY_RESULT_SUFFIX if identity_split else RESULT_SUFFIX).fullmatch(clean)
+            suffix = (tail_pattern if tail_pattern is not None else RESULT_SUFFIX).fullmatch(clean)
             if suffix:
-                event = (raw + suffix.group(1), suffix.group(2)) if identity_split else (raw, suffix.group(1))
+                event = (raw + suffix.group(1), suffix.group(2)) if tail_pattern is not None else (raw, suffix.group(1))
                 reconstructed = True
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
@@ -245,17 +252,21 @@ def verify_log(text, expected):
             else:
                 header = CASE_HEADER.search(line)
                 identity_split = SPLIT_IDENTITY_CASE.fullmatch(clean)
+                method_split = SPLIT_METHOD_CASE.fullmatch(clean)
                 if identity_split:
-                    pending = (identity_split.group(1), number, True)
+                    pending = (identity_split.group(1), number, IDENTITY_RESULT_SUFFIX)
+                elif method_split:
+                    pending = (method_split.group(1), number, METHOD_RESULT_SUFFIX)
                 elif header and any(target + "." in header.group(1) for target in TARGETS):
                     split = SPLIT_CASE.fullmatch(clean)
                     if split:
-                        pending = (split.group(1), number, False)
+                        pending = (split.group(1), number, None)
                     else:
                         problems.append(f"Malformed native/UI case at line {number}: {header.group(1)}")
                 elif NATIVE_HEADER_PREFIX.search(line):
                     problems.append(f"Malformed native/UI case prefix at line {number}")
-                elif RESULT_SUFFIX.fullmatch(clean) or IDENTITY_RESULT_SUFFIX.fullmatch(clean):
+                elif (RESULT_SUFFIX.fullmatch(clean) or IDENTITY_RESULT_SUFFIX.fullmatch(clean)
+                      or METHOD_RESULT_SUFFIX.fullmatch(clean)):
                     problems.append(f"Orphan case result suffix at line {number}")
                 continue
         raw, status = event
