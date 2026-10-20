@@ -291,6 +291,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private var outputStart: Int64 = 0
         private var outputCount = 0
         private var generatedFrames: Int64 = 0
+        private var supportFramesSupplied: Int64 = 0
         private var converterFinished = false
         private var cursor: Int64
         private var eof = false
@@ -395,16 +396,43 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 output.frameLength = 0
                 var inputFailure: Failure?
                 var conversionError: NSError?
+                let sourceTarget = totalFrames, rate = nativeRate
+                var suppliedSupport = supportFramesSupplied
                 let status = converter.convert(to: output, error: &conversionError) { requested, status in
                     do {
+                        guard requested > 0 else { status.pointee = .noDataNow; return nil }
                         let count = try native.read(into: input, maximumFrames: min(Int(requested), Int(input.frameCapacity)))
-                        if count == 0 { status.pointee = .endOfStream; return nil }
+                        if count == 0 {
+                            guard native.reachedEnd else { throw Failure.cannotDecode }
+                            // A fractional target frame may require the next native
+                            // sample for interpolation. Supply only the mathematically
+                            // required zero support outside the original timeline;
+                            // never append fabricated output PCM or change its end.
+                            let target = max(sourceTarget, Int64((Double(native.totalFrames) * 48_000 / rate).rounded()))
+                            // Integral rates and the <24-hour source limit make
+                            // this integer ceiling safe without floating ambiguity.
+                            let requiredNative = (target * Int64(rate) + 47_999) / 48_000
+                            let support = max(0, requiredNative - native.totalFrames)
+                            let maximumSupport = Int64(ceil(rate / 96_000 + 0.5))
+                            guard support <= maximumSupport else { throw Failure.invalidTimeline }
+                            let needed = support - suppliedSupport
+                            if needed > 0 {
+                                let frames = min(Int(needed), Int(requested), Int(input.frameCapacity))
+                                guard frames > 0, let samples = input.floatChannelData?[0] else { throw Failure.cannotDecode }
+                                samples.update(repeating: 0, count: frames * Int(input.format.channelCount))
+                                input.frameLength = AVAudioFrameCount(frames)
+                                suppliedSupport += Int64(frames)
+                                status.pointee = .haveData; return input
+                            }
+                            status.pointee = .endOfStream; return nil
+                        }
                         status.pointee = .haveData; return input
                     } catch {
                         inputFailure = (error as? Failure) ?? .cannotDecode
                         status.pointee = .endOfStream; return nil
                     }
                 }
+                supportFramesSupplied = suppliedSupport
                 if let inputFailure { throw inputFailure }
                 guard status != .error, conversionError == nil else { throw Failure.cannotDecode }
                 totalFrames = max(totalFrames, Int64((Double(native.totalFrames) * 48_000 / nativeRate).rounded()))
@@ -432,6 +460,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private var cursor: Int64 = 0
         private var eof = false
         private(set) var totalFrames: Int64
+        var reachedEnd: Bool { eof && sampleCount == 0 && cursor >= totalFrames }
 
         init(description: Description) throws {
             guard let track = description.track else { throw Failure.cannotDecode }

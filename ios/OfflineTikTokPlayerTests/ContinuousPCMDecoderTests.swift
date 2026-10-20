@@ -202,7 +202,14 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             return [value, -value]
         }
         try writePCM(samples, to: url, sampleRate: 44_100)
-        let expected = try await independentlyDecode(AVURLAsset(url: url), diagnosticName: "sample-rate-44100-to-48000")
+        let asset = AVURLAsset(url: url)
+        let expected = try await independentlyDecode(asset, diagnosticName: "sample-rate-44100-to-48000")
+        let withoutSupport = try await independentlyDecode(asset, quantizedEndSupport: false)
+        XCTAssertEqual(withoutSupport.count, 10_667 * 2, "Characterize the converter's floor-sized termination without native support")
+        assertSamples(Array(expected.prefix(withoutSupport.count)), equal: withoutSupport)
+        let finalLeft = try XCTUnwrap(expected.suffix(2).first)
+        XCTAssertGreaterThan(abs(finalLeft), 0.01,
+            "The final fractional frame must be calculated from the source, not padded with an output zero")
         let renderer = ContinuousPCMRenderer(prefixFrames: 20_000, ringFrames: 512)
         let decoder = ContinuousPCMDecoder(renderer: renderer)
         defer { decoder.shutdown() }
@@ -445,7 +452,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
     /// Array-backed reference: native PCM first, then a separate converter driver
     /// using 113-frame input and 257-frame output blocks (production uses 4096).
     /// This avoids the implicit AudioMixOutput converter that lost its tail.
-    private func independentlyDecode(_ asset: AVAsset, diagnosticName: String? = nil) async throws -> [Float] {
+    private func independentlyDecode(_ asset: AVAsset, diagnosticName: String? = nil, quantizedEndSupport: Bool = true) async throws -> [Float] {
         let tracks = try await asset.loadTracks(withMediaType: .audio)
         let track = try XCTUnwrap(tracks.first, "Synthetic fixture needs an iOS-readable audio track")
         let descriptions = try await track.load(.formatDescriptions)
@@ -522,6 +529,11 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         if channels == 1 { converter.channelMap = [0, 0] }
         let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 113))
         let outputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 257))
+        let presentationFrames = max(Int((seconds * 48_000).rounded()), Int((Double(nativeFrames) * 48_000 / rate).rounded()))
+        let requiredNative = (Int64(presentationFrames) * Int64(rate) + 47_999) / 48_000
+        let supportFrames = quantizedEndSupport ? max(0, Int(requiredNative) - nativeFrames) : 0
+        XCTAssertLessThanOrEqual(supportFrames, Int(ceil(rate / 96_000 + 0.5)))
+        var suppliedSupport = 0
         var inputOffset = 0, converted: [Float] = [], iterations = 0
         while true {
             iterations += 1
@@ -529,8 +541,19 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             outputBuffer.frameLength = 0
             var conversionError: NSError?
             let status = converter.convert(to: outputBuffer, error: &conversionError) { requested, status in
+                guard requested > 0 else { status.pointee = .noDataNow; return nil }
                 let count = min(Int(requested), 113, nativeFrames - inputOffset)
-                guard count > 0 else { status.pointee = .endOfStream; return nil }
+                guard count > 0 else {
+                    let needed = supportFrames - suppliedSupport
+                    if needed > 0 {
+                        let count = min(needed, Int(requested), 113)
+                        guard count > 0 else { status.pointee = .endOfStream; return nil }
+                        inputBuffer.floatChannelData![0].update(repeating: 0, count: count * channels)
+                        inputBuffer.frameLength = AVAudioFrameCount(count); suppliedSupport += count
+                        status.pointee = .haveData; return inputBuffer
+                    }
+                    status.pointee = .endOfStream; return nil
+                }
                 samples.withUnsafeBufferPointer {
                     inputBuffer.floatChannelData![0].update(from: $0.baseAddress!.advanced(by: inputOffset * channels), count: count * channels)
                 }
@@ -543,17 +566,23 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             converted.append(contentsOf: UnsafeBufferPointer(start: outputBuffer.floatChannelData![0], count: Int(outputBuffer.frameLength) * 2))
             if status == .endOfStream { break }
         }
-        let presentationFrames = max(Int((seconds * 48_000).rounded()), Int((Double(nativeFrames) * 48_000 / rate).rounded()))
-        XCTAssertEqual(converted.count, presentationFrames * 2, "Explicit end-of-stream flushing must return the complete presentation without fabricated silence")
+        if quantizedEndSupport {
+            XCTAssertGreaterThanOrEqual(converted.count, presentationFrames * 2,
+                "Native support and explicit flushing must calculate every declared presentation frame")
+            XCTAssertLessThanOrEqual(converted.count / 2, presentationFrames + Int(ceil(48_000 / rate)),
+                "Only the bounded native support may generate samples outside the declared timeline")
+        }
         if let diagnosticName {
             let metrics: [String: Any] = ["fixture": diagnosticName, "assetSeconds": duration.seconds,
                 "trackStartSeconds": range.start.seconds, "trackEndSeconds": range.end.seconds,
                 "nativeDecodedFrames": samples.count / channels, "convertedFrames": converted.count / 2,
-                "presentationFrames": presentationFrames, "packets": packets,
+                "presentationFrames": presentationFrames, "nativeSupportFrames": suppliedSupport, "packets": packets,
                 "first": firstPacket ?? [:], "last": lastPackets]
             let data = try JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys])
             print("PCM_PACKET_DIAGNOSTICS " + String(decoding: data, as: UTF8.self))
         }
-        return converted
+        // Support is outside the original presentation. Its filter response is
+        // needed to calculate the final included frame, not to extend playback.
+        return quantizedEndSupport ? Array(converted.prefix(presentationFrames * 2)) : converted
     }
 }
