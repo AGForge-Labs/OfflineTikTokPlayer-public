@@ -59,7 +59,8 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         }
         try writePCM(samples, to: url, compressed: true)
         let asset = AVURLAsset(url: url)
-        let expected = try await independentlyDecode(asset)
+        let expected = try await independentlyDecode(asset, diagnosticName: "generated-aac")
+        XCTAssertGreaterThan(expected.map { abs($0) }.max() ?? 0, 0.01, "AAC reference must contain the encoded tone")
         let renderer = ContinuousPCMRenderer(prefixFrames: 24_000, ringFrames: 24_000)
         let decoder = ContinuousPCMDecoder(renderer: renderer)
         defer { decoder.shutdown() }
@@ -127,8 +128,10 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let urls = try ["test-video", "test-slideshow-mp3.iphone"].map {
             try XCTUnwrap(Bundle(for: Self.self).url(forResource: $0, withExtension: "mp4"))
         }
-        let first = try await independentlyDecode(AVURLAsset(url: urls[0]))
-        let second = try await independentlyDecode(AVURLAsset(url: urls[1]))
+        let first = try await independentlyDecode(AVURLAsset(url: urls[0]), diagnosticName: "aac-video")
+        let second = try await independentlyDecode(AVURLAsset(url: urls[1]), diagnosticName: "alac-compatibility-video")
+        XCTAssertGreaterThan(first.map { abs($0) }.max() ?? 0, 0.01, "AAC graph reference must contain audible tone")
+        XCTAssertGreaterThan(second.map { abs($0) }.max() ?? 0, 0.01, "ALAC graph reference must contain audible tone")
         let maximum = max(first.count, second.count) / 2
         guard maximum > 0, maximum <= 960_000 else { throw XCTSkip("Synthetic fixture outside the test's bounded PCM allocation") }
         // Retain these short synthetic sources completely so faster-than-realtime
@@ -159,6 +162,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let expectedMP3 = try await independentlyDecode(AVURLAsset(url: mp3), diagnosticName: "standalone-mp3")
         XCTAssertGreaterThan(expectedMP3.count, 48_000, "The real MP3 decoder must return the complete synthetic tone")
         XCTAssertLessThan(expectedMP3.count, 192_000)
+        XCTAssertGreaterThan(expectedMP3.map { abs($0) }.max() ?? 0, 0.01, "MP3 sample comparisons must exercise audible decoded tone")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -178,7 +182,9 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         graph.engine.prepare()
         try graph.engine.start()
         defer { graph.engine.stop() }
-        assertSamples(try render(graph, frames: expectedMP3.count / 2 * 3), equal: expectedMP3 + expectedMP3 + expectedMP3)
+        let looped = try render(graph, frames: expectedMP3.count / 2 * 3)
+        XCTAssertGreaterThan(looped.map { abs($0) }.max() ?? 0, 0.01, "The production graph must emit audible MP3 samples")
+        assertSamples(looped, equal: expectedMP3 + expectedMP3 + expectedMP3)
         renderer.setSuccessor(token: 2, for: 1)
         renderer.select(token: 1, frame: 0)
         assertSamples(try render(graph, frames: (expectedMP3.count + expectedFollowing.count) / 2), equal: expectedMP3 + expectedFollowing)
@@ -190,6 +196,35 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             assertSamples(try render(graph, frames: expectedFollowing.count / 2), equal: expectedFollowing)
         }
         XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+
+    func testRepeatedMP3ReadersAndPreparationsPreserveTheSameFullDeclaredPresentation() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-tone", withExtension: "mp3"))
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        let duration = try await asset.load(.duration)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let range = try await track.load(.timeRange)
+        let end = CMTimeCompare(range.end, duration) > 0 ? range.end : duration
+        let declaredFrames = CMTimeConvertScale(end, timescale: 48_000, method: .roundHalfAwayFromZero).value
+        let expected = try await independentlyDecode(AVURLAsset(url: url), diagnosticName: "repeated-mp3-declared-presentation")
+        XCTAssertEqual(expected.count, Int(declaredFrames) * 2, "The standalone fixture's precise declared timeline is authoritative")
+        XCTAssertGreaterThan(expected.map { abs($0) }.max() ?? 0, 0.01)
+        for _ in 0..<3 {
+            let repeated = try await independentlyDecode(AVURLAsset(url: url))
+            assertSamples(repeated, equal: expected)
+            let renderer = ContinuousPCMRenderer(prefixFrames: 65_000, ringFrames: 512)
+            let decoder = ContinuousPCMDecoder(renderer: renderer)
+            defer { decoder.shutdown() }
+            let prepared = try await decoder.prepare(url: url, token: 1, slot: 0)
+            XCTAssertEqual(prepared.totalFrames, declaredFrames)
+            XCTAssertEqual(renderer.source(at: 0).totalFrames, declaredFrames)
+            renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+            var actual = [Float](repeating: .nan, count: expected.count)
+            actual.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: expected.count / 2) }
+            assertSamples(actual, equal: expected)
+            XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        }
     }
 
     func testSampleRateConversionPreservesTheCompleteDeclaredTimeline() async throws {
@@ -367,6 +402,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let export = try XCTUnwrap(AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A))
         try await export.export(to: edited, as: .m4a)
         let expected = try await independentlyDecode(AVURLAsset(url: edited), diagnosticName: "exported-audio-offset")
+        XCTAssertGreaterThan(expected.map { abs($0) }.max() ?? 0, 0.01, "The edited AAC reference must retain its tone")
         XCTAssertEqual(expected.count, 16_800 * 2)
         XCTAssertTrue(expected.prefix(8_000).allSatisfy { abs($0) < 0.00001 })
         let renderer = ContinuousPCMRenderer(prefixFrames: 20_000, ringFrames: 512)
@@ -452,7 +488,15 @@ final class ContinuousPCMDecoderTests: XCTestCase {
     /// Array-backed reference: native PCM first, then a separate converter driver
     /// using 113-frame input and 257-frame output blocks (production uses 4096).
     /// This avoids the implicit AudioMixOutput converter that lost its tail.
-    private func independentlyDecode(_ asset: AVAsset, diagnosticName: String? = nil, quantizedEndSupport: Bool = true) async throws -> [Float] {
+    private func independentlyDecode(_ inputAsset: AVAsset, diagnosticName: String? = nil, quantizedEndSupport: Bool = true) async throws -> [Float] {
+        let asset: AVAsset
+        if let urlAsset = inputAsset as? AVURLAsset {
+            asset = AVURLAsset(url: urlAsset.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        } else { asset = inputAsset }
+        guard try await asset.load(.providesPreciseDurationAndTiming) else {
+            XCTFail("Full-presentation comparisons require precise source timing")
+            throw ContinuousPCMDecoder.Failure.unsupportedPCM
+        }
         let tracks = try await asset.loadTracks(withMediaType: .audio)
         let track = try XCTUnwrap(tracks.first, "Synthetic fixture needs an iOS-readable audio track")
         let descriptions = try await track.load(.formatDescriptions)
@@ -460,17 +504,23 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let sourceASBD = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(description))
         let rate = sourceASBD.pointee.mSampleRate
         let channels = Int(sourceASBD.pointee.mChannelsPerFrame)
+        let duration = try await asset.load(.duration)
+        let range = try await track.load(.timeRange)
+        let readEnd = CMTimeCompare(range.end, duration) > 0 ? range.end : duration
+        let nativePresentationFrames = Int(CMTimeConvertScale(readEnd, timescale: CMTimeScale(rate), method: .roundHalfAwayFromZero).value)
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVLinearPCMIsFloatKey: true, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false
         ])
         reader.add(output)
+        reader.timeRange = CMTimeRange(start: .zero, duration: readEnd)
         XCTAssertTrue(reader.startReading())
         var samples: [Float] = []
         var packets = 0
         var firstPacket: [String: Double]?
         var lastPackets: [[String: Double]] = []
+        var outsidePresentationFrames = 0
         while let sample = output.copyNextSampleBuffer(), let block = CMSampleBufferGetDataBuffer(sample) {
             var bytes = Data(count: CMBlockBufferGetDataLength(block))
             let status = bytes.withUnsafeMutableBytes {
@@ -485,11 +535,16 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             let trimEnd = Int((trimSeconds(kCMSampleBufferAttachmentKey_TrimDurationAtEnd) * rate).rounded())
             let packetFrames = bytes.count / (channels * 4)
             let packetStart = Int((CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds * rate).rounded())
-            let validFrames = packetFrames - trimStart - trimEnd
-            XCTAssertGreaterThanOrEqual(validFrames, 0)
-            guard validFrames >= 0 else { throw ContinuousPCMDecoder.Failure.invalidTimeline }
+            let decodedFrames = packetFrames - trimStart - trimEnd
+            XCTAssertGreaterThanOrEqual(decodedFrames, 0)
+            guard decodedFrames >= 0 else { throw ContinuousPCMDecoder.Failure.invalidTimeline }
+            let validFrames = max(0, min(decodedFrames, nativePresentationFrames - packetStart))
+            let included = max(0, min(nativePresentationFrames, packetStart + decodedFrames) - max(0, packetStart))
+            outsidePresentationFrames += decodedFrames - included
             let oldFrames = samples.count / channels
-            if packetStart > oldFrames { samples.append(contentsOf: repeatElement(0, count: (packetStart - oldFrames) * channels)) }
+            if packetStart > oldFrames {
+                samples.append(contentsOf: repeatElement(0, count: (min(packetStart, nativePresentationFrames) - oldFrames) * channels))
+            }
             let skipped = max(0, samples.count / channels - packetStart)
             if skipped < validFrames {
                 bytes.withUnsafeBytes {
@@ -517,10 +572,8 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             }
         }
         XCTAssertEqual(reader.status, .completed)
-        let duration = try await asset.load(.duration)
-        let range = try await track.load(.timeRange)
-        let seconds = max(duration.seconds, range.end.seconds)
-        let nativeFrames = max(samples.count / channels, Int((seconds * rate).rounded()))
+        let nativeFrames = nativePresentationFrames
+        XCTAssertLessThanOrEqual(samples.count / channels, nativeFrames)
         samples.append(contentsOf: repeatElement(0, count: nativeFrames * channels - samples.count))
         let inputFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate,
             channels: UInt32(channels), interleaved: true))
@@ -529,7 +582,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         if channels == 1 { converter.channelMap = [0, 0] }
         let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 113))
         let outputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 257))
-        let presentationFrames = max(Int((seconds * 48_000).rounded()), Int((Double(nativeFrames) * 48_000 / rate).rounded()))
+        let presentationFrames = Int(CMTimeConvertScale(readEnd, timescale: 48_000, method: .roundHalfAwayFromZero).value)
         let requiredNative = (Int64(presentationFrames) * Int64(rate) + 47_999) / 48_000
         let supportFrames = quantizedEndSupport ? max(0, Int(requiredNative) - nativeFrames) : 0
         XCTAssertLessThanOrEqual(supportFrames, Int(ceil(rate / 96_000 + 0.5)))
@@ -576,7 +629,10 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             let metrics: [String: Any] = ["fixture": diagnosticName, "assetSeconds": duration.seconds,
                 "trackStartSeconds": range.start.seconds, "trackEndSeconds": range.end.seconds,
                 "nativeDecodedFrames": samples.count / channels, "convertedFrames": converted.count / 2,
-                "presentationFrames": presentationFrames, "nativeSupportFrames": suppliedSupport, "packets": packets,
+                "presentationFrames": presentationFrames, "nativeSupportFrames": suppliedSupport,
+                "outsidePresentationNativeFrames": outsidePresentationFrames, "packets": packets,
+                "nativePeak": samples.reduce(0.0) { max($0, Double(abs($1))) },
+                "convertedPeak": converted.reduce(0.0) { max($0, Double(abs($1))) },
                 "first": firstPacket ?? [:], "last": lastPackets]
             let data = try JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys])
             print("PCM_PACKET_DIAGNOSTICS " + String(decoding: data, as: UTF8.self))

@@ -88,8 +88,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     func prepare(url: URL, token: Int, slot index: Int) async throws -> Prepared {
         guard url.isFileURL else { throw Failure.localFileRequired }
         guard token > 0, (0..<3).contains(index) else { throw Failure.invalidTimeline }
-        let asset = AVURLAsset(url: url)
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let duration = try await asset.load(.duration)
+        // An approximate endpoint must never become an implicit content trim.
+        guard try await asset.load(.providesPreciseDurationAndTiming) else { throw Failure.unsupportedPCM }
         let tracks = try await asset.loadTracks(withMediaType: .audio)
         // Do not mix alternate-language tracks together. Select the first enabled
         // audio track, matching the asset's ordinary default presentation.
@@ -408,7 +410,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                             // sample for interpolation. Supply only the mathematically
                             // required zero support outside the original timeline;
                             // never append fabricated output PCM or change its end.
-                            let target = max(sourceTarget, Int64((Double(native.totalFrames) * 48_000 / rate).rounded()))
+                            let target = sourceTarget
                             // Integral rates and the <24-hour source limit make
                             // this integer ceiling safe without floating ambiguity.
                             let requiredNative = (target * Int64(rate) + 47_999) / 48_000
@@ -435,7 +437,6 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 supportFramesSupplied = suppliedSupport
                 if let inputFailure { throw inputFailure }
                 guard status != .error, conversionError == nil else { throw Failure.cannotDecode }
-                totalFrames = max(totalFrames, Int64((Double(native.totalFrames) * 48_000 / nativeRate).rounded()))
                 if status == .endOfStream { converterFinished = true }
                 outputStart = generatedFrames; outputCount = Int(output.frameLength)
                 generatedFrames += Int64(outputCount)
@@ -474,6 +475,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { throw Failure.cannotDecode }
             reader.add(output)
+            // The default range extends to positive infinity and may expose
+            // decoder postroll outside a compressed asset's presentation.
+            // Request the complete declared asset/track interval explicitly.
+            reader.timeRange = CMTimeRange(start: .zero, duration: description.endTime)
             guard reader.startReading() else { throw Failure.cannotDecode }
         }
 
@@ -541,22 +546,25 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let trimStart = try trim(kCMSampleBufferAttachmentKey_TrimDurationAtStart)
             let trimEnd = try trim(kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
             guard trimStart + trimEnd <= Int64(frames) else { throw Failure.invalidTimeline }
-            let validFrames = Int64(frames) - trimStart - trimEnd
+            let decodedFrames = Int64(frames) - trimStart - trimEnd
             let outputDuration = CMSampleBufferGetOutputDuration(buffer)
             if outputDuration.isNumeric {
                 let durationFrames = try ContinuousPCMDecoder.frame(outputDuration, rate: rate)
                 // The native-rate output has no SRC discrepancy. A scaled edit
                 // needs an explicit time-pitch implementation, not silent sample
                 // deletion or duplication to force it onto the timeline.
-                guard abs(durationFrames - validFrames) <= 1 else { throw Failure.unsupportedPCM }
+                guard abs(durationFrames - decodedFrames) <= 1 else { throw Failure.unsupportedPCM }
             }
+            // Explicit finite reader ranges can still straddle a packet. Keep
+            // the intersection with the precise declared presentation, after
+            // declared codec trims; decoder postroll cannot extend playback.
+            let validFrames = max(0, min(decodedFrames, totalFrames - start))
             samples = [Float](repeating: 0, count: frames * channels)
             let result = samples.withUnsafeMutableBytes {
                 CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes, destination: $0.baseAddress!)
             }
             guard result == kCMBlockBufferNoErr else { throw Failure.cannotDecode }
             sampleStart = start; sampleOffset = Int(trimStart); sampleCount = Int(validFrames)
-            totalFrames = max(totalFrames, sampleStart + validFrames)
         }
     }
 }
