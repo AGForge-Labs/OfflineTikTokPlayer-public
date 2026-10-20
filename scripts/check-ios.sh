@@ -2,11 +2,64 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+# Xcode's build queue limit does not replace the Swift driver's generated -jN.
+export SWIFTC_MAXIMUM_DETERMINISM=1
+mkdir -p artifacts/native
+native_log="artifacts/native/xcodebuild-test.log"
+# An early failure must never leave a previous run's successful evidence behind.
+: > "$native_log"
+validation_complete=0
+validation_mode=full
+if [ "$#" -eq 0 ]; then
+  set --
+elif [ "$#" -eq 1 ] && [ "$1" = "--selection-only" ]; then
+  validation_mode=selection-only
+  set -- \
+    -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionFailureTests \
+    -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests \
+    -only-testing:OfflineTikTokPlayerTests/ContinuousAudioPlayerTests \
+    -only-testing:OfflineTikTokPlayerTests/ContinuousPCMDecoderTests
+else
+  printf '%s\n' 'Usage: check-ios.sh [--selection-only]' >&2
+  exit 2
+fi
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode 26 or later on macOS is required.' >&2; exit 2; }
+# Print the selected driver's plan only; no compilation is executed by this probe.
+printf '' | xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/swift-driver-plan.log 2>&1
+cat artifacts/native/swift-driver-plan.log
+grep -Fq 'SWIFTC_MAXIMUM_DETERMINISM overriding -j' artifacts/native/swift-driver-plan.log || {
+  printf '%s\n' 'The selected Swift driver did not confirm its one-job override.' >&2
+  exit 1
+}
 python3 scripts/generate-ios-project.py --check
 bash scripts/test-core.sh
-mkdir -p artifacts/native
+bash scripts/test-apple-buffer.sh
+destination="${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro Max}"
+simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
+# Native window tests request real compositor pixels through their own app tmp.
+# Pin the test and capture to the same existing Simulator; one helper, no extra app launch.
+python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 &
+capture_pid=$!
+cleanup_capture() {
+  local cleanup_status=$?
+  trap - EXIT
+  kill "$capture_pid" 2>/dev/null || true
+  wait "$capture_pid" 2>/dev/null || true
+  if [ "$cleanup_status" -eq 0 ] && [ "$validation_complete" -ne 1 ]; then
+    cleanup_status=1
+  fi
+  exit "$cleanup_status"
+}
+trap cleanup_capture EXIT
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
-  -destination "${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro Max}" \
+  -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Tests-$(date +%Y%m%d-%H%M%S).xcresult" \
-  CODE_SIGNING_ALLOWED=NO test
+  -jobs 1 -parallel-testing-enabled NO \
+  "$@" SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+  CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+if [ "$validation_mode" = selection-only ]; then
+  python3 scripts/verify-native-test-log.py --log "$native_log" --selection-only
+else
+  python3 scripts/verify-native-test-log.py --log "$native_log"
+fi
+validation_complete=1

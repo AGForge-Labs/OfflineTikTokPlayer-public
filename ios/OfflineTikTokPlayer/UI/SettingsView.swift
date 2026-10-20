@@ -5,6 +5,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var connecting = false
     @State private var status: String?
+    @State private var diagnosticsURL: URL?
 
     var body: some View {
         @Bindable var account = app.account
@@ -43,11 +44,20 @@ struct SettingsView: View {
                 }
                 Section("Playback") {
                     Toggle("Speaker sound", isOn: $playback.speakerSound)
-                    Text("Adds bass, clarity and controlled volume through the iPhone speakers. Turn off for Original sound. Headphones use the original audio.")
+                    Text("Boosts quieter music and adds fuller bass through the iPhone speakers, with peak protection. Turn off for Original sound. Headphones and Bluetooth use the original audio. Your iPhone volume stays under your control.")
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("Automatic Picture in Picture", isOn: $playback.automaticPiP)
+                    Toggle("Audio only", isOn: $playback.audioOnly)
+                    Text("Keeps the current audio position while video is hidden. Turn off to restore video. A camera or call can still interrupt audio when iOS requires it.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("Audio keeps playing when you lock your phone. Your queue and position return paused when you reopen the app.")
                         .font(.caption).foregroundStyle(.secondary)
+                    DisclosureGroup("Playback diagnostics") {
+                        Button("Prepare local report") { diagnosticsURL = playback.exportPlaybackDiagnostics() }
+                        if let diagnosticsURL { ShareLink("Share playback report", item: diagnosticsURL) }
+                        Text("Contains recent playback, PiP and audio-session events. No video names, links, account details or recordings are included.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 Section("About") {
                     Text("Private offline player · iOS 26+")

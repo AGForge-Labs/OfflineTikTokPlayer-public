@@ -97,6 +97,7 @@ final class SpeakerAudioController {
         let token: UUID
         let task: Task<Void, Never>?
         var awaitingEnqueue = false
+        var retryWhenReady = false
     }
     private var entries: [ObjectIdentifier: Entry] = [:]
     private var enabled = false
@@ -110,19 +111,20 @@ final class SpeakerAudioController {
     }
 
     /// Configure before the item enters AVQueuePlayer, so play doesn't rebuild its audio path.
-    func prepare(_ item: AVPlayerItem) async {
+    func prepare(_ item: AVPlayerItem, within budget: Duration? = nil) async {
         let id = ObjectIdentifier(item), token = UUID()
         entries[id]?.task?.cancel()
         entries[id] = Entry(item: item, enabled: enabled, token: token, task: nil, awaitingEnqueue: true)
         let loader = loadTracks
-        let tracks = enabled ? await PlaybackPreparation.value(within: preparationBudget) { await loader(item) } : nil
+        let tracks = enabled ? await PlaybackPreparation.value(within: budget ?? preparationBudget) { await loader(item) } : nil
         guard !Task.isCancelled, entries[id]?.token == token else {
             if entries[id]?.token == token { entries.removeValue(forKey: id) }
             return
         }
         // A route or Original-sound change can happen while metadata is loading.
         item.audioMix = enabled ? tracks.flatMap { SpeakerAudioMix.make(tracks: $0) } : nil
-        entries[id] = Entry(item: item, enabled: enabled, token: token, task: nil, awaitingEnqueue: true)
+        entries[id] = Entry(item: item, enabled: enabled, token: token, task: nil, awaitingEnqueue: true,
+                            retryWhenReady: enabled && tracks == nil)
     }
 
     func update(items: [AVPlayerItem], enabled: Bool) {
@@ -134,7 +136,8 @@ final class SpeakerAudioController {
         for item in items {
             let id = ObjectIdentifier(item)
             entries[id]?.awaitingEnqueue = false
-            if let entry = entries[id], entry.item === item, entry.enabled == enabled { continue }
+            if let entry = entries[id], entry.item === item, entry.enabled == enabled,
+               !(entry.retryWhenReady && item.status == .readyToPlay) { continue }
             entries[id]?.task?.cancel()
             let token = UUID()
             if !enabled {
@@ -150,7 +153,8 @@ final class SpeakerAudioController {
                       self.entries[id]?.token == token else { return }
                 item.audioMix = tracks.flatMap { SpeakerAudioMix.make(tracks: $0) }
             }
-            entries[id] = Entry(item: item, enabled: true, token: token, task: task)
+            entries[id] = Entry(item: item, enabled: true, token: token, task: task,
+                                retryWhenReady: item.status != .readyToPlay)
         }
     }
 

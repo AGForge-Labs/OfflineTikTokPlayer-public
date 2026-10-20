@@ -1,0 +1,23 @@
+name: Public playback validation
+on:
+  push:
+    branches: [fix/playback-continuity, fix/continuous-pcm-playback, fix/selected-video-regression]
+    paths: ['ios/**', 'scripts/**', 'tests/apple-playback/**', 'tests/validation-shell/**', '.github/workflows/playback-validation.yml']
+permissions:
+  contents: read
+jobs:
+  ios:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Unsigned full playback validation with one build job
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+          bash scripts/check-ios.sh
+      - name: Require every native and UI test identity
+        run: python3 scripts/verify-native-test-log.py --log artifacts/native/xcodebuild-test.log

@@ -38,11 +38,11 @@ def generate():
             if file.is_dir() and file.suffix != ".xcassets": children.append(group(file, target)); continue
             if file.name.startswith("."): continue
             filetype = {".swift": "sourcecode.swift", ".plist": "text.plist.xml", ".entitlements": "text.plist.entitlements",
-                        ".xcprivacy": "text.xml", ".xcassets": "folder.assetcatalog", ".mp4": "file", ".svg": "image.svg"}.get(file.suffix, "text")
+                        ".xcprivacy": "text.xml", ".xcassets": "folder.assetcatalog", ".mp4": "file", ".mp3": "audio.mp3", ".svg": "image.svg"}.get(file.suffix, "text")
             ref = add("file:" + file.relative_to(ROOT).as_posix(), "PBXFileReference", lastKnownFileType=filetype, path=file.name, sourceTree="<group>")
             children.append(ref)
             if file.suffix == ".swift": build_sources[target].append(add("source:" + file.relative_to(ROOT).as_posix(), "PBXBuildFile", fileRef=ref))
-            if file.suffix in (".xcassets", ".xcprivacy", ".mp4"):
+            if file.suffix in (".xcassets", ".xcprivacy", ".mp4", ".mp3"):
                 resources[target].append(add("resource:" + file.relative_to(ROOT).as_posix(), "PBXBuildFile", fileRef=ref))
         return add("group:" + path.relative_to(ROOT).as_posix(), "PBXGroup", children=children, path=path.name, sourceTree="<group>")
 

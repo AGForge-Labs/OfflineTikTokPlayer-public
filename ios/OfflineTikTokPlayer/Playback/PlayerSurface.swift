@@ -3,6 +3,7 @@ import AVFoundation
 import SwiftUI
 
 final class PlayerSurface: UIView {
+    private var pipDisplayLayer: AVSampleBufferDisplayLayer?
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
     init(player: AVPlayer) {
@@ -13,6 +14,18 @@ final class PlayerSurface: UIView {
         isUserInteractionEnabled = false
     }
     required init?(coder: NSCoder) { fatalError("Use init(player:)") }
+    func attachPiPDisplayLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
+        pipDisplayLayer?.removeFromSuperlayer()
+        pipDisplayLayer = displayLayer
+        layer.addSublayer(displayLayer)
+        setNeedsLayout()
+    }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        pipDisplayLayer?.frame = bounds
+        CATransaction.commit()
+    }
 }
 
 /// SwiftUI owns each host, while the playback service owns the single video layer.

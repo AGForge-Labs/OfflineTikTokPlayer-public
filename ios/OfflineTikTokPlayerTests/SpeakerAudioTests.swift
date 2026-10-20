@@ -5,6 +5,66 @@ import AudioToolbox
 
 @MainActor
 final class SpeakerAudioTests: XCTestCase {
+    func testColdSelectionUsesTheShortOptionalPreparationBudget() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let item = AVPlayerItem(url: url)
+        let audio = SpeakerAudioController { _ in
+            try? await Task.sleep(for: .seconds(2)); return nil
+        }
+        audio.update(items: [], enabled: true)
+        let start = ContinuousClock.now
+        await audio.prepare(item, within: .milliseconds(100))
+        let elapsed = start.duration(to: .now)
+        XCTAssertLessThan(elapsed, .milliseconds(300))
+        XCTAssertNil(item.audioMix)
+        print("Cold optional speaker preparation elapsed: \(elapsed)")
+    }
+
+    func testLoopReplicasKeepIndependentSpeakerProcessingState() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let asset = AVURLAsset(url: url), buffer = PlaybackBuffer(), audio = SpeakerAudioController()
+        audio.update(items: [], enabled: true)
+        let first = AVPlayerItem(asset: asset), next = AVPlayerItem(asset: asset), reserve = AVPlayerItem(asset: asset)
+        await audio.prepare(first); await audio.prepare(next); await audio.prepare(reserve)
+        let firstMix = try XCTUnwrap(first.audioMix), nextMix = try XCTUnwrap(next.audioMix), reserveMix = try XCTUnwrap(reserve.audioMix)
+        XCTAssertFalse(firstMix === nextMix); XCTAssertFalse(nextMix === reserveMix)
+        buffer.replace(with: first, mediaID: "loop")
+        defer { buffer.replace(with: nil); buffer.discardPrevious() }
+        buffer.stage(.init(mediaID: "loop", item: next, isLocal: true))
+        buffer.stageLoopReserve(.init(mediaID: "loop", item: reserve, isLocal: true))
+        audio.update(items: buffer.player.items(), enabled: true)
+        XCTAssertTrue(first.audioMix === firstMix); XCTAssertTrue(next.audioMix === nextMix); XCTAssertTrue(reserve.audioMix === reserveMix)
+        audio.update(items: buffer.player.items(), enabled: false)
+        XCTAssertTrue(buffer.player.items().allSatisfy { $0.audioMix == nil })
+    }
+
+    func testTimedOutOptionalPreparationRetriesWhenTheItemBecomesReady() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let item = AVPlayerItem(url: url)
+        let tracks = try await item.asset.loadTracks(withMediaType: .audio)
+        var attempts = 0
+        let audio = SpeakerAudioController(preparationBudget: .milliseconds(20)) { _ in
+            attempts += 1
+            if attempts == 1 { try? await Task.sleep(for: .seconds(1)); return nil }
+            return tracks
+        }
+        audio.update(items: [], enabled: true)
+        await audio.prepare(item)
+        XCTAssertNil(item.audioMix)
+        let player = AVPlayer(playerItem: item)
+        defer { player.replaceCurrentItem(with: nil) }
+        let deadline = Date().addingTimeInterval(5)
+        while item.status == .unknown, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(item.status, .readyToPlay)
+        audio.update(items: [item], enabled: true)
+        let retryDeadline = Date().addingTimeInterval(1)
+        while item.audioMix == nil, Date() < retryDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNotNil(item.audioMix, "A cold metadata timeout must not disable speaker enhancement for the entire clip")
+        XCTAssertEqual(attempts, 2)
+        audio.update(items: [item], enabled: false)
+        XCTAssertNil(item.audioMix, "Headphones/Bluetooth and Original sound must remove the boost")
+    }
+
     func testSlowPreparationFallsBackWithoutInstallingAMixAfterEnqueue() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
         let item = AVPlayerItem(url: url)
@@ -85,6 +145,11 @@ final class SpeakerAudioTests: XCTestCase {
         XCTAssertNotEqual(enhanced, original, "The native audio tap must actually process PCM")
         XCTAssertTrue(enhanced.allSatisfy { $0.isFinite && abs($0) <= 0.98001 })
         XCTAssertGreaterThan(enhanced.map { abs($0) }.max() ?? 0, 0.01)
+        let originalRMS = sqrt(original.reduce(0.0) { $0 + Double($1 * $1) } / Double(original.count))
+        let enhancedRMS = sqrt(enhanced.reduce(0.0) { $0 + Double($1 * $1) } / Double(enhanced.count))
+        XCTAssertGreaterThan(enhancedRMS, originalRMS)
+        XCTAssertLessThanOrEqual(enhanced.map { abs($0) }.max() ?? 0, 0.89001)
+        print("Native speaker tap fixture: samples=\(enhanced.count), originalRMS=\(originalRMS), enhancedRMS=\(enhancedRMS), gainDB=\(20 * log10(enhancedRMS / originalRMS))")
     }
 
     func testRoutePolicyUsesOnlyBuiltInSpeakersAndOriginalChoiceBypasses() {
