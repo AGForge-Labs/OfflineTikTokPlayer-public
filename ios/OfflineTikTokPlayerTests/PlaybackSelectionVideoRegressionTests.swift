@@ -131,7 +131,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         defer { fixture.remove() }
         let audio = ContinuousAudioPlayer()
         let tap = SelectionOutputTap()
-        let service = fixture.service(continuousAudio: audio)
+        let seeks = SelectionLatencySeekProbe()
+        let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
+        seeks.service = service
         let screen = try SelectionVideoScreen(service: service)
         audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
             tap.append(buffer, time: time)
@@ -158,6 +160,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertTrue(runway, "The complete A presentation must reach its final half second")
         guard runway else { return }
         let first = tap.begin(), submitted = service.submittedVideoFrameCount
+        seeks.phase = 3; seeks.origin = SelectionOutputTap.hostSeconds()
         let underruns = service.audioSnapshot.underrunFrames
         var cursor = first
         var outgoing: SelectionOutputTap.Window?
@@ -183,7 +186,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let quiet = SelectionOutputTap.quietRun(captured.values, rate: captured.rate)
         let hole = SelectionOutputTap.maximumTimelineHole(captured.hosts, rate: captured.rate)
         let visibleMs = incoming.flatMap { tone in ready.map { ($0 - tone.start) * 1_000 } }
-        print("SelectionNaturalOutput completeSourceSeconds=\(SelectionVideoFixture.duration) outgoingTone=\(outgoing != nil) incomingTone=\(incoming != nil) customReadyFromIncomingWindowMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) timelineHoleMs=\(hole * 1_000) underrunDelta=\(service.audioSnapshot.underrunFrames - underruns) tapFrames=\(captured.values.count)")
+        print("SelectionNaturalOutput completeSourceSeconds=\(SelectionVideoFixture.duration) outgoingTone=\(outgoing != nil) incomingTone=\(incoming != nil) customReadyFromIncomingWindowMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) timelineHoleMs=\(hole * 1_000) underrunDelta=\(service.audioSnapshot.underrunFrames - underruns) nativeSeekCalls=\(seeks.nativeSeekCount[3] ?? 0) tapFrames=\(captured.values.count)")
         XCTAssertNotNil(outgoing, "The captured output must include A before B, rather than starting after the boundary")
         XCTAssertNotNil(incoming, "B's independent tone must reach the real mixer after complete A")
         if let outgoing, let incoming { XCTAssertLessThanOrEqual(outgoing.end, incoming.start) }
@@ -749,7 +752,8 @@ final class SelectionVideoFixture {
         temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         cloud = OneDriveClient(account: MicrosoftAccount())
-        downloads = OfflineDownloads(cloud: cloud, network: NetworkStatus())
+        downloads = OfflineDownloads(cloud: cloud, network: NetworkStatus(),
+            storageRoot: temporary.appendingPathComponent("Downloads", isDirectory: true), usesBackgroundSession: false)
         library = LibraryRepository(cloud: cloud, catalogURL: temporary.appendingPathComponent("catalog.json"))
         ids = ["local:selected-A-" + UUID().uuidString, "local:selected-B-" + UUID().uuidString]
         do {
@@ -821,6 +825,7 @@ final class SelectionVideoFixture {
     }
 
     func remove() {
+        downloads.shutdownLocalSession()
         for id in ids { downloads.remove(id) }
         let manager = FileManager.default
         let parent = manager.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
@@ -848,10 +853,12 @@ private final class SelectionLatencySeekProbe {
     var phase = -1
     var origin = 0.0
     private(set) var alignedPreparedSeekCount: [Int: Int] = [:]
+    private(set) var nativeSeekCount: [Int: Int] = [:]
     func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
         let started = SelectionOutputTap.hostSeconds()
         let phase = self.phase, origin = self.origin, requested = time.seconds
         let current = player.currentTime().seconds
+        nativeSeekCount[phase, default: 0] += 1
         if phase > 0, abs(current - requested) <= 0.080, player.rate > 0.999 {
             alignedPreparedSeekCount[phase, default: 0] += 1
         }

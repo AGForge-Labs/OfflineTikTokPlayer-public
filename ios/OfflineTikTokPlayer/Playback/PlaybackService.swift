@@ -386,7 +386,8 @@ final class PlaybackService: NSObject {
             currentIsLocal = prepared.isLocal
             resumeContinuousAudio()
             recordPlaybackEvent("preparedAdoption")
-            observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
+            observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind,
+                           naturalHandoff: audioAlreadySelected)
             prepareUpcoming()
             return
         }
@@ -436,7 +437,8 @@ final class PlaybackService: NSObject {
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
-                    self.observeCurrent(playerItem, position: itemPosition, request: request)
+                    self.observeCurrent(playerItem, position: itemPosition, request: request,
+                                        naturalHandoff: audioAlreadySelected)
                     // A warm video could not be staged while the buffer was
                     // empty; reconcile it now without discarding prepared PCM.
                     self.prepareUpcoming()
@@ -479,7 +481,8 @@ final class PlaybackService: NSObject {
         }
     }
 
-    private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
+    private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false,
+                                naturalHandoff: Bool = false) {
         observedItem = playerItem
         continuousPiP.setCurrentItem(playerItem)
         refreshAudioProcessing()
@@ -503,7 +506,19 @@ final class PlaybackService: NSObject {
                     self.isLoading = false
                     self.recordPlaybackEvent("itemReady")
                     // A new or prebuffered item is already at zero; an exact zero seek discards that benefit.
-                    if position > 0 || rewind {
+                    if naturalHandoff, !rewind, self.intent.canPlay, self.videoAllowed,
+                       self.continuousAudio.selectedID == self.queue.currentID,
+                       self.syncingVideoGeneration != request {
+                        // Audio has already crossed this boundary. Schedule the
+                        // arriving video from its fresh host-clock position;
+                        // seeking to an older poll position adds a decode barrier.
+                        let host = CMClockGetTime(CMClockGetHostTimeClock())
+                        let desired = self.continuousAudio.presentationPosition(at: host)
+                        self.continuousPiP.updatePlayback(positionSeconds: desired,
+                            durationSeconds: self.clock.duration, isPlaying: true)
+                        self.monitorFirstFrame(playerItem, request: request)
+                        self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
+                    } else if position > 0 || rewind {
                         // Audio already owns its position. Readiness of a reused
                         // muted video must never rewind the audible PCM cursor.
                         self.synchronizeVideoToAudio(force: true)
