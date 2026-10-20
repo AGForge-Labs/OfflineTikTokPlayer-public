@@ -70,6 +70,30 @@ final class ContinuousPCMTests: XCTestCase {
         XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
     }
 
+    func testStreamReadinessRejectsOldAndUncommittedEpochsAfterRestart() {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
+        let source = renderer.source(at: 0)
+        XCTAssertTrue([Float(1), 2].withUnsafeBufferPointer { source.prepare(token: 1, totalFrames: 5, prefix: $0) })
+        let initial = source.streamRequest
+        XCTAssertEqual(source.availableStreamFrames(for: initial.epoch), 0)
+        XCTAssertTrue(source.beginStream(epoch: initial.epoch))
+        XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer { source.append(interleaved: $0, epoch: initial.epoch) }, 3)
+        XCTAssertEqual(source.availableStreamFrames(for: initial.epoch), 3)
+        renderer.select(token: 1); renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 1), [1])
+        renderer.select(token: 1)
+        XCTAssertEqual(render(renderer, frames: 1), [1])
+        let restarted = source.streamRequest
+        XCTAssertNotEqual(restarted.epoch, initial.epoch)
+        XCTAssertEqual(source.availableStreamFrames(for: initial.epoch), 0, "Old queued PCM is not readiness for a new visit")
+        XCTAssertEqual(source.availableStreamFrames(for: restarted.epoch), 0, "A requested epoch has no committed stream yet")
+        XCTAssertTrue(source.beginStream(epoch: restarted.epoch))
+        XCTAssertEqual(source.availableStreamFrames(for: restarted.epoch), 0)
+        XCTAssertEqual([Float(3), 4].withUnsafeBufferPointer { source.append(interleaved: $0, epoch: restarted.epoch) }, 2)
+        XCTAssertEqual(source.availableStreamFrames(for: restarted.epoch), 2)
+        XCTAssertEqual(source.availableStreamFrames(for: initial.epoch), 0)
+    }
+
     func testUnderrunIsCountedWithoutSkippingUnrenderedContent() {
         let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
         let source = renderer.source(at: 0)

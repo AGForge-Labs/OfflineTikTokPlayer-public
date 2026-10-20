@@ -49,6 +49,17 @@ public final class ContinuousPCMSource: @unchecked Sendable {
     public var availableStreamFrames: Int {
         max(0, Int(writePosition.load(ordering: .acquiring) - readPosition.load(ordering: .acquiring)))
     }
+    /// Readiness for one visit's committed stream. Recheck the epoch around the
+    /// count so old ring contents cannot satisfy a restart's preparation gate.
+    public func availableStreamFrames(for epoch: Int) -> Int {
+        guard epoch > 0, epoch & 1 == 0,
+              requestEpoch.load(ordering: .sequentiallyConsistent) == epoch,
+              committedEpoch.load(ordering: .acquiring) == epoch else { return 0 }
+        let available = availableStreamFrames
+        guard requestEpoch.load(ordering: .sequentiallyConsistent) == epoch,
+              committedEpoch.load(ordering: .acquiring) == epoch else { return 0 }
+        return min(ringCapacityFrames, available)
+    }
     public var writableStreamFrames: Int { max(0, ringCapacityFrames - availableStreamFrames) }
     public var streamRequest: ContinuousPCMStreamRequest {
         // Only the renderer changes requests while a slot is live. This accessor
