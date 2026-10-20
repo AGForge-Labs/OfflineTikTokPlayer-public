@@ -3,6 +3,12 @@
 This candidate replaces item-owned audio with a persistent AVAudioEngine and
 AVAudioSourceNode. It is a draft, not a device acceptance or release claim.
 
+**Device acceptance failed for build 13.1.** Selected videos did not reliably
+appear or match the playing source on the owner's iPhone. The historical passing
+run below did not cover those visible-frame regressions and does not establish
+release readiness. The selected-video repair is undergoing full unsigned
+validation; no repaired signed build has been accepted.
+
 ## Reviewed scope
 
 Base: `5ae95b42d89cbdbd5a6b93ef3202f9ed57603881`.

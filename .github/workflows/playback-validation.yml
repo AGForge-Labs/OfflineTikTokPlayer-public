@@ -14,5 +14,5 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Unsigned core and selected-video regressions with one build job
-        run: bash scripts/check-ios.sh --selection-only
+      - name: Unsigned full playback validation with one build job
+        run: bash scripts/check-ios.sh

@@ -4,7 +4,6 @@ import UIKit
 import AVFoundation
 import AudioToolbox
 import CoreMedia
-import CoreVideo
 import PlayerCore
 @testable import OfflineTikTokPlayer
 
@@ -51,7 +50,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await require({ !service.isLoading && abs(service.player.currentTime().seconds - 0.4) < 0.04 },
                           "The real Saved B item must finish restoring to 0.4 seconds")
         assertSelection(service, fixture: fixture, id: fixture.bID)
-        await assertVisibleFrame(service, screen: screen, identity: .b, label: "restored-B-at-0.4")
+        if let restored = await assertVisibleFrame(service, screen: screen, identity: .b, label: "restored-B-at-0.4") {
+            let center = try XCTUnwrap(restored.blueBarCenter, "The paused restored frame must contain B's blue marker")
+            let normalized = center / Double(restored.width)
+            print("SelectionRestored position=0.4 blueNormalized=\(normalized) expected=\(41.0 / 160.0)")
+            XCTAssertEqual(normalized, 41.0 / 160.0, accuracy: 0.04,
+                           "The visible paused B frame must correspond to the restored 0.4-second offset")
+        }
         XCTAssertFalse(service.wantsToPlay)
         XCTAssertEqual(service.player.rate, 0)
 
@@ -162,6 +167,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                           "Both Saved sources must be prepared before rapid supersession")
         await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "rapid-baseline-A")
         let aToken = service.audioSnapshot.token
+        let priorSelectionVersion = service.audioSnapshot.selectionVersion
         // One main-actor turn: the paused seek has an outstanding native completion when
         // Next and Previous replace its generation. There is no wait for B readiness.
         service.pause()
@@ -170,7 +176,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         service.previous()
         service.play()
         try await require({ service.queue.currentID == fixture.aID && service.audioSnapshot.token == aToken
-            && service.audioSnapshot.frame > 2_400 }, "The newest A selection must own the audio renderer")
+            && service.audioSnapshot.selectionVersion >= priorSelectionVersion + 6
+            && service.audioSnapshot.frame > 2_400 }, "The renderer must acknowledge the final A selection")
+        print("SelectionRapid beforeVersion=\(priorSelectionVersion) finalVersion=\(service.audioSnapshot.selectionVersion) frame=\(service.audioSnapshot.frame)")
         assertSelection(service, fixture: fixture, id: fixture.aID)
         await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "rapid-final-A")
         service.seek(0.35)
@@ -227,9 +235,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertTrue(service.surface.playerLayer.player === service.player, file: file, line: line)
     }
 
+    @discardableResult
     private func assertVisibleFrame(_ service: PlaybackService, screen: SelectionVideoScreen,
                                     identity: SelectionVideoIdentity, label: String,
-                                    file: StaticString = #filePath, line: UInt = #line) async {
+                                    file: StaticString = #filePath, line: UInt = #line) async -> SelectionVideoPixels? {
         let ready = await waitUntil {
             service.isVideoReady && (service.surface.playerLayer.isReadyForDisplay
                 || screen.customVideoLayer?.isReadyForDisplay == true)
@@ -242,17 +251,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                  "The whole composite must show \(identity), not the opaque poster or another source", file: file, line: line)
             XCTAssertLessThan(pixels.magentaFraction, 0.02,
                               "The real readiness path must uncover video instead of leaving the poster opaque", file: file, line: line)
-        } catch { XCTFail("Composite capture failed: \(error)", file: file, line: line) }
+            return pixels
+        } catch {
+            XCTFail("Composite capture failed: \(error)", file: file, line: line)
+            return nil
+        }
     }
 
     private func assertMovingVisibleVideo(_ service: PlaybackService, screen: SelectionVideoScreen,
                                           identity: SelectionVideoIdentity, label: String,
                                           file: StaticString = #filePath, line: UInt = #line) async {
-        await assertVisibleFrame(service, screen: screen, identity: identity, label: label + "-first", file: file, line: line)
+        guard let first = await assertVisibleFrame(service, screen: screen, identity: identity,
+                                                  label: label + "-motion-start", file: file, line: line) else { return }
         do {
-            let first = try await screen.capture(label: label + "-motion-start", test: self)
-            first.log(label: label + "-motion-start", identity: identity)
-            XCTAssertGreaterThan(first.fraction(identity), 0.65, file: file, line: line)
             let firstTime = service.player.currentTime().seconds
             let advanced = await waitUntil(timeout: 1) { service.player.currentTime().seconds > firstTime + 0.18 }
             XCTAssertTrue(advanced, "The selected AVPlayerItem clock must actually advance", file: file, line: line)
@@ -285,14 +296,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
 enum SelectionVideoIdentity: String { case a, b }
 private enum SelectionVideoTestFailure: Error {
-    case timeout, writer, sample, capture, unsafeCapturePath
+    case timeout, sample, capture, unsafeCapturePath
     case simulatorCaptureUnavailable
     case simulatorCaptureRejected(Int)
 }
 
 @MainActor
 final class SelectionVideoFixture {
-    static let duration = 6.0
+    static let duration = 30.0
     let temporary: URL
     let cloud: OneDriveClient
     let downloads: OfflineDownloads
@@ -315,8 +326,8 @@ final class SelectionVideoFixture {
         ids = ["local:selected-A-" + UUID().uuidString, "local:selected-B-" + UUID().uuidString]
         do {
             for (index, identity) in [SelectionVideoIdentity.a, .b].enumerated() {
-                let source = temporary.appendingPathComponent(identity.rawValue).appendingPathExtension("mp4")
-                try await Self.writeMovie(to: source, identity: identity)
+                let source = try XCTUnwrap(Bundle(for: PlaybackSelectionVideoRegressionTests.self)
+                    .url(forResource: "test-selection-" + identity.rawValue, withExtension: "mp4"))
                 _ = try await downloads.importLocal(source, mediaID: ids[index])
             }
             let records = ids.map { MediaRecord(id: $0, title: "Generated selection fixture", creator: "Test", duration: Self.duration) }
@@ -383,135 +394,6 @@ final class SelectionVideoFixture {
         else { UserDefaults.standard.removeObject(forKey: "automaticPiP") }
     }
 
-    private static func writeMovie(to url: URL, identity: SelectionVideoIdentity) async throws {
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        var finished = false
-        defer { if !finished { writer.cancelWriting(); try? FileManager.default.removeItem(at: url) } }
-        let video = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 160, AVVideoHeightKey: 96,
-            AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 200_000, AVVideoMaxKeyFrameIntervalKey: 24]
-        ])
-        let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-            AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 128_000
-        ])
-        let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: 160, kCVPixelBufferHeightKey as String: 96,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
-        let pixels = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: video, sourcePixelBufferAttributes: attributes)
-        guard writer.canAdd(video), writer.canAdd(audio) else { throw SelectionVideoTestFailure.writer }
-        writer.add(video); writer.add(audio)
-        guard writer.startWriting() else { throw writer.error ?? SelectionVideoTestFailure.writer }
-        writer.startSession(atSourceTime: .zero)
-        let audioDescription = try makeAudioDescription()
-        var videoFrames = 0, audioChunks = 0
-        let started = ProcessInfo.processInfo.systemUptime
-        let deadline = started + 3
-        func logWriter(_ phase: String) {
-            print("SelectionWriter source=\(identity.rawValue) phase=\(phase) videoFrames=\(videoFrames) audioChunks=\(audioChunks) videoReady=\(video.isReadyForMoreMediaData) audioReady=\(audio.isReadyForMoreMediaData) status=\(writer.status.rawValue) errorCode=\((writer.error as NSError?)?.code ?? 0) elapsed=\(ProcessInfo.processInfo.systemUptime - started)")
-        }
-        // Each encoder/mux input may apply backpressure independently. Waiting for one
-        // input before feeding the other can starve the track the writer needs next.
-        while videoFrames < 144 || audioChunks < 144 {
-            guard writer.status == .writing, ProcessInfo.processInfo.systemUptime < deadline else {
-                logWriter("feed-stalled")
-                throw writer.error ?? SelectionVideoTestFailure.timeout
-            }
-            var progressed = false
-            if videoFrames < 144, video.isReadyForMoreMediaData {
-                let pixel = try makePixel(frame: videoFrames, identity: identity, attributes: attributes)
-                guard pixels.append(pixel, withPresentationTime: CMTime(value: Int64(videoFrames), timescale: 24)) else {
-                    logWriter("video-append-failed")
-                    throw writer.error ?? SelectionVideoTestFailure.writer
-                }
-                videoFrames += 1
-                progressed = true
-                if videoFrames == 144 { video.markAsFinished() }
-            }
-            if audioChunks < 144, audio.isReadyForMoreMediaData {
-                let sample = try makeAudioChunk(start: audioChunks * 2_000, description: audioDescription,
-                                               frequency: identity == .a ? 440 : 880)
-                guard audio.append(sample) else {
-                    logWriter("audio-append-failed")
-                    throw writer.error ?? SelectionVideoTestFailure.writer
-                }
-                audioChunks += 1
-                progressed = true
-                if audioChunks == 144 { audio.markAsFinished() }
-            }
-            if !progressed { try await Task.sleep(for: .milliseconds(2)) }
-        }
-        writer.endSession(atSourceTime: CMTime(value: 6, timescale: 1))
-        await writer.finishWriting()
-        guard writer.status == .completed else {
-            logWriter("finish-failed")
-            throw writer.error ?? SelectionVideoTestFailure.writer
-        }
-        logWriter("completed")
-        finished = true
-    }
-
-    private static func makePixel(frame: Int, identity: SelectionVideoIdentity,
-                                  attributes: [String: Any]) throws -> CVPixelBuffer {
-        var pixel: CVPixelBuffer?
-        guard CVPixelBufferCreate(kCFAllocatorDefault, 160, 96, kCVPixelFormatType_32BGRA,
-                                  attributes as CFDictionary, &pixel) == kCVReturnSuccess,
-              let pixel else { throw SelectionVideoTestFailure.sample }
-        CVPixelBufferLockBaseAddress(pixel, [])
-        defer { CVPixelBufferUnlockBaseAddress(pixel, []) }
-        guard let base = CVPixelBufferGetBaseAddress(pixel) else { throw SelectionVideoTestFailure.sample }
-        let bytes = base.assumingMemoryBound(to: UInt8.self)
-        let row = CVPixelBufferGetBytesPerRow(pixel)
-        let marker = ((frame / 3) * 11) % 144
-        for y in 0..<96 {
-            for x in 0..<160 {
-                let offset = y * row + x * 4
-                let blue = x >= marker && x < marker + 16
-                bytes[offset] = blue ? 240 : 24
-                bytes[offset + 1] = !blue && identity == .b ? 240 : 24
-                bytes[offset + 2] = !blue && identity == .a ? 240 : 24
-                bytes[offset + 3] = 255
-            }
-        }
-        return pixel
-    }
-
-    private static func makeAudioDescription() throws -> CMAudioFormatDescription {
-        var format = AudioStreamBasicDescription(mSampleRate: 48_000, mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked, mBytesPerPacket: 8,
-            mFramesPerPacket: 1, mBytesPerFrame: 8, mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0)
-        var description: CMAudioFormatDescription?
-        guard CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &format,
-            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil,
-            formatDescriptionOut: &description) == noErr, let description else { throw SelectionVideoTestFailure.sample }
-        return description
-    }
-
-    private static func makeAudioChunk(start: Int, description: CMAudioFormatDescription,
-                                       frequency: Double) throws -> CMSampleBuffer {
-        var samples = [Float](repeating: 0, count: 4_000)
-        for frame in 0..<2_000 {
-            let value = Float(0.2 * sin(2 * .pi * frequency * Double(start + frame) / 48_000))
-            samples[frame * 2] = value; samples[frame * 2 + 1] = value
-        }
-        var block: CMBlockBuffer?
-        let bytes = samples.count * MemoryLayout<Float>.size
-        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
-            blockLength: bytes, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-            offsetToData: 0, dataLength: bytes, flags: 0, blockBufferOut: &block) == kCMBlockBufferNoErr,
-              let block else { throw SelectionVideoTestFailure.sample }
-        let copied = samples.withUnsafeBytes {
-            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
-                                          offsetIntoDestination: 0, dataLength: bytes)
-        }
-        guard copied == kCMBlockBufferNoErr else { throw SelectionVideoTestFailure.sample }
-        var sample: CMSampleBuffer?
-        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault,
-            dataBuffer: block, formatDescription: description, sampleCount: 2_000,
-            presentationTimeStamp: CMTime(value: Int64(start), timescale: 48_000), packetDescriptions: nil,
-            sampleBufferOut: &sample) == noErr, let sample else { throw SelectionVideoTestFailure.sample }
-        return sample
-    }
 }
 
 @MainActor

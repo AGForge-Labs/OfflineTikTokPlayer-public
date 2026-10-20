@@ -76,7 +76,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var audioPollTask: Task<Void, Never>?
     @ObservationIgnored private var audioVisit: Int64 = -1
     @ObservationIgnored private var audioToken = 0
-    @ObservationIgnored private var syncingVideo = false
+    @ObservationIgnored private var syncingVideoGeneration: Int?
     @ObservationIgnored private var audioLoadingID: String?
     @ObservationIgnored private var pendingAudioSeek: (seek: PlaybackTimeline.Seek, version: Int)?
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
@@ -152,6 +152,7 @@ final class PlaybackService: NSObject {
         surface = PlayerSurface(player: player)
         player.isMuted = true
         self.buffer.automaticAdvancementEnabled = false
+        self.buffer.usesExternalClock = true
         player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
         self.buffer.didAdvance = { [weak self] prepared in
             guard let self else { return }
@@ -350,6 +351,7 @@ final class PlaybackService: NSObject {
         loadTask?.cancel(); itemObservation = nil; frameMonitor.cancel(); observedItem = nil; readyGeneration = nil
         audioCheckTask?.cancel(); hasAudioTrack = nil
         isVideoReady = false
+        if intent.canPlay { message = nil }
         warmTask?.cancel()
         clock.reset(position: position, duration: current?.duration ?? 0)
         isLoading = true
@@ -372,6 +374,7 @@ final class PlaybackService: NSObject {
             prepareUpcoming()
             return
         }
+        if !selectedAtRequest && !audioAlreadySelected { continuousAudio.clearSelection() }
         player.pause(); buffer.replace(with: nil)
         loadTask = Task { [weak self] in
             guard let self else { return }
@@ -426,10 +429,13 @@ final class PlaybackService: NSObject {
                     return
                 }
                 catch {
-                    guard self.generation == request else { return }
-                    if !self.wantsToPlay { self.isLoading = false; return }
-                    self.queue.markUnavailable(item.id)
-                    guard self.queue.next() != nil else { break }
+                    guard self.generation == request, !Task.isCancelled else { return }
+                    self.continuousAudio.clearSelection()
+                    self.audioLoadingID = nil; self.isLoading = false
+                    self.pause()
+                    self.recordDiagnostic(.sourcePreparationFailed)
+                    self.message = "This video could not be prepared. Tap Play to retry or choose another video."
+                    return
                 }
             }
             guard self.generation == request else { return }
@@ -591,7 +597,8 @@ final class PlaybackService: NSObject {
     }
 
     private func resumeContinuousAudio() {
-        guard intent.canPlay, continuousAudio.isSelected else { return }
+        guard intent.canPlay, audioLoadingID == nil, continuousAudio.isSelected,
+              continuousAudio.selectedID == queue.currentID else { return }
         do { try continuousAudio.setPlaying(true) }
         catch {
             intent.activationCompleted(succeeded: false)
@@ -663,27 +670,33 @@ final class PlaybackService: NSObject {
     }
 
     private func synchronizeVideoToAudio(force: Bool = false) {
-        guard videoAllowed, continuousAudio.isSelected, audioLoadingID == nil, !syncingVideo,
+        guard videoAllowed, continuousAudio.isSelected, audioLoadingID == nil, syncingVideoGeneration != generation,
               let item = player.currentItem, item.status == .readyToPlay else { return }
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         let position = continuousAudio.presentationPosition(at: hostTime)
         guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
-        syncingVideo = true
         let request = generation
+        syncingVideoGeneration = request
         player.seek(to: CMTime(seconds: position, preferredTimescale: 48_000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
             Task { @MainActor in
-                guard let self else { return }
-                self.syncingVideo = false
-                guard finished, self.generation == request, self.player.currentItem === item, self.videoAllowed else { return }
-                if !self.intent.canPlay {
-                    let desired = self.continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
-                    if abs((item?.currentTime().seconds ?? desired) - desired) > 0.080 { self.synchronizeVideoToAudio(force: true) }
+                guard let self, self.syncingVideoGeneration == request else { return }
+                self.syncingVideoGeneration = nil
+                guard finished, let item, self.generation == request,
+                      self.player.currentItem === item, self.videoAllowed else { return }
+                let host = CMClockGetTime(CMClockGetHostTimeClock())
+                let desired = self.continuousAudio.presentationPosition(at: host)
+                if !self.intent.canPlay, abs(item.currentTime().seconds - desired) > 0.080 {
+                    self.synchronizeVideoToAudio(force: true)
                     return
                 }
+                // The display layer also needs the requested paused/restored position,
+                // even before the engine has acknowledged its first selection command.
+                self.continuousPiP.updatePlayback(positionSeconds: desired, durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay)
+                if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
+                guard self.intent.canPlay else { return }
                 // AVPlayer schedules the muted video on the system host clock;
                 // it never gates the audio render callback or its next boundary.
-                let host = CMClockGetTime(CMClockGetHostTimeClock())
-                self.player.setRate(1, time: CMTime(seconds: self.continuousAudio.presentationPosition(at: host), preferredTimescale: 48_000),
+                self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000),
                                     atHostTime: host)
             }
         }

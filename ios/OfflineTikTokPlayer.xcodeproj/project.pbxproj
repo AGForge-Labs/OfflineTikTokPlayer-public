@@ -464,6 +464,26 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "823D92756EFEACD3CFB746BD";
 		};
+		"A8F6764A13156B91EFA7EB79" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-selection-a.mp4";
+			"sourceTree" = "<group>";
+		};
+		"768C483BD57061BC08CB7E54" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "A8F6764A13156B91EFA7EB79";
+		};
+		"E9555D2EA4D7A1795504F02E" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-selection-b.mp4";
+			"sourceTree" = "<group>";
+		};
+		"494447A8A2A13E1E9DC6CC13" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "E9555D2EA4D7A1795504F02E";
+		};
 		"1F42C7A72E48159A7F757E9D" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "audio.mp3";
@@ -477,6 +497,8 @@
 		"49D98E474BBBDF405BABEA93" = {
 			"isa" = "PBXGroup";
 			"children" = (
+				"A8F6764A13156B91EFA7EB79",
+				"E9555D2EA4D7A1795504F02E",
 				"1F42C7A72E48159A7F757E9D",
 			);
 			"path" = "Fixtures";
@@ -934,6 +956,8 @@
 			"isa" = "PBXResourcesBuildPhase";
 			"buildActionMask" = 2147483647;
 			"files" = (
+				"768C483BD57061BC08CB7E54",
+				"494447A8A2A13E1E9DC6CC13",
 				"2D6F617377A1E9DB15C50254",
 				"911E24FB09AD366501E79934",
 				"BB25FB65101CB3C0DC7A87DA",

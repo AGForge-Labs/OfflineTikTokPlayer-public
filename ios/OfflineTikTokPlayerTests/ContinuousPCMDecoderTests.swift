@@ -412,9 +412,23 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let editedTrack = try XCTUnwrap(editedTracks.first, "The MOV offset fixture must retain its PCM track")
         let range = try await editedTrack.load(.timeRange)
         let duration = try await editedAsset.load(.duration)
+        let segments = try await editedTrack.load(.segments)
+        let content = try XCTUnwrap(segments.first { !$0.isEmpty },
+            "The MOV fixture must retain a nonempty PCM edit segment")
+        let contentStart = CMTime(value: 4_800, timescale: 48_000)
         let presentationEnd = CMTime(value: 16_800, timescale: 48_000)
-        XCTAssertEqual(CMTimeCompare(range.start, CMTime(value: 4_800, timescale: 48_000)), 0,
-            "The MOV fixture must preserve the exact 0.1-second track offset")
+        // The track range includes its leading empty edit; the content segment
+        // identifies the exact offset without treating presentation silence as priming.
+        XCTAssertEqual(CMTimeCompare(content.timeMapping.target.start, contentStart), 0,
+            "The MOV PCM content must start at exactly 0.1 seconds")
+        XCTAssertEqual(CMTimeCompare(content.timeMapping.target.end, presentationEnd), 0,
+            "The MOV PCM content must retain its complete 12,000-frame span")
+        if let first = segments.first, first.isEmpty {
+            XCTAssertEqual(CMTimeCompare(first.timeMapping.target.start, .zero), 0,
+                "The leading empty edit must begin at presentation zero")
+            XCTAssertEqual(CMTimeCompare(first.timeMapping.target.end, contentStart), 0,
+                "The leading empty edit must preserve all 4,800 quiet frames")
+        }
         XCTAssertEqual(CMTimeCompare(range.end, presentationEnd), 0,
             "The MOV track must end at exactly 0.35 seconds")
         XCTAssertEqual(CMTimeCompare(duration, presentationEnd), 0,

@@ -19,6 +19,7 @@ final class PlaybackBuffer {
     private var observation: NSKeyValueObservation?
     var didAdvance: ((Prepared) -> Void)?
     var automaticAdvancementEnabled = true { didSet { updateEndAction() } }
+    var usesExternalClock = false { didSet { updateEndAction() } }
     var previousMediaID: String? { previous?.mediaID }
     var retainedItems: [AVPlayerItem] {
         var ids = Set<ObjectIdentifier>()
@@ -45,7 +46,9 @@ final class PlaybackBuffer {
         // Full local files need no HTTP stall-minimization delay. Streamed items
         // keep AVFoundation's waiting/recovery policy until a verified local handoff.
         let localWindow = active?.isLocal == true && next?.isLocal != false && loopReserve?.isLocal != false
-        player.automaticallyWaitsToMinimizeStalling = !localWindow
+        // Host-clock setRate requires waiting disabled, including while a remote
+        // neighbour is staged. Standalone streamed players retain automatic recovery.
+        player.automaticallyWaitsToMinimizeStalling = !usesExternalClock && !localWindow
     }
 
     private func retainPrevious(before prepared: Prepared) {

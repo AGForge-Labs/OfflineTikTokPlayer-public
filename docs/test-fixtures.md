@@ -15,3 +15,26 @@ ffmpeg -hide_banner -loglevel error -threads 1 -i ios/OfflineTikTokPlayerTests/t
 The file is 30,719 bytes with SHA-256 `c1360da578e7878e64d6f73634cff9bf9f00a77278e6a16ad2d6f89f1f119101`. SHA-256 over the copied encoded audio packets is `7b5c46b6c23ff848a25b027402967cb56be6e9da29566286781b61394fad4bbd` for both source and derivative. FFprobe reports mono MP3 at 44.1 kHz, start 0.025057 seconds, and container duration 1.253878 seconds; native tests must use the new file's presentation metadata rather than assuming the MP4's 1.207007-second edit duration transferred.
 
 Importer URL fixtures use consistent fixture_creator identities and short synthetic IDs. Token-like query values are redaction-test markers rather than account credentials. Runtime authenticated libraries, imported catalogs, cached media and session state stay outside source.
+
+## Selected-video compositor fixtures
+
+`Fixtures/test-selection-a.mp4` and `Fixtures/test-selection-b.mp4` are generated
+entirely from FFmpeg color, overlay and sine sources by
+`scripts/generate-selection-fixtures.py`, using one encoder worker at a time.
+Both contain 30 seconds of 160 by 96 H.264 video at 24 fps and 48 kHz stereo AAC.
+A is red with a 440 Hz tone; B is green with an 880 Hz tone. A blue 16-pixel bar
+moves horizontally every eighth of a second. They contain no user recordings.
+Native tests independently decode their tones and inspect actual Simulator
+compositor screenshots for source color, poster exclusion, marker motion and a
+restored paused frame's marker position. The tests do not encode media at runtime.
+
+| File | Bytes | SHA-256 |
+| --- | ---: | --- |
+| test-selection-a.mp4 | 395,890 | `666017d389c30c55b35066a718158d287360f60c0f96370e9e39507ad7627d75` |
+| test-selection-b.mp4 | 395,605 | `d9da16bdaa03f447f113c42c0118a6a33a08125894861a09fbc1c53b0f750e65` |
+
+The offset-preservation decoder test separately exports lossless PCM in MOV. It
+asserts the nonempty edit's exact 0.1-second offset, the complete 0.35-second
+presentation, all 4,800 leading quiet frames and all 16,800 converted frames.
+An AAC export can quantize that composition's duration, so it is unsuitable as
+an exact 16,800-frame reference for this lossless placement regression.
