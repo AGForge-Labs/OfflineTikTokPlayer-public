@@ -84,6 +84,28 @@ def test_child_tools_do_not_inherit_the_master_delivery_secret(delivery, monkeyp
     assert result.strip() == b"absent"
 
 
+def test_split_public_credentials_are_not_inherited_by_child_tools(delivery, monkeypatch):
+    names = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD", "APPLE_PROVISIONING_PROFILE_BASE64", "APP_STORE_CONNECT_KEY_BASE64")
+    for name in names:
+        monkeypatch.setenv(name, "private-fixture")
+    command = "import os; print(any(os.environ.get(n) for n in " + repr(names) + "))"
+    assert delivery.run_tool([sys.executable, "-c", command]).strip() == b"False"
+
+
+def test_split_public_configuration_preserves_the_approved_existing_identity(delivery):
+    env = dict(APPLE_CERTIFICATE_BASE64=base64.b64encode(b"fixture-p12").decode(),
+               APPLE_PROVISIONING_PROFILE_BASE64=base64.b64encode(b"fixture-cms").decode(),
+               APPLE_CERTIFICATE_PASSWORD="fixture-password", APPLE_CERTIFICATE_SHA256="a" * 64,
+               APP_STORE_CONNECT_KEY_BASE64=base64.b64encode(b"-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----").decode(),
+               APP_STORE_CONNECT_KEY_ID="ABC1234567", APP_STORE_CONNECT_ISSUER_ID="11111111-2222-4333-8444-555555555555")
+    config = delivery.public_configuration(env)
+    assert config["teamID"] == TEAM
+    assert config["certificateSHA256"] == "a" * 64
+    assert config["apiKeyRole"] == "Developer"
+    with pytest.raises(ValueError):
+        delivery.public_configuration({**env, "APPLE_CERTIFICATE_SHA256": ""})
+
+
 def test_delivery_credentials_are_accepted_only_for_the_approved_team_and_role(delivery):
     config = dict(teamID=TEAM, apiKeyRole="Developer", apiKeyID="ABC1234567",
                   issuerID="11111111-2222-4333-8444-555555555555", certificatePassword="fixture-only",
