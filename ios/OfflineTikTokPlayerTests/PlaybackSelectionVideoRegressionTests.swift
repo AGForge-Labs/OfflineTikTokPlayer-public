@@ -404,32 +404,51 @@ final class SelectionVideoFixture {
         guard writer.startWriting() else { throw writer.error ?? SelectionVideoTestFailure.writer }
         writer.startSession(atSourceTime: .zero)
         let audioDescription = try makeAudioDescription()
-        for frame in 0..<144 {
-            try await ready(video, writer: writer)
-            let pixel = try makePixel(frame: frame, identity: identity, attributes: attributes)
-            guard pixels.append(pixel, withPresentationTime: CMTime(value: Int64(frame), timescale: 24)) else {
-                throw writer.error ?? SelectionVideoTestFailure.writer
-            }
-            try await ready(audio, writer: writer)
-            let sample = try makeAudioChunk(start: frame * 2_000, description: audioDescription,
-                                            frequency: identity == .a ? 440 : 880)
-            guard audio.append(sample) else { throw writer.error ?? SelectionVideoTestFailure.writer }
+        var videoFrames = 0, audioChunks = 0
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + 3
+        func logWriter(_ phase: String) {
+            print("SelectionWriter source=\(identity.rawValue) phase=\(phase) videoFrames=\(videoFrames) audioChunks=\(audioChunks) videoReady=\(video.isReadyForMoreMediaData) audioReady=\(audio.isReadyForMoreMediaData) status=\(writer.status.rawValue) errorCode=\((writer.error as NSError?)?.code ?? 0) elapsed=\(ProcessInfo.processInfo.systemUptime - started)")
         }
-        writer.endSession(atSourceTime: CMTime(value: 6, timescale: 1))
-        video.markAsFinished(); audio.markAsFinished()
-        await writer.finishWriting()
-        guard writer.status == .completed else { throw writer.error ?? SelectionVideoTestFailure.writer }
-        finished = true
-    }
-
-    private static func ready(_ input: AVAssetWriterInput, writer: AVAssetWriter) async throws {
-        let deadline = ProcessInfo.processInfo.systemUptime + 3
-        while !input.isReadyForMoreMediaData {
+        // Each encoder/mux input may apply backpressure independently. Waiting for one
+        // input before feeding the other can starve the track the writer needs next.
+        while videoFrames < 144 || audioChunks < 144 {
             guard writer.status == .writing, ProcessInfo.processInfo.systemUptime < deadline else {
+                logWriter("feed-stalled")
                 throw writer.error ?? SelectionVideoTestFailure.timeout
             }
-            try await Task.sleep(for: .milliseconds(2))
+            var progressed = false
+            if videoFrames < 144, video.isReadyForMoreMediaData {
+                let pixel = try makePixel(frame: videoFrames, identity: identity, attributes: attributes)
+                guard pixels.append(pixel, withPresentationTime: CMTime(value: Int64(videoFrames), timescale: 24)) else {
+                    logWriter("video-append-failed")
+                    throw writer.error ?? SelectionVideoTestFailure.writer
+                }
+                videoFrames += 1
+                progressed = true
+                if videoFrames == 144 { video.markAsFinished() }
+            }
+            if audioChunks < 144, audio.isReadyForMoreMediaData {
+                let sample = try makeAudioChunk(start: audioChunks * 2_000, description: audioDescription,
+                                               frequency: identity == .a ? 440 : 880)
+                guard audio.append(sample) else {
+                    logWriter("audio-append-failed")
+                    throw writer.error ?? SelectionVideoTestFailure.writer
+                }
+                audioChunks += 1
+                progressed = true
+                if audioChunks == 144 { audio.markAsFinished() }
+            }
+            if !progressed { try await Task.sleep(for: .milliseconds(2)) }
         }
+        writer.endSession(atSourceTime: CMTime(value: 6, timescale: 1))
+        await writer.finishWriting()
+        guard writer.status == .completed else {
+            logWriter("finish-failed")
+            throw writer.error ?? SelectionVideoTestFailure.writer
+        }
+        logWriter("completed")
+        finished = true
     }
 
     private static func makePixel(frame: Int, identity: SelectionVideoIdentity,

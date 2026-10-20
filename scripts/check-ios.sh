@@ -8,6 +8,7 @@ if [ "$#" -eq 1 ] && [ "$1" = "--selection-only" ]; then
     -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionFailureTests
     -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests
     -only-testing:OfflineTikTokPlayerTests/ContinuousAudioPlayerTests
+    -only-testing:OfflineTikTokPlayerTests/ContinuousPCMDecoderTests
   )
 elif [ "$#" -gt 0 ]; then
   printf '%s\n' 'Usage: check-ios.sh [--selection-only]' >&2

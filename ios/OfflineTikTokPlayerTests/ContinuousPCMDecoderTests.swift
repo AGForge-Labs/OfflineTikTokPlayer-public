@@ -386,7 +386,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = directory.appendingPathComponent("tone.caf")
-        let edited = directory.appendingPathComponent("offset.m4a")
+        let edited = directory.appendingPathComponent("offset.mov")
         let samples = (0..<12_000).flatMap { frame -> [Float] in
             let value = Float(sin(Double(frame) * 0.071)) * 0.2
             return [value, -value]
@@ -399,20 +399,43 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let composed = try XCTUnwrap(composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid))
         try composed.insertTimeRange(CMTimeRange(start: .zero, duration: CMTime(value: 12_000, timescale: 48_000)),
             of: track, at: CMTime(value: 4_800, timescale: 48_000))
-        let export = try XCTUnwrap(AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A))
-        try await export.export(to: edited, as: .m4a)
-        let expected = try await independentlyDecode(AVURLAsset(url: edited), diagnosticName: "exported-audio-offset")
-        XCTAssertGreaterThan(expected.map { abs($0) }.max() ?? 0, 0.01, "The edited AAC reference must retain its tone")
+        // Preserve the PCM and its edit offset without AAC export quantization.
+        let export = try XCTUnwrap(AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetPassthrough),
+            "The offset fixture requires lossless PCM passthrough export")
+        guard export.supportedFileTypes.contains(.mov) else {
+            XCTFail("Lossless PCM passthrough must support a MOV offset fixture")
+            throw ContinuousPCMDecoder.Failure.unsupportedPCM
+        }
+        try await export.export(to: edited, as: .mov)
+        let editedAsset = AVURLAsset(url: edited, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        let editedTracks = try await editedAsset.loadTracks(withMediaType: .audio)
+        let editedTrack = try XCTUnwrap(editedTracks.first, "The MOV offset fixture must retain its PCM track")
+        let range = try await editedTrack.load(.timeRange)
+        let duration = try await editedAsset.load(.duration)
+        let presentationEnd = CMTime(value: 16_800, timescale: 48_000)
+        XCTAssertEqual(CMTimeCompare(range.start, CMTime(value: 4_800, timescale: 48_000)), 0,
+            "The MOV fixture must preserve the exact 0.1-second track offset")
+        XCTAssertEqual(CMTimeCompare(range.end, presentationEnd), 0,
+            "The MOV track must end at exactly 0.35 seconds")
+        XCTAssertEqual(CMTimeCompare(duration, presentationEnd), 0,
+            "The MOV asset must present exactly 16,800 frames at 48 kHz")
+        let formats = try await editedTrack.load(.formatDescriptions)
+        let format = try XCTUnwrap(formats.first)
+        let asbd = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(format))
+        XCTAssertEqual(asbd.pointee.mFormatID, kAudioFormatLinearPCM, "The offset fixture must remain lossless PCM")
+        XCTAssertEqual(asbd.pointee.mSampleRate, 48_000)
+        let expected = try await independentlyDecode(editedAsset, diagnosticName: "exported-audio-offset")
+        XCTAssertGreaterThan(expected.map { abs($0) }.max() ?? 0, 0.01, "The edited PCM reference must retain its tone")
         XCTAssertEqual(expected.count, 16_800 * 2)
-        XCTAssertTrue(expected.prefix(8_000).allSatisfy { abs($0) < 0.00001 })
+        XCTAssertTrue(expected.prefix(4_800 * 2).allSatisfy { abs($0) < 0.00001 })
         let renderer = ContinuousPCMRenderer(prefixFrames: 20_000, ringFrames: 512)
         let decoder = ContinuousPCMDecoder(renderer: renderer)
         defer { decoder.shutdown() }
         let prepared = try await decoder.prepare(url: edited, token: 1, slot: 0)
         XCTAssertEqual(prepared.totalFrames, 16_800)
         renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
-        var actual = [Float](repeating: .nan, count: expected.count)
-        actual.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: expected.count / 2) }
+        var actual = [Float](repeating: .nan, count: 16_800 * 2)
+        actual.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 16_800) }
         assertSamples(actual, equal: expected)
     }
 
