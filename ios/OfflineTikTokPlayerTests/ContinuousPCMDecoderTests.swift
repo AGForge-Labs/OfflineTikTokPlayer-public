@@ -120,8 +120,10 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         XCTAssertEqual(reports.withLock { $0 }, 0, "A tail-only reader cannot know source leading/trailing quiet frames")
     }
 
-    func testPreparedAACAndMP3VideosJoinInTheProductionGraphAndReverseWithoutExtraFrames() async throws {
-        let urls = try ["test-video", "test-slideshow-mp3"].map {
+    func testPreparedAACAndALACVideosJoinInTheProductionGraphAndReverseWithoutExtraFrames() async throws {
+        // The original MP3-in-MP4 asset has no iOS-readable audio track. The
+        // archived iPhone compatibility derivative contains lossless ALAC.
+        let urls = try ["test-video", "test-slideshow-mp3.iphone"].map {
             try XCTUnwrap(Bundle(for: Self.self).url(forResource: $0, withExtension: "mp4"))
         }
         let first = try await independentlyDecode(AVURLAsset(url: urls[0]))
@@ -161,7 +163,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             return [value, -value]
         }
         try writePCM(samples, to: url, sampleRate: 44_100)
-        let expected = try await independentlyDecode(AVURLAsset(url: url))
+        let expected = try await independentlyDecode(AVURLAsset(url: url), diagnosticName: "sample-rate-44100-to-48000")
         let renderer = ContinuousPCMRenderer(prefixFrames: 20_000, ringFrames: 512)
         let decoder = ContinuousPCMDecoder(renderer: renderer)
         defer { decoder.shutdown() }
@@ -224,7 +226,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             of: track, at: CMTime(value: 4_800, timescale: 48_000))
         let export = try XCTUnwrap(AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A))
         try await export.export(to: edited, as: .m4a)
-        let expected = try await independentlyDecode(AVURLAsset(url: edited))
+        let expected = try await independentlyDecode(AVURLAsset(url: edited), diagnosticName: "exported-audio-offset")
         XCTAssertEqual(expected.count, 16_800 * 2)
         XCTAssertTrue(expected.prefix(8_000).allSatisfy { abs($0) < 0.00001 })
         let renderer = ContinuousPCMRenderer(prefixFrames: 20_000, ringFrames: 512)
@@ -278,16 +280,20 @@ final class ContinuousPCMDecoderTests: XCTestCase {
     }
 
     /// Independent decoder comparison deliberately avoids the production timestamp/chunk helpers.
-    private func independentlyDecode(_ asset: AVAsset) async throws -> [Float] {
+    private func independentlyDecode(_ asset: AVAsset, diagnosticName: String? = nil) async throws -> [Float] {
         let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first, "Synthetic fixture needs an iOS-readable audio track")
         let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderAudioMixOutput(audioTracks: Array(tracks.prefix(1)), audioSettings: [
+        let output = AVAssetReaderAudioMixOutput(audioTracks: [track], audioSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
             AVLinearPCMIsFloatKey: true, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false
         ])
         reader.add(output)
         XCTAssertTrue(reader.startReading())
         var samples: [Float] = []
+        var packets = 0
+        var firstPacket: [String: Double]?
+        var lastPackets: [[String: Double]] = []
         while let sample = output.copyNextSampleBuffer(), let block = CMSampleBufferGetDataBuffer(sample) {
             var bytes = Data(count: CMBlockBufferGetDataLength(block))
             let status = bytes.withUnsafeMutableBytes {
@@ -295,8 +301,40 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             }
             XCTAssertEqual(status, kCMBlockBufferNoErr)
             bytes.withUnsafeBytes { samples.append(contentsOf: $0.bindMemory(to: Float.self)) }
+            if diagnosticName != nil {
+                func trimSeconds(_ key: CFString) -> Double {
+                    guard let dictionary = CMGetAttachment(sample, key: key, attachmentModeOut: nil) as? [String: Any] else { return 0 }
+                    return CMTimeMakeFromDictionary(dictionary as CFDictionary).seconds
+                }
+                let asbd = CMSampleBufferGetFormatDescription(sample).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0) }
+                let packet: [String: Double] = [
+                    "packet": Double(packets), "byteFrames": Double(bytes.count / 8),
+                    "numSamples": Double(CMSampleBufferGetNumSamples(sample)),
+                    "sampleRate": asbd?.pointee.mSampleRate ?? -1,
+                    "rawPTS": CMSampleBufferGetPresentationTimeStamp(sample).seconds,
+                    "outputPTS": CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds,
+                    "rawDuration": CMSampleBufferGetDuration(sample).seconds,
+                    "outputDuration": CMSampleBufferGetOutputDuration(sample).seconds,
+                    "trimStart": trimSeconds(kCMSampleBufferAttachmentKey_TrimDurationAtStart),
+                    "trimEnd": trimSeconds(kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+                ].mapValues { $0.isFinite ? $0 : -1 }
+                if firstPacket == nil { firstPacket = packet }
+                lastPackets.append(packet)
+                if lastPackets.count > 3 { lastPackets.removeFirst() }
+                packets += 1
+            }
         }
         XCTAssertEqual(reader.status, .completed)
+        if let diagnosticName {
+            let duration = try await asset.load(.duration)
+            let range = try await track.load(.timeRange)
+            let metrics: [String: Any] = ["fixture": diagnosticName, "assetSeconds": duration.seconds,
+                "trackStartSeconds": range.start.seconds, "trackEndSeconds": range.end.seconds,
+                "decodedFrames": samples.count / 2, "packets": packets,
+                "first": firstPacket ?? [:], "last": lastPackets]
+            let data = try JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys])
+            print("PCM_PACKET_DIAGNOSTICS " + String(decoding: data, as: UTF8.self))
+        }
         return samples
     }
 }

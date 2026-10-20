@@ -132,7 +132,7 @@ final class ContinuousAudioPlayer {
         // started again only after the service has reactivated its session.
         renderer.setPlaying(playing)
         do {
-            if playing, !graph.engine.isRunning { try graph.engine.start() }
+            if playing, !graph.engine.isRunning { graph.engine.prepare(); try graph.engine.start() }
             renderingPermitted = playing
         } catch {
             renderer.setPlaying(false); renderingPermitted = false

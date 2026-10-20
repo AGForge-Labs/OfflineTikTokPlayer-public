@@ -17,7 +17,7 @@ final class PlaybackContinuityTests: XCTestCase {
         service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
         try await until { service.audioSnapshot.frame > 2_400 }
         service.seek(0.8); service.seek(0.2); service.pause()
-        try await until { abs(service.clock.position - 0.2) < 0.02 }
+        try await until { abs(service.clock.position - 0.2) < 0.02 && service.audioSnapshot.frame == 9_600 }
         let frame = service.audioSnapshot.frame
         try await Task.sleep(for: .milliseconds(80))
         XCTAssertEqual(service.audioSnapshot.frame, frame)

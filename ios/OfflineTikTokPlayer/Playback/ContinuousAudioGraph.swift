@@ -81,6 +81,5 @@ final class ContinuousAudioGraph {
         }
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
-        engine.prepare()
     }
 }
