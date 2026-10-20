@@ -73,7 +73,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let downloads: OfflineDownloads
     @ObservationIgnored private let cloud: OneDriveClient
     @ObservationIgnored private let buffer: PlaybackBuffer
-    @ObservationIgnored private let continuousAudio = ContinuousAudioPlayer()
+    @ObservationIgnored private let continuousAudio: ContinuousAudioPlayer
     @ObservationIgnored private var audioPollTask: Task<Void, Never>?
     @ObservationIgnored private var audioVisit: Int64 = -1
     @ObservationIgnored private var audioToken = 0
@@ -86,6 +86,7 @@ final class PlaybackService: NSObject {
     var pausedFutureVideoFrameRejectionCount: UInt64 { continuousPiP.pausedFutureFrameRejectionCount }
     var videoFrameAcquisitionBlockedCount: UInt64 { continuousPiP.blockedFrameAcquisitionCount }
     var submittedVideoFrameCount: UInt64 { continuousPiP.submittedFrameCount }
+    var customVideoReadyForDisplay: Bool { continuousPiP.isVideoReadyForDisplay }
     var videoRequestedPositionSeconds: Double { continuousPiP.requestedPositionSeconds }
     var videoTimebasePositionSeconds: Double? { continuousPiP.timebasePositionSeconds }
     var preparedAudioCount: Int { continuousAudio.preparedCount }
@@ -126,6 +127,7 @@ final class PlaybackService: NSObject {
          bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
          activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) },
          buffer: PlaybackBuffer? = nil, speakerAudio: SpeakerAudioController? = nil,
+         continuousAudio: ContinuousAudioPlayer? = nil,
          audioRoutes: @escaping () -> [AVAudioSession.Port] = { AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType) },
          seekPlayer: @escaping SeekPlayer = { player, time, completion in
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
@@ -136,6 +138,7 @@ final class PlaybackService: NSObject {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
         self.buffer = buffer ?? PlaybackBuffer()
+        self.continuousAudio = continuousAudio ?? ContinuousAudioPlayer()
         self.speakerAudio = speakerAudio ?? SpeakerAudioController()
         self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
         self.seekVideo = seekVideo

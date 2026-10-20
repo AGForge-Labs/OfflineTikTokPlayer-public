@@ -72,7 +72,7 @@ def validate_workflow(config):
 
 def validate_public_workflow(config):
     """Allow only this task's standard, public, unsigned simulator validation."""
-    expected_trigger = {"push": {"branches": ["fix/playback-continuity", "fix/continuous-pcm-playback", "fix/selected-video-regression", "fix/ui-shell-dismissal-sync"],
+    expected_trigger = {"push": {"branches": ["fix/playback-continuity", "fix/continuous-pcm-playback", "fix/selected-video-regression", "fix/ui-shell-dismissal-sync", "fix/playback-start-latency"],
         "paths": ["ios/**", "scripts/**", "tests/apple-playback/**", "tests/validation-shell/**", ".github/workflows/playback-validation.yml"]}}
     public_guard = "${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}"
     job = config.get("jobs", {}).get("ios", {})
