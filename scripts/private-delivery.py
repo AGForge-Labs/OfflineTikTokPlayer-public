@@ -8,6 +8,7 @@ import base64
 import binascii
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,24 @@ import uuid
 TEAM = "YU2A5J5978"
 BUNDLE = "dev.galaxybigbird.OfflineTikTokPlayer"
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def public_configuration(env):
+    """Use individually protected inputs; never extract the old repository secret."""
+    try:
+        config = dict(teamID=TEAM, apiKeyRole="Developer",
+                      apiKeyID=env["APP_STORE_CONNECT_KEY_ID"], issuerID=env["APP_STORE_CONNECT_ISSUER_ID"],
+                      certificatePassword=env["APPLE_CERTIFICATE_PASSWORD"],
+                      certificateP12=env["APPLE_CERTIFICATE_BASE64"],
+                      provisioningProfile=env["APPLE_PROVISIONING_PROFILE_BASE64"],
+                      apiPrivateKey=base64.b64decode(env["APP_STORE_CONNECT_KEY_BASE64"], validate=True).decode("utf-8"),
+                      certificateSHA256=env["APPLE_CERTIFICATE_SHA256"])
+        if not re.fullmatch(r"[0-9a-f]{64}", config["certificateSHA256"]):
+            raise ValueError
+        validate_configuration(config)
+        return config
+    except (KeyError, ValueError, UnicodeError, binascii.Error):
+        raise ValueError("Protected public signing inputs are incomplete or invalid.") from None
 
 
 def validate_build_number(value):
@@ -87,6 +106,9 @@ def run_tool(args, *, visible=False, **kwargs):
     # Several security commands take passwords as arguments. Never format their exceptions or command lines.
     environment = dict(kwargs.pop("env", os.environ))
     environment.pop("APPLE_PRIVATE_DELIVERY", None)
+    for name in ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD", "APPLE_PROVISIONING_PROFILE_BASE64",
+                 "APP_STORE_CONNECT_KEY_BASE64"):
+        environment.pop(name, None)
     result = subprocess.run(args, stdout=None if visible else subprocess.PIPE,
                             stderr=None if visible else subprocess.PIPE, env=environment, **kwargs)
     if result.returncode:
@@ -110,6 +132,9 @@ def materialize(config, directory):
     run_tool(["openssl", "pkcs12", "-in", str(certificate), "-passin", "file:" + str(password),
               "-clcerts", "-nokeys", "-out", str(cert_pem)])
     cert_der = run_tool(["openssl", "x509", "-in", str(cert_pem), "-outform", "DER"])
+    if config.get("certificateSHA256"):
+        if hashlib.sha256(cert_der).hexdigest() != config["certificateSHA256"]:
+            raise ValueError("Distribution certificate differs from the approved existing signing identity.")
     profile_uuid = validate_profile(plistlib.loads(decoded), cert_der)
     run_tool(["openssl", "x509", "-in", str(cert_pem), "-checkend", "3600", "-noout"])
     run_tool(["openssl", "pkey", "-in", str(api_key), "-check", "-noout"])
@@ -170,18 +195,27 @@ def upload(config, directory, material, build_number):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upload", action="store_true", help="Archive and upload; omission validates credentials only.")
+    parser.add_argument("--public-release", action="store_true", help="Use the reviewed protected public release route.")
     args = parser.parse_args()
     if sys.platform != "darwin":
         raise ValueError("Private signing requires the approved macOS runner.")
-    if os.environ.get("GITHUB_REPOSITORY") != "AGForge-Labs/OfflineTikTokPlayer" or os.environ.get("GITHUB_REF") != "refs/heads/main":
-        raise ValueError("Private delivery is restricted to the approved repository's main branch.")
-    if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
-        raise ValueError("Private delivery must be deliberately dispatched.")
-    build_number = validate_build_number(os.environ.get("BUILD_NUMBER", ""))
-    try:
-        config = json.loads(os.environ.get("APPLE_PRIVATE_DELIVERY", ""))
-    except (ValueError, TypeError):
-        raise ValueError("The APPLE_PRIVATE_DELIVERY repository secret is missing or invalid.") from None
+    if args.public_release:
+        spec = importlib.util.spec_from_file_location("public_release", ROOT / "scripts/public-release.py")
+        public = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(public)
+        build_number = public.validate_context(os.environ, signing=True)
+        public.verify_checkout(os.environ)
+        config = public_configuration(os.environ)
+    else:
+        if os.environ.get("GITHUB_REPOSITORY") != "AGForge-Labs/OfflineTikTokPlayer" or os.environ.get("GITHUB_REF") != "refs/heads/main":
+            raise ValueError("Private delivery is restricted to the approved repository's main branch.")
+        if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise ValueError("Private delivery must be deliberately dispatched.")
+        build_number = validate_build_number(os.environ.get("BUILD_NUMBER", ""))
+        try:
+            config = json.loads(os.environ.get("APPLE_PRIVATE_DELIVERY", ""))
+        except (ValueError, TypeError):
+            raise ValueError("The APPLE_PRIVATE_DELIVERY repository secret is missing or invalid.") from None
     validate_configuration(config)
     runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="offline-player-signing-", dir=runner_temp) as temporary:

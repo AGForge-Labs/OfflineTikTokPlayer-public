@@ -72,7 +72,7 @@ def validate_workflow(config):
 
 def validate_public_workflow(config):
     """Allow only this task's standard, public, unsigned simulator validation."""
-    expected_trigger = {"push": {"branches": ["fix/playback-continuity"],
+    expected_trigger = {"push": {"branches": ["fix/playback-continuity", "fix/continuous-pcm-playback"],
         "paths": ["ios/**", "scripts/**", "tests/apple-playback/**", ".github/workflows/playback-validation.yml"]}}
     public_guard = "${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}"
     job = config.get("jobs", {}).get("ios", {})
@@ -95,14 +95,76 @@ def validate_public_workflow(config):
         raise ValueError("Only unsigned source and simulator checks are approved.")
 
 
+def validate_public_release_workflow(config):
+    """A separate strict policy for the explicitly approved release infrastructure.
+
+    The existing unsigned validator still rejects all signing/secret access.
+    This policy never dispatches a workflow or grants a credential.
+    """
+    def check(condition):
+        if not condition:
+            raise ValueError("Public release differs from its reviewed owner, source, environment or credential policy.")
+
+    def step(value):
+        check(not re.search(r"\$\{\{", value.get("name", "")))
+        return {key: item for key, item in value.items() if key != "name"}
+
+    try:
+        check(set(config) == {"name", "on", "permissions", "concurrency", "env", "jobs"})
+        check(not re.search(r"\$\{\{", config["name"]))
+        check(config["permissions"] == {"contents": "read"})
+        check(config["concurrency"] == {"group": "public-testflight-release", "cancel-in-progress": "false"})
+        check(set(config["on"]) == {"workflow_dispatch"})
+        inputs = config["on"]["workflow_dispatch"]["inputs"]
+        check(set(inputs) == {"authorize_upload", "expected_commit", "build_number"})
+        for name, kind in (("authorize_upload", "boolean"), ("expected_commit", "string"), ("build_number", "string")):
+            allowed = {"description", "type", "required", "default"} if name == "authorize_upload" else {"description", "type", "required"}
+            check(set(inputs[name]) == allowed and inputs[name]["type"] == kind and inputs[name]["required"] == "true")
+        check(inputs["authorize_upload"]["default"] == "false")
+        check(config["env"] == {"EXPECTED_COMMIT": "${{ inputs.expected_commit }}",
+              "RELEASE_BUILD_NUMBER": "${{ inputs.build_number }}", "RELEASE_AUTHORIZED": "${{ inputs.authorize_upload }}",
+              "PYTHONDONTWRITEBYTECODE": "1"})
+        check(set(config["jobs"]) == {"validate", "release"})
+        validation, release = config["jobs"]["validate"], config["jobs"]["release"]
+        check(set(validation) == {"if", "runs-on", "timeout-minutes", "steps"})
+        check(set(release) == {"needs", "if", "environment", "runs-on", "timeout-minutes", "env", "steps"})
+        gate = ("github.event_name == 'workflow_dispatch' && inputs.authorize_upload && "
+                "github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private && "
+                "github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' && "
+                "github.ref == 'refs/heads/main' && github.run_attempt == 1")
+        check(" ".join(validation["if"].split()) == gate)
+        check(release["needs"] == "validate" and release["if"] == "${{ needs.validate.result == 'success' }}")
+        check(release["environment"] == {"name": "release"})
+        check(release["env"] == {"RELEASE_ENVIRONMENT": "release", "RELEASE_ACCEPTED_COMMIT": "${{ vars.RELEASE_ACCEPTED_COMMIT }}"})
+        check(validation["runs-on"] == release["runs-on"] == "macos-26")
+        check(1 <= int(validation["timeout-minutes"]) <= 25 and 1 <= int(release["timeout-minutes"]) <= 35)
+        checkout = {"uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                    "with": {"ref": "${{ github.sha }}", "persist-credentials": "false"}}
+        check([step(value) for value in validation["steps"]] == [checkout,
+              {"run": "python3 -B scripts/public-release.py check"},
+              {"run": "python3 -B -m unittest discover -s tests/release -v"},
+              {"shell": "bash", "run": "bash scripts/check-ios.sh"}])
+        credentials = {name: "${{ secrets." + name + " }}" for name in (
+            "APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD", "APPLE_PROVISIONING_PROFILE_BASE64", "APP_STORE_CONNECT_KEY_BASE64")}
+        credentials.update({name: "${{ vars." + name + " }}" for name in (
+            "APP_STORE_CONNECT_KEY_ID", "APP_STORE_CONNECT_ISSUER_ID", "APPLE_CERTIFICATE_SHA256")})
+        check([step(value) for value in release["steps"]] == [checkout,
+              {"env": credentials, "run": "python3 -B scripts/public-release.py sign-upload"}])
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError("Public release is missing a required protection.") from None
+
+
 def run_checks(root, *, runner=subprocess.run, platform=sys.platform):
     root = Path(root)
     directory = root / ".github/workflows"
     active = [path for path in directory.iterdir() if path.suffix.lower() in {".yaml", ".yml"}] if directory.exists() else []
     if active:
-        if len(active) != 1 or active[0].name != "playback-validation.yml":
-            raise ValueError("Only the reviewed free public playback validation workflow may be active.")
-        validate_public_workflow(yaml.load(active[0].read_text(encoding="utf-8"), Loader=yaml.BaseLoader))
+        validators = {"playback-validation.yml": validate_public_workflow,
+                      "public-testflight.yml": validate_public_release_workflow}
+        if any(path.name not in validators for path in active):
+            raise ValueError("Only the reviewed public playback and protected release workflows may be present.")
+        for path in active:
+            validators[path.name](yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader))
     workflow = yaml.load((root / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     validate_workflow(workflow)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

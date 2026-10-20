@@ -37,6 +37,23 @@ def test_public_playback_validation_is_standard_unsigned_and_private_guarded(pre
         with pytest.raises(ValueError): preflight.validate_public_workflow(altered)
 
 
+def test_protected_public_release_is_validated_without_weakening_unsigned_checks(preflight):
+    config = yaml.load((ROOT / ".github/workflows/public-testflight.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    preflight.validate_public_release_workflow(config)
+    for change in ("trigger", "owner", "environment", "acceptance", "secret_before_gate", "artifact", "action", "permissions"):
+        altered = copy.deepcopy(config)
+        if change == "trigger": altered["on"]["pull_request_target"] = {}
+        elif change == "owner": altered["jobs"]["validate"]["if"] = "true"
+        elif change == "environment": altered["jobs"]["release"].pop("environment")
+        elif change == "acceptance": altered["jobs"]["release"]["env"].pop("RELEASE_ACCEPTED_COMMIT")
+        elif change == "secret_before_gate": altered["jobs"]["validate"]["steps"][1]["env"] = {"KEY": "${{ secrets.APPLE_CERTIFICATE_BASE64 }}"}
+        elif change == "artifact": altered["jobs"]["release"]["steps"].append({"uses": "actions/upload-artifact@" + "a" * 40})
+        elif change == "action": altered["jobs"]["release"]["steps"][0]["uses"] = "actions/checkout@main"
+        elif change == "permissions": altered["permissions"]["contents"] = "write"
+        with pytest.raises(ValueError):
+            preflight.validate_public_release_workflow(altered)
+
+
 def test_inactive_unsigned_draft_requires_a_deliberate_capped_run(preflight):
     preflight.validate_workflow(workflow())
 
