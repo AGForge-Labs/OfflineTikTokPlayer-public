@@ -116,6 +116,32 @@ the earlier playing-frame pairs. The PCM timeline, source silence and audio
 intent remain unchanged. Full acceptance now expects 89 native tests and one UI
 test; the new candidate is pending validation.
 
+Run [39401227236](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39401227236)
+at `ead31bcb7ee0fafd432beb48317676579f71a1ce` passed 81 core tests, the UI
+test, seven macOS Bash 3 launcher regressions and eleven evidence regressions.
+All 89 native tests executed, with six assertions failing across two cases.
+Those assertions rejected capture windows of 11.05 and 11.29 seconds against
+the fixture's eight-second limit. The host screenshot commands consumed 10.63
+and 10.98 seconds respectively. During both waits, player and PCM time advanced
+about eleven seconds, ownership stayed fixed, no new underruns appeared, and
+custom submissions advanced from 0 to 261 and 72 to 338. These are capture-window
+eligibility failures, not evidence of a frame-feed stall. The run is failed,
+returned 65, and its separate acceptance step correctly did not run.
+
+The deterministic held-completion seek regression passed: at least two attempted
+pulls were blocked while the real native seek completion was held, with no copied
+or submitted frame. Releasing it produced the correct actual compositor marker
+and fresh custom frame while audio remained paused. All other moving-frame
+phases and the `.40`, `.35` and `.60` paused-marker checks passed.
+
+The next change affects only tests and synthetic fixtures. A 16 by 24 pixel marker
+has 240 distinct two-dimensional positions throughout the 30-second clip;
+decoded source pixels verify every position. The tests still require actual
+visible motion greater than three pixels, fresh custom submissions, progressing
+audio/video clocks, fixed ownership, no loop and no new underruns. The entire
+capture window must remain below 29 seconds of wall, media and PCM time. Capture
+errors still fail immediately. Native acceptance of this revision is pending.
+
 Unsigned validation keeps Xcode's build queue at one job and disables parallel
 tests. It now also exports `SWIFTC_MAXIMUM_DETERMINISM=1`, confirms the selected
 Swift driver's one-job override with a print-only plan before compilation, and

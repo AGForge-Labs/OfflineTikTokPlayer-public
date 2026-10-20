@@ -431,6 +431,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                   label: label + "-motion-start", file: file, line: line) else { return }
         do {
             let firstBar = try XCTUnwrap(first.blueBarCenter, "The first composite must contain its decoded blue marker", file: file, line: line)
+            let firstBarY = try XCTUnwrap(first.blueBarCenterY, "The first composite must locate the blue marker vertically", file: file, line: line)
             let firstSubmitted = service.submittedVideoFrameCount
             XCTAssertGreaterThan(firstSubmitted, 0, "The first image must have a submitted custom frame", file: file, line: line)
             let firstReady = service.isVideoReady && screen.customVideoLayer?.isReadyForDisplay == true
@@ -440,8 +441,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             var visibleDelta = 0.0
             var states = [first.captureBefore, first.captureAfter]
             guard assertMotionCaptureWindow(states, label: label, file: file, line: line) else { return }
-            // The even-stride fixture repeats after nine seconds. Every observation
-            // must fit a strictly shorter real-time and media-time capture window.
+            // The two-dimensional marker is unique throughout the 30-second fixture.
+            // Every observation must fit a shorter real-time and media-time window.
             for observation in 2...3 {
                 let previousTime = service.player.currentTime().seconds
                 let previousAudio = service.audioSnapshot
@@ -476,8 +477,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 let ready = service.isVideoReady && screen.customVideoLayer?.isReadyForDisplay == true
                 XCTAssertTrue(ready, "The actual custom video must remain ready during motion proof", file: file, line: line)
                 let nextBar = try XCTUnwrap(next.blueBarCenter, "Every composite must contain its decoded blue marker", file: file, line: line)
+                let nextBarY = try XCTUnwrap(next.blueBarCenterY, "Every composite must locate the blue marker vertically", file: file, line: line)
                 guard next.fraction(identity) > 0.65, next.magentaFraction < 0.02, ready else { return }
-                visibleDelta = abs(nextBar - firstBar)
+                visibleDelta = hypot(nextBar - firstBar, nextBarY - firstBarY)
                 print("SelectionMotion label=\(label) observation=\(observation) deltaPixels=\(visibleDelta)")
                 if visibleDelta > 3 { break }
             }
@@ -505,14 +507,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let noUnderruns = states.allSatisfy { $0.audioUnderrunFrames == first.audioUnderrunFrames }
         print("SelectionMotionWindow label=\(label) captures=\(states.count / 2) wallSeconds=\(wall) mediaSeconds=\(media) pcmSeconds=\(pcm) stableSource=\(stableSource) monotonicPCM=\(monotonicPCM) noUnderruns=\(noUnderruns)")
         XCTAssertGreaterThanOrEqual(wall, 0, file: file, line: line)
-        XCTAssertLessThan(wall, 8, "The capture window must be shorter than the fixture's nine-second marker period", file: file, line: line)
+        XCTAssertLessThan(wall, 29, "The capture window must fit inside the fixture's nonrepeating 30-second presentation", file: file, line: line)
         XCTAssertTrue(validPositions, "Capture media-time brackets must be finite and nonnegative", file: file, line: line)
-        XCTAssertLessThan(media, 8, "The bracketed media window must exclude marker-period aliasing", file: file, line: line)
+        XCTAssertLessThan(media, 29, "The bracketed media window must exclude a full presentation or loop", file: file, line: line)
         XCTAssertGreaterThanOrEqual(pcm, 0, file: file, line: line)
-        XCTAssertLessThan(pcm, 8, file: file, line: line)
+        XCTAssertLessThan(pcm, 29, file: file, line: line)
         XCTAssertTrue(stableSource && monotonicPCM, "No PCM token, visit or loop change may cross the capture window", file: file, line: line)
         XCTAssertTrue(noUnderruns, "audioClockHold/underruns: capture acquisition must not conceal a new PCM underrun", file: file, line: line)
-        return wall >= 0 && wall < 8 && validPositions && media < 8 && pcm >= 0 && pcm < 8
+        return wall >= 0 && wall < 29 && validPositions && media < 29 && pcm >= 0 && pcm < 29
             && stableSource && monotonicPCM && noUnderruns
     }
 
@@ -865,6 +867,8 @@ private struct SelectionVideoPixels {
     let bytes: [UInt8]
     let scaleX: Double
     let scaleY: Double
+    let blueBarCenter: Double?
+    let blueBarCenterY: Double?
     let captureBefore: SelectionVideoCaptureState
     var captureAfter: SelectionVideoCaptureState
     init(_ image: CGImage, scaleX: Double, scaleY: Double, captureBefore: SelectionVideoCaptureState) throws {
@@ -881,27 +885,27 @@ private struct SelectionVideoPixels {
         }
         guard rendered else { throw SelectionVideoTestFailure.capture }
         bytes = storage
+        var sumX = 0.0, sumY = 0.0, blueCount = 0
+        for pixel in 0..<(width * height) {
+            let offset = pixel * 4
+            if storage[offset + 2] > 150 && storage[offset] < 100 && storage[offset + 1] < 100 {
+                sumX += Double(pixel % width)
+                sumY += Double(pixel / width)
+                blueCount += 1
+            }
+        }
+        blueBarCenter = blueCount >= 4 ? sumX / Double(blueCount) : nil
+        blueBarCenterY = blueCount >= 4 ? sumY / Double(blueCount) : nil
     }
 
     func log(label: String, identity: SelectionVideoIdentity) {
-        print("SelectionPixels label=\(label) expected=\(identity.rawValue) fraction=\(fraction(identity)) magenta=\(magentaFraction) blueCenter=\(blueBarCenter.map { String($0) } ?? "missing") scaleX=\(scaleX) scaleY=\(scaleY)")
+        print("SelectionPixels label=\(label) expected=\(identity.rawValue) fraction=\(fraction(identity)) magenta=\(magentaFraction) blueCenterX=\(blueBarCenter.map { String($0) } ?? "missing") blueCenterY=\(blueBarCenterY.map { String($0) } ?? "missing") scaleX=\(scaleX) scaleY=\(scaleY)")
     }
 
     func fraction(_ identity: SelectionVideoIdentity) -> Double {
         fraction { r, g, b in identity == .a ? r > 150 && g < 100 && b < 100 : g > 150 && r < 100 && b < 100 }
     }
     var magentaFraction: Double { fraction { $0 > 150 && $1 < 100 && $2 > 150 } }
-    var blueBarCenter: Double? {
-        var sum = 0.0, count = 0
-        let y = height / 2
-        for x in 0..<width {
-            let offset = (y * width + x) * 4
-            if bytes[offset + 2] > 150 && bytes[offset] < 100 && bytes[offset + 1] < 100 {
-                sum += Double(x); count += 1
-            }
-        }
-        return count >= 4 ? sum / Double(count) : nil
-    }
     private func fraction(_ predicate: (UInt8, UInt8, UInt8) -> Bool) -> Double {
         var count = 0
         for pixel in 0..<(width * height) {

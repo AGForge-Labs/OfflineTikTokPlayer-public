@@ -22,19 +22,21 @@ Importer URL fixtures use consistent fixture_creator identities and short synthe
 entirely from FFmpeg color, overlay and sine sources by
 `scripts/generate-selection-fixtures.py`, using one encoder worker at a time.
 Both contain 30 seconds of 160 by 96 H.264 video at 24 fps and 48 kHz stereo AAC.
-A is red with a 440 Hz tone; B is green with an 880 Hz tone. A blue 16-pixel bar
-moves horizontally every eighth of a second, using a chroma-aligned ten-pixel
-step modulo 144. Its 72 distinct positions have a nine-second period; accepted
-motion captures must fit within eight seconds of wall and media time. They
-contain no user recordings.
+A is red with a 440 Hz tone; B is green with an 880 Hz tone. A blue 16 by 24 pixel
+marker moves every eighth of a second, using a chroma-aligned ten-pixel X step
+modulo 144 and advancing one 24-pixel Y row after each 72 steps. Its 240 distinct
+two-dimensional positions do not repeat within the 30-second clip. Accepted
+motion captures must fit within 29 seconds of wall, media and PCM time, with no
+loop or ownership change. Actual decoded pixels verify every marker position.
+These files contain no user recordings.
 Native tests independently decode their tones and inspect actual Simulator
 compositor screenshots for source color, poster exclusion, marker motion and a
 restored paused frame's marker position. The tests do not encode media at runtime.
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
-| test-selection-a.mp4 | 395,368 | `2ad9cf3addd4f8d082ac9685714562165c1a79f412aa267c0a2a15c171100ff2` |
-| test-selection-b.mp4 | 395,307 | `539e72fb59d576310f37955b79d43c41f89460eeb73faf3ddb1f47b12037a94e` |
+| test-selection-a.mp4 | 394,956 | `2b9d994c23eb3337f3c2198fe65081e61abc73e2c21caa0351f0c6c6ace2c999` |
+| test-selection-b.mp4 | 394,889 | `e616c8a5bf839697ccbb77d452480f90462a166afd0dbb85d04dec087b8ec6b5` |
 
 The offset-preservation decoder test separately exports lossless PCM in MOV. It
 asserts the nonempty edit's exact 0.1-second offset, the complete 0.35-second
