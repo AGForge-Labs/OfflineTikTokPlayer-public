@@ -2,9 +2,16 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+mkdir -p artifacts/native
+native_log="artifacts/native/xcodebuild-test.log"
+# An early failure must never leave a previous run's successful evidence behind.
+: > "$native_log"
+validation_complete=0
+validation_mode=full
 if [ "$#" -eq 0 ]; then
   set --
 elif [ "$#" -eq 1 ] && [ "$1" = "--selection-only" ]; then
+  validation_mode=selection-only
   set -- \
     -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionFailureTests \
     -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests \
@@ -18,7 +25,6 @@ command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode 26 or later on macOS 
 python3 scripts/generate-ios-project.py --check
 bash scripts/test-core.sh
 bash scripts/test-apple-buffer.sh
-mkdir -p artifacts/native
 destination="${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro Max}"
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
 # Native window tests request real compositor pixels through their own app tmp.
@@ -30,6 +36,9 @@ cleanup_capture() {
   trap - EXIT
   kill "$capture_pid" 2>/dev/null || true
   wait "$capture_pid" 2>/dev/null || true
+  if [ "$cleanup_status" -eq 0 ] && [ "$validation_complete" -ne 1 ]; then
+    cleanup_status=1
+  fi
   exit "$cleanup_status"
 }
 trap cleanup_capture EXIT
@@ -37,4 +46,10 @@ xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlaye
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Tests-$(date +%Y%m%d-%H%M%S).xcresult" \
   -jobs 1 -parallel-testing-enabled NO \
-  "$@" CODE_SIGNING_ALLOWED=NO test
+  "$@" CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+if [ "$validation_mode" = selection-only ]; then
+  python3 scripts/verify-native-test-log.py --log "$native_log" --selection-only
+else
+  python3 scripts/verify-native-test-log.py --log "$native_log"
+fi
+validation_complete=1
