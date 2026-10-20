@@ -33,7 +33,7 @@ enum PlaybackDiagnosticPhase: Int, Codable {
     case rendererStarted = 43
     case rendererStopped = 44
     case rendererUnderrun = 45
-    case sourceTimelineAnalyzed = 46
+    case sourceTimelineAnalyzed = 48
     case videoRateChanged = 46
     case pipCommandsUnavailable = 47
 }

@@ -492,6 +492,7 @@ final class PlaybackService: NSObject {
         let active = current
         let previous = previousID.flatMap { library.catalog.mediaByID[$0] }
         let successor = naturalID.flatMap { library.catalog.mediaByID[$0] }
+        let explicitSuccessor = nextID.flatMap { library.catalog.mediaByID[$0] }
         let pcmIDs = Set([active?.id, previous?.id, nextID].compactMap { $0 })
         continuousAudio.setWindow(pcmIDs)
         updateAudioSuccessor()
@@ -502,6 +503,16 @@ final class PlaybackService: NSObject {
             let pinned = ([active, previous].compactMap { $0 } + upcoming).compactMap(\.asset)
             await self.mediaCache?.setWindow(pinned, revision: revision)
             guard !Task.isCancelled, self.generation == request else { return }
+            // Repeat-one uses the current prefix for its natural boundary; its
+            // explicit Next still needs the second slot, including Saved media
+            // that the later network-prefetch loop deliberately skips.
+            if let explicitSuccessor, explicitSuccessor.id != naturalID,
+               self.continuousAudio.entry(for: explicitSuccessor.id) == nil {
+                let saved = await self.downloads.localURL(for: explicitSuccessor)
+                let cached = if let asset = explicitSuccessor.asset { await self.mediaCache?.file(for: asset) } else { nil as URL? }
+                if let local = saved ?? cached { _ = try? await self.continuousAudio.prepare(id: explicitSuccessor.id, url: local) }
+                guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+            }
             // Resolve and enqueue the next AVPlayerItem before waiting for any full-file transfer.
             if let next = successor, !self.buffer.hasPrepared(next.id) {
                 let saved = await self.downloads.localURL(for: next)

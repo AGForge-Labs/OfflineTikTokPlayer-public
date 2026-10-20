@@ -146,6 +146,22 @@ final class PlaybackContinuityTests: XCTestCase {
         XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
     }
 
+    func testRepeatOneStillPreparesSavedExplicitNext() async throws {
+        let fixture = try await ServiceFixture()
+        defer { fixture.remove() }
+        let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {})
+        defer { service.pause() }
+        service.cycleRepeat(); service.cycleRepeat()
+        service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+        try await until { service.audioSnapshot.frame > 2_400 && service.preparedAudioCount >= 2 }
+        let visit = service.audioSnapshot.visit
+        service.next()
+        try await until { service.audioSnapshot.visit > visit && service.queue.currentID == fixture.ids[1] }
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
+        XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
+    }
+
     private func until(_ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(5)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(5)) }
