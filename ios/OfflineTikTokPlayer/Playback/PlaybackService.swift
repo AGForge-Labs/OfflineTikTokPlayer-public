@@ -31,6 +31,7 @@ final class PlaybackService: NSObject {
         let retainedItems: Int
     }
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
+    typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
     @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
     @ObservationIgnored private var firstProgressGeneration: Int?
@@ -83,6 +84,7 @@ final class PlaybackService: NSObject {
     var videoFramePositionSeconds: Double? { continuousPiP.lastFramePositionSeconds }
     var copiedVideoFramePositionSeconds: Double? { continuousPiP.lastCopiedFramePositionSeconds }
     var pausedFutureVideoFrameRejectionCount: UInt64 { continuousPiP.pausedFutureFrameRejectionCount }
+    var videoFrameAcquisitionBlockedCount: UInt64 { continuousPiP.blockedFrameAcquisitionCount }
     var submittedVideoFrameCount: UInt64 { continuousPiP.submittedFrameCount }
     var videoRequestedPositionSeconds: Double { continuousPiP.requestedPositionSeconds }
     var videoTimebasePositionSeconds: Double? { continuousPiP.timebasePositionSeconds }
@@ -100,6 +102,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let speakerAudio: SpeakerAudioController
     @ObservationIgnored private let audioRoutes: () -> [AVAudioSession.Port]
     @ObservationIgnored private let seekPlayer: SeekPlayer
+    @ObservationIgnored private let seekVideo: SeekVideo
     @ObservationIgnored private var audioCheckTask: Task<Void, Never>?
     @ObservationIgnored private var timeControlObservation: NSKeyValueObservation?
     @ObservationIgnored private var stallTask: Task<Void, Never>?
@@ -126,12 +129,16 @@ final class PlaybackService: NSObject {
          audioRoutes: @escaping () -> [AVAudioSession.Port] = { AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType) },
          seekPlayer: @escaping SeekPlayer = { player, time, completion in
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
+         },
+         seekVideo: @escaping SeekVideo = { player, time, completion in
+             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
          }) {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
         self.buffer = buffer ?? PlaybackBuffer()
         self.speakerAudio = speakerAudio ?? SpeakerAudioController()
         self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
+        self.seekVideo = seekVideo
         mediaCache = PlaybackCacheLoader.make(cloud: cloud)
         automaticPiP = UserDefaults.standard.bool(forKey: "automaticPiP")
         speakerSound = UserDefaults.standard.object(forKey: "speakerSound") as? Bool ?? true
@@ -693,9 +700,12 @@ final class PlaybackService: NSObject {
         guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
         let request = generation
         syncingVideoGeneration = request
-        player.seek(to: CMTime(seconds: position, preferredTimescale: 48_000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
+        let videoSeek = continuousPiP.beginSeek()
+        seekVideo(player, CMTime(seconds: position, preferredTimescale: 48_000)) { [weak self, weak item] finished in
             Task { @MainActor in
-                guard let self, self.syncingVideoGeneration == request else { return }
+                guard let self else { return }
+                defer { self.continuousPiP.completeSeek(videoSeek) }
+                guard self.syncingVideoGeneration == request else { return }
                 self.syncingVideoGeneration = nil
                 guard finished, let item, self.generation == request,
                       self.player.currentItem === item, self.videoAllowed else { return }
@@ -711,9 +721,9 @@ final class PlaybackService: NSObject {
                 }
                 // The display layer also needs the requested paused/restored position,
                 // even before the engine has acknowledged its first selection command.
-                // Every completed seek starts a new frame epoch, including short
-                // backwards seeks below the ordinary drift-correction threshold.
-                self.continuousPiP.flushForSeek()
+                // The epoch was reset before seeking. Release acquisition only
+                // now; never flush a target frame already pulled by the timer.
+                self.continuousPiP.completeSeek(videoSeek)
                 self.continuousPiP.updatePlayback(positionSeconds: desired, durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay)
                 if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
                 guard self.intent.canPlay else { return }

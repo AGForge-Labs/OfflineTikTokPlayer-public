@@ -74,6 +74,48 @@ and the superseded `.65` request. Numeric requested/timebase/submitted positions
 and submission counts distinguish output replay from retained display content.
 Native acceptance is pending.
 
+Run [39397007052](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39397007052)
+at `5ecb45dfff792b33929ff6e5ea3eca05969767a8` passed 81 core tests, the UI
+test, all seven macOS Bash 3 launcher regressions and eleven evidence regressions.
+It executed all 88 native tests with three failures. Paused `.40`, backward `.35`
+and coalesced `.60` had correct actual compositor markers and fresh custom
+submissions `2 → 3 → 4`; copied/submitted/requested/timebase values matched each
+target, and the superseded future frame was rejected. The selected Mac driver
+confirmed the one-job override, including integrated build targets.
+
+Two moving-frame pairs had identical marker positions. The YUV420 overlay rounds
+x to an even pixel: marker steps 3/16 render at x32 and steps 15/28 at x20, exactly
+matching those pairs. This creates equal images 1.625 seconds apart even though
+the expression's full period is 18 seconds. Buffered log timestamps do not identify
+the acquisition phase, so those pairs neither prove motion nor a production stall.
+See FFmpeg's [overlay coordinate normalization](https://github.com/FFmpeg/FFmpeg/blob/master/libavfilter/vf_overlay.c).
+The third failure was specifically the host `simctl screenshot` subprocess's
+20-second timeout, separate from player readiness.
+
+The next test records monotonic capture timing and audio/player/custom-frame
+state around every real compositor capture. A valid identical pair permits one
+additional capture, with a maximum of three images; an unchanged display still
+fails the same greater-than-three-pixel motion requirement. Custom submissions
+must also advance. Capture errors fail immediately, without retry; one screenshot
+command has a 30-second bound and its native response wait a 45-second bound.
+The corrected fixture uses an even ten-pixel step, with unique marker positions
+for nine seconds. Motion acceptance requires both capture and media windows to
+stay below eight seconds, alongside stable audio ownership and progressing
+audio/video clocks. A clock hold or underrun is reported separately from stale
+visible output; none is accepted as motion.
+
+Review also identified a separate acquisition/reset ordering risk. A paused
+target could become available before the native seek's completion reached the
+main actor; pulling it and then flushing could leave no new output to reacquire.
+The next candidate resets the frame epoch and gates pulls before seeking, then
+releases only the matching seek ticket at completion, without flushing afterward.
+A deterministic native regression holds the real seek completion while polls
+attempt acquisition, then releases it and requires a fresh custom frame and the
+correct actual compositor marker. This is not claimed as the explanation for
+the earlier playing-frame pairs. The PCM timeline, source silence and audio
+intent remain unchanged. Full acceptance now expects 89 native tests and one UI
+test; the new candidate is pending validation.
+
 Unsigned validation keeps Xcode's build queue at one job and disables parallel
 tests. It now also exports `SWIFTC_MAXIMUM_DETERMINISM=1`, confirms the selected
 Swift driver's one-job override with a print-only plan before compilation, and

@@ -54,8 +54,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let restored = await assertVisibleFrame(service, screen: screen, identity: .b, label: "restored-B-at-0.4") {
             let center = try XCTUnwrap(restored.blueBarCenter, "The paused restored frame must contain B's blue marker")
             let normalized = center / Double(restored.width)
-            print("SelectionRestored position=0.4 blueNormalized=\(normalized) expected=\(41.0 / 160.0)")
-            XCTAssertEqual(normalized, 41.0 / 160.0, accuracy: 0.04,
+            print("SelectionRestored position=0.4 blueNormalized=\(normalized) expected=\(38.0 / 160.0)")
+            XCTAssertEqual(normalized, 38.0 / 160.0, accuracy: 0.04,
                            "The visible paused B frame must correspond to the restored 0.4-second offset")
         }
         assertPausedCustomFrameState(service, screen: screen, requested: 0.4, after: 0, label: "restore-0.4-captured")
@@ -77,8 +77,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let earlier = await assertVisibleFrame(service, screen: screen, identity: .b, label: "paused-B-backwards-to-0.35") {
             let center = try XCTUnwrap(earlier.blueBarCenter)
             let normalized = center / Double(earlier.width)
-            print("SelectionPausedBackward position=0.35 blueNormalized=\(normalized) expected=\(30.0 / 160.0)")
-            XCTAssertEqual(normalized, 30.0 / 160.0, accuracy: 0.04,
+            print("SelectionPausedBackward position=0.35 blueNormalized=\(normalized) expected=\(28.0 / 160.0)")
+            XCTAssertEqual(normalized, 28.0 / 160.0, accuracy: 0.04,
                            "The actual paused composite must replace the later frame after a short backwards seek")
         }
         assertPausedCustomFrameState(service, screen: screen, requested: 0.35, after: beforeBackward,
@@ -102,8 +102,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let newest = await assertVisibleFrame(service, screen: screen, identity: .b, label: "paused-B-latest-0.60") {
             let center = try XCTUnwrap(newest.blueBarCenter)
             let normalized = center / Double(newest.width)
-            print("SelectionPausedLatest position=0.60 blueNormalized=\(normalized) expected=\(52.0 / 160.0)")
-            XCTAssertEqual(normalized, 52.0 / 160.0, accuracy: 0.04,
+            print("SelectionPausedLatest position=0.60 blueNormalized=\(normalized) expected=\(48.0 / 160.0)")
+            XCTAssertEqual(normalized, 48.0 / 160.0, accuracy: 0.04,
                            "The actual paused composite must show the latest coalesced seek target")
         }
         assertPausedCustomFrameState(service, screen: screen, requested: 0.60, after: beforeCoalesced,
@@ -117,6 +117,60 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await require({ service.audioSnapshot.token != 0 && service.audioSnapshot.frame > 2_400 },
                           "Restored B must enter the actual audio renderer after explicit Play")
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "restored-B-playing")
+    }
+
+    func testPausedRestoreBlocksFrameAcquisitionUntilTheRealSeekCompletionIsReleased() async throws {
+        let fixture = try await SelectionVideoFixture()
+        defer { fixture.remove() }
+        try JSONEncoder().encode(PlaybackBookmark(
+            queue: PlaybackQueue(ids: fixture.ids, startAt: fixture.bID), position: 0.4))
+            .write(to: fixture.bookmark)
+        let scheduler = SelectionVideoSeekScheduler()
+        let service = fixture.service(seekVideo: scheduler.seek)
+        let screen = try SelectionVideoScreen(service: service)
+        defer { scheduler.release(); service.pause(); screen.close() }
+        var submittedAtStart: UInt64?
+        var blockedAtStart: UInt64?
+        scheduler.onSeekStarted = { [weak service] in
+            submittedAtStart = service?.submittedVideoFrameCount
+            blockedAtStart = service?.videoFrameAcquisitionBlockedCount
+        }
+
+        service.restore()
+        try await require({ scheduler.isHoldingCompletion && scheduler.nativeFinished == true
+            && abs(service.player.currentTime().seconds - 0.4) < 0.04 },
+                          "The real AVPlayer seek must finish while its service callback remains held")
+        let submitted = try XCTUnwrap(submittedAtStart)
+        let blocked = try XCTUnwrap(blockedAtStart)
+        try await require({ service.videoFrameAcquisitionBlockedCount >= blocked + 2 },
+                          "At least two real frame-poll attempts must encounter the held seek gate")
+        logCustomFrame(service, screen: screen, label: "held-real-seek-0.4")
+        print("SelectionHeldSeek blockedDelta=\(service.videoFrameAcquisitionBlockedCount - blocked) submittedAtStart=\(submitted) submittedNow=\(service.submittedVideoFrameCount)")
+        XCTAssertEqual(service.submittedVideoFrameCount, submitted,
+                       "No custom frame may be acquired while the real seek callback is withheld")
+        XCTAssertNil(service.videoFramePositionSeconds, "The seek's emptied epoch must contain no submitted frame")
+        XCTAssertNil(service.copiedVideoFramePositionSeconds, "The held seek must prevent even copying a frame from the old epoch")
+        assertSelection(service, fixture: fixture, id: fixture.bID)
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertFalse(service.audioEngineRunning)
+        XCTAssertEqual(service.player.rate, 0)
+
+        scheduler.release()
+        await assertPausedCustomFrame(service, screen: screen, requested: 0.4, after: submitted,
+                                      label: "released-real-seek-0.4-settled")
+        if let pixels = await assertVisibleFrame(service, screen: screen, identity: .b,
+                                                 label: "released-real-seek-0.4") {
+            let center = try XCTUnwrap(pixels.blueBarCenter)
+            let normalized = center / Double(pixels.width)
+            print("SelectionHeldSeekReleased position=0.4 blueNormalized=\(normalized) expected=\(38.0 / 160.0)")
+            XCTAssertEqual(normalized, 38.0 / 160.0, accuracy: 0.04)
+        }
+        assertPausedCustomFrameState(service, screen: screen, requested: 0.4, after: submitted,
+                                     label: "released-real-seek-0.4-captured")
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertFalse(service.audioEngineRunning)
+        XCTAssertEqual(service.audioSnapshot.selectionVersion, 0)
+        XCTAssertEqual(service.player.rate, 0)
     }
 
     func testPreparedRewoundBUncoversItsOwnMovingVideo() async throws {
@@ -376,17 +430,90 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         guard let first = await assertVisibleFrame(service, screen: screen, identity: identity,
                                                   label: label + "-motion-start", file: file, line: line) else { return }
         do {
-            let firstTime = service.player.currentTime().seconds
-            let advanced = await waitUntil(timeout: 1) { service.player.currentTime().seconds > firstTime + 0.18 }
-            XCTAssertTrue(advanced, "The selected AVPlayerItem clock must actually advance", file: file, line: line)
-            let second = try await screen.capture(label: label + "-motion-end", test: self)
-            second.log(label: label + "-motion-end", identity: identity)
-            XCTAssertGreaterThan(second.fraction(identity), 0.65, file: file, line: line)
             let firstBar = try XCTUnwrap(first.blueBarCenter, "The first composite must contain its decoded blue marker", file: file, line: line)
-            let secondBar = try XCTUnwrap(second.blueBarCenter, "The second composite must contain its decoded blue marker", file: file, line: line)
-            XCTAssertGreaterThan(abs(secondBar - firstBar), 3,
+            let firstSubmitted = service.submittedVideoFrameCount
+            XCTAssertGreaterThan(firstSubmitted, 0, "The first image must have a submitted custom frame", file: file, line: line)
+            let firstReady = service.isVideoReady && screen.customVideoLayer?.isReadyForDisplay == true
+            XCTAssertTrue(firstReady, "The first composite must have a ready custom video frame", file: file, line: line)
+            guard first.fraction(identity) > 0.65, first.magentaFraction < 0.02,
+                  firstSubmitted > 0, firstReady else { return }
+            var visibleDelta = 0.0
+            var states = [first.captureBefore, first.captureAfter]
+            guard assertMotionCaptureWindow(states, label: label, file: file, line: line) else { return }
+            // The even-stride fixture repeats after nine seconds. Every observation
+            // must fit a strictly shorter real-time and media-time capture window.
+            for observation in 2...3 {
+                let previousTime = service.player.currentTime().seconds
+                let previousAudio = service.audioSnapshot
+                _ = await waitUntil(timeout: 1) {
+                    let audio = service.audioSnapshot
+                    return service.player.currentTime().seconds > previousTime + 0.18
+                        && audio.token == previousAudio.token && audio.visit == previousAudio.visit
+                        && audio.frame >= previousAudio.frame + 8_640
+                }
+                let currentAudio = service.audioSnapshot
+                let sameWindowSource = previousAudio.token == first.captureBefore.audioToken
+                    && previousAudio.visit == first.captureBefore.audioVisit
+                let audioAdvanced = sameWindowSource && currentAudio.token == previousAudio.token && currentAudio.visit == previousAudio.visit
+                    && currentAudio.frame >= previousAudio.frame + 8_640
+                let noUnderrun = currentAudio.underrunFrames == previousAudio.underrunFrames
+                    && previousAudio.underrunFrames == first.captureBefore.audioUnderrunFrames
+                print("SelectionMotionInterval label=\(label) observation=\(observation) audioDelta=\(currentAudio.frame - previousAudio.frame) underrunDelta=\(currentAudio.underrunFrames - previousAudio.underrunFrames) sameToken=\(currentAudio.token == previousAudio.token) sameVisit=\(currentAudio.visit == previousAudio.visit)")
+                guard audioAdvanced, noUnderrun else {
+                    XCTFail("audioClockHold/underruns: PCM must advance at least 8640 frames in the same visit without new underruns", file: file, line: line)
+                    return
+                }
+                let videoAdvanced = service.player.currentTime().seconds > previousTime + 0.18
+                XCTAssertTrue(videoAdvanced, "The selected AVPlayerItem clock must actually advance for each observation", file: file, line: line)
+                guard videoAdvanced else { return }
+                let captureLabel = label + "-motion-observation-\(observation)"
+                let next = try await screen.capture(label: captureLabel, test: self)
+                next.log(label: captureLabel, identity: identity)
+                states += [next.captureBefore, next.captureAfter]
+                guard assertMotionCaptureWindow(states, label: label, file: file, line: line) else { return }
+                XCTAssertGreaterThan(next.fraction(identity), 0.65, file: file, line: line)
+                XCTAssertLessThan(next.magentaFraction, 0.02, file: file, line: line)
+                let ready = service.isVideoReady && screen.customVideoLayer?.isReadyForDisplay == true
+                XCTAssertTrue(ready, "The actual custom video must remain ready during motion proof", file: file, line: line)
+                let nextBar = try XCTUnwrap(next.blueBarCenter, "Every composite must contain its decoded blue marker", file: file, line: line)
+                guard next.fraction(identity) > 0.65, next.magentaFraction < 0.02, ready else { return }
+                visibleDelta = abs(nextBar - firstBar)
+                print("SelectionMotion label=\(label) observation=\(observation) deltaPixels=\(visibleDelta)")
+                if visibleDelta > 3 { break }
+            }
+            XCTAssertGreaterThan(visibleDelta, 3,
                                  "Advancing clocks must produce different visible video frames", file: file, line: line)
+            let customAdvanced = await waitUntil(timeout: 1) {
+                service.submittedVideoFrameCount > firstSubmitted && screen.customVideoLayer?.isReadyForDisplay == true
+            }
+            XCTAssertTrue(customAdvanced, "Motion proof requires new custom-frame submission beyond the first capture", file: file, line: line)
         } catch { XCTFail("Moving-frame proof failed: \(error)", file: file, line: line) }
+    }
+
+    private func assertMotionCaptureWindow(_ states: [SelectionVideoCaptureState], label: String,
+                                            file: StaticString, line: UInt) -> Bool {
+        guard let first = states.first, let last = states.last else { return false }
+        let wall = last.uptime - first.uptime
+        let positions = states.map(\.playerPosition)
+        let media = (positions.max() ?? .infinity) - (positions.min() ?? -.infinity)
+        let pcm = Double(last.audioFrame - first.audioFrame) / 48_000
+        let validPositions = positions.allSatisfy { $0.isFinite && $0 >= 0 }
+        let stableSource = first.audioToken != 0 && states.allSatisfy {
+            $0.audioToken == first.audioToken && $0.audioVisit == first.audioVisit
+        }
+        let monotonicPCM = zip(states, states.dropFirst()).allSatisfy { pair in pair.0.audioFrame <= pair.1.audioFrame }
+        let noUnderruns = states.allSatisfy { $0.audioUnderrunFrames == first.audioUnderrunFrames }
+        print("SelectionMotionWindow label=\(label) captures=\(states.count / 2) wallSeconds=\(wall) mediaSeconds=\(media) pcmSeconds=\(pcm) stableSource=\(stableSource) monotonicPCM=\(monotonicPCM) noUnderruns=\(noUnderruns)")
+        XCTAssertGreaterThanOrEqual(wall, 0, file: file, line: line)
+        XCTAssertLessThan(wall, 8, "The capture window must be shorter than the fixture's nine-second marker period", file: file, line: line)
+        XCTAssertTrue(validPositions, "Capture media-time brackets must be finite and nonnegative", file: file, line: line)
+        XCTAssertLessThan(media, 8, "The bracketed media window must exclude marker-period aliasing", file: file, line: line)
+        XCTAssertGreaterThanOrEqual(pcm, 0, file: file, line: line)
+        XCTAssertLessThan(pcm, 8, file: file, line: line)
+        XCTAssertTrue(stableSource && monotonicPCM, "No PCM token, visit or loop change may cross the capture window", file: file, line: line)
+        XCTAssertTrue(noUnderruns, "audioClockHold/underruns: capture acquisition must not conceal a new PCM underrun", file: file, line: line)
+        return wall >= 0 && wall < 8 && validPositions && media < 8 && pcm >= 0 && pcm < 8
+            && stableSource && monotonicPCM && noUnderruns
     }
 
     private func require(_ condition: () -> Bool, _ message: String,
@@ -452,9 +579,15 @@ final class SelectionVideoFixture {
         } catch { remove(); throw error }
     }
 
-    func service(buffer: PlaybackBuffer? = nil) -> PlaybackService {
-        let result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
+    func service(buffer: PlaybackBuffer? = nil, seekVideo: PlaybackService.SeekVideo? = nil) -> PlaybackService {
+        let result: PlaybackService
+        if let seekVideo {
+            result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
+                                     bookmarkURL: bookmark, activateSession: {}, buffer: buffer, seekVideo: seekVideo)
+        } else {
+            result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
                                      bookmarkURL: bookmark, activateSession: {}, buffer: buffer)
+        }
         result.speakerSound = false
         result.automaticPiP = false
         return result
@@ -520,6 +653,46 @@ final class SelectionVideoFixture {
 }
 
 @MainActor
+private final class SelectionVideoSeekScheduler {
+    var onSeekStarted: (@MainActor () -> Void)?
+    private(set) var nativeFinished: Bool?
+    private var intercepted = false
+    private var released = false
+    private var heldCompletion: (@Sendable (Bool) -> Void)?
+    var isHoldingCompletion: Bool { heldCompletion != nil }
+
+    func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
+        let hold = !intercepted && abs(time.seconds - 0.4) < 0.000_001
+        if hold { intercepted = true; onSeekStarted?() }
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor [weak self] in
+                guard let self else { completion(finished); return }
+                if hold, !self.released { self.nativeFinished = finished; self.heldCompletion = completion }
+                else { completion(finished) }
+            }
+        }
+    }
+
+    func release() {
+        // Teardown can precede the native callback. In that case the callback
+        // passes through when it arrives instead of becoming a leaked hold.
+        released = true
+        guard let completion = heldCompletion, let finished = nativeFinished else { return }
+        heldCompletion = nil
+        completion(finished)
+    }
+}
+
+private struct SelectionVideoCaptureState {
+    let uptime: Double
+    let playerPosition: Double
+    let audioFrame: Int64
+    let audioVisit: Int64
+    let audioToken: Int
+    let audioUnderrunFrames: Int64
+}
+
+@MainActor
 private final class SelectionVideoScreen {
     let window: UIWindow
     let service: PlaybackService
@@ -547,6 +720,11 @@ private final class SelectionVideoScreen {
     }
 
     func capture(label: String, test: XCTestCase) async throws -> SelectionVideoPixels {
+        let before = captureState()
+        let started = before.uptime
+        var completed = false
+        logCapture(label: label, phase: "before", started: started, failed: false)
+        defer { logCapture(label: label, phase: "after", started: started, failed: !completed) }
         window.rootViewController?.view.layoutIfNeeded()
         CATransaction.flush()
         let image: UIImage
@@ -584,7 +762,23 @@ private final class SelectionVideoScreen {
         guard let cg = image.cgImage, rect.width > 0, rect.height > 0,
               CGRect(x: 0, y: 0, width: cg.width, height: cg.height).contains(rect),
               let cropped = cg.cropping(to: rect) else { throw SelectionVideoTestFailure.capture }
-        return try SelectionVideoPixels(cropped, scaleX: Double(scaleX), scaleY: Double(scaleY))
+        var pixels = try SelectionVideoPixels(cropped, scaleX: Double(scaleX), scaleY: Double(scaleY), captureBefore: before)
+        pixels.captureAfter = captureState()
+        completed = true
+        return pixels
+    }
+
+    private func captureState() -> SelectionVideoCaptureState {
+        let audio = service.audioSnapshot
+        return SelectionVideoCaptureState(uptime: ProcessInfo.processInfo.systemUptime,
+            playerPosition: service.player.currentTime().seconds, audioFrame: audio.frame,
+            audioVisit: audio.visit, audioToken: audio.token, audioUnderrunFrames: audio.underrunFrames)
+    }
+
+    private func logCapture(label: String, phase: String, started: Double, failed: Bool) {
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let audio = service.audioSnapshot
+        print("SelectionCapture label=\(label) phase=\(phase) uptime=\(uptime) elapsed=\(uptime - started) failed=\(failed) playerPosition=\(service.player.currentTime().seconds) playerRate=\(service.player.rate) audioFrame=\(audio.frame) audioVisit=\(audio.visit) audioToken=\(audio.token) audioUnderrunFrames=\(audio.underrunFrames) engineRunning=\(service.audioEngineRunning) wantsToPlay=\(service.wantsToPlay) requested=\(service.videoRequestedPositionSeconds) timebase=\(service.videoTimebasePositionSeconds.map { String($0) } ?? "missing") copiedPTS=\(service.copiedVideoFramePositionSeconds.map { String($0) } ?? "missing") submittedPTS=\(service.videoFramePositionSeconds.map { String($0) } ?? "missing") submitted=\(service.submittedVideoFrameCount) futureRejected=\(service.pausedFutureVideoFrameRejectionCount) customReady=\(customVideoLayer?.isReadyForDisplay == true)")
     }
 
     #if targetEnvironment(simulator)
@@ -615,7 +809,7 @@ private final class SelectionVideoScreen {
         }
         defer { for path in paths { try? manager.removeItem(at: path) } }
         try JSONEncoder().encode(CaptureRequest(schemaVersion: 1, requestID: identifier)).write(to: request, options: .atomic)
-        let deadline = ProcessInfo.processInfo.systemUptime + 30
+        let deadline = ProcessInfo.processInfo.systemUptime + 45
         while !manager.fileExists(atPath: response.path) {
             guard ProcessInfo.processInfo.systemUptime < deadline else {
                 // scripts/capture-simulator-test-frames.py must run beside the native test.
@@ -671,9 +865,12 @@ private struct SelectionVideoPixels {
     let bytes: [UInt8]
     let scaleX: Double
     let scaleY: Double
-    init(_ image: CGImage, scaleX: Double, scaleY: Double) throws {
+    let captureBefore: SelectionVideoCaptureState
+    var captureAfter: SelectionVideoCaptureState
+    init(_ image: CGImage, scaleX: Double, scaleY: Double, captureBefore: SelectionVideoCaptureState) throws {
         width = image.width; height = image.height
         self.scaleX = scaleX; self.scaleY = scaleY
+        self.captureBefore = captureBefore; self.captureAfter = captureBefore
         var storage = [UInt8](repeating: 0, count: image.width * image.height * 4)
         let rendered = storage.withUnsafeMutableBytes { raw -> Bool in
             guard let context = CGContext(data: raw.baseAddress, width: image.width, height: image.height,

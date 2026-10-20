@@ -32,6 +32,7 @@ final class ContinuousPictureInPicture: NSObject {
     private(set) var lastFramePositionSeconds: Double?
     private(set) var lastCopiedFramePositionSeconds: Double?
     private(set) var pausedFutureFrameRejectionCount: UInt64 = 0
+    private(set) var blockedFrameAcquisitionCount: UInt64 = 0
     private(set) var orientationPrepared = false
     var onSetPlaying: ((Bool) -> Void)?
     /// Complete after the service has applied or rejected the seek, including cancellation.
@@ -57,6 +58,8 @@ final class ContinuousPictureInPicture: NSObject {
     private var frameFeedEnabled = true
     private var preparationTask: Task<Void, Never>?
     private var itemGeneration = 0
+    private var seekTicket: UInt64 = 0
+    private var activeSeekTicket: UInt64?
     private var originalComposition: AVVideoComposition?
     private var installedComposition: AVVideoComposition?
 
@@ -112,6 +115,7 @@ final class ContinuousPictureInPicture: NSObject {
         preparationTask = nil
         stopFrameTimer()
         itemGeneration &+= 1
+        activeSeekTicket = nil
         let generation = itemGeneration
         if let videoOutput { currentItem?.remove(videoOutput) }
         restoreOriginalComposition()
@@ -236,6 +240,20 @@ final class ContinuousPictureInPicture: NSObject {
         hasReportedFrameFailure = false
     }
 
+    /// Stop pulls before native seeking can make its target available. Acquiring it
+    /// before completion and then flushing would consume a paused one-shot frame.
+    func beginSeek() -> UInt64 {
+        seekTicket &+= 1
+        activeSeekTicket = seekTicket
+        flushForSeek()
+        return seekTicket
+    }
+
+    func completeSeek(_ ticket: UInt64) {
+        guard activeSeekTicket == ticket else { return }
+        activeSeekTicket = nil
+    }
+
     /// Call when video is intentionally disabled, even if audio remains active.
     func suspendFrameFeed() {
         frameFeedEnabled = false
@@ -253,6 +271,7 @@ final class ContinuousPictureInPicture: NSObject {
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true
+        activeSeekTicket = nil
         preparationTask?.cancel()
         preparationTask = nil
         stopFrameTimer()
@@ -293,6 +312,10 @@ final class ContinuousPictureInPicture: NSObject {
 
     private func renderFrame() {
         guard !invalidated, frameFeedEnabled, let videoOutput, let timebase else { return }
+        guard activeSeekTicket == nil else {
+            blockedFrameAcquisitionCount &+= 1
+            return
+        }
         if displayLayer.status == .failed {
             if !hasReportedFrameFailure {
                 onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)

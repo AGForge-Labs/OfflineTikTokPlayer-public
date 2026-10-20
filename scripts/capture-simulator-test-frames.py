@@ -125,6 +125,7 @@ def capture(udid, temporary, request, identifier):
         return
     image = temporary / f"{PREFIX}{identifier}.png"
     code = 1  # Invalid request or unsafe path.
+    started = time.monotonic()
     try:
         if not regular(request, temporary, 4096):
             return
@@ -136,7 +137,7 @@ def capture(udid, temporary, request, identifier):
         if image.exists() or image.is_symlink() or image.resolve().parent != temporary:
             return
         code = 2  # The compositor capture command failed.
-        result = run("io", udid, "screenshot", "--type=png", str(image), timeout=20)
+        result = run("io", udid, "screenshot", "--type=png", str(image), timeout=30)
         if result.returncode == 0 and regular(image, temporary, 32 * 1024 * 1024):
             code = 0
     except subprocess.TimeoutExpired:
@@ -144,6 +145,7 @@ def capture(udid, temporary, request, identifier):
     except (OSError, ValueError, TypeError):
         pass
     finally:
+        print(f"SimulatorCaptureResult errorCode={code} startUptime={started:.6f} elapsedSeconds={time.monotonic() - started:.6f}", flush=True)
         acknowledge(temporary, identifier, code)
 
 

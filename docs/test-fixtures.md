@@ -23,15 +23,18 @@ entirely from FFmpeg color, overlay and sine sources by
 `scripts/generate-selection-fixtures.py`, using one encoder worker at a time.
 Both contain 30 seconds of 160 by 96 H.264 video at 24 fps and 48 kHz stereo AAC.
 A is red with a 440 Hz tone; B is green with an 880 Hz tone. A blue 16-pixel bar
-moves horizontally every eighth of a second. They contain no user recordings.
+moves horizontally every eighth of a second, using a chroma-aligned ten-pixel
+step modulo 144. Its 72 distinct positions have a nine-second period; accepted
+motion captures must fit within eight seconds of wall and media time. They
+contain no user recordings.
 Native tests independently decode their tones and inspect actual Simulator
 compositor screenshots for source color, poster exclusion, marker motion and a
 restored paused frame's marker position. The tests do not encode media at runtime.
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
-| test-selection-a.mp4 | 395,890 | `666017d389c30c55b35066a718158d287360f60c0f96370e9e39507ad7627d75` |
-| test-selection-b.mp4 | 395,605 | `d9da16bdaa03f447f113c42c0118a6a33a08125894861a09fbc1c53b0f750e65` |
+| test-selection-a.mp4 | 395,368 | `2ad9cf3addd4f8d082ac9685714562165c1a79f412aa267c0a2a15c171100ff2` |
+| test-selection-b.mp4 | 395,307 | `539e72fb59d576310f37955b79d43c41f89460eeb73faf3ddb1f47b12037a94e` |
 
 The offset-preservation decoder test separately exports lossless PCM in MOV. It
 asserts the nonempty edit's exact 0.1-second offset, the complete 0.35-second
