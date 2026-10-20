@@ -72,8 +72,8 @@ def validate_workflow(config):
 
 def validate_public_workflow(config):
     """Allow only this task's standard, public, unsigned simulator validation."""
-    expected_trigger = {"push": {"branches": ["fix/playback-continuity", "fix/continuous-pcm-playback"],
-        "paths": ["ios/**", "scripts/**", "tests/apple-playback/**", ".github/workflows/playback-validation.yml"]}}
+    expected_trigger = {"push": {"branches": ["fix/playback-continuity", "fix/continuous-pcm-playback", "fix/selected-video-regression"],
+        "paths": ["ios/**", "scripts/**", "tests/apple-playback/**", "tests/validation-shell/**", ".github/workflows/playback-validation.yml"]}}
     public_guard = "${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}"
     job = config.get("jobs", {}).get("ios", {})
     if set(config) != {"name", "on", "permissions", "jobs"} or config.get("on") != expected_trigger:
@@ -87,11 +87,17 @@ def validate_public_workflow(config):
     if any(re.search(r"\bsecrets\s*(?:\.|\[)", value, re.I) for value in _values(config)):
         raise ValueError("Public playback validation cannot use secrets.")
     steps = job["steps"]
-    if len(steps) != 2:
+    if len(steps) != 3:
         raise ValueError("Public playback validation has unreviewed steps.")
     if steps[0] != {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with": {"persist-credentials": "false"}}:
         raise ValueError("Public checkout must be pinned and discard credentials.")
-    if set(steps[1]) != {"name", "run"} or steps[1]["run"] != "bash scripts/check-ios.sh":
+    if set(steps[1]) != {"name", "run"} or steps[1]["run"] != (
+            "python3 tests/validation-shell/test_check_ios_shell.py\n"
+            "python3 tests/validation-shell/test_native_test_evidence.py\n"
+            "bash scripts/check-ios.sh\n"):
+        raise ValueError("Only unsigned source and simulator checks are approved.")
+    if set(steps[2]) != {"name", "run"} or steps[2]["run"] != (
+            "python3 scripts/verify-native-test-log.py --log artifacts/native/xcodebuild-test.log"):
         raise ValueError("Only unsigned source and simulator checks are approved.")
 
 
@@ -143,7 +149,10 @@ def validate_public_release_workflow(config):
         check([step(value) for value in validation["steps"]] == [checkout,
               {"run": "python3 -B scripts/public-release.py check"},
               {"run": "python3 -B -m unittest discover -s tests/release -v"},
-              {"shell": "bash", "run": "bash scripts/check-ios.sh"}])
+              {"run": "python3 -B tests/validation-shell/test_check_ios_shell.py\n"
+                      "python3 -B tests/validation-shell/test_native_test_evidence.py\n"},
+              {"shell": "bash", "run": "bash scripts/check-ios.sh"},
+              {"run": "python3 -B scripts/verify-native-test-log.py --log artifacts/native/xcodebuild-test.log"}])
         credentials = {name: "${{ secrets." + name + " }}" for name in (
             "APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD", "APPLE_PROVISIONING_PROFILE_BASE64", "APP_STORE_CONNECT_KEY_BASE64")}
         credentials.update({name: "${{ vars." + name + " }}" for name in (

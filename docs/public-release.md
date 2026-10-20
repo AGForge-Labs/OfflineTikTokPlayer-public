@@ -1,6 +1,6 @@
 # Public source to private TestFlight
 
-Infrastructure preparation only. This branch is not an accepted release and has not uploaded a build. Player 13.1 failed physical-device acceptance; use the later reviewed rollback/repair source before enabling a release.
+Release integration preparation only; no signing or upload has occurred. Every `ios/` blob is preserved from software-accepted `7da8c8f10bdb7f5b02bba7a1ca02498b74dd714b`, whose unsigned run [39410213569](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39410213569) passed 83 core, 90 native and one UI test, plus eight launcher and 16 evidence regressions. This does not establish physical iPhone/OnTrac acceptance. Player 13.1 failed device acceptance and remains withdrawn from Owner; 12.1 remains offered.
 
 ## Release contract
 
@@ -10,7 +10,11 @@ A credential-free job runs the existing complete core, Apple buffer and simulato
 
 A new isolated standard hosted macOS job then builds, verifies and uploads. The `release` environment is the credential boundary. The workflow requests only `contents: read`, uses checkout pinned to its immutable v7.0.1 commit, persists no checkout credential, publishes no cache or artifact, and captures signing/Apple output into temporary files that are deleted. Signed IPA, archives, provisioning, credentials, private data and raw signing logs are never uploaded to GitHub artifacts.
 
+Both native validation and the separate archive process force `SWIFTC_MAXIMUM_DETERMINISM=1`, Xcode `-jobs 1`, disabled parallel tests and `SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO`. Each runner checks its selected Swift driver's print-only plan for the one-job override before building. This establishes configured limits; it does not measure CPU usage. Release validation also runs the launcher/evidence regression suites and an independent full native identity check.
+
 Use an explicit Apple-compatible build number greater than every existing App Store Connect build for this version. Public workflow numbering starts separately and must never determine the release number. The guard also rejects 13.1 and earlier. An uncertain or interrupted upload requires checking Apple before a fresh dispatch; do not use rerun to duplicate it.
+
+Proposed next candidate: marketing version `1.0`, build `14.1`, supplied only as the manual dispatch input. Recheck Apple immediately before dispatch for a newer or uncertain upload. The protected acceptance value must name the final integrated main commit, including this infrastructure; acceptance of the earlier software commit alone cannot satisfy it. Standard hosted runners in this public repository are expected to cost $0; no larger runner, paid fallback or private workflow is authorized here.
 
 Existing app identifiers, team, entitlements, App Group/keychain access and on-device stores stay unchanged. Export is internal TestFlight only. This workflow does not create testers, change groups, enable public links or submit a public beta. Existing private audience availability and a normal update over the installed app still require verification in Apple/TestFlight.
 
@@ -42,4 +46,4 @@ Risk: reviewed code on a public hosted runner will temporarily possess signing a
 5. Verify successful Apple upload, processing, unchanged identifiers and existing private tester availability. Install as an update and confirm saved data persists.
 6. Only after the public route is verified should the legacy private build route be retired. Keep original repositories private and retain private history.
 
-The migration is incomplete until step 5 succeeds. This preparation does not authorize a new release of the current failed candidate.
+The migration is incomplete until step 5 succeeds. This preparation does not authorize dispatch; physical-device and installed-upgrade acceptance remain pending.

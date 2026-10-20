@@ -25,7 +25,7 @@ def workflow():
 def test_public_playback_validation_is_standard_unsigned_and_private_guarded(preflight):
     config = yaml.load((ROOT / ".github/workflows/playback-validation.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     preflight.validate_public_workflow(config)
-    for change in ["private_guard", "runner", "secret", "write", "command", "extra_step"]:
+    for change in ["private_guard", "runner", "secret", "write", "command", "extra_step", "evidence_guard", "launcher_regressions"]:
         altered = copy.deepcopy(config)
         job = altered["jobs"]["ios"]
         if change == "private_guard": job["if"] = "true"
@@ -34,13 +34,15 @@ def test_public_playback_validation_is_standard_unsigned_and_private_guarded(pre
         elif change == "write": altered["permissions"]["contents"] = "write"
         elif change == "command": job["steps"][1]["run"] += " --upload"
         elif change == "extra_step": job["steps"].append({"run": "unexpected command"})
+        elif change == "evidence_guard": job["steps"].pop()
+        elif change == "launcher_regressions": job["steps"][1]["run"] = "bash scripts/check-ios.sh"
         with pytest.raises(ValueError): preflight.validate_public_workflow(altered)
 
 
 def test_protected_public_release_is_validated_without_weakening_unsigned_checks(preflight):
     config = yaml.load((ROOT / ".github/workflows/public-testflight.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     preflight.validate_public_release_workflow(config)
-    for change in ("trigger", "owner", "environment", "acceptance", "secret_before_gate", "artifact", "action", "permissions"):
+    for change in ("trigger", "owner", "environment", "acceptance", "secret_before_gate", "artifact", "action", "permissions", "evidence_guard", "launcher_regressions"):
         altered = copy.deepcopy(config)
         if change == "trigger": altered["on"]["pull_request_target"] = {}
         elif change == "owner": altered["jobs"]["validate"]["if"] = "true"
@@ -50,6 +52,8 @@ def test_protected_public_release_is_validated_without_weakening_unsigned_checks
         elif change == "artifact": altered["jobs"]["release"]["steps"].append({"uses": "actions/upload-artifact@" + "a" * 40})
         elif change == "action": altered["jobs"]["release"]["steps"][0]["uses"] = "actions/checkout@main"
         elif change == "permissions": altered["permissions"]["contents"] = "write"
+        elif change == "evidence_guard": altered["jobs"]["validate"]["steps"].pop()
+        elif change == "launcher_regressions": altered["jobs"]["validate"]["steps"].pop(3)
         with pytest.raises(ValueError):
             preflight.validate_public_release_workflow(altered)
 

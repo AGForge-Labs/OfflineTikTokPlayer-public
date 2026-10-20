@@ -102,7 +102,7 @@ def export_options(profile_uuid, certificate_sha1):
                 testFlightInternalTestingOnly=True, manageAppVersionAndBuildNumber=False, uploadSymbols=True)
 
 
-def run_tool(args, *, visible=False, **kwargs):
+def run_tool(args, *, visible=False, combined_output=False, **kwargs):
     # Several security commands take passwords as arguments. Never format their exceptions or command lines.
     environment = dict(kwargs.pop("env", os.environ))
     environment.pop("APPLE_PRIVATE_DELIVERY", None)
@@ -110,7 +110,8 @@ def run_tool(args, *, visible=False, **kwargs):
                  "APP_STORE_CONNECT_KEY_BASE64"):
         environment.pop(name, None)
     result = subprocess.run(args, stdout=None if visible else subprocess.PIPE,
-                            stderr=None if visible else subprocess.PIPE, env=environment, **kwargs)
+                            stderr=subprocess.STDOUT if combined_output else (None if visible else subprocess.PIPE),
+                            env=environment, **kwargs)
     if result.returncode:
         raise RuntimeError(f"{Path(args[0]).name} failed (exit {result.returncode}); private arguments were omitted.")
     return result.stdout
@@ -143,6 +144,13 @@ def materialize(config, directory):
 
 def upload(config, directory, material, build_number):
     certificate, cms_profile, api_key, profile_uuid, certificate_sha1 = material
+    # This archive runs on a different hosted job from native validation.
+    # Force the Swift driver's cap as well as Xcode's build queue limit.
+    archive_environment = dict(os.environ, SWIFTC_MAXIMUM_DETERMINISM="1")
+    driver_plan = run_tool(["xcrun", "swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-"],
+                           input=b"", env=archive_environment, combined_output=True)
+    if b"SWIFTC_MAXIMUM_DETERMINISM overriding -j" not in driver_plan:
+        raise ValueError("The selected archive Swift driver did not confirm its one-job override.")
     keychain = directory / "player-signing.keychain-db"
     keychain_password = secrets.token_urlsafe(32)
     old_search_list = shlex.split(run_tool(["security", "list-keychains", "-d", "user"]).decode())
@@ -170,10 +178,12 @@ def upload(config, directory, material, build_number):
         run_tool(["python3", "scripts/generate-ios-project.py", "--check"], cwd=ROOT, visible=True)
         run_tool(["xcodebuild", "-project", "ios/OfflineTikTokPlayer.xcodeproj", "-scheme", "OfflineTikTokPlayer",
                   "-configuration", "Release", "-destination", "generic/platform=iOS", "-archivePath", str(archive),
-                  "-derivedDataPath", "artifacts/DerivedData", "DEVELOPMENT_TEAM=" + TEAM,
+                  "-derivedDataPath", "artifacts/DerivedData", "-jobs", "1", "-parallel-testing-enabled", "NO",
+                  "SWIFTC_MAXIMUM_DETERMINISM=1", "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO",
+                  "DEVELOPMENT_TEAM=" + TEAM,
                   "CURRENT_PROJECT_VERSION=" + build_number, "CODE_SIGN_STYLE=Manual",
                   "PROVISIONING_PROFILE_SPECIFIER=" + profile_uuid, "CODE_SIGN_IDENTITY=" + certificate_sha1, "archive"],
-                 cwd=ROOT, visible=True)
+                 cwd=ROOT, visible=True, env=archive_environment)
         options_file = directory / "ExportOptions.plist"
         options_file.write_bytes(plistlib.dumps(export_options(profile_uuid, certificate_sha1)))
         run_tool(["xcodebuild", "-exportArchive", "-archivePath", str(archive), "-exportPath", str(directory / "export"),

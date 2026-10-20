@@ -106,6 +106,59 @@ def test_split_public_configuration_preserves_the_approved_existing_identity(del
         delivery.public_configuration({**env, "APPLE_CERTIFICATE_SHA256": ""})
 
 
+def test_archive_overrides_inherited_parallelism_and_keeps_internal_export(delivery, monkeypatch, tmp_path):
+    monkeypatch.setenv("SWIFTC_MAXIMUM_DETERMINISM", "0")
+    monkeypatch.setattr(delivery, "ROOT", tmp_path)
+    monkeypatch.setattr(delivery.Path, "home", lambda: tmp_path / "home")
+    commands = []
+    real_tool = delivery.run_tool
+
+    def tool(args, **kwargs):
+        commands.append((args, kwargs))
+        if args[:2] == ["xcrun", "swiftc"]:
+            # Swift emits this remark on stderr; stdout contains its job plan.
+            return real_tool([sys.executable, "-c", "import sys; print('driver job plan'); print('SWIFTC_MAXIMUM_DETERMINISM overriding -j', file=sys.stderr)"], **kwargs)
+        return b""
+
+    monkeypatch.setattr(delivery, "run_tool", tool)
+    directory = tmp_path / "signing"
+    directory.mkdir()
+    profile_file = directory / "fixture-profile"
+    profile_file.write_bytes(b"fixture-profile")
+    config = dict(certificatePassword="fixture", apiKeyID="ABC1234567", issuerID="fixture-issuer")
+    delivery.upload(config, directory, (directory / "cert", profile_file, directory / "key", "fixture-uuid", "A" * 40), "14.1")
+    archive, arguments = next((args, kwargs) for args, kwargs in commands if args[0] == "xcodebuild" and "archive" in args)
+    assert archive[archive.index("-jobs") + 1] == "1"
+    assert archive[archive.index("-parallel-testing-enabled") + 1] == "NO"
+    assert "SWIFTC_MAXIMUM_DETERMINISM=1" in archive
+    assert "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO" in archive
+    assert arguments["env"]["SWIFTC_MAXIMUM_DETERMINISM"] == "1"
+    assert "CURRENT_PROJECT_VERSION=14.1" in archive
+    probe, probe_arguments = commands[0]
+    assert probe == ["xcrun", "swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-"]
+    assert probe_arguments["env"]["SWIFTC_MAXIMUM_DETERMINISM"] == "1"
+    assert probe_arguments["input"] == b""
+    assert probe_arguments["combined_output"] is True
+    assert delivery.plistlib.loads((directory / "ExportOptions.plist").read_bytes())["testFlightInternalTestingOnly"] is True
+
+
+@pytest.mark.parametrize("driver_failure", ["missing_override", "nonzero_exit"])
+def test_archive_stops_before_keychain_or_build_without_driver_override(delivery, monkeypatch, tmp_path, driver_failure):
+    commands = []
+    monkeypatch.setattr(delivery.Path, "home", lambda: tmp_path / "home")
+    def tool(args, **kwargs):
+        commands.append(args)
+        assert args[:2] == ["xcrun", "swiftc"]
+        if driver_failure == "nonzero_exit":
+            raise RuntimeError("one-job override probe failed")
+        return b"unconfirmed driver plan"
+    monkeypatch.setattr(delivery, "run_tool", tool)
+    with pytest.raises((ValueError, RuntimeError), match="one-job override"):
+        delivery.upload({}, tmp_path, (None, None, None, "fixture-uuid", "A" * 40), "14.1")
+    assert len(commands) == 1
+    assert commands[0][:2] == ["xcrun", "swiftc"]
+
+
 def test_delivery_credentials_are_accepted_only_for_the_approved_team_and_role(delivery):
     config = dict(teamID=TEAM, apiKeyRole="Developer", apiKeyID="ABC1234567",
                   issuerID="11111111-2222-4333-8444-555555555555", certificatePassword="fixture-only",

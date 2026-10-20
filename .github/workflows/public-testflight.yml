@@ -43,9 +43,15 @@ jobs:
         run: python3 -B scripts/public-release.py check
       - name: Release gate regression checks
         run: python3 -B -m unittest discover -s tests/release -v
+      - name: Keep native launcher and evidence checks fail closed
+        run: |
+          python3 -B tests/validation-shell/test_check_ios_shell.py
+          python3 -B tests/validation-shell/test_native_test_evidence.py
       - name: Preserve existing native and source regression checks
         shell: bash
         run: bash scripts/check-ios.sh
+      - name: Require every native and UI test identity independently
+        run: python3 -B scripts/verify-native-test-log.py --log artifacts/native/xcodebuild-test.log
   release:
     needs: validate
     if: ${{ needs.validate.result == 'success' }}
