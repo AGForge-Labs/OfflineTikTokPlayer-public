@@ -4,6 +4,40 @@ import AVFoundation
 
 @MainActor
 final class ContinuousAudioPlayerTests: XCTestCase {
+    func testDecodeFailureUsesPendingSelectionOrActualNaturalSuccessor() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for explicitSelection in [true, false] {
+            let audio = ContinuousAudioPlayer()
+            defer { audio.suspend(); audio.graph.engine.stop() }
+            audio.setWindow(["a", "b"])
+            let a = try await audio.prepare(id: "a", url: url, currentPriority: true)
+            let b = try await audio.prepare(id: "b", url: url)
+            try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+            XCTAssertTrue(audio.select(id: "a"))
+            try audio.setPlaying(true)
+            let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+            XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+            if explicitSelection {
+                XCTAssertTrue(audio.select(id: "b"))
+                XCTAssertFalse(audio.invalidateForRetry(token: a.token), "A delayed old-current failure cannot cancel requested B")
+                XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+                XCTAssertEqual(audio.snapshot.token, b.token)
+                XCTAssertGreaterThan(audio.snapshot.frame, 0)
+                XCTAssertTrue(audio.graph.engine.isRunning)
+            } else {
+                audio.follow(from: "a", to: "b")
+                XCTAssertTrue(audio.select(id: "a", position: Double(a.frames - 1) / 48_000))
+                XCTAssertEqual(try audio.graph.engine.renderOffline(3, to: output), .success)
+                XCTAssertEqual(audio.snapshot.token, b.token)
+                XCTAssertEqual(audio.selectedID, "a", "The natural boundary precedes the service poll")
+                XCTAssertTrue(audio.invalidateForRetry(token: b.token), "The actual natural successor's failure must stop it")
+                XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+                audio.settlePausedState()
+                XCTAssertFalse(audio.graph.engine.isRunning)
+            }
+        }
+    }
+
     func testInvalidatingAPendingSelectionLetsTheSilentEngineSettle() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
         let audio = ContinuousAudioPlayer()

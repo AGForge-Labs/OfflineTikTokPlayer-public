@@ -162,7 +162,12 @@ final class ContinuousAudioPlayer {
         failedTokens.insert(token)
         for entry in entries.values { renderer.setSuccessor(token: 0, for: entry.token) }
         successors.removeAll()
-        let selected = renderer.snapshot.token == token || selectedID.flatMap { entries[$0]?.token } == token
+        let sample = renderer.snapshot
+        let requested = selectedID.flatMap { entries[$0]?.token }
+        let relevant: Int?
+        if isSelectionPending(in: sample) { relevant = requested }
+        else { relevant = sample.token > 0 ? sample.token : requested }
+        let selected = relevant == token
         if selected {
             suspend(); pendingPosition = nil; renderer.select(token: 0); selectedID = nil
         }
