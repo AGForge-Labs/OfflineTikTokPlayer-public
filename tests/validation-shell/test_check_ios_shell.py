@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class NativeLauncherTests(unittest.TestCase):
     def exercise(self, arguments=(), status=0, expansion_error=False, preflight_failure=False,
-                 driver_status=0, driver_remark=True):
+                 driver_status=0, driver_remark=True, successful_output=None):
         with tempfile.TemporaryDirectory(prefix="offline-ios-shell-") as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -22,6 +22,8 @@ class NativeLauncherTests(unittest.TestCase):
             (root / "artifacts/native").mkdir(parents=True)
             evidence_log = root / "artifacts/native/xcodebuild-test.log"
             evidence_log.write_text("** TEST SUCCEEDED ** stale previous evidence\n")
+            if successful_output is not None:
+                (root / "successful-output.log").write_text(successful_output)
             launcher = (ROOT / "scripts/check-ios.sh").read_text()
             if expansion_error:
                 # Inject the original failure category into a disposable copy after
@@ -53,6 +55,9 @@ for ((attempt=0; attempt<100; attempt++)); do
   [ -f "$LAUNCHER_TEST_ROOT/helper.pid" ] && break
   sleep 0.01
 done
+if [ -f "$LAUNCHER_TEST_ROOT/successful-output.log" ]; then
+  cat "$LAUNCHER_TEST_ROOT/successful-output.log"
+fi
 exit "$LAUNCHER_TEST_STATUS"
 """)
             python.chmod(0o755)
@@ -108,6 +113,8 @@ exit "$LAUNCHER_TEST_DRIVER_STATUS"
                     self.fail("The launcher left its screenshot helper running")
             self.assertTrue(pid_file.exists(), "The isolated screenshot helper must actually start")
             self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+            if successful_output is not None:
+                self.assertIn(successful_output, result.stdout)
             if expansion_error:
                 self.assertIn("unbound variable", result.stderr)
                 self.assertEqual(actual, [], "An earlier error must prevent the native launch")
@@ -138,6 +145,11 @@ exit "$LAUNCHER_TEST_DRIVER_STATUS"
 
     def test_native_failure_survives_exit_cleanup(self):
         self.exercise(status=23)
+
+    def test_full_passing_case_output_cannot_mask_native_exit_failure(self):
+        from test_native_test_evidence import case_line, current_manifest
+        output = "\n".join([case_line(identity) for identity in current_manifest()] + ["** TEST SUCCEEDED **"]) + "\n"
+        self.exercise(status=23, successful_output=output)
 
     def test_first_expansion_error_survives_cleanup(self):
         self.exercise(status=1, expansion_error=True)

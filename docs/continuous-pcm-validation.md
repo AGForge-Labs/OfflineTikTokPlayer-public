@@ -142,6 +142,26 @@ audio/video clocks, fixed ownership, no loop and no new underruns. The entire
 capture window must remain below 29 seconds of wall, media and PCM time. Capture
 errors still fail immediately. Native acceptance of this revision is pending.
 
+Run [39404404737](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39404404737)
+at `b319d1c261ac1ea5575401f783cf6715922b1a49` passed all 81 core, 89 native
+and one UI test with zero failures. All eight selected-video regressions passed,
+including the actual two-dimensional moving marker and held-completion seek.
+Xcode printed `TEST SUCCEEDED` at 10:10:48 UTC. The overall workflow still failed:
+a timestamped VRP framework diagnostic split one case's terminal record between
+the complete identity and its `passed` suffix. The strict identity guard rejected
+that record and returned 1; the separate acceptance step correctly did not run.
+This run remains failed and unaccepted.
+
+The next change affects only the validation harness and this record. It accepts
+that exact two-line interleaving only when the suffix is immediately adjacent and
+the case has one prior start and no outcome. Unmatched native fragments and
+orphan suffixes fail. Original failure/success markers are still checked before
+reconstruction; failed, skipped, duplicate and unexpected cases still fail.
+Sixteen evidence regressions cover these cases. Eight launcher regressions also
+require a native exit of 23 to propagate even when its output contains all 90
+passing case identities and `TEST SUCCEEDED`. Production, native tests and media
+are unchanged from the run above. Overall native acceptance remains pending.
+
 Unsigned validation keeps Xcode's build queue at one job and disables parallel
 tests. It now also exports `SWIFTC_MAXIMUM_DETERMINISM=1`, confirms the selected
 Swift driver's one-job override with a print-only plan before compilation, and

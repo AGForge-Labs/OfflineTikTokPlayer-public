@@ -22,7 +22,16 @@ IDENTIFIER = re.compile(r"[A-Za-z_]\w*", re.ASCII)
 CLASS = re.compile(r"\bclass\s+([A-Za-z_]\w*)\b([^{}]*)\{", re.ASCII)
 METHOD = re.compile(r"\bfunc\s+(test[^\s(]*)\s*\(([^)]*)\)")
 CASE = re.compile(r"\bTest Case '([^']+)' ([A-Za-z]+)(?:\s|\.)")
+CASE_HEADER = re.compile(r"\bTest Case '([^']+)'")
 CASE_ID = re.compile(r"^-\[([A-Za-z_]\w*)\.([A-Za-z_]\w*) ([^\]]+)\]$", re.ASCII)
+GITHUB_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT\S+Z ")
+# Xcode can interleave one framework stderr record between the complete case
+# identity and its result suffix. Recognize only the observed bounded shape;
+# never search forward, discard arbitrary noise, or use a suite summary.
+SPLIT_CASE = re.compile(
+    r"Test Case '([^']+)'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[\] <<<< VRP >>>> signalled err=-?\d+ at <>:\d+")
+RESULT_SUFFIX = re.compile(r" (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 FAILURE = re.compile(r"\*\* TEST(?: [A-Z]+)* FAILED \*\*")
 
@@ -199,15 +208,38 @@ def source_manifest(repo_root, selection_only=False):
 def verify_log(text, expected):
     starts, outcomes = Counter(), defaultdict(Counter)
     observed, problems, successes, last_case = set(), [], [], 0
+    pending = None
     for number, line in enumerate(text.splitlines(), 1):
         if SUCCESS.fullmatch(line):
             successes.append(number)
         if FAILURE.search(line):
             problems.append(f"TEST FAILED marker at line {number}")
-        match = CASE.search(line)
-        if not match:
-            continue
-        raw, status = match.groups()
+        clean = GITHUB_TIMESTAMP.sub("", line, count=1)
+        event, reconstructed = None, False
+        if pending is not None:
+            raw, header_line = pending
+            pending = None
+            suffix = RESULT_SUFFIX.fullmatch(clean)
+            if suffix:
+                event, reconstructed = (raw, suffix.group(1)), True
+            else:
+                problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
+        if event is None:
+            match = CASE.search(line)
+            if match:
+                event = match.groups()
+            else:
+                header = CASE_HEADER.search(line)
+                if header and any(target + "." in header.group(1) for target in TARGETS):
+                    split = SPLIT_CASE.fullmatch(clean)
+                    if split:
+                        pending = (split.group(1), number)
+                    else:
+                        problems.append(f"Malformed native/UI case at line {number}: {header.group(1)}")
+                elif RESULT_SUFFIX.fullmatch(clean):
+                    problems.append(f"Orphan case result suffix at line {number}")
+                continue
+        raw, status = event
         parsed = CASE_ID.fullmatch(raw)
         if not parsed:
             if any(target + "." in raw for target in TARGETS):
@@ -221,12 +253,17 @@ def verify_log(text, expected):
             continue
         observed.add(identity)
         last_case = number
+        if reconstructed and (starts[identity] != 1 or sum(outcomes[identity].values()) != 0):
+            problems.append(f"Ambiguous interleaved case at line {number}: {identity}")
         if status == "started":
             starts[identity] += 1
         elif status in ("passed", "failed", "skipped"):
             outcomes[identity][status] += 1
         else:
             problems.append(f"Unsupported native/UI case status at line {number}: {status} {identity}")
+    if pending is not None:
+        raw, header_line = pending
+        problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
     if len(successes) != 1:
         problems.append(f"Expected exactly one TEST SUCCEEDED marker; found {len(successes)}")
     elif successes[0] <= last_case:

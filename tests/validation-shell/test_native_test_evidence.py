@@ -39,6 +39,14 @@ def case_line(identity, status="passed", timestamp=False):
     return f"{prefix}Test Case '-[{owner} {method}]' {status} (0.001 seconds)."
 
 
+def split_case(identity, status="passed", timestamp=False):
+    owner, method = identity.split("/")
+    prefix = "2026-10-20T10:06:44.0489010Z " if timestamp else ""
+    return [f"{prefix}Test Case '-[{owner} {method}]'"
+            "2026-10-20 10:06:43.416902+0000 OfflineTikTokPlayer[14643:52859] [] <<<< VRP >>>> signalled err=-12852 at <>:2246",
+            prefix + f" {status} (1.774 seconds)."]
+
+
 class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -103,6 +111,10 @@ class NativeTestEvidenceTests(unittest.TestCase):
                 result = self.check_log([case_line(target + ".NewTests/testUnexpected")] + self.full_log())
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("unexpected", result.stderr.lower())
+                unexpected = target + ".NewTests/testUnexpected"
+                result = self.check_log([case_line(unexpected, "started")] + split_case(unexpected) + self.full_log())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unexpected", result.stderr.lower())
 
     def test_requires_one_success_marker_after_results_and_no_failure_marker(self):
         cases = [case_line(x) for x in self.expected]
@@ -119,6 +131,62 @@ class NativeTestEvidenceTests(unittest.TestCase):
         self.assertNotEqual(self.check_log(summary + ["** TEST SUCCEEDED **"]).returncode, 0)
         result = self.check_log(self.full_log()[:-1] + summary + ["** TEST SUCCEEDED **"])
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_only_adjacent_interleaved_case_result_with_process_diagnostic(self):
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                lines = [case_line(x) for x in self.expected[1:]]
+                lines += [case_line(self.expected[0], "started")] + split_case(self.expected[0], timestamp=timestamp)
+                result = self.check_log(lines + ["** TEST SUCCEEDED **"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PASS " + self.expected[0], result.stdout)
+
+    def test_interleaved_failure_skip_duplicate_and_retry_still_fail(self):
+        others = [case_line(x) for x in self.expected[1:]]
+        started = [case_line(self.expected[0], "started")]
+        for status in ("failed", "skipped"):
+            with self.subTest(status=status):
+                result = self.check_log(others + started + split_case(self.expected[0], status) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(status, result.stderr.lower())
+        for status in ("failed", "passed"):
+            with self.subTest(retry_or_duplicate=status):
+                result = self.check_log(others + started + split_case(self.expected[0], status)
+                                        + [case_line(self.expected[0]), "** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("duplicate", result.stderr.lower())
+
+    def test_split_result_cannot_borrow_across_any_other_record(self):
+        header, result = split_case(self.expected[0])
+        for intervening in ("unrelated output", case_line(self.expected[1], "started"),
+                            "** TEST SUCCEEDED **", "** TEST FAILED **", ""):
+            with self.subTest(intervening=intervening):
+                lines = [case_line(x) for x in self.expected[1:]] + [case_line(self.expected[0], "started")]
+                checked = self.check_log(lines + [header, intervening, result, "** TEST SUCCEEDED **"])
+                self.assertNotEqual(checked.returncode, 0)
+                self.assertIn(self.expected[0], checked.stderr)
+
+    def test_split_case_rejects_unknown_noise_missing_result_and_embedded_test_markers(self):
+        header, result = split_case(self.expected[0])
+        for fragment in ([header], [header.replace("2026-10-20 10:06:43.416902+0000", "unknown-noise"), result],
+                         [header + " ** TEST FAILED **", result],
+                         [header + " " + case_line(self.expected[1], "failed"), result]):
+            with self.subTest(fragment=fragment):
+                lines = [case_line(x) for x in self.expected[1:]] + [case_line(self.expected[0], "started")]
+                checked = self.check_log(lines + fragment + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(checked.returncode, 0)
+
+    def test_split_terminal_requires_its_own_unique_started_case(self):
+        others = [case_line(x) for x in self.expected[1:]]
+        for extra in (split_case(self.expected[0]),
+                      [case_line(self.expected[0], "started")] * 2 + split_case(self.expected[0])):
+            with self.subTest(extra=extra):
+                checked = self.check_log(others + extra + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(checked.returncode, 0)
+                self.assertIn("Ambiguous", checked.stderr)
+        checked = self.check_log([" passed (1.774 seconds)."] + self.full_log())
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn("Orphan", checked.stderr)
 
     def test_selection_only_requires_exactly_the_four_focused_classes_and_no_ui(self):
         focused = [x for x in self.expected if x.split(".", 1)[1].split("/")[0] in FOCUSED_CLASSES]
