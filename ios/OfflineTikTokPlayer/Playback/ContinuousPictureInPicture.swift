@@ -29,6 +29,7 @@ final class ContinuousPictureInPicture: NSObject {
     let displayLayer = AVSampleBufferDisplayLayer()
     private(set) var controller: AVPictureInPictureController?
     private(set) var submittedFrameCount: UInt64 = 0
+    private(set) var frameEpoch: UInt64 = 0
     private(set) var lastFramePositionSeconds: Double?
     private(set) var lastCopiedFramePositionSeconds: Double?
     private(set) var pausedFutureFrameRejectionCount: UInt64 = 0
@@ -116,6 +117,7 @@ final class ContinuousPictureInPicture: NSObject {
         preparationTask = nil
         stopFrameTimer()
         itemGeneration &+= 1
+        frameEpoch &+= 1
         activeSeekTicket = nil
         let generation = itemGeneration
         if let videoOutput, !(videoOutput is PreparedVideoOutput) { currentItem?.remove(videoOutput) }
@@ -183,7 +185,7 @@ final class ContinuousPictureInPicture: NSObject {
     /// AVQueuePlayer. Item ownership bounds lifetime to the existing buffer.
     @discardableResult
     static func prepareVideoOutput(for item: AVPlayerItem) -> AVPlayerItemVideoOutput {
-        if let existing = item.outputs.first(where: { $0 is PreparedVideoOutput }) as? AVPlayerItemVideoOutput { return existing }
+        if let existing = preparedVideoOutput(for: item) { return existing }
         let output = PreparedVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]
@@ -191,6 +193,10 @@ final class ContinuousPictureInPicture: NSObject {
         output.suppressesPlayerRendering = false
         item.add(output)
         return output
+    }
+
+    static func preparedVideoOutput(for item: AVPlayerItem) -> AVPlayerItemVideoOutput? {
+        item.outputs.first(where: { $0 is PreparedVideoOutput }) as? AVPlayerItemVideoOutput
     }
 
     private final class PreparedVideoOutput: AVPlayerItemVideoOutput {}
@@ -286,6 +292,7 @@ final class ContinuousPictureInPicture: NSObject {
 
     /// A seek starts a new frame epoch, including the image held by a paused timebase.
     func flushForSeek() {
+        frameEpoch &+= 1
         displayLayer.flushAndRemoveImage()
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
@@ -324,6 +331,9 @@ final class ContinuousPictureInPicture: NSObject {
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true
+        frameEpoch &+= 1
+        lastFramePositionSeconds = nil
+        lastCopiedFramePositionSeconds = nil
         activeSeekTicket = nil
         preparationTask?.cancel()
         preparationTask = nil
@@ -374,6 +384,9 @@ final class ContinuousPictureInPicture: NSObject {
                 onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)
                 hasReportedFrameFailure = true
             }
+            frameEpoch &+= 1
+            lastFramePositionSeconds = nil
+            lastCopiedFramePositionSeconds = nil
             displayLayer.flushAndRemoveImage()
             lastEnqueuedTime = .invalid
         }

@@ -23,6 +23,12 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertEqual(a.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
         XCTAssertEqual(b.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
         XCTAssertFalse(aOutput.suppressesPlayerRendering)
+        let monitor = PlaybackFrameMonitor()
+        monitor.start(item: a, layer: AVPlayerLayer(), decodedFrameEpoch: { nil }) { XCTFail("No decoded frame is available") }
+        XCTAssertEqual(a.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1,
+                       "Even false external evidence must not create a second late output")
+        monitor.cancel()
+        XCTAssertTrue(a.outputs.contains { $0 === aOutput }, "Observation cannot remove the shared prepared output")
         bridge.setCurrentItem(fallback)
         let deadline = ProcessInfo.processInfo.systemUptime + 3
         while !bridge.orientationPrepared, ProcessInfo.processInfo.systemUptime < deadline {

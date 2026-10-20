@@ -539,7 +539,18 @@ final class PlaybackService: NSObject {
     }
 
     private func monitorFirstFrame(_ playerItem: AVPlayerItem, request: Int) {
-        frameMonitor.start(item: playerItem, layer: surface.playerLayer) { [weak self, weak playerItem] in
+        var decodedFrameEpoch: (() -> UInt64?)?
+        if ContinuousPictureInPicture.preparedVideoOutput(for: playerItem) != nil {
+            // Observe the current epoch's actual submitted frame without adding
+            // a second late output or competing with its pixel-buffer consumer.
+            decodedFrameEpoch = { [weak self, weak playerItem] in
+                guard let self, let playerItem, self.generation == request,
+                      self.player.currentItem === playerItem,
+                      self.continuousPiP.lastFramePositionSeconds != nil else { return nil }
+                return self.continuousPiP.frameEpoch
+            }
+        }
+        frameMonitor.start(item: playerItem, layer: surface.playerLayer, decodedFrameEpoch: decodedFrameEpoch) { [weak self, weak playerItem] in
             guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
             self.isVideoReady = true
             self.recordPlaybackEvent("firstFrame")

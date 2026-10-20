@@ -6,7 +6,16 @@ public struct PlaybackFrameReadiness {
     private var decoded = false
     private var armedAt: Double?
     private var ready = false
+    private var frameEpoch: UInt64?
     public init() {}
+
+    /// Level evidence from an actively submitted frame. A missing/replaced epoch
+    /// must earn its own native-layer display opportunity after every flush.
+    public mutating func sampleCurrentFrame(epoch: UInt64?, layerReady: Bool, displayTime: Double) -> Bool {
+        guard let epoch else { self = Self(); return false }
+        if frameEpoch != epoch { self = Self(); frameEpoch = epoch }
+        return sample(decodedFrame: true, layerReady: layerReady, displayTime: displayTime)
+    }
 
     public mutating func sample(decodedFrame: Bool, layerReady: Bool, displayTime: Double) -> Bool {
         if ready { return true }
