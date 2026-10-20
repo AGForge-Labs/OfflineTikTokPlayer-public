@@ -44,14 +44,27 @@ final class PlaybackService: NSObject {
     private(set) var hasAudioTrack: Bool?
     var message: String?
     var isInteractingWithFeed = false {
-        didSet { buffer.automaticAdvancementEnabled = !isInteractingWithFeed }
+        didSet { updateAudioSuccessor() }
     }
     var speakerSound: Bool {
         didSet { UserDefaults.standard.set(speakerSound, forKey: "speakerSound"); refreshAudioProcessing() }
     }
     var automaticPiP: Bool {
-        didSet { pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP; UserDefaults.standard.set(automaticPiP, forKey: "automaticPiP") }
+        didSet { pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture; UserDefaults.standard.set(automaticPiP, forKey: "automaticPiP") }
     }
+    var audioOnly = false {
+        didSet {
+            applyPresentation(presentationPolicy.setAudioOnly(audioOnly))
+            recordDiagnostic(audioOnly ? .audioOnlySelected : .videoSelected)
+        }
+    }
+    @ObservationIgnored private var presentationPolicy = PlaybackPresentationPolicy()
+    @ObservationIgnored private var diagnostics = PlaybackDiagnosticJournal(capacity: 128)
+    @ObservationIgnored private let continuousPiP = ContinuousPictureInPicture()
+    @ObservationIgnored private var pipSkipCompletion: (() -> Void)?
+    @ObservationIgnored private var pipSkipDeadline = 0.0
+    @ObservationIgnored private var lastUnderrun: Int64 = 0
+    private var videoAllowed: Bool { presentationPolicy.presentation != .audioOnly }
     @ObservationIgnored var requestPlayerUI: (() -> Void)?
     @ObservationIgnored private(set) var surface: PlayerSurface!
     @ObservationIgnored private var pip: AVPictureInPictureController?
@@ -59,6 +72,15 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let downloads: OfflineDownloads
     @ObservationIgnored private let cloud: OneDriveClient
     @ObservationIgnored private let buffer: PlaybackBuffer
+    @ObservationIgnored private let continuousAudio = ContinuousAudioPlayer()
+    @ObservationIgnored private var audioPollTask: Task<Void, Never>?
+    @ObservationIgnored private var audioVisit: Int64 = -1
+    @ObservationIgnored private var audioToken = 0
+    @ObservationIgnored private var syncingVideo = false
+    @ObservationIgnored private var audioLoadingID: String?
+    @ObservationIgnored private var pendingAudioSeek: (seek: PlaybackTimeline.Seek, visit: Int64)?
+    var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
+    var preparedAudioCount: Int { continuousAudio.preparedCount }
     @ObservationIgnored private let mediaCache: PlaybackMediaCache?
     @ObservationIgnored private var warmTask: Task<Void, Never>?
     @ObservationIgnored private var warmRevision = 0
@@ -106,10 +128,30 @@ final class PlaybackService: NSObject {
         automaticPiP = UserDefaults.standard.bool(forKey: "automaticPiP")
         speakerSound = UserDefaults.standard.object(forKey: "speakerSound") as? Bool ?? true
         super.init()
+        continuousAudio.onSourceSilence { [weak self] _, analysis in
+            Task { @MainActor in self?.recordDiagnostic(.sourceTimelineAnalyzed, sourceSilence: analysis) }
+        }
+        continuousAudio.onDecodeFailure { [weak self] token, _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let selected = self.continuousAudio.invalidateForRetry(token: token)
+                self.recordDiagnostic(.sourcePreparationFailed)
+                self.updateAudioSuccessor()
+                if selected {
+                    self.pause(); self.recordPlaybackEvent("decodeFailed")
+                    self.message = "Audio could not be decoded. Choose another video or tap Play to retry."
+                }
+            }
+        }
         surface = PlayerSurface(player: player)
+        player.isMuted = true
+        self.buffer.automaticAdvancementEnabled = false
         player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
         self.buffer.didAdvance = { [weak self] prepared in
             guard let self else { return }
+            // Muted video never owns the audio queue. A delayed visual KVO event
+            // cannot advance (or pause) the sample timeline.
+            if self.continuousAudio.isSelected { return }
             var advanced = self.queue
             guard advanced.next(explicit: false) == prepared.mediaID else {
                 self.player.pause(); self.loadCurrent(position: self.clock.position); return
@@ -117,12 +159,42 @@ final class PlaybackService: NSObject {
             self.queue = advanced
             self.loadCurrent(adopting: prepared)
         }
-        pip = AVPictureInPictureController(playerLayer: surface.playerLayer)
-        pip?.delegate = self; pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP
+        surface.attachPiPDisplayLayer(continuousPiP.displayLayer)
+        pip = continuousPiP.controller
+        pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP
+        continuousPiP.onSetPlaying = { [weak self] playing in
+            if playing { self?.play() } else { self?.pause() }
+        }
+        continuousPiP.onSkip = { [weak self] seconds, completion in
+            guard let self else { completion(); return }
+            self.pipSkipCompletion?()
+            self.pipSkipCompletion = completion
+            self.pipSkipDeadline = ProcessInfo.processInfo.systemUptime + 1
+            self.seek(self.clock.position + seconds)
+            if self.pendingAudioSeek == nil { self.completePiPSkip() }
+        }
+        continuousPiP.onRestoreUI = { [weak self] completion in
+            guard let self, let restore = self.requestPlayerUI else { completion(false); return }
+            restore()
+            DispatchQueue.main.async { [weak self] in
+                self?.synchronizeVideoToAudio(force: true)
+                completion(self?.surface.window != nil)
+            }
+        }
+        continuousPiP.onStateChanged = { [weak self] _, _, _ in self?.samplePiPState() }
+        continuousPiP.onEvent = { [weak self] event, code in self?.handlePiPEvent(event, code: code) }
         configureAudio(); installObservers(); installRemoteControls()
+        audioPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard self != nil else { return }
+                self?.sampleContinuousAudio()
+                do { try await Task.sleep(for: .milliseconds(33)) } catch { return }
+            }
+        }
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600), queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, let item = self.observedItem, self.player.currentItem === item else { return }
+                guard !self.continuousAudio.isSelected else { return }
                 // Read the current item now: an already queued callback can belong to the old item.
                 self.clock.sample(position: item.currentTime().seconds)
                 if self.firstProgressGeneration != self.generation, item.currentTime().seconds >= 0.05 {
@@ -156,11 +228,13 @@ final class PlaybackService: NSObject {
     func play() {
         guard current != nil else { return }
         intent.requestPlay(); activateAudio()
+        recordDiagnostic(.playRequested)
+        resumeContinuousAudio()
         if intent.canPlay, resumeAfterPreparedEnd() { return }
-        if player.currentItem == nil { loadCurrent(position: clock.position) }
+        if player.currentItem == nil || !continuousAudio.isSelected { loadCurrent(position: clock.position) }
         else {
             if clock.duration > 0, clock.position >= clock.duration { seek(0) }
-            else if intent.canPlay { player.play() }
+            else if intent.canPlay, videoAllowed { player.play() }
             prepareUpcoming()
             if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { armStallRecovery() }
         }
@@ -168,12 +242,19 @@ final class PlaybackService: NSObject {
     }
     func pause() {
         intent.pause()
+        recordDiagnostic(.pauseRequested)
+        continuousAudio.suspend()
+        continuousPiP.updatePlayback(positionSeconds: clock.position, durationSeconds: clock.duration, isPlaying: false)
         cancelStallRecovery()
         player.pause(); persist(); updateNowPlaying()
     }
 
     func next(explicit: Bool = true) {
+        let previousVisit = audioVisit
+        sampleContinuousAudio(handleEnd: false)
+        if !explicit, audioVisit != previousVisit { return }
         recordPlaybackEvent("next")
+        recordDiagnostic(.nextRequested)
         buffer.synchronize()
         endedDuringScroll = false
         let previous = queue.currentID
@@ -188,7 +269,9 @@ final class PlaybackService: NSObject {
     }
 
     func previous() {
+        sampleContinuousAudio(handleEnd: false)
         recordPlaybackEvent("previous")
+        recordDiagnostic(.previousRequested)
         buffer.synchronize()
         endedDuringScroll = false
         guard queue.previous() != nil else { seek(0); return }
@@ -202,12 +285,27 @@ final class PlaybackService: NSObject {
         else if endedDuringScroll { next(explicit: false) }
     }
 
-    func setShuffle(_ enabled: Bool) { buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
-    func cycleRepeat() { buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
+    func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
+    func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
+        if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds) {
+            pendingAudioSeek = (seek, continuousAudio.snapshot.visit)
+            continuousAudio.seek(seek.target)
+            recordDiagnostic(.seekRequested)
+            if !intent.canPlay {
+                _ = clock.completeSeek(seek, actualPosition: seek.target)
+                pendingAudioSeek = nil
+                synchronizeVideoToAudio(force: true)
+                completePiPSkip()
+            }
+            persist(); updateNowPlaying()
+            return
+        }
         guard let item = player.currentItem, item === observedItem,
               let seek = clock.beginSeek(to: seconds) else { return }
         let request = generation
+        continuousAudio.seek(seek.target)
+        recordDiagnostic(.seekRequested)
         recordPlaybackEvent("seekRequested")
         seekPlayer(player, CMTime(seconds: seek.target, preferredTimescale: 600)) { [weak self, weak item] finished in
             Task { @MainActor in
@@ -217,14 +315,19 @@ final class PlaybackService: NSObject {
                 self.recordPlaybackEvent("seekCompleted")
                 // The latest seek inherits playback intent when it supersedes a
                 // paused startup rewind. Explicit Pause/interruption still wins.
-                if self.intent.canPlay { self.player.playImmediately(atRate: 1) }
+                if self.intent.canPlay {
+                    self.resumeContinuousAudio()
+                    if self.videoAllowed { self.player.playImmediately(atRate: 1) }
+                }
                 self.persist(); self.updateNowPlaying()
             }
         }
         persist(); updateNowPlaying()
     }
 
-    private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil) {
+    private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil,
+                             audioAlreadySelected: Bool = false) {
+        if !audioAlreadySelected { audioLoadingID = queue.currentID }
         reachedPreparedEnd = adopting?.reachedEnd ?? false
         if reachedPreparedEnd {
             var following = queue
@@ -244,14 +347,21 @@ final class PlaybackService: NSObject {
         clock.reset(position: position, duration: current?.duration ?? 0)
         isLoading = true
         let allowRemote = downloads.network.isConnected && !downloads.readyIDs.contains(queue.currentID ?? "")
+        continuousAudio.setWindow(Set([queue.currentID, previousID, nextID].compactMap { $0 }))
         // An automatic AVQueuePlayer advance must obey the same Saved/offline
         // eligibility as an explicit handoff. Re-resolve a rejected remote stage.
         let eligibleAdoption = adopting.flatMap { $0.isLocal || allowRemote ? $0 : nil }
-        if !forceRemote, position == 0, let id = queue.currentID,
+        let selectedAtRequest = !forceRemote && !audioAlreadySelected && queue.currentID.flatMap { continuousAudio.entry(for: $0) } != nil
+        if selectedAtRequest, let id = queue.currentID {
+            selectContinuousAudio(id: id, position: position)
+            resumeContinuousAudio()
+        }
+        if !forceRemote, let id = queue.currentID, continuousAudio.entry(for: id) != nil,
            let prepared = eligibleAdoption ?? buffer.advance(to: id, allowRemote: allowRemote) {
             currentIsLocal = prepared.isLocal
+            resumeContinuousAudio()
             recordPlaybackEvent("preparedAdoption")
-            observeCurrent(prepared.item, position: 0, request: request, rewind: prepared.needsRewind)
+            observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
             prepareUpcoming()
             return
         }
@@ -266,29 +376,48 @@ final class PlaybackService: NSObject {
                     let saved = await self.downloads.localURL(for: item)
                     let cached: URL?
                     if let asset = item.asset { cached = await self.mediaCache?.file(for: asset) } else { cached = nil }
-                    let local = saved ?? cached
+                    var local = saved ?? cached
+                    // AVAssetReader prepares only verified local media. A cold
+                    // network selection must download before it can be gapless.
+                    if local == nil, let asset = item.asset, self.downloads.network.isConnected {
+                        let pinned = [self.current, self.previousID.flatMap { self.library.catalog.mediaByID[$0] },
+                                      self.nextID.flatMap { self.library.catalog.mediaByID[$0] }].compactMap { $0?.asset }
+                        await self.mediaCache?.setWindow(pinned, revision: self.warmRevision)
+                        local = await self.mediaCache?.prefetch(asset, revision: self.warmRevision)
+                    }
                     let url: URL
                     if let local { url = local }
                     else {
-                        guard self.downloads.network.isConnected, let asset = item.asset else { throw AppError.message("No offline copy of this video.") }
-                        url = try await self.cloud.downloadURL(asset, forceRefresh: forceRemote)
+                        throw AppError.message("This video must finish preparing before playback.")
                     }
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
                     self.currentIsLocal = local != nil
                     let playerItem = AVPlayerItem(url: url)
                     playerItem.preferredForwardBufferDuration = 8
-                    // An explicit cold selection must not wait half a second for
-                    // optional EQ metadata. Readiness provides one safe retry.
-                    await self.speakerAudio.prepare(playerItem, within: .milliseconds(100))
+                    _ = try await self.continuousAudio.prepare(id: item.id, url: url, currentPriority: true)
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
+                    if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
+                    self.resumeContinuousAudio()
                     self.recordPlaybackEvent("coldAudioPrepared")
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
                     self.observeCurrent(playerItem, position: itemPosition, request: request)
                     self.prepareUpcoming()
                     self.persist(); return
                 } catch is CancellationError { return }
+                catch ContinuousPCMDecoder.Failure.cancelled {
+                    guard self.generation == request, !Task.isCancelled else { return }
+                    self.loadCurrent(position: itemPosition)
+                    return
+                }
+                catch ContinuousAudioPlayer.PreparationError.windowBusy {
+                    guard self.generation == request else { return }
+                    do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+                    guard self.generation == request else { return }
+                    self.loadCurrent(position: itemPosition)
+                    return
+                }
                 catch {
                     guard self.generation == request else { return }
                     if !self.wantsToPlay { self.isLoading = false; return }
@@ -304,6 +433,7 @@ final class PlaybackService: NSObject {
 
     private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
         observedItem = playerItem
+        continuousPiP.setCurrentItem(playerItem)
         refreshAudioProcessing()
         audioCheckTask = Task { [weak self, weak playerItem] in
             guard let playerItem else { return }
@@ -326,12 +456,15 @@ final class PlaybackService: NSObject {
                     self.recordPlaybackEvent("itemReady")
                     // A new or prebuffered item is already at zero; an exact zero seek discards that benefit.
                     if position > 0 || rewind {
-                        // Reused history items must finish rewinding before any audio is played.
-                        self.player.pause()
-                        self.seek(position)
-                    } else if self.intent.canPlay { self.player.playImmediately(atRate: 1) }
+                        // Audio already owns its position. Readiness of a reused
+                        // muted video must never rewind the audible PCM cursor.
+                        self.synchronizeVideoToAudio(force: true)
+                    } else if self.intent.canPlay, self.videoAllowed { self.player.playImmediately(atRate: 1) }
                     self.updateNowPlaying()
-                } else if playerItem.status == .failed { self.handlePlaybackFailure() }
+                } else if playerItem.status == .failed {
+                    if self.continuousAudio.isSelected { self.message = "Video is unavailable. Audio will continue." }
+                    else { self.handlePlaybackFailure() }
+                }
             }
         }
     }
@@ -359,6 +492,9 @@ final class PlaybackService: NSObject {
         let active = current
         let previous = previousID.flatMap { library.catalog.mediaByID[$0] }
         let successor = naturalID.flatMap { library.catalog.mediaByID[$0] }
+        let pcmIDs = Set([active?.id, previous?.id, nextID].compactMap { $0 })
+        continuousAudio.setWindow(pcmIDs)
+        updateAudioSuccessor()
         if buffer.nextMediaID != naturalID { buffer.discardNext() }
         if buffer.previousMediaID != previous?.id { buffer.discardPrevious() }
         warmTask = Task { [weak self] in
@@ -381,23 +517,12 @@ final class PlaybackService: NSObject {
                     // Never infer a trim point from a silent tail or catalog duration.
                     let playerItem = AVPlayerItem(url: url)
                     playerItem.preferredForwardBufferDuration = 8
-                    await self.speakerAudio.prepare(playerItem)
+                    if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil), after: active?.id)
+                    self.updateAudioSuccessor()
                     self.refreshAudioProcessing()
                 }
-            }
-            if naturalID == active?.id, !self.buffer.hasLoopReserve,
-               let asset = self.player.currentItem?.asset, let id = naturalID {
-                // Apple's looper similarly maintains at least three replicas. We own
-                // this bounded queue so each item receives an independent speaker tap.
-                let reserve = AVPlayerItem(asset: asset)
-                reserve.preferredForwardBufferDuration = 8
-                await self.speakerAudio.prepare(reserve)
-                self.buffer.synchronize()
-                guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
-                self.buffer.stageLoopReserve(.init(mediaID: id, item: reserve, isLocal: self.currentIsLocal))
-                self.refreshAudioProcessing()
             }
             if let previous, self.buffer.previousMediaID != previous.id {
                 let saved = await self.downloads.localURL(for: previous)
@@ -411,7 +536,7 @@ final class PlaybackService: NSObject {
                     let item = AVPlayerItem(url: url)
                     item.preferredForwardBufferDuration = 8
                     _ = await PlaybackPreparation.value(within: .milliseconds(500)) { try? await item.asset.load(.isPlayable) }
-                    await self.speakerAudio.prepare(item)
+                    if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stagePrevious(.init(mediaID: previous.id, item: item, isLocal: saved != nil || cached != nil))
                     self.refreshAudioProcessing()
@@ -423,18 +548,120 @@ final class PlaybackService: NSObject {
                 guard !Task.isCancelled, self.warmRevision == revision else { return }
                 guard let asset = item.asset else { continue }
                 if await self.downloads.localURL(for: item) != nil { continue }
-                if let url = await self.mediaCache?.prefetch(asset, revision: revision), item.id == naturalID {
+                if let url = await self.mediaCache?.prefetch(asset, revision: revision), pcmIDs.contains(item.id) {
                     guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
+                    _ = try? await self.continuousAudio.prepare(id: item.id, url: url)
+                    self.updateAudioSuccessor()
                     // Keep the prepared decoder. Promote the file now only for an offline handoff.
                     let requireLocal = !self.downloads.network.isConnected
                     if requireLocal || !self.buffer.hasPrepared(item.id) {
                         let playerItem = AVPlayerItem(url: url)
-                        await self.speakerAudio.prepare(playerItem)
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
                         self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal, after: active?.id)
+                        self.updateAudioSuccessor()
                         self.refreshAudioProcessing()
                     }
                 }
+            }
+        }
+    }
+
+    private func selectContinuousAudio(id: String, position: Double) {
+        audioVisit = continuousAudio.snapshot.visit
+        audioToken = continuousAudio.snapshot.token
+        if continuousAudio.select(id: id, position: position) { audioLoadingID = nil }
+    }
+
+    private func resumeContinuousAudio() {
+        guard intent.canPlay, continuousAudio.isSelected else { return }
+        do { try continuousAudio.setPlaying(true) }
+        catch {
+            intent.activationCompleted(succeeded: false)
+            continuousAudio.suspend(); player.pause()
+            message = "Audio could not restart. Tap Play to try again."
+            recordPlaybackEvent("engineStartFailed")
+        }
+    }
+
+    private func updateAudioSuccessor() {
+        guard let id = queue.currentID else { return }
+        var following = queue
+        let next = isInteractingWithFeed ? nil : following.next(explicit: false)
+        continuousAudio.follow(from: id, to: next)
+        buffer.automaticAdvancementEnabled = false
+    }
+
+    private func sampleContinuousAudio(handleEnd: Bool = true) {
+        guard audioLoadingID == nil else { return }
+        let sample = continuousAudio.snapshot
+        guard let entry = continuousAudio.entry(forToken: sample.token) else { return }
+        if let pending = pendingAudioSeek, sample.visit != pending.visit {
+            _ = clock.completeSeek(pending.seek, actualPosition: Double(sample.frame) / 48_000)
+            pendingAudioSeek = nil
+            completePiPSkip()
+        }
+        if sample.underrunFrames != lastUnderrun {
+            lastUnderrun = sample.underrunFrames; recordDiagnostic(.rendererUnderrun)
+        }
+        if sample.visit != audioVisit {
+            let changedSource = sample.token != audioToken
+            audioVisit = sample.visit; audioToken = sample.token
+            continuousPiP.flushForSeek()
+            continuousAudio.adoptRendered(id: entry.id)
+            if changedSource, entry.id != queue.currentID {
+                var following = queue
+                guard following.next(explicit: false) == entry.id else {
+                    continuousAudio.suspend(); return
+                }
+                queue = following
+                let video = buffer.advance(to: entry.id)
+                loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
+            } else { synchronizeVideoToAudio(force: true) }
+            prepareUpcoming()
+        }
+        clock.sample(position: Double(sample.frame) / 48_000)
+        clock.updateDuration(Double(entry.frames) / 48_000)
+        continuousPiP.updatePlayback(positionSeconds: continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock())),
+            durationSeconds: clock.duration, isPlaying: intent.canPlay && !sample.ended)
+        if pipSkipCompletion != nil, ProcessInfo.processInfo.systemUptime >= pipSkipDeadline { completePiPSkip() }
+        if firstProgressGeneration != generation, sample.frame >= 2_400 {
+            firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
+        }
+        if handleEnd, sample.ended, intent.canPlay {
+            if isInteractingWithFeed { endedDuringScroll = true }
+            else {
+                var following = queue
+                if following.next(explicit: false) != nil { next(explicit: false) }
+                else { pause() }
+            }
+        }
+        synchronizeVideoToAudio()
+        if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
+    }
+
+    private func synchronizeVideoToAudio(force: Bool = false) {
+        guard videoAllowed, continuousAudio.isSelected, audioLoadingID == nil, !syncingVideo,
+              let item = player.currentItem, item.status == .readyToPlay else { return }
+        let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
+        let position = continuousAudio.presentationPosition(at: hostTime)
+        guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
+        syncingVideo = true
+        let request = generation
+        player.seek(to: CMTime(seconds: position, preferredTimescale: 48_000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
+            Task { @MainActor in
+                guard let self else { return }
+                self.syncingVideo = false
+                guard finished, self.generation == request, self.player.currentItem === item, self.videoAllowed else { return }
+                if !self.intent.canPlay {
+                    let desired = self.continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+                    if abs((item?.currentTime().seconds ?? desired) - desired) > 0.080 { self.synchronizeVideoToAudio(force: true) }
+                    return
+                }
+                // AVPlayer schedules the muted video on the system host clock;
+                // it never gates the audio render callback or its next boundary.
+                let host = CMClockGetTime(CMClockGetHostTimeClock())
+                self.player.setRate(1, time: CMTime(seconds: self.continuousAudio.presentationPosition(at: host), preferredTimescale: 48_000),
+                                    atHostTime: host)
             }
         }
     }
@@ -453,6 +680,7 @@ final class PlaybackService: NSObject {
     private func cancelStallRecovery() { stallTask?.cancel(); stallTask = nil }
 
     private func armStallRecovery() {
+        guard !continuousAudio.isSelected else { return } // A video stall cannot skip audible PCM.
         guard intent.canPlay, stallTask == nil, player.currentItem != nil, let id = queue.currentID else { return }
         let ticket = PlaybackStallTicket(generation: generation, mediaID: id, position: clock.position,
                                          deadline: Date().addingTimeInterval(12))
@@ -469,6 +697,7 @@ final class PlaybackService: NSObject {
     }
 
     func startPiP() {
+        audioOnly = false
         guard let pip, pip.isPictureInPicturePossible else { message = "Play a video on this screen before opening Picture in Picture."; return }
         if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() }
     }
@@ -489,28 +718,35 @@ final class PlaybackService: NSObject {
         do {
             try activateSession()
             intent.activationCompleted(succeeded: true); refreshAudioProcessing()
+            recordDiagnostic(.audioSessionActivated)
             recordPlaybackEvent("activationCompleted")
         } catch {
-            intent.activationCompleted(succeeded: false); player.pause(); cancelStallRecovery()
+            intent.activationCompleted(succeeded: false); continuousAudio.suspend(); player.pause(); cancelStallRecovery()
+            recordDiagnostic(.audioSessionActivationFailed, error: PlaybackDiagnosticError(family: .audioSession, code: (error as NSError).code))
             message = "Audio is in use. Tap Play after the camera or call finishes."
             recordPlaybackEvent("activationFailed")
         }
     }
 
     func enteredForeground() {
+        applyPresentation(presentationPolicy.applicationDidBecomeActive())
+        recordDiagnostic(.appForegrounded)
         let interrupted = intent.isInterrupted
         intent.enteredForeground()
-        if interrupted { player.pause(); message = "Audio was interrupted. Tap Play to resume." }
+        if interrupted { continuousAudio.suspend(); player.pause(); message = "Audio was interrupted. Tap Play to resume." }
+        else { synchronizeVideoToAudio(force: true) }
     }
 
     func handleInterruption(began: Bool, shouldResume: Bool = false) {
         recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
             intent.interruptionBegan(); cancelStallRecovery()
+            continuousAudio.suspend()
             player.pause(); persist()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
             activateAudio()
-            if intent.canPlay, !resumeAfterPreparedEnd() { player.play() }
+            resumeContinuousAudio()
+            if intent.canPlay, !resumeAfterPreparedEnd(), videoAllowed { player.play() }
         }
         updateNowPlaying()
     }
@@ -525,7 +761,99 @@ final class PlaybackService: NSObject {
     }
 
     private func refreshAudioProcessing() {
-        speakerAudio.update(items: buffer.retainedItems, enabled: SpeakerAudioMix.shouldEnhance(enabled: speakerSound, routes: audioRoutes()))
+        // Video is always muted; applying item taps as well would duplicate DSP.
+        speakerAudio.update(items: buffer.retainedItems, enabled: false)
+        continuousAudio.setSpeakerEnabled(SpeakerAudioMix.shouldEnhance(enabled: speakerSound, routes: audioRoutes()))
+    }
+
+    private func applyPresentation(_ actions: PlaybackPresentationPolicy.Actions) {
+        pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
+        if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
+        if !videoAllowed { player.pause(); continuousPiP.suspendFrameFeed() }
+        else { continuousPiP.resumeFrameFeed() }
+        if actions.restoreInlineVideo { synchronizeVideoToAudio(force: true) }
+    }
+
+    private func samplePiPState() {
+        guard let pip else { return }
+        applyPresentation(presentationPolicy.pictureInPictureChanged(active: pip.isPictureInPictureActive,
+            possible: pip.isPictureInPicturePossible, suspended: pip.isPictureInPictureSuspended))
+        recordDiagnostic(.pipStateChanged)
+    }
+
+    private func completePiPSkip() {
+        let completion = pipSkipCompletion
+        pipSkipCompletion = nil
+        completion?()
+    }
+
+    private func handlePiPEvent(_ event: ContinuousPictureInPicture.Event, code: Int?) {
+        let phase: PlaybackDiagnosticPhase
+        switch event {
+        case .willStart: phase = .pipWillStart
+        case .didStart: phase = .pipDidStart
+        case .willStop: phase = .pipWillStop
+        case .didStop: phase = .pipDidStop
+        case .startFailed:
+            applyPresentation(presentationPolicy.pictureInPictureFailedToStart())
+            message = "Picture in Picture could not start. Audio will continue."
+            phase = .pipStartFailed
+        case .restoreRequested: phase = .inlineRestoreRequested
+        case .restoreCompleted: phase = .inlineRestoreCompleted
+        case .restoreUnavailable: phase = .inlineRestoreUnavailable
+        case .userPlayRequested: phase = .playRequested
+        case .userPauseRequested: phase = .pauseRequested
+        case .userSkipRequested: phase = .seekRequested
+        case .frameFailed: phase = .sampled
+        case .sourcePrepared: phase = .sourcePreparationCompleted
+        case .sourcePreparationFailed: phase = .sourcePreparationFailed
+        }
+        recordDiagnostic(phase, error: code.map { PlaybackDiagnosticError(family: .avKit, code: $0) })
+    }
+
+    private func recordDiagnostic(_ phase: PlaybackDiagnosticPhase,
+                                  interruptionReason: Int? = nil, interruptionOptions: UInt? = nil,
+                                  wasSuspended: Bool? = nil, routeReason: Int? = nil,
+                                  error: PlaybackDiagnosticError? = nil,
+                                  sourceSilence: ContinuousPCMDecoder.SourceSilence? = nil) {
+        let session = AVAudioSession.sharedInstance()
+        let routes = audioRoutes()
+        let route: PlaybackDiagnosticOutputRoute
+        if routes.isEmpty { route = .none }
+        else if routes.contains(.airPlay) { route = .airPlay }
+        else if routes.contains(.bluetoothA2DP) || routes.contains(.bluetoothHFP) || routes.contains(.bluetoothLE) { route = .bluetooth }
+        else if routes.contains(.headphones) { route = .headphones }
+        else if routes.contains(.builtInSpeaker) { route = .builtInSpeaker }
+        else if routes.contains(.builtInReceiver) { route = .builtInReceiver }
+        else { route = .other }
+        diagnostics.record(phase, snapshot: PlaybackDiagnosticSnapshot(generation: generation,
+            audioRequested: intent.wantsToPlay, audioPermitted: intent.canPlay, audioInterrupted: intent.isInterrupted,
+            interruptionReason: interruptionReason, interruptionOptions: interruptionOptions,
+            wasSuspended: wasSuspended, routeChangeReason: routeReason,
+            engineRunning: continuousAudio.graph.engine.isRunning, audioOnlySelected: audioOnly,
+            presentation: presentationPolicy.presentation,
+            pipeline: continuousAudio.graph.engine.isRunning && intent.canPlay ? .playing : .paused,
+            positionSeconds: clock.position, durationSeconds: clock.duration, playbackRate: Double(player.rate),
+            retainedItems: buffer.retainedItemCount, preparedPCMBytes: continuousAudio.renderer.retainedPCMMemoryBytes,
+            underrunFrames: UInt64(max(0, continuousAudio.snapshot.underrunFrames)), outputRoute: route,
+            sampleRate: session.sampleRate, ioBufferSeconds: session.ioBufferDuration, outputLatencySeconds: session.outputLatency,
+            pipActive: pip?.isPictureInPictureActive ?? false, pipPossible: pip?.isPictureInPicturePossible ?? false,
+            pipSuspended: pip?.isPictureInPictureSuspended ?? false,
+            sourceFrames: sourceSilence?.totalFrames,
+            sourceLeadingBelowMinus60DBFrames: sourceSilence?.leadingFrames,
+            sourceTrailingBelowMinus60DBFrames: sourceSilence?.trailingFrames), error: error)
+    }
+
+    func exportPlaybackDiagnostics() -> URL? {
+        recordDiagnostic(.sampled)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("OfflinePlayer-playback-diagnostics.json")
+        do {
+            let data = try diagnostics.exportJSON()
+            guard data.count <= 256 * 1_024 else { return nil }
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
+            return url
+        } catch { return nil }
     }
 
     private func recordPlaybackEvent(_ name: StaticString) {
@@ -545,6 +873,20 @@ final class PlaybackService: NSObject {
             }
         }
         let center = NotificationCenter.default
+        notifications.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.applyPresentation(self.presentationPolicy.applicationDidEnterBackground())
+                self.recordDiagnostic(.appBackgrounded)
+            }
+        })
+        notifications.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] note in
+            MainActor.assumeIsolated {
+                guard let self, note.object as? AVAudioEngine === self.continuousAudio.graph.engine else { return }
+                self.recordDiagnostic(.rendererStopped)
+                self.resumeContinuousAudio()
+            }
+        })
         notifications.append(center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
                 guard let self, note.object as? AVPlayerItem === self.player.currentItem else { return }
@@ -554,6 +896,7 @@ final class PlaybackService: NSObject {
         notifications.append(center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
                 guard let self, note.object as? AVPlayerItem === self.observedItem else { return }
+                guard !self.continuousAudio.isSelected else { return }
                 self.buffer.synchronize()
                 guard note.object as? AVPlayerItem === self.player.currentItem else { return }
                 if self.isInteractingWithFeed { self.endedDuringScroll = true }
@@ -563,7 +906,10 @@ final class PlaybackService: NSObject {
         notifications.append(center.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
                 guard let self, note.object as? AVPlayerItem === self.player.currentItem else { return }
-                self.handlePlaybackFailure()
+                if self.continuousAudio.isSelected {
+                    self.recordPlaybackEvent("videoFailed")
+                    self.message = "Video is unavailable. Audio will continue."
+                } else { self.handlePlaybackFailure() }
             }
         })
         notifications.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
@@ -571,11 +917,16 @@ final class PlaybackService: NSObject {
                 guard let self, let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                       let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
                 let options = AVAudioSession.InterruptionOptions(rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+                self.recordDiagnostic(type == .began ? .audioInterruptionBegan : .audioInterruptionEnded,
+                    interruptionReason: note.userInfo?[AVAudioSessionInterruptionReasonKey] as? Int,
+                    interruptionOptions: options.rawValue,
+                    wasSuspended: note.userInfo?[AVAudioSessionInterruptionWasSuspendedKey] as? Bool)
                 self.handleInterruption(began: type == .began, shouldResume: options.contains(.shouldResume))
             }
         })
         notifications.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
+                self?.recordDiagnostic(.audioRouteChanged, routeReason: note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? Int)
                 self?.refreshAudioProcessing()
                 if note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue { self?.pause() }
             }
@@ -583,7 +934,8 @@ final class PlaybackService: NSObject {
         notifications.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.pause(); self.buffer.discardPrevious(); self.configureAudio()
+                self.recordDiagnostic(.audioMediaServicesReset)
+                self.pause(); self.continuousAudio.rebuildAfterMediaServicesReset(); self.buffer.discardPrevious(); self.configureAudio()
                 self.loadCurrent(position: self.clock.position)
             }
         })
@@ -593,6 +945,7 @@ final class PlaybackService: NSObject {
                 self?.buffer.synchronize()
                 self?.warmTask?.cancel(); self?.warmRevision += 1
                 self?.buffer.discardNext(); self?.buffer.discardPrevious()
+                if let self { self.continuousAudio.trimWindow(preserving: self.queue.currentID) }
                 self?.refreshAudioProcessing()
             }
         })
@@ -627,16 +980,5 @@ final class PlaybackService: NSObject {
             MPNowPlayingInfoPropertyPlaybackRate: intent.canPlay ? 1.0 : 0.0,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.video.rawValue
         ]
-    }
-}
-
-extension PlaybackService: AVPictureInPictureControllerDelegate {
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
-                                    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
-        requestPlayerUI?()
-        DispatchQueue.main.async { completionHandler(true) }
-    }
-    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, failedToStartPictureInPictureWithError error: Error) {
-        message = "Picture in Picture could not start. Try again while the video is playing."
     }
 }

@@ -1,38 +1,30 @@
 import XCTest
 import AVFoundation
 import AudioToolbox
+import UIKit
 import PlayerCore
 @testable import OfflineTikTokPlayer
 
 @MainActor
 final class PlaybackContinuityTests: XCTestCase {
-    func testSupersedingStartupSeekResumesOnlyTheLatestSeekWithPlayIntent() async throws {
+    func testAudioSeekCompletesWithoutWaitingForMutedVideoAndPauseWins() async throws {
         let fixture = try await ServiceFixture()
         defer { fixture.remove() }
-        let bookmark = PlaybackBookmark(queue: PlaybackQueue(ids: fixture.ids, startAt: fixture.ids[0]), position: 0.4)
-        try JSONEncoder().encode(bookmark).write(to: fixture.bookmark)
-        var seeks: [(CMTime, (Bool) -> Void)] = []
         let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
-            bookmarkURL: fixture.bookmark, activateSession: {}, seekPlayer: { _, time, completion in seeks.append((time, completion)) })
+            bookmarkURL: fixture.bookmark, activateSession: {}, seekPlayer: { _, _, _ in XCTFail("PCM seek must not wait on AVPlayer") })
         defer { service.pause() }
-        service.restore(); service.play()
-        try await until { !seeks.isEmpty }
-        XCTAssertEqual(service.player.rate, 0, "The restored-position seek must gate startup")
-        service.seek(0.2)
-        XCTAssertEqual(seeks.count, 2)
-        seeks[0].1(false)
-        let latest = seeks[1]
-        let finished = await service.player.seek(to: latest.0, toleranceBefore: .zero, toleranceAfter: .zero)
-        latest.1(finished)
-        try await until { service.player.rate > 0 }
-        XCTAssertTrue(service.wantsToPlay)
-        // A new scrub followed by explicit Pause must never resurrect playback.
-        service.seek(0.3); service.pause()
-        let paused = seeks[2]
-        let pausedFinished = await service.player.seek(to: paused.0, toleranceBefore: .zero, toleranceAfter: .zero)
-        paused.1(pausedFinished)
-        try await Task.sleep(for: .milliseconds(30))
-        XCTAssertFalse(service.wantsToPlay); XCTAssertEqual(service.player.rate, 0)
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+        try await until { service.audioSnapshot.frame > 2_400 }
+        service.seek(0.8); service.seek(0.2); service.pause()
+        try await until { abs(service.clock.position - 0.2) < 0.02 }
+        let frame = service.audioSnapshot.frame
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(service.audioSnapshot.frame, frame)
+        XCTAssertFalse(service.wantsToPlay)
+        service.handleInterruption(began: true)
+        service.handleInterruption(began: false, shouldResume: true)
+        XCTAssertFalse(service.wantsToPlay)
     }
 
     func testCoalescedAndDrainedLoopBoundariesReconcileActualCurrentItem() throws {
@@ -58,120 +50,100 @@ final class PlaybackContinuityTests: XCTestCase {
         }
     }
 
-    func testDrainedFinalBoundaryAdoptsFinalMetadataAndPausesWithoutRewind() async throws {
+    func testPreparedPCMReversalsAreIndependentOfVideoReadinessAndBoundMemory() async throws {
+        let fixture = try await ServiceFixture(count: 3)
+        defer { fixture.remove() }
+        let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {})
+        defer { service.pause() }
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+        try await until { service.audioSnapshot.frame > 2_400 && service.preparedAudioCount >= 2 }
+        for _ in 0..<10 {
+            var visit = service.audioSnapshot.visit
+            service.next()
+            try await until { service.audioSnapshot.visit > visit && service.audioSnapshot.frame > 64 }
+            // Muted video can stall or pause without changing audio intent/position.
+            service.player.pause()
+            let frame = service.audioSnapshot.frame
+            try await Task.sleep(for: .milliseconds(40))
+            XCTAssertGreaterThan(service.audioSnapshot.frame, frame)
+            visit = service.audioSnapshot.visit
+            service.previous()
+            try await until { service.audioSnapshot.visit > visit && service.audioSnapshot.frame > 64 }
+            XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
+        }
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
+        service.audioOnly = true
+        service.pause(); let paused = service.audioSnapshot.frame
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        service.enteredForeground(); service.audioOnly = false
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertEqual(service.audioSnapshot.frame, paused)
+    }
+
+    func testPCMOwnsNaturalLoopsAndQueueEndWhenVideoStops() async throws {
         let fixture = try await ServiceFixture()
         defer { fixture.remove() }
-        let buffer = PlaybackBuffer()
         let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
-            bookmarkURL: fixture.bookmark, activateSession: {}, buffer: buffer)
-        defer { service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+            bookmarkURL: fixture.bookmark, activateSession: {})
+        defer { service.pause() }
+        service.audioOnly = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
-        try await until { buffer.hasPrepared(fixture.ids[1]) }
-        buffer.player.pause()
-        // Emulate both boundaries passing before queued KVO can reconcile them.
-        let final = try XCTUnwrap(buffer.player.items().last)
-        buffer.player.advanceToNextItem(); buffer.player.advanceToNextItem(); buffer.synchronize()
-        try await until { !service.isLoading }
+        try await until { service.queue.currentID == fixture.ids[1] }
+        try await until { !service.wantsToPlay }
         XCTAssertEqual(service.queue.currentID, fixture.ids[1])
-        XCTAssertTrue(service.player.currentItem === final)
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
+        service.cycleRepeat(); service.cycleRepeat() // repeat one
+        service.play()
+        let visit = service.audioSnapshot.visit
+        try await until { service.audioSnapshot.visit >= visit + 3 }
+        XCTAssertTrue(service.wantsToPlay)
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
+        NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        service.pause()
+        let frame = service.audioSnapshot.frame
+        NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
+            userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue])
+        service.enteredForeground()
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertEqual(service.audioSnapshot.frame, frame)
+        XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
+    }
+
+    func testPausedRestoreAndSeekUseRequestedAudioPositionBeforeEngineStarts() async throws {
+        let fixture = try await ServiceFixture()
+        defer { fixture.remove() }
+        let bookmark = PlaybackBookmark(queue: PlaybackQueue(ids: fixture.ids, startAt: fixture.ids[0]), position: 0.4)
+        try JSONEncoder().encode(bookmark).write(to: fixture.bookmark)
+        let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {})
+        defer { service.pause() }
+        service.restore()
+        try await until { !service.isLoading && abs(service.player.currentTime().seconds - 0.4) < 0.04 }
+        XCTAssertFalse(service.wantsToPlay)
+        service.seek(0.8)
+        try await until { abs(service.clock.position - 0.8) < 0.02 && abs(service.player.currentTime().seconds - 0.8) < 0.04 }
         XCTAssertFalse(service.wantsToPlay)
         XCTAssertEqual(service.player.rate, 0)
-        XCTAssertNil(buffer.nextMediaID)
     }
 
-    func testDrainedPreparedWindowContinuesLongerQueueOnlyWhenPlaybackIsPermitted() async throws {
-        for mode in 0..<3 { // normal, interruption with resume, interruption plus user pause
-            let fixture = try await ServiceFixture(count: 3)
-            defer { fixture.remove() }
-            let buffer = PlaybackBuffer()
-            let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
-                bookmarkURL: fixture.bookmark, activateSession: {}, buffer: buffer)
-            defer { service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
-            service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
-            try await until { buffer.hasPrepared(fixture.ids[1]) }
-            buffer.player.pause()
-            if mode > 0 { service.handleInterruption(began: true) }
-            buffer.player.advanceToNextItem(); buffer.player.advanceToNextItem(); buffer.synchronize()
-            if mode > 0 {
-                try await until { !service.isLoading }
-                XCTAssertEqual(service.queue.currentID, fixture.ids[1]); XCTAssertEqual(service.player.rate, 0)
-                if mode == 2 { service.pause() }
-                service.handleInterruption(began: false, shouldResume: true)
-                if mode == 2 {
-                    XCTAssertEqual(service.queue.currentID, fixture.ids[1]); XCTAssertEqual(service.player.rate, 0)
-                    service.play()
-                }
-            }
-            try await until { service.queue.currentID == fixture.ids[2] && !service.isLoading }
-            XCTAssertTrue(service.wantsToPlay)
-        }
-    }
-
-    func testProductionServiceMeasuresIdenticalColdNextPreviousAndRetainsPreviousMix() async throws {
+    func testMemoryWarningDuringColdPreparationKeepsTheRequestedCurrent() async throws {
         let fixture = try await ServiceFixture()
         defer { fixture.remove() }
-        let oldSpeakerPreference = UserDefaults.standard.object(forKey: "speakerSound")
-        defer { UserDefaults.standard.set(oldSpeakerPreference, forKey: "speakerSound") }
-        var trials: [[String: Any]] = []
-        // Three serial trials per mode, alternating order to expose tap setup cost.
-        for (index, enhance) in [true, false, false, true, true, false].enumerated() {
-            let trial = index / 2
-            let buffer = PlaybackBuffer()
-            var loads: [ObjectIdentifier: Int] = [:]
-            let audio = SpeakerAudioController { item in
-                loads[ObjectIdentifier(item), default: 0] += 1
-                return try? await item.asset.loadTracks(withMediaType: .audio)
-            }
-            let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
-                bookmarkURL: fixture.bookmark, activateSession: { try AVAudioSession.sharedInstance().setActive(true) },
-                buffer: buffer, speakerAudio: audio, audioRoutes: { [.builtInSpeaker] })
-            service.speakerSound = enhance; service.isInteractingWithFeed = true
-            var events: [[String: Any]] = []
-            service.onPlaybackEvent = { event in
-                events.append(["phase": event.name, "uptime": event.uptime, "generation": event.generation,
-                               "position": event.position.isFinite ? event.position : -1, "retainedItems": event.retainedItems])
-            }
-            defer { service.onPlaybackEvent = nil; service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
-            let coldStart = ProcessInfo.processInfo.systemUptime
-            service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
-            try await until { service.player.currentTime().seconds >= 0.05 }
-            let cold = ProcessInfo.processInfo.systemUptime - coldStart
-            service.pause()
-            let first = try XCTUnwrap(service.player.currentItem)
-            if enhance { try await until { first.audioMix != nil } }
-            else { XCTAssertNil(first.audioMix) }
-            let firstMix = first.audioMix
-            let firstLoads = loads[ObjectIdentifier(first)] ?? 0
-            try await until { buffer.hasPrepared(fixture.ids[1]) }
-            try await Task.sleep(for: .milliseconds(500))
-            let queuedReady = buffer.player.items().last?.status == .readyToPlay
-            let nextStart = ProcessInfo.processInfo.systemUptime
-            service.next()
-            try await until { service.queue.currentID == fixture.ids[1] && service.player.currentTime().seconds >= 0.05 }
-            let next = ProcessInfo.processInfo.systemUptime - nextStart
-            service.pause()
-            try await Task.sleep(for: .milliseconds(500))
-            XCTAssertTrue(first.audioMix === firstMix, "Retained Previous must keep its configured mix")
-            XCTAssertEqual(loads[ObjectIdentifier(first)] ?? 0, firstLoads)
-            let previousStart = ProcessInfo.processInfo.systemUptime
-            service.previous()
-            try await until { service.queue.currentID == fixture.ids[0] && service.player.currentTime().seconds >= 0.05 }
-            let previous = ProcessInfo.processInfo.systemUptime - previousStart
-            XCTAssertTrue(service.player.currentItem === first)
-            XCTAssertTrue(first.audioMix === firstMix, "Previous must not rebuild its audio path on handoff")
-            XCTAssertEqual(loads[ObjectIdentifier(first)] ?? 0, firstLoads, "Previous must not reload its audio-track metadata")
-            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 4)
-            XCTAssertLessThan(max(cold, next, previous), 2, "Synthetic local startup stalled; this is not an immediate-play acceptance threshold")
-            let result: [String: Any] = ["trial": trial, "speakerSound": enhance, "coldClock50msSeconds": cold, "nextClock50msSeconds": next,
-                "previousClock50msSeconds": previous, "queuedReadyBeforeHandoff": queuedReady,
-                "previousMixReused": first.audioMix === firstMix, "previousTrackLoads": loads[ObjectIdentifier(first)] ?? 0,
-                "retainedItems": buffer.retainedItemCount, "events": events]
-            trials.append(result)
-            print("Production service timing: trial=\(trial), speakerSound=\(enhance), cold=\(cold), next=\(next), previous=\(previous), queuedReady=\(queuedReady), previousMixReused=\(first.audioMix === firstMix)")
-        }
-        let attachment = XCTAttachment(data: try JSONSerialization.data(withJSONObject: trials, options: [.sortedKeys]), uniformTypeIdentifier: "public.json")
-        attachment.name = "Production-service-identical-startup-phases"; attachment.lifetime = .keepAlways; add(attachment)
-        print("Production service phase trace: \(String(data: try JSONSerialization.data(withJSONObject: trials, options: [.sortedKeys]), encoding: .utf8)!)")
+        let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {})
+        defer { service.pause() }
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+        await Task.yield()
+        NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
+        try await until { service.audioSnapshot.frame > 2_400 }
+        XCTAssertEqual(service.queue.currentID, fixture.ids[0])
+        XCTAssertTrue(service.wantsToPlay)
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
     }
 
     private func until(_ condition: () -> Bool) async throws {
@@ -202,44 +174,6 @@ final class PlaybackContinuityTests: XCTestCase {
         }
         func remove() { for id in ids { downloads.remove(id) }; try? FileManager.default.removeItem(at: temporary) }
     }
-    func testAutomaticHandoffReResolvesRemotePreparationWhenASavedCopyIsAvailable() async throws {
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        let cloud = OneDriveClient(account: MicrosoftAccount()), network = NetworkStatus()
-        let downloads = OfflineDownloads(cloud: cloud, network: network)
-        let library = LibraryRepository(cloud: cloud, catalogURL: temporary.appendingPathComponent("catalog.json"))
-        let source = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
-        let ids = (0..<2).map { "local:handoff-\($0)-" + UUID().uuidString }
-        let records = ids.map { MediaRecord(id: $0, title: "Synthetic tone", creator: "Fixture", duration: 1.2) }
-        for id in ids { _ = try await downloads.importLocal(source, mediaID: id) }
-        defer { for id in ids { downloads.remove(id) } }
-        try library.install(LibraryCatalog(libraryID: "local:test", media: records,
-            playlists: [PlaylistRecord(id: "local:handoff", name: "Synthetic", itemIDs: ids)]))
-        let buffer = PlaybackBuffer()
-        let service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
-            bookmarkURL: temporary.appendingPathComponent("playback.json"), activateSession: {}, buffer: buffer)
-        defer { service.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
-        service.start(playlistIDs: ["local:handoff"], at: ids[0])
-        let preparedDeadline = Date().addingTimeInterval(5)
-        while !buffer.hasPrepared(ids[1]), Date() < preparedDeadline { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertTrue(buffer.hasPrepared(ids[1]))
-        buffer.player.pause(); buffer.discardNext()
-        // Emulate a stage resolved before its Saved download finished.
-        let remote = AVPlayerItem(url: source)
-        buffer.stage(.init(mediaID: ids[1], item: remote, isLocal: false))
-        buffer.player.advanceToNextItem(); buffer.synchronize()
-        let deadline = Date().addingTimeInterval(5)
-        while service.isLoading, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
-        XCTAssertFalse(service.isLoading)
-        XCTAssertEqual(service.queue.currentID, ids[1])
-        XCTAssertFalse(service.player.currentItem === remote, "Automatic handoff must not bypass Saved eligibility")
-        let savedCandidate = await downloads.localURL(for: records[1])
-        let saved = try XCTUnwrap(savedCandidate)
-        let current = try XCTUnwrap(service.player.currentItem)
-        XCTAssertEqual((current.asset as? AVURLAsset)?.url, saved)
-    }
-
     func testServiceReadinessAndForegroundRespectInterruptionPauseAndActivationFailure() async throws {
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
