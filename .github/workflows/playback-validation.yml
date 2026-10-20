@@ -1,7 +1,7 @@
 name: Public playback validation
 on:
   push:
-    branches: [fix/playback-continuity, fix/continuous-pcm-playback]
+    branches: [fix/playback-continuity, fix/continuous-pcm-playback, fix/selected-video-regression]
     paths: ['ios/**', 'scripts/**', 'tests/apple-playback/**', '.github/workflows/playback-validation.yml']
 permissions:
   contents: read
