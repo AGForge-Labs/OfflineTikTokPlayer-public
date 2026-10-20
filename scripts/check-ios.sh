@@ -2,6 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+# Xcode's build queue limit does not replace the Swift driver's generated -jN.
+export SWIFTC_MAXIMUM_DETERMINISM=1
 mkdir -p artifacts/native
 native_log="artifacts/native/xcodebuild-test.log"
 # An early failure must never leave a previous run's successful evidence behind.
@@ -22,6 +24,13 @@ else
   exit 2
 fi
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode 26 or later on macOS is required.' >&2; exit 2; }
+# Print the selected driver's plan only; no compilation is executed by this probe.
+printf '' | xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/swift-driver-plan.log 2>&1
+cat artifacts/native/swift-driver-plan.log
+grep -Fq 'SWIFTC_MAXIMUM_DETERMINISM overriding -j' artifacts/native/swift-driver-plan.log || {
+  printf '%s\n' 'The selected Swift driver did not confirm its one-job override.' >&2
+  exit 1
+}
 python3 scripts/generate-ios-project.py --check
 bash scripts/test-core.sh
 bash scripts/test-apple-buffer.sh
@@ -46,7 +55,8 @@ xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlaye
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Tests-$(date +%Y%m%d-%H%M%S).xcresult" \
   -jobs 1 -parallel-testing-enabled NO \
-  "$@" CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+  "$@" SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+  CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
 if [ "$validation_mode" = selection-only ]; then
   python3 scripts/verify-native-test-log.py --log "$native_log" --selection-only
 else

@@ -80,6 +80,12 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var audioLoadingID: String?
     @ObservationIgnored private var pendingAudioSeek: (seek: PlaybackTimeline.Seek, version: Int)?
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
+    var videoFramePositionSeconds: Double? { continuousPiP.lastFramePositionSeconds }
+    var copiedVideoFramePositionSeconds: Double? { continuousPiP.lastCopiedFramePositionSeconds }
+    var pausedFutureVideoFrameRejectionCount: UInt64 { continuousPiP.pausedFutureFrameRejectionCount }
+    var submittedVideoFrameCount: UInt64 { continuousPiP.submittedFrameCount }
+    var videoRequestedPositionSeconds: Double { continuousPiP.requestedPositionSeconds }
+    var videoTimebasePositionSeconds: Double? { continuousPiP.timebasePositionSeconds }
     var preparedAudioCount: Int { continuousAudio.preparedCount }
     var audioEngineRunning: Bool { continuousAudio.graph.engine.isRunning }
     var audioRenderQuantumFrames: Int { continuousAudio.graph.maximumRenderFrameCount }

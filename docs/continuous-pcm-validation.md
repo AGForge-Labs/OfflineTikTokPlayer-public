@@ -54,7 +54,39 @@ checks. Cold far-seek setup is not a prepared-transition latency measurement.
 Full acceptance now requires exactly all 88 native and one UI identities plus
 `TEST SUCCEEDED`, independently of job status. Five launcher and eleven evidence
 guard regressions cover missing UI, partial/skipped/failed/retried results, first
-error propagation, stale-log clearing and cleanup. Native acceptance is pending.
+error propagation, stale-log clearing and cleanup.
+
+Run [39393470199](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39393470199)
+at `57b5f92b6494da906c6096f690bcaf4aea109700` passed 81 core tests, 87 of
+88 native tests, the UI test, all five launcher regressions on macOS Bash 3.2,
+and all eleven evidence-guard regressions. It failed the paused backward `.40`
+to `.35` visible-marker assertion: the old `.375` frame remained visible.
+Paused restoration and the natural positive-offset boundary now passed actual
+compositor checks. This is still a failed candidate; the native process returned
+65 and the separate acceptance step did not run.
+
+The next candidate removes the held display image at a seek epoch and rejects
+future presentation timestamps while paused. It retains valid past frames for
+long or variable-duration source samples. Paused regressions require a fresh
+custom-video submission at the requested position as well as the compositor
+marker; `.65` then `.60` uses distinct markers from both the earlier `.40` frame
+and the superseded `.65` request. Numeric requested/timebase/submitted positions
+and submission counts distinguish output replay from retained display content.
+Native acceptance is pending.
+
+Unsigned validation keeps Xcode's build queue at one job and disables parallel
+tests. It now also exports `SWIFTC_MAXIMUM_DETERMINISM=1`, confirms the selected
+Swift driver's one-job override with a print-only plan before compilation, and
+disables parallel whole-module frontend optimization. Xcode's generated `-j3`
+appeared in an earlier log despite `-jobs 1`; that argument alone does not prove
+three concurrent compiler processes. These explicit caps close that configuration
+gap. The override was confirmed with the existing local Swift 6.2.3 driver;
+selected macOS toolchain confirmation remains part of the next run.
+Seven launcher regressions now include both failed-driver and missing-override
+preflights; both must prevent helper/native launch and clear stale evidence.
+See the official [Swift driver override](https://github.com/swiftlang/swift-driver/blob/swift-6.2.3-RELEASE/Sources/SwiftDriver/Driver/Driver.swift#L2353-L2369),
+[whole-module thread setting](https://github.com/swiftlang/swift-build/blob/main/Sources/SWBCore/SpecImplementations/Tools/SwiftCompiler.swift#L1333-L1346),
+and [integrated driver environment](https://github.com/swiftlang/swift-build/blob/main/Sources/SWBTaskExecution/TaskActions/SwiftDriverTaskAction.swift#L47-L63).
 
 ## Reviewed scope
 
@@ -266,4 +298,5 @@ required before another signed candidate/device test build.
 - [Asset-reader presentation range](https://developer.apple.com/documentation/avfoundation/avassetreader/timerange)
 - [Precise media timing](https://developer.apple.com/documentation/avfoundation/avurlassetpreferprecisedurationandtimingkey)
 - [Host-clock scheduling and automatic waiting](https://developer.apple.com/documentation/avfoundation/avplayer/setrate(_:time:athosttime:))
+- [Removing a held display image on flush](https://developer.apple.com/documentation/avfoundation/avsamplebufferdisplaylayer/flushandremoveimage())
 - [Sample-buffer PiP playback commands](https://developer.apple.com/documentation/avkit/avpictureinpicturesamplebufferplaybackdelegate/pictureinpicturecontroller(_:setplaying:))

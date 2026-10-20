@@ -50,6 +50,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await require({ !service.isLoading && abs(service.player.currentTime().seconds - 0.4) < 0.04 },
                           "The real Saved B item must finish restoring to 0.4 seconds")
         assertSelection(service, fixture: fixture, id: fixture.bID)
+        await assertPausedCustomFrame(service, screen: screen, requested: 0.4, after: 0, label: "restore-0.4-settled")
         if let restored = await assertVisibleFrame(service, screen: screen, identity: .b, label: "restored-B-at-0.4") {
             let center = try XCTUnwrap(restored.blueBarCenter, "The paused restored frame must contain B's blue marker")
             let normalized = center / Double(restored.width)
@@ -57,6 +58,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(normalized, 41.0 / 160.0, accuracy: 0.04,
                            "The visible paused B frame must correspond to the restored 0.4-second offset")
         }
+        assertPausedCustomFrameState(service, screen: screen, requested: 0.4, after: 0, label: "restore-0.4-captured")
         XCTAssertFalse(service.wantsToPlay)
         XCTAssertEqual(service.player.rate, 0)
         XCTAssertFalse(service.audioEngineRunning)
@@ -65,9 +67,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
         // A short backwards seek must reset the custom display's frame epoch,
         // even though its distance is below the ordinary 80 ms drift threshold.
+        let beforeBackward = service.submittedVideoFrameCount
+        logCustomFrame(service, screen: screen, label: "backward-0.35-before")
         service.seek(0.35)
         try await require({ abs(service.player.currentTime().seconds - 0.35) < 0.04 },
                           "The selected paused item must complete the backwards seek")
+        await assertPausedCustomFrame(service, screen: screen, requested: 0.35, after: beforeBackward,
+                                      label: "backward-0.35-settled")
         if let earlier = await assertVisibleFrame(service, screen: screen, identity: .b, label: "paused-B-backwards-to-0.35") {
             let center = try XCTUnwrap(earlier.blueBarCenter)
             let normalized = center / Double(earlier.width)
@@ -75,6 +81,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(normalized, 30.0 / 160.0, accuracy: 0.04,
                            "The actual paused composite must replace the later frame after a short backwards seek")
         }
+        assertPausedCustomFrameState(service, screen: screen, requested: 0.35, after: beforeBackward,
+                                     label: "backward-0.35-captured")
         assertSelection(service, fixture: fixture, id: fixture.bID)
         XCTAssertFalse(service.wantsToPlay)
         XCTAssertFalse(service.audioEngineRunning)
@@ -83,17 +91,23 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
         // Both requests share one actor turn, so the first native completion must
         // converge on the latest target even though they differ by only 50 ms.
-        service.seek(0.50)
-        service.seek(0.45)
-        try await require({ abs(service.player.currentTime().seconds - 0.45) < 0.04 },
+        let beforeCoalesced = service.submittedVideoFrameCount
+        logCustomFrame(service, screen: screen, label: "coalesced-0.65-to-0.60-before")
+        service.seek(0.65)
+        service.seek(0.60)
+        try await require({ abs(service.player.currentTime().seconds - 0.60) < 0.04 },
                           "The latest paused seek must supersede the in-flight target")
-        if let newest = await assertVisibleFrame(service, screen: screen, identity: .b, label: "paused-B-latest-0.45") {
+        await assertPausedCustomFrame(service, screen: screen, requested: 0.60, after: beforeCoalesced,
+                                      label: "coalesced-0.60-settled")
+        if let newest = await assertVisibleFrame(service, screen: screen, identity: .b, label: "paused-B-latest-0.60") {
             let center = try XCTUnwrap(newest.blueBarCenter)
             let normalized = center / Double(newest.width)
-            print("SelectionPausedLatest position=0.45 blueNormalized=\(normalized) expected=\(41.0 / 160.0)")
-            XCTAssertEqual(normalized, 41.0 / 160.0, accuracy: 0.04,
+            print("SelectionPausedLatest position=0.60 blueNormalized=\(normalized) expected=\(52.0 / 160.0)")
+            XCTAssertEqual(normalized, 52.0 / 160.0, accuracy: 0.04,
                            "The actual paused composite must show the latest coalesced seek target")
         }
+        assertPausedCustomFrameState(service, screen: screen, requested: 0.60, after: beforeCoalesced,
+                                     label: "coalesced-0.60-captured")
         XCTAssertFalse(service.wantsToPlay)
         XCTAssertFalse(service.audioEngineRunning)
         XCTAssertEqual(service.audioSnapshot.selectionVersion, 0)
@@ -282,6 +296,46 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     private func stallMainActorForBoundary(seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
+
+    private func logCustomFrame(_ service: PlaybackService, screen: SelectionVideoScreen, label: String) {
+        print("SelectionCustomFrame label=\(label) submitted=\(service.submittedVideoFrameCount) pts=\(service.videoFramePositionSeconds.map { String($0) } ?? "missing") copiedPTS=\(service.copiedVideoFramePositionSeconds.map { String($0) } ?? "missing") futureRejected=\(service.pausedFutureVideoFrameRejectionCount) requested=\(service.videoRequestedPositionSeconds) timebase=\(service.videoTimebasePositionSeconds.map { String($0) } ?? "missing") customReady=\(screen.customVideoLayer?.isReadyForDisplay == true) playerPosition=\(service.player.currentTime().seconds) clockPosition=\(service.clock.position)")
+    }
+
+    private func assertPausedCustomFrame(_ service: PlaybackService, screen: SelectionVideoScreen,
+                                         requested: Double, after count: UInt64, label: String,
+                                         file: StaticString = #filePath, line: UInt = #line) async {
+        let epsilon = 0.000_001
+        let settled = await waitUntil {
+            guard let pts = service.videoFramePositionSeconds, pts.isFinite else { return false }
+            return service.submittedVideoFrameCount > count && screen.customVideoLayer?.isReadyForDisplay == true
+                && abs(service.videoRequestedPositionSeconds - requested) <= epsilon
+                && pts <= requested + epsilon && requested - pts <= 1.0 / 24.0 + epsilon
+        }
+        XCTAssertTrue(settled, "The custom display must submit a fresh frame for the settled paused seek", file: file, line: line)
+        assertPausedCustomFrameState(service, screen: screen, requested: requested, after: count,
+                                     label: label, file: file, line: line)
+    }
+
+    private func assertPausedCustomFrameState(_ service: PlaybackService, screen: SelectionVideoScreen,
+                                              requested: Double, after count: UInt64, label: String,
+                                              file: StaticString = #filePath, line: UInt = #line) {
+        logCustomFrame(service, screen: screen, label: label)
+        XCTAssertGreaterThan(service.submittedVideoFrameCount, count,
+                             "Underlying AVPlayerLayer pixels cannot replace custom-frame submission", file: file, line: line)
+        XCTAssertTrue(screen.customVideoLayer?.isReadyForDisplay == true,
+                      "The fresh custom frame must remain visible after compositor capture", file: file, line: line)
+        let epsilon = 0.000_001
+        XCTAssertEqual(service.videoRequestedPositionSeconds, requested, accuracy: epsilon, file: file, line: line)
+        guard let pts = service.videoFramePositionSeconds, pts.isFinite else {
+            XCTFail("The custom display must expose a finite submitted frame PTS", file: file, line: line)
+            return
+        }
+        XCTAssertGreaterThanOrEqual(pts, 0, file: file, line: line)
+        XCTAssertLessThanOrEqual(pts, requested + epsilon,
+                                 "A paused display must not show a future video frame", file: file, line: line)
+        XCTAssertLessThanOrEqual(requested - pts, 1.0 / 24.0 + epsilon,
+                                 "The 24 fps fixture must settle within one frame before the requested position", file: file, line: line)
+    }
 
     private func assertSelection(_ service: PlaybackService, fixture: SelectionVideoFixture, id: String,
                                  file: StaticString = #filePath, line: UInt = #line) {
