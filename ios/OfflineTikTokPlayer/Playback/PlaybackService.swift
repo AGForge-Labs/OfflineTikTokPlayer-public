@@ -127,7 +127,7 @@ final class PlaybackService: NSObject {
          bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
          activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) },
          buffer: PlaybackBuffer? = nil, speakerAudio: SpeakerAudioController? = nil,
-         continuousAudio: ContinuousAudioPlayer? = nil,
+         continuousAudio injectedAudio: ContinuousAudioPlayer? = nil,
          audioRoutes: @escaping () -> [AVAudioSession.Port] = { AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType) },
          seekPlayer: @escaping SeekPlayer = { player, time, completion in
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
@@ -138,7 +138,7 @@ final class PlaybackService: NSObject {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
         self.buffer = buffer ?? PlaybackBuffer()
-        self.continuousAudio = continuousAudio ?? ContinuousAudioPlayer()
+        self.continuousAudio = injectedAudio ?? ContinuousAudioPlayer()
         self.speakerAudio = speakerAudio ?? SpeakerAudioController()
         self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
         self.seekVideo = seekVideo

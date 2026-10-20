@@ -34,6 +34,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let bReference = try await fixture.decodedTone(id: fixture.bID, startSeconds: 0)
         let sourceQuiet = max(SelectionOutputTap.quietRun(aReference, rate: 48_000),
                               SelectionOutputTap.quietRun(bReference, rate: 48_000))
+        XCTAssertEqual(sourceQuiet, 0, "Continuous-tone fixtures must provide no quiet-window allowance that could mask inserted silence")
 
         await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: 0,
                                       id: fixture.aID, frequency: 440, prepared: false, sourceQuiet: sourceQuiet) {
@@ -96,10 +97,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let recorded = tap.samples(since: firstFrame)
         let quiet = SelectionOutputTap.quietRun(recorded.values, rate: recorded.rate)
         let addedQuiet = max(0, quiet - sourceQuiet)
+        let timelineHole = SelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
         let toneMs = tone.map { ($0.end - origin) * 1_000 }
         let visibleMs = visible.map { ($0 - origin) * 1_000 }
         let underrunDelta = service.audioSnapshot.underrunFrames - underruns
-        print("SelectionLatency phase=\(phase) prepared=\(prepared) frequency=\(frequency) outputWindowStartMs=\(tone.map { String(($0.start - origin) * 1_000) } ?? "missing") outputWindowEndMs=\(toneMs.map { String($0) } ?? "missing") customReadyMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) sourceQuietMs=\(sourceQuiet * 1_000) addedQuietMs=\(addedQuiet * 1_000) underrunDelta=\(underrunDelta) tapRate=\(recorded.rate) tapFrames=\(recorded.values.count)")
+        print("SelectionLatency phase=\(phase) prepared=\(prepared) frequency=\(frequency) outputWindowStartMs=\(tone.map { String(($0.start - origin) * 1_000) } ?? "missing") outputWindowEndMs=\(toneMs.map { String($0) } ?? "missing") customReadyMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) sourceQuietMs=\(sourceQuiet * 1_000) addedQuietMs=\(addedQuiet * 1_000) timelineHoleMs=\(timelineHole * 1_000) underrunDelta=\(underrunDelta) tapRate=\(recorded.rate) tapFrames=\(recorded.values.count)")
         XCTAssertNotNil(tone, "The independently classified target tone must reach the real engine mixer tap")
         XCTAssertNotNil(visible, "A fresh selected custom frame must become ready within the phase watchdog")
         if prepared {
@@ -107,6 +109,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if let visibleMs { XCTAssertLessThanOrEqual(visibleMs, 250, "Prepared selected custom video must become ready within 250 ms") }
             XCTAssertEqual(underrunDelta, 0, "Prepared output must introduce no renderer underruns")
             XCTAssertLessThanOrEqual(addedQuiet, 0.000_001, "Prepared boundaries must add no 10 ms RMS-silence windows beyond the decoded source")
+            XCTAssertGreaterThan(recorded.rate, 0)
+            XCTAssertLessThanOrEqual(timelineHole, 0.5 / max(1, recorded.rate),
+                                     "Prepared output timestamps must remain continuous to half a frame; missing callbacks cannot disappear from silence accounting")
         }
     }
 
@@ -831,9 +836,9 @@ private final class SelectionOutputTap: @unchecked Sendable {
         return Window(samples: Array(values[index..<(index + count)]), rate: rate,
                       start: hosts[index], end: hosts[index + count - 1] + 1 / rate)
     }
-    func samples(since index: Int) -> (values: [Float], rate: Double) {
+    func samples(since index: Int) -> (values: [Float], hosts: [Double], rate: Double) {
         lock.lock(); defer { lock.unlock() }
-        return (Array(values[min(index, values.count)...]), rate)
+        return (Array(values[min(index, values.count)...]), Array(hosts[min(index, hosts.count)...]), rate)
     }
     func validity() -> (invalidTimestamps: Int, droppedFrames: Int) {
         lock.lock(); defer { lock.unlock() }
@@ -863,6 +868,16 @@ private final class SelectionOutputTap: @unchecked Sendable {
             else { run = 0 }
         }
         return Double(longest * window) / rate
+    }
+    static func maximumTimelineHole(_ hosts: [Double], rate: Double) -> Double {
+        guard rate > 0, hosts.count > 1 else { return 0 }
+        var largest = 0.0
+        for index in 1..<hosts.count {
+            let interval = hosts[index] - hosts[index - 1]
+            guard interval.isFinite, interval > 0 else { return .infinity }
+            largest = max(largest, interval - 1 / rate)
+        }
+        return largest
     }
 }
 
