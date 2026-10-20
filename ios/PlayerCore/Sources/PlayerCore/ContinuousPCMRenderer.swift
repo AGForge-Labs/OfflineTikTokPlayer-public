@@ -193,7 +193,9 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         public let visit: Int64
         public let ended: Bool
         public let underrunFrames: Int64
-        fileprivate let selectionVersion: Int
+        /// Last serial selection command actually consumed by the render thread.
+        /// Zero is the initial state; publishing a newer command does not acknowledge it.
+        public let selectionVersion: Int
     }
     public let sampleRate: Double
     public let channels: Int
@@ -266,13 +268,17 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         return true
     }
 
-    public func select(token: Int, frame: Int64 = 0) {
+    /// Publish a selection and return its serial command version. Compare it with
+    /// `snapshot.selectionVersion` to distinguish pending from rendered positions.
+    @discardableResult
+    public func select(token: Int, frame: Int64 = 0) -> Int {
         livePendingToken.store(token, ordering: .sequentiallyConsistent)
         nextCommandVersion &+= 2
         commandVersion.store(nextCommandVersion - 1, ordering: .sequentiallyConsistent)
         commandFrame.store(max(0, frame), ordering: .sequentiallyConsistent)
         commandToken.store(token, ordering: .sequentiallyConsistent)
         commandVersion.store(nextCommandVersion, ordering: .sequentiallyConsistent)
+        return nextCommandVersion
     }
 
     public func setPlaying(_ value: Bool) { playing.store(value, ordering: .releasing) }

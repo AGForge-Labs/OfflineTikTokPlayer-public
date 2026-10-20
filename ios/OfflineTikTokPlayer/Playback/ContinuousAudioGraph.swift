@@ -9,6 +9,8 @@ final class ContinuousAudioGraph {
     let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
     private let source: AVAudioSourceNode
     private let anchor: RenderAnchor
+    private let storage: RenderStorage
+    var maximumRenderFrameCount: Int { storage.maximumFrameCount.load(ordering: .acquiring) }
 
     private final class RenderAnchor: @unchecked Sendable {
         let sequence = Atomic<Int>(0)
@@ -46,6 +48,7 @@ final class ContinuousAudioGraph {
     private final class RenderStorage: @unchecked Sendable {
         let renderer: ContinuousPCMRenderer
         let scratch = UnsafeMutablePointer<Float>.allocate(capacity: 512 * 2)
+        let maximumFrameCount = Atomic<Int>(0)
         init(_ renderer: ContinuousPCMRenderer) {
             self.renderer = renderer
             scratch.initialize(repeating: 0, count: 512 * 2)
@@ -55,9 +58,15 @@ final class ContinuousAudioGraph {
 
     init(renderer: ContinuousPCMRenderer) {
         let storage = RenderStorage(renderer)
+        self.storage = storage
         let anchor = RenderAnchor()
         self.anchor = anchor
         source = AVAudioSourceNode(format: format) { isSilence, timestamp, count, audioBufferList in
+            // One render writer; expose the actual callback quantum rather than
+            // assuming that the fixed scratch chunk is the hardware buffer size.
+            if Int(count) > storage.maximumFrameCount.load(ordering: .relaxed) {
+                storage.maximumFrameCount.store(Int(count), ordering: .releasing)
+            }
             isSilence.pointee = false
             let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
             guard buffers.count == 2,

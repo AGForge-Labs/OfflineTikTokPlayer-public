@@ -19,7 +19,7 @@ final class ContinuousAudioPlayer {
     private(set) var selectedID: String?
     private var renderingPermitted = false
     private var failedTokens = Set<Int>()
-    private var pendingPosition: (visit: Int64, position: Double)?
+    private var pendingPosition: (version: Int, position: Double)?
 
     init() {
         graph = ContinuousAudioGraph(renderer: renderer)
@@ -116,8 +116,8 @@ final class ContinuousAudioPlayer {
         guard let entry = entries[id] else { return false }
         selectedID = id
         let bounded = min(Double(entry.frames) / 48_000, max(0, position.isFinite ? position : 0))
-        pendingPosition = (renderer.snapshot.visit, bounded)
-        renderer.select(token: entry.token, frame: Int64(bounded * 48_000))
+        let version = renderer.select(token: entry.token, frame: Int64(bounded * 48_000))
+        pendingPosition = (version, bounded)
         return true
     }
 
@@ -141,9 +141,12 @@ final class ContinuousAudioPlayer {
     }
     func setSpeakerEnabled(_ enabled: Bool) { renderer.setSpeakerEnabled(enabled) }
     func adoptRendered(id: String) { selectedID = id }
+    func isSelectionPending(in sample: ContinuousPCMRenderer.Snapshot) -> Bool {
+        pendingPosition.map { $0.version != sample.selectionVersion } ?? false
+    }
     func presentationPosition(at hostTime: CMTime) -> Double {
         let sample = renderer.snapshot
-        if let pendingPosition, pendingPosition.visit == sample.visit { return pendingPosition.position }
+        if let pendingPosition, pendingPosition.version != sample.selectionVersion { return pendingPosition.position }
         pendingPosition = nil
         guard renderingPermitted, graph.engine.isRunning else { return Double(sample.frame) / 48_000 }
         return graph.presentationPosition(token: sample.token, at: hostTime) ?? Double(sample.frame) / 48_000
@@ -161,7 +164,7 @@ final class ContinuousAudioPlayer {
         successors.removeAll()
         let selected = renderer.snapshot.token == token || selectedID.flatMap { entries[$0]?.token } == token
         if selected {
-            suspend(); renderer.select(token: 0); selectedID = nil
+            suspend(); pendingPosition = nil; renderer.select(token: 0); selectedID = nil
         }
         evictUnused()
         return selected
@@ -172,12 +175,16 @@ final class ContinuousAudioPlayer {
         let sample = renderer.snapshot
         if let selectedID, entries[selectedID]?.token != sample.token { return }
         if selectedID == nil, sample.token != 0 { return }
-        if let pendingPosition, pendingPosition.visit == sample.visit { return }
+        if let pendingPosition, pendingPosition.version != sample.selectionVersion { return }
         pendingPosition = nil
         graph.engine.pause()
         evictUnused()
     }
-    func seek(_ position: Double) { if let selectedID { _ = select(id: selectedID, position: position) } }
+    @discardableResult
+    func seek(_ position: Double) -> Int? {
+        guard let selectedID, select(id: selectedID, position: position) else { return nil }
+        return pendingPosition?.version
+    }
     func clearSelection() { suspend(); selectedID = nil; pendingPosition = nil }
     func rebuildAfterMediaServicesReset() {
         suspend()

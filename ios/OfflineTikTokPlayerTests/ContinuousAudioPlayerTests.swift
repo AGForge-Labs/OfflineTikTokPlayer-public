@@ -4,6 +4,26 @@ import AVFoundation
 
 @MainActor
 final class ContinuousAudioPlayerTests: XCTestCase {
+    func testInvalidatingAPendingSelectionLetsTheSilentEngineSettle() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let audio = ContinuousAudioPlayer()
+        audio.setWindow(["a"])
+        let entry = try await audio.prepare(id: "a", url: url, currentPriority: true)
+        try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+        XCTAssertTrue(audio.select(id: "a"))
+        try audio.setPlaying(true)
+        let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+        XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+        _ = audio.seek(0.1)
+        XCTAssertTrue(audio.isSelectionPending(in: audio.snapshot))
+        XCTAssertTrue(audio.invalidateForRetry(token: entry.token))
+        XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+        XCTAssertEqual(audio.snapshot.token, 0)
+        XCTAssertFalse(audio.isSelectionPending(in: audio.snapshot))
+        audio.settlePausedState()
+        XCTAssertFalse(audio.graph.engine.isRunning)
+    }
+
     func testNewCurrentEvictsANeighbourRatherThanWaitingForeverForOldCurrent() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

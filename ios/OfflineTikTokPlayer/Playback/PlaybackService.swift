@@ -78,9 +78,11 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var audioToken = 0
     @ObservationIgnored private var syncingVideo = false
     @ObservationIgnored private var audioLoadingID: String?
-    @ObservationIgnored private var pendingAudioSeek: (seek: PlaybackTimeline.Seek, visit: Int64)?
+    @ObservationIgnored private var pendingAudioSeek: (seek: PlaybackTimeline.Seek, version: Int)?
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
     var preparedAudioCount: Int { continuousAudio.preparedCount }
+    var audioEngineRunning: Bool { continuousAudio.graph.engine.isRunning }
+    var audioRenderQuantumFrames: Int { continuousAudio.graph.maximumRenderFrameCount }
     @ObservationIgnored private let mediaCache: PlaybackMediaCache?
     @ObservationIgnored private var warmTask: Task<Void, Never>?
     @ObservationIgnored private var warmRevision = 0
@@ -138,6 +140,10 @@ final class PlaybackService: NSObject {
                 self.recordDiagnostic(.sourcePreparationFailed)
                 self.updateAudioSuccessor()
                 if selected {
+                    if let pending = self.pendingAudioSeek {
+                        _ = self.clock.completeSeek(pending.seek, actualPosition: self.clock.position)
+                        self.pendingAudioSeek = nil; self.completePiPSkip()
+                    }
                     self.pause(); self.recordPlaybackEvent("decodeFailed")
                     self.message = "Audio could not be decoded. Choose another video or tap Play to retry."
                 }
@@ -288,9 +294,9 @@ final class PlaybackService: NSObject {
     func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
-        if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds) {
-            pendingAudioSeek = (seek, continuousAudio.snapshot.visit)
-            continuousAudio.seek(seek.target)
+        if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
+           let version = continuousAudio.seek(seek.target) {
+            pendingAudioSeek = (seek, version)
             recordDiagnostic(.seekRequested)
             if !intent.canPlay {
                 _ = clock.completeSeek(seek, actualPosition: seek.target)
@@ -327,6 +333,7 @@ final class PlaybackService: NSObject {
 
     private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil,
                              audioAlreadySelected: Bool = false) {
+        pendingAudioSeek = nil; completePiPSkip()
         if !audioAlreadySelected { audioLoadingID = queue.currentID }
         reachedPreparedEnd = adopting?.reachedEnd ?? false
         if reachedPreparedEnd {
@@ -606,8 +613,12 @@ final class PlaybackService: NSObject {
         continuousAudio.settlePausedState()
         guard audioLoadingID == nil else { return }
         let sample = continuousAudio.snapshot
+        // A natural boundary can publish an older visit after a selection is
+        // requested. It must not replace the requested source/queue before that
+        // exact command has been consumed by the audio thread.
+        guard !continuousAudio.isSelectionPending(in: sample) else { return }
         guard let entry = continuousAudio.entry(forToken: sample.token) else { return }
-        if let pending = pendingAudioSeek, sample.visit != pending.visit {
+        if let pending = pendingAudioSeek, sample.selectionVersion == pending.version {
             _ = clock.completeSeek(pending.seek, actualPosition: Double(sample.frame) / 48_000)
             pendingAudioSeek = nil
             completePiPSkip()

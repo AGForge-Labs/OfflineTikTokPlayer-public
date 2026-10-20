@@ -129,6 +129,43 @@ final class ContinuousPCMTests: XCTestCase {
         XCTAssertTrue(renderer.retireSource(at: 1), "Retired source 1 must no longer pin source 2")
     }
 
+    func testSelectionAcknowledgementTracksOnlyRenderedCommandAcrossCoalescingAndPause() {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 8, ringFrames: 8)
+        prepare(renderer, slot: 0, token: 1, samples: [1, 2, 3, 4])
+        prepare(renderer, slot: 1, token: 2, samples: [5, 6, 7, 8])
+        let first = renderer.select(token: 1, frame: 1)
+        XCTAssertEqual(renderer.snapshot.selectionVersion, 0, "Publishing a command is not render acknowledgement")
+        XCTAssertEqual(renderer.snapshot.token, 0)
+        XCTAssertEqual(render(renderer, frames: 1), [0], "A paused renderer acknowledges position without playing")
+        XCTAssertEqual(renderer.snapshot.selectionVersion, first)
+        XCTAssertEqual(renderer.snapshot.token, 1)
+        XCTAssertEqual(renderer.snapshot.frame, 1)
+
+        let selectedVisit = renderer.snapshot.visit
+        renderer.setSuccessor(token: 1, for: 1)
+        renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 9), [2, 3, 4, 1, 2, 3, 4, 1, 2])
+        XCTAssertGreaterThan(renderer.snapshot.visit, selectedVisit + 1, "Two natural loops must produce distinct source visits")
+        XCTAssertEqual(renderer.snapshot.selectionVersion, first, "Natural visits cannot acknowledge a selection command")
+        renderer.setPlaying(false)
+
+        let superseded = renderer.select(token: 2, frame: 3)
+        let final = renderer.select(token: 1, frame: 2)
+        XCTAssertGreaterThan(final, superseded)
+        XCTAssertGreaterThan(superseded, first)
+        XCTAssertEqual(renderer.snapshot.selectionVersion, first, "An older rendered command cannot acknowledge a newer request")
+        XCTAssertNotEqual(renderer.snapshot.selectionVersion, final)
+        renderer.setPlaying(false)
+        XCTAssertEqual(render(renderer, frames: 4), [0, 0, 0, 0])
+        XCTAssertEqual(renderer.snapshot.selectionVersion, final)
+        XCTAssertEqual(renderer.snapshot.token, 1, "The coalesced middle command must not become current")
+        XCTAssertEqual(renderer.snapshot.frame, 2)
+        renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 1), [3])
+        XCTAssertEqual(renderer.snapshot.selectionVersion, final)
+        XCTAssertEqual(renderer.snapshot.frame, 3)
+    }
+
     func testLiveAndReferencedSourcesCannotBeEvictedAndStorageRemainsBounded() {
         let renderer = ContinuousPCMRenderer(channels: 2, prefixFrames: 2, ringFrames: 3)
         prepare(renderer, slot: 0, token: 1, samples: [1, 1, 2, 2])

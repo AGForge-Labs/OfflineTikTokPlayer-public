@@ -16,14 +16,43 @@ final class PlaybackContinuityTests: XCTestCase {
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
         try await until { service.audioSnapshot.frame > 2_400 }
-        service.seek(0.8); service.seek(0.2); service.pause()
-        try await until { abs(service.clock.position - 0.2) < 0.02 && service.audioSnapshot.frame == 9_600 }
+        let visit = service.audioSnapshot.visit
+        service.pause(); service.seek(0.8); service.seek(0.2)
+        try await until { !service.audioEngineRunning && service.audioSnapshot.visit > visit }
+        XCTAssertEqual(service.audioSnapshot.frame, 9_600)
+        XCTAssertEqual(service.clock.position, 0.2, accuracy: 0.0001)
         let frame = service.audioSnapshot.frame
         try await Task.sleep(for: .milliseconds(80))
         XCTAssertEqual(service.audioSnapshot.frame, frame)
         XCTAssertFalse(service.wantsToPlay)
         service.handleInterruption(began: true)
         service.handleInterruption(began: false, shouldResume: true)
+        XCTAssertFalse(service.wantsToPlay)
+    }
+
+    func testPauseAfterPlayingSeekStopsAtTheAcknowledgedLatestCommand() async throws {
+        let fixture = try await ServiceFixture()
+        defer { fixture.remove() }
+        let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {})
+        defer { service.pause() }
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
+        try await until { service.audioSnapshot.frame > 2_400 }
+        let priorVersion = service.audioSnapshot.selectionVersion
+        service.seek(0.8)
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        service.seek(0.2); service.pause()
+        let elapsed = ProcessInfo.processInfo.systemUptime - requestedAt
+        try await until { !service.audioEngineRunning && service.audioSnapshot.selectionVersion >= priorVersion + 4 }
+        let stopped = service.audioSnapshot.frame
+        // The callback may render its actual native quantum ahead of wall time.
+        // Fixed 512-frame scratch chunks are not a hardware latency measurement.
+        XCTAssertGreaterThanOrEqual(stopped, 9_600)
+        XCTAssertGreaterThan(service.audioRenderQuantumFrames, 0)
+        XCTAssertLessThanOrEqual(stopped, 9_600 + Int64(ceil(elapsed * 48_000)) + Int64(service.audioRenderQuantumFrames))
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(service.audioSnapshot.frame, stopped)
         XCTAssertFalse(service.wantsToPlay)
     }
 
@@ -75,7 +104,9 @@ final class PlaybackContinuityTests: XCTestCase {
         }
         XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
         service.audioOnly = true
-        service.pause(); let paused = service.audioSnapshot.frame
+        service.pause()
+        try await until { !service.audioEngineRunning }
+        let paused = service.audioSnapshot.frame
         NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
         service.enteredForeground(); service.audioOnly = false
         try await Task.sleep(for: .milliseconds(60))
@@ -103,6 +134,7 @@ final class PlaybackContinuityTests: XCTestCase {
         XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
         NotificationCenter.default.post(name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
         service.pause()
+        try await until { !service.audioEngineRunning }
         let frame = service.audioSnapshot.frame
         NotificationCenter.default.post(name: AVAudioSession.routeChangeNotification, object: nil,
             userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue])
