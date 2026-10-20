@@ -473,12 +473,17 @@ final class PlaybackService: NSObject {
     }
 
     private func prepareVideoForPlayback(_ item: AVPlayerItem) async {
-        guard item.videoComposition == nil, let asset = item.asset as? AVURLAsset,
+        guard let asset = item.asset as? AVURLAsset,
               asset.url.isFileURL else { return }
-        if let composition = try? await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset),
-           !Task.isCancelled {
-            item.videoComposition = composition
-        }
+        do {
+            if item.videoComposition == nil {
+                let composition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset)
+                try Task.checkCancellation()
+                item.videoComposition = composition
+            }
+            try Task.checkCancellation()
+            ContinuousPictureInPicture.prepareVideoOutput(for: item)
+        } catch { /* The selected-item path retains its existing guarded retry. */ }
     }
 
     private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false,
@@ -519,6 +524,7 @@ final class PlaybackService: NSObject {
                         self.monitorFirstFrame(playerItem, request: request)
                         self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
                     } else if position > 0 || rewind {
+                        self.recordPlaybackEvent(rewind ? "videoRewindRequested" : "videoRestoreRequested")
                         // Audio already owns its position. Readiness of a reused
                         // muted video must never rewind the audible PCM cursor.
                         self.synchronizeVideoToAudio(force: true)
@@ -746,6 +752,7 @@ final class PlaybackService: NSObject {
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         let position = continuousAudio.presentationPosition(at: hostTime)
         guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
+        recordPlaybackEvent(force ? "videoForcedSeek" : "videoDriftSeek")
         let request = generation
         syncingVideoGeneration = request
         let videoSeek = continuousPiP.beginSeek()
@@ -924,8 +931,11 @@ final class PlaybackService: NSObject {
         case .userSkipRequested: phase = .seekRequested
         case .frameFailed: phase = .sampled
         case .sourcePrepared:
+            recordPlaybackEvent("videoOutputPrepared")
             // Composition/output attachment can finish after an initial paused seek.
-            if !intent.canPlay { synchronizeVideoToAudio(force: true) }
+            // A preinstalled output can also be adopted before readiness observes
+            // this selection; that observer must establish its restore target first.
+            if !intent.canPlay, readyGeneration == generation { synchronizeVideoToAudio(force: true) }
             phase = .sourcePreparationCompleted
         case .sourcePreparationFailed: phase = .sourcePreparationFailed
         }

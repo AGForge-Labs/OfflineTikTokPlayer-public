@@ -5,6 +5,38 @@ import CoreVideo
 
 @MainActor
 final class ContinuousPictureInPictureTests: XCTestCase {
+    func testPreparedOutputSurvivesSelectionReturnWithoutDuplicatesAndFallbackIsRemoved() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let a = AVPlayerItem(url: url), b = AVPlayerItem(url: url), fallback = AVPlayerItem(url: url)
+        for item in [a, b] {
+            item.videoComposition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: item.asset)
+        }
+        let aOutput = ContinuousPictureInPicture.prepareVideoOutput(for: a)
+        let bOutput = ContinuousPictureInPicture.prepareVideoOutput(for: b)
+        XCTAssertTrue(ContinuousPictureInPicture.prepareVideoOutput(for: a) === aOutput)
+        let bridge = ContinuousPictureInPicture()
+        defer { bridge.invalidate() }
+        bridge.setCurrentItem(a); bridge.setCurrentItem(b); bridge.setCurrentItem(a)
+        XCTAssertTrue(bridge.orientationPrepared)
+        XCTAssertTrue(a.outputs.contains { $0 === aOutput })
+        XCTAssertTrue(b.outputs.contains { $0 === bOutput })
+        XCTAssertEqual(a.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
+        XCTAssertEqual(b.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
+        XCTAssertFalse(aOutput.suppressesPlayerRendering)
+        bridge.setCurrentItem(fallback)
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while !bridge.orientationPrepared, ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(bridge.orientationPrepared)
+        XCTAssertEqual(fallback.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
+        bridge.setCurrentItem(a)
+        XCTAssertTrue(fallback.outputs.isEmpty, "Unprepared fallback outputs retain their existing detach lifecycle")
+        XCTAssertTrue(a.outputs.contains { $0 === aOutput })
+        bridge.invalidate()
+        XCTAssertTrue(a.outputs.isEmpty, "Invalidation detaches the active prepared output")
+    }
+
     func testOnlyExplicitPiPCommandsReachAudioIntent() {
         let bridge = ContinuousPictureInPicture()
         defer { bridge.invalidate() }

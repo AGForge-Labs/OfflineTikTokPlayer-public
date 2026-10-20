@@ -88,6 +88,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
             }
             let asset = service.player.currentItem?.asset as? AVURLAsset
+            if asset?.url.standardizedFileURL == fixture.savedURLs[id]?.standardizedFileURL {
+                seeks.sampleVideo()
+            }
             if visible == nil, service.queue.currentID == id,
                asset?.url.standardizedFileURL == fixture.savedURLs[id]?.standardizedFileURL,
                service.submittedVideoFrameCount > submitted, service.customVideoReadyForDisplay,
@@ -173,6 +176,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 if outgoing == nil, SelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: 440) { outgoing = window }
                 if SelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: 880) { incoming = window }
             }
+            if service.queue.currentID == fixture.bID { seeks.sampleVideo() }
             if ready == nil, service.queue.currentID == fixture.bID, service.isVideoReady,
                service.customVideoReadyForDisplay, service.submittedVideoFrameCount > submitted,
                let position = service.videoFramePositionSeconds, position < 2,
@@ -849,11 +853,27 @@ final class SelectionVideoFixture {
 
 @MainActor
 private final class SelectionLatencySeekProbe {
-    weak var service: PlaybackService?
-    var phase = -1
+    weak var service: PlaybackService? {
+        didSet {
+            service?.onPlaybackEvent = { [weak self] event in
+                guard let self, self.phase >= 0, let service = self.service else { return }
+                print("SelectionLatencyEvent phase=\(self.phase) name=\(event.name) commandMs=\((SelectionOutputTap.hostSeconds() - self.origin) * 1_000) playerPosition=\(service.player.currentTime().seconds) playerRate=\(service.player.rate) videoOutputs=\(service.player.currentItem?.outputs.filter { $0 is AVPlayerItemVideoOutput }.count ?? 0) customReady=\(service.customVideoReadyForDisplay)")
+            }
+        }
+    }
+    var phase = -1 { didSet { videoMilestones.removeAll() } }
     var origin = 0.0
+    private var videoMilestones = Set<String>()
     private(set) var alignedPreparedSeekCount: [Int: Int] = [:]
     private(set) var nativeSeekCount: [Int: Int] = [:]
+    func sampleVideo() {
+        guard let service else { return }
+        for (name, position) in [("firstCopied", service.copiedVideoFramePositionSeconds),
+                                 ("firstSubmitted", service.videoFramePositionSeconds)] {
+            guard let position, videoMilestones.insert(name).inserted else { continue }
+            print("SelectionLatencyVideo phase=\(phase) name=\(name) commandMs=\((SelectionOutputTap.hostSeconds() - origin) * 1_000) framePosition=\(position) requested=\(service.videoRequestedPositionSeconds) playerPosition=\(service.player.currentTime().seconds) playerRate=\(service.player.rate)")
+        }
+    }
     func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
         let started = SelectionOutputTap.hostSeconds()
         let phase = self.phase, origin = self.origin, requested = time.seconds

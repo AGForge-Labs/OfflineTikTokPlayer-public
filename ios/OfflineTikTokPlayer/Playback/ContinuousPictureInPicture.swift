@@ -108,7 +108,8 @@ final class ContinuousPictureInPicture: NSObject {
         ]
     }
 
-    /// Exactly one item output is attached at a time; this never prepares additional video items.
+    /// Prepared outputs belong to the existing bounded item window. Only the
+    /// selected output is pulled; no frame history or extra player is created.
     func setCurrentItem(_ item: AVPlayerItem?) {
         guard !invalidated, currentItem !== item else { return }
         preparationTask?.cancel()
@@ -117,7 +118,7 @@ final class ContinuousPictureInPicture: NSObject {
         itemGeneration &+= 1
         activeSeekTicket = nil
         let generation = itemGeneration
-        if let videoOutput { currentItem?.remove(videoOutput) }
+        if let videoOutput, !(videoOutput is PreparedVideoOutput) { currentItem?.remove(videoOutput) }
         restoreOriginalComposition()
         currentItem = item
         videoOutput = nil
@@ -130,6 +131,12 @@ final class ContinuousPictureInPicture: NSObject {
         lastCopiedFramePositionSeconds = nil
         guard let item else { stopFrameTimer(); return }
         originalComposition = item.videoComposition
+        if let prepared = item.outputs.first(where: { $0 is PreparedVideoOutput }) as? AVPlayerItemVideoOutput {
+            orientationPrepared = true
+            useOutput(prepared)
+            onEvent?(.sourcePrepared, nil)
+            return
+        }
         let existingComposition = item.videoComposition
         preparationTask = Task { [weak self, weak item] in
             guard let item else { return }
@@ -163,10 +170,30 @@ final class ContinuousPictureInPicture: NSObject {
         // The AVPlayer can continue to render its ordinary inline layer underneath this layer.
         output.suppressesPlayerRendering = false
         item.add(output)
+        useOutput(output)
+    }
+
+    private func useOutput(_ output: AVPlayerItemVideoOutput) {
         videoOutput = output
         renderFrame()
         if frameFeedEnabled && playbackState.read().isPlaying { startFrameTimer() }
     }
+
+    /// Call only after this item's geometry is prepared and before it enters
+    /// AVQueuePlayer. Item ownership bounds lifetime to the existing buffer.
+    @discardableResult
+    static func prepareVideoOutput(for item: AVPlayerItem) -> AVPlayerItemVideoOutput {
+        if let existing = item.outputs.first(where: { $0 is PreparedVideoOutput }) as? AVPlayerItemVideoOutput { return existing }
+        let output = PreparedVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ])
+        output.suppressesPlayerRendering = false
+        item.add(output)
+        return output
+    }
+
+    private final class PreparedVideoOutput: AVPlayerItemVideoOutput {}
 
     /// Avoid inserting a compositor when decoded pixels already have ordinary
     /// presentation geometry. Conservatively normalize rotation, mirroring,
