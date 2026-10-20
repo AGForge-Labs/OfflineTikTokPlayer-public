@@ -2,7 +2,7 @@ name: Public playback validation
 on:
   push:
     branches: [fix/playback-continuity, fix/continuous-pcm-playback, fix/selected-video-regression]
-    paths: ['ios/**', 'scripts/**', 'tests/apple-playback/**', '.github/workflows/playback-validation.yml']
+    paths: ['ios/**', 'scripts/**', 'tests/apple-playback/**', 'tests/validation-shell/**', '.github/workflows/playback-validation.yml']
 permissions:
   contents: read
 jobs:
@@ -15,4 +15,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Unsigned full playback validation with one build job
-        run: bash scripts/check-ios.sh
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          bash scripts/check-ios.sh

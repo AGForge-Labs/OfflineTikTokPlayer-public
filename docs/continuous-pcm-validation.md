@@ -9,6 +9,28 @@ run below did not cover those visible-frame regressions and does not establish
 release readiness. The selected-video repair is undergoing full unsigned
 validation; no repaired signed build has been accepted.
 
+The repair preserves a cold selection on preparation failure and stops the old
+audio source before waiting. It publishes deselection acknowledgement, scopes
+video synchronization to its selection generation, re-arms first-frame readiness
+after seeks and updates paused/restored display time. Host-clock video scheduling
+always disables automatic stall waiting, as required by Apple's `setRate` API.
+It does not change the PCM timeline, source samples or three-slot allocation.
+
+Pre-fix runs [39384290017](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39384290017)
+and [39386077449](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39386077449)
+reproduced cold selection skipping, stale audio and invalid external-clock waiting.
+The latter also showed actual compositor images containing only the opaque poster
+after restored and natural positive-offset selections; baseline A/B/A movie pixels
+and independently decoded tones worked. Failed runtime fixture setup is separate
+from that evidence. Fixed synthetic moving/tone resources now avoid runtime encoding.
+
+Run [39389451153](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39389451153)
+reported success, but its log contains a macOS Bash 3 empty-array expansion error
+before `xcodebuild`. Only its 81 core tests and Apple buffer harness ran. It is
+**not native validation**. The launcher now uses safe positional arguments and
+explicitly preserves exit status during helper cleanup. Isolated launcher tests
+check full/focused native arguments, failure propagation and helper termination.
+
 ## Reviewed scope
 
 Base: `5ae95b42d89cbdbd5a6b93ef3202f9ed57603881`.
@@ -203,9 +225,11 @@ Repeat while explicitly paused, pause during the interruption, and foreground
 the player afterward: none may override the user's Pause. If the camera takes
 an exclusive session, record that limitation rather than claiming to defeat it.
 
-The previously shipped 12.1 candidate remains untouched. No new private signed
-build, archive, upload or TestFlight distribution ran for this change. A separate
-release approval is required before another signed candidate/device test build.
+Build 13.1 was withdrawn from the owner testing offer after device acceptance
+failed. The private source was reverted normally to the shipped 12.1 tree while
+the failed source was preserved separately. No repaired signed build, archive,
+upload or TestFlight distribution has run. A separate release approval is
+required before another signed candidate/device test build.
 
 ## Apple references
 
@@ -216,4 +240,5 @@ release approval is required before another signed candidate/device test build.
 - [Declared codec priming/remainder, QA1636](https://developer.apple.com/library/archive/qa/qa1636/_index.html)
 - [Asset-reader presentation range](https://developer.apple.com/documentation/avfoundation/avassetreader/timerange)
 - [Precise media timing](https://developer.apple.com/documentation/avfoundation/avurlassetpreferprecisedurationandtimingkey)
+- [Host-clock scheduling and automatic waiting](https://developer.apple.com/documentation/avfoundation/avplayer/setrate(_:time:athosttime:))
 - [Sample-buffer PiP playback commands](https://developer.apple.com/documentation/avkit/avpictureinpicturesamplebufferplaybackdelegate/pictureinpicturecontroller(_:setplaying:))
