@@ -3,7 +3,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 # Filled only after the complete source/test diff is reviewed and committed.
-expected_ios_tree=PENDING_REVIEWED_TREE
+expected_ios_tree=8a1cae1ad2bf1d2deb3a2ec2902902f635937dca
 test "$(git rev-parse HEAD:ios)" = "$expected_ios_tree"
 export SWIFTC_MAXIMUM_DETERMINISM=1
 mkdir -p artifacts/native
@@ -30,7 +30,7 @@ if result.returncode:
 PY
 destination='platform=iOS Simulator,name=iPhone 17 Pro Max'
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
-printf '%s\n' "CurrentSourceScope appAndTestsSource=PENDING_REVIEWED_SOURCE iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 compositorRequests=0 externalProfilerRequests=0 fullApplicationAcceptance=false"
+printf '%s\n' "CurrentSourceScope appAndTestsSource=483e8e6c5e2ac28f9bec1649db0362af3a0e78c4 iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 compositorRequests=0 externalProfilerRequests=0 fullApplicationAcceptance=false"
 # No screenshot/profile watcher is launched. Existing original capture cases
 # remain in the full suite; this focused control does not accept visibility.
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
