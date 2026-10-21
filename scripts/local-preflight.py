@@ -94,6 +94,7 @@ def validate_public_workflow(config):
     if set(steps[1]) != {"name", "run"} or steps[1]["run"] != (
             "python3 tests/validation-shell/test_check_ios_shell.py\n"
             "python3 tests/validation-shell/test_native_test_evidence.py\n"
+            "python3 tests/validation-shell/test_native_worker_trace.py\n"
             "bash scripts/check-ios.sh\n"):
         raise ValueError("Only unsigned source and simulator checks are approved.")
     if set(steps[2]) != {"name", "run"} or steps[2]["run"] != (

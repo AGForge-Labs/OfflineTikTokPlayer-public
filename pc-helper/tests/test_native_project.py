@@ -39,6 +39,31 @@ def test_debug_app_and_test_targets_match_the_active_swift_package_architecture(
         assert release.get("ONLY_ACTIVE_ARCH") == "NO", "Release archives must retain their normal supported architectures"
 
 
+def test_generator_traversal_matches_case_sensitive_and_insensitive_path_order(tmp_path, monkeypatch):
+    path = Path(__file__).resolve().parents[2] / "scripts" / "generate-ios-project.py"
+    spec = importlib.util.spec_from_file_location("native_project_order", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class CaseSensitivePath(type(Path())):
+        def __lt__(self, other):
+            return self.as_posix() < other.as_posix()
+
+    class CaseInsensitivePath(type(Path())):
+        def __lt__(self, other):
+            return self.as_posix().casefold() < other.as_posix().casefold()
+
+    for target in (module.APP, module.APP + "Tests", module.APP + "UITests"):
+        directory = tmp_path / target
+        directory.mkdir()
+        for name in ("SpeakerTests.swift", "WorkerTests.swift", "test-video.mp4"):
+            (directory / name).write_text("")
+    monkeypatch.setattr(module, "ROOT", CaseSensitivePath(tmp_path))
+    sensitive = module.generate()
+    monkeypatch.setattr(module, "ROOT", CaseInsensitivePath(tmp_path))
+    assert module.generate() == sensitive, "Source ordering must not inherit the host Path comparison rules"
+
+
 def _capture_helper():
     path = Path(__file__).resolve().parents[2] / "scripts" / "capture-simulator-test-frames.py"
     spec = importlib.util.spec_from_file_location("native_worker_capture", path)
