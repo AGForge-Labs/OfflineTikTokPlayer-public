@@ -150,6 +150,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let toneBlocks = ProductionSelectionOutputTap.toneBlocks(returned.values, rate: returned.rate, frequency: 440)
         let validity = tap.validity()
         print("ProductionSelectionReturnedOutput seconds=\(returnedSeconds) wallSeconds=\(returnedWall) firstHostOffsetMs=\(((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0)) * 1_000) lastHostOffsetMs=\(((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity)) * 1_000) frames=\(returned.values.count) rate=\(returned.rate) toneBlocks=\(toneBlocks.total) correctToneBlocks=\(toneBlocks.correct) quietMs=\(returnedQuiet * 1_000) maximumHoleMs=\(returnedHole * 1_000) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) retainedFrames=\(tap.count) capacityFrames=576000")
+        let anomalies = ProductionSelectionOutputTap.anomalyLocations(returned, origin: returnedOrigin, frequency: 440)
+        print("ProductionSelectionReturnedAnomalySummary schema=1 available=\(anomalies.available) originHostSeconds=\(returnedOrigin.map { String($0) } ?? "unknown") monitorStopHostSeconds=unknown quietCount=\(anomalies.quietCount) badToneCount=\(anomalies.badToneCount) retainedRecords=\(anomalies.records.count) perKindCapacity=4 droppedAnomalyCount=\(anomalies.droppedAnomalyCount) indices=recording-relative endFrame=exclusive")
+        for record in anomalies.records {
+            print("ProductionSelectionReturnedAnomaly schema=1 kind=\(record.kind) windowOrdinal=\(record.windowOrdinal) firstFrame=\(record.firstFrame) endFrame=\(record.endFrame) startOffsetMs=\(record.startOffsetMs.map { String($0) } ?? "unknown") endOffsetMs=\(record.endOffsetMs.map { String($0) } ?? "unknown") rms=\(record.rms)")
+        }
         XCTAssertGreaterThanOrEqual(returnedSeconds, 7.5); XCTAssertGreaterThanOrEqual(returnedWall, 7.5)
         XCTAssertTrue(returned.values.allSatisfy { $0.isFinite })
         XCTAssertGreaterThanOrEqual(toneBlocks.total, 375); XCTAssertEqual(toneBlocks.correct, toneBlocks.total)
@@ -1692,6 +1697,12 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     struct Tone { let start: Double; let end: Double }
     struct Window { let samples: [Float]; let rate: Double; let start: Double; let end: Double }
     struct Recording { let values: [Float]; let hosts: [Double]; let rate: Double }
+    struct Anomaly {
+        let kind: Int // 0 = existing 10 ms RMS quiet test; 1 = existing 20 ms tone test.
+        let windowOrdinal: Int, firstFrame: Int, endFrame: Int
+        let startOffsetMs: Double?, endOffsetMs: Double?
+        let rms: Double
+    }
     private let lock = NSLock()
     private let capacity = 12 * 48_000
     private var values: [Float] = []
@@ -1786,6 +1797,39 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
             if sqrt(square / Double(frames)) < 0.01 { run += 1; longest = max(longest, run) } else { run = 0 }
         }
         return Double(longest * frames) / rate
+    }
+
+    /// Replay unchanged classifications after cleanup; never clip either recording edge.
+    static func anomalyLocations(_ recording: Recording, origin: Double?, frequency: Double)
+        -> (available: Bool, records: [Anomaly], quietCount: Int, badToneCount: Int, droppedAnomalyCount: Int) {
+        guard recording.rate.isFinite, recording.rate > 0,
+              recording.values.count == recording.hosts.count else { return (false, [], 0, 0, 0) }
+        var records: [Anomaly] = []
+        records.reserveCapacity(8)
+        var quietCount = 0, badToneCount = 0
+        for kind in 0..<2 {
+            let frames = Int(recording.rate * (kind == 0 ? 0.01 : 0.02))
+            guard frames > 0, recording.values.count >= frames else { continue }
+            for first in stride(from: 0, through: recording.values.count - frames, by: frames) {
+                let end = first + frames
+                var square = 0.0
+                for value in recording.values[first..<end] { square += Double(value) * Double(value) }
+                let rms = sqrt(square / Double(frames))
+                let anomalous = kind == 0 ? rms < 0.01
+                    : !isTone(Array(recording.values[first..<end]), rate: recording.rate, frequency: frequency)
+                guard anomalous else { continue }
+                let ordinal = kind == 0 ? quietCount : badToneCount
+                if kind == 0 { quietCount += 1 } else { badToneCount += 1 }
+                guard ordinal < 4 else { continue }
+                let validOrigin = origin.flatMap { $0.isFinite ? $0 : nil }
+                records.append(Anomaly(kind: kind, windowOrdinal: first / frames,
+                    firstFrame: first, endFrame: end,
+                    startOffsetMs: validOrigin.map { (recording.hosts[first] - $0) * 1_000 },
+                    endOffsetMs: validOrigin.map { (recording.hosts[end - 1] + 1 / recording.rate - $0) * 1_000 },
+                    rms: rms))
+            }
+        }
+        return (true, records, quietCount, badToneCount, max(0, quietCount - 4) + max(0, badToneCount - 4))
     }
 
     static func maximumTimelineHole(_ hosts: [Double], rate: Double) -> Double {
