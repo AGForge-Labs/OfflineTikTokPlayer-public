@@ -47,6 +47,13 @@ def split_case(identity, status="passed", timestamp=False):
             prefix + f" {status} (1.774 seconds)."]
 
 
+def aq_word_case(identity, status="passed", timestamp=False):
+    prefix = "2026-10-21T13:06:39.5431950Z " if timestamp else ""
+    result = case_line(identity, status).replace("0.001 seconds", "0.104 seconds")
+    return [prefix + "2026-10-21 13:06:38.051696+0000 OfflineTikTokPlayer[20057:82227] [AQ]        LoudnessMan" + result,
+            prefix + "ager.mm:1215  IsHardwareSupported: no plist loaded, returning false"]
+
+
 class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -187,6 +194,77 @@ class NativeTestEvidenceTests(unittest.TestCase):
         checked = self.check_log([" passed (1.774 seconds)."] + self.full_log())
         self.assertNotEqual(checked.returncode, 0)
         self.assertIn("Orphan", checked.stderr)
+
+    def test_accepts_exact_adjacent_aq_word_interleave_with_complete_case(self):
+        target = "OfflineTikTokPlayerTests.SpeakerAudioTests/testTimedOutOptionalPreparationRetriesWhenTheItemBecomesReady"
+        self.assertIn(target, self.expected)
+        others = [case_line(x) for x in self.expected if x != target]
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                result = self.check_log(others + [case_line(target, "started")]
+                                        + aq_word_case(target, timestamp=timestamp) + ["** TEST SUCCEEDED **"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PASS " + target + "\n", result.stdout)
+
+    def test_aq_word_interleave_preserves_failed_skipped_and_failed_summary(self):
+        target = self.expected[0]
+        others = [case_line(x) for x in self.expected[1:]]
+        summary = ["Executed 97 tests, with 0 failures (0 unexpected)"]
+        for status in ("failed", "skipped"):
+            with self.subTest(status=status):
+                result = self.check_log(others + [case_line(target, "started")]
+                                        + aq_word_case(target, status) + summary + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(status, result.stderr.lower())
+        result = self.check_log(others + [case_line(target, "started")] + aq_word_case(target)
+                                + ["** TEST FAILED **", "** TEST SUCCEEDED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TEST FAILED", result.stderr)
+
+    def test_aq_word_interleave_rejects_wrong_identity_retry_and_duplicate(self):
+        target = self.expected[0]
+        others = [case_line(x) for x in self.expected[1:]]
+        unexpected = TARGETS[0] + ".UnexpectedTests/testWrongIdentity"
+        result = self.check_log(others + [case_line(target, "started"), case_line(unexpected, "started")]
+                                + aq_word_case(unexpected) + ["** TEST SUCCEEDED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(unexpected, result.stderr)
+        self.assertIn(target, result.stderr)
+        for status in ("passed", "failed"):
+            with self.subTest(status=status):
+                result = self.check_log(others + [case_line(target, "started")] + aq_word_case(target, status)
+                                        + [case_line(target), "** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("duplicate", result.stderr.lower())
+
+    def test_aq_word_interleave_rejects_malformed_nonadjacent_and_orphan_records(self):
+        header, tail = aq_word_case(self.expected[0])
+        fragments = ([header], [header, "unrelated output", tail], [header, "", tail],
+                     [header.replace("2026-10-21 13:06:38.051696+0000", "unknown-time"), tail],
+                     [header.replace("OfflineTikTokPlayer[", "OtherProcess["), tail],
+                     [header.replace("0.104 seconds", "unknown seconds"), tail],
+                     [header, tail.replace("1215", "1216")], [tail],
+                     [header + " ** TEST FAILED **", tail])
+        # Every expected identity already passes, so malformed extra records must
+        # be rejected directly rather than merely by a missing-target side effect.
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                result = self.check_log(self.full_log()[:-1] + fragment + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_aq_word_interleave_requires_one_prior_start_and_keeps_missing_ui_gate(self):
+        target = self.expected[0]
+        others = [case_line(x) for x in self.expected[1:]]
+        for starts in ([], [case_line(target, "started")] * 2):
+            with self.subTest(starts=starts):
+                result = self.check_log(others + starts + aq_word_case(target) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Ambiguous", result.stderr)
+        native_others = [case_line(x) for x in self.expected[1:] if x.startswith(TARGETS[0] + ".")]
+        result = self.check_log(native_others + [case_line(target, "started")]
+                                + aq_word_case(target) + ["** TEST SUCCEEDED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(TARGETS[1], result.stderr)
 
     def test_selection_only_requires_exactly_the_four_focused_classes_and_no_ui(self):
         focused = [x for x in self.expected if x.split(".", 1)[1].split("/")[0] in FOCUSED_CLASSES]

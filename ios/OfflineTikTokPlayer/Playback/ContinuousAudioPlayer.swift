@@ -9,6 +9,9 @@ final class ContinuousAudioPlayer {
     let renderer = ContinuousPCMRenderer()
     private(set) var graph: ContinuousAudioGraph
     private let decoder: ContinuousPCMDecoder
+    #if DEBUG
+    private nonisolated let debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder?
+    #endif
     private var entries: [String: Entry] = [:]
     private var preparing: [String: Task<Entry, Error>] = [:]
     private var reservedSlots = Set<Int>()
@@ -21,14 +24,32 @@ final class ContinuousAudioPlayer {
     private var failedTokens = Set<Int>()
     private var pendingPosition: (version: Int, position: Double)?
 
+    #if DEBUG
+    init(debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil) {
+        self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
+        graph = ContinuousAudioGraph(renderer: renderer)
+        decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder)
+    }
+    #else
     init() {
         graph = ContinuousAudioGraph(renderer: renderer)
         decoder = ContinuousPCMDecoder(renderer: renderer)
     }
+    #endif
     deinit { decoder.shutdown(); graph.engine.stop() }
     var isSelected: Bool { selectedID != nil }
 
     #if DEBUG
+    /// Direct independent scalar record read; it does not cohere with the worker snapshot.
+    nonisolated func debugNativeLaneActivitySnapshot(at laneIndex: Int) -> ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot? {
+        debugNativeLaneActivityRecorder?.snapshot(at: laneIndex)
+    }
+    var debugSelectionState: (selectedToken: Int, pendingVersion: Int?) {
+        (selectedID.flatMap { entries[$0]?.token } ?? 0, pendingPosition?.version)
+    }
+    func debugDecoderFailureState(_ completion: @escaping @Sendable (ContinuousPCMDecoder.DebugFailureState) -> Void) {
+        decoder.debugFailureState(completion)
+    }
     func debugShutdown(_ completion: @escaping @Sendable (Bool) -> Void) {
         decoder.shutdown()
         decoder.debugAfterShutdown(completion)

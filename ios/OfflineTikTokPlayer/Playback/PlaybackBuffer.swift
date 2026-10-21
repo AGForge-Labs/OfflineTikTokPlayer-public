@@ -21,6 +21,9 @@ final class PlaybackBuffer {
     var automaticAdvancementEnabled = true { didSet { updateEndAction() } }
     var usesExternalClock = false { didSet { updateEndAction() } }
     var previousMediaID: String? { previous?.mediaID }
+    #if DEBUG
+    var debugPreviousNeedsRewind: Bool? { previous?.needsRewind }
+    #endif
     var retainedItems: [AVPlayerItem] {
         var ids = Set<ObjectIdentifier>()
         return (player.items() + [active?.item, next?.item, loopReserve?.item, previous?.item].compactMap { $0 })

@@ -47,6 +47,59 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private enum ReadControl: Error { case deferred, pending }
 
     #if DEBUG
+    enum DebugNativeLaneActivityStage: UInt64, Sendable {
+        case none = 0, construction = 1, startReading = 2, nativeReadEntered = 3
+        case copyEntered = 4, copyReturned = 5, parser = 6, nativeReadReturned = 7, close = 8
+    }
+    struct DebugNativeLaneActivitySnapshot: Sendable {
+        let laneIndex: Int
+        let packedState: UInt64
+        let copySequence: UInt64
+        let stageCode: UInt64
+        let sequenceOverflowed: Bool
+    }
+    /// Three independent scalar records. Only the owning serial native lane
+    /// writes its record. Readers load one packed word; leases/lanes/worker
+    /// observations have no shared coherence or timing guarantee.
+    final class DebugNativeLaneActivityRecorder: @unchecked Sendable {
+        fileprivate final class Record: @unchecked Sendable {
+            private let packed = Atomic<UInt64>(0)
+            private var sequence: UInt64 = 0 // Owning lane only.
+            private var overflowed = false // Latched, never wraps the sequence.
+            fileprivate static let maximumSequence = (UInt64(1) << 59) - 1
+            fileprivate static let overflowBit = UInt64(1) << 63
+
+            fileprivate func publish(_ stage: DebugNativeLaneActivityStage) {
+                packed.store((sequence << 4) | stage.rawValue | (overflowed ? Self.overflowBit : 0),
+                             ordering: .releasing)
+            }
+            fileprivate func enterCopy() {
+                if sequence == Self.maximumSequence { overflowed = true }
+                else { sequence += 1 }
+                publish(.copyEntered)
+            }
+            fileprivate func load() -> UInt64 { packed.load(ordering: .acquiring) }
+        }
+        private let first = Record()
+        private let second = Record()
+        private let third = Record()
+        fileprivate func record(at laneIndex: Int) -> Record {
+            switch laneIndex {
+            case 0: return first
+            case 1: return second
+            case 2: return third
+            default: preconditionFailure("Three native lanes")
+            }
+        }
+        func snapshot(at laneIndex: Int) -> DebugNativeLaneActivitySnapshot? {
+            guard (0..<3).contains(laneIndex) else { return nil }
+            let value = record(at: laneIndex).load()
+            return DebugNativeLaneActivitySnapshot(laneIndex: laneIndex, packedState: value,
+                copySequence: (value >> 4) & Record.maximumSequence, stageCode: value & 15,
+                sequenceOverflowed: value & Record.overflowBit != 0)
+        }
+    }
+
     /// An on-worker logical snapshot, never sampled by the audio callback.
     /// Pending jobs include completed payloads queued for worker acceptance and
     /// retired jobs awaiting close. These fields do not identify an SDK wait.
@@ -82,6 +135,44 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let counterOverflowed: Bool
         let shutdownRequested: Bool
         let readerLeasesClosed: Bool
+    }
+
+    /// Requested only after a test has already failed. All mutable fields below
+    /// are read on the existing worker; no native object or SDK state is queried.
+    struct DebugStreamState: Sendable {
+        let cursor: Int64
+        let generatedFrames: Int64
+        let outputStart: Int64
+        let outputCount: Int
+        let converterFinished: Bool
+        let reachedEnd: Bool
+    }
+    struct DebugSlotState: Sendable {
+        let index: Int
+        let token: Int
+        let epoch: Int
+        let finished: Bool
+        let cancelled: Bool
+        let leaseIndex: Int
+        let stream: DebugStreamState?
+    }
+    struct DebugLeaseState: Sendable {
+        let index: Int
+        let present: Bool
+        let starting: Bool
+        let readPending: Bool
+        let retired: Bool
+        let requestedFrames: Int
+        let packetFrames: Int
+        let packetOffset: Int
+        let reachedEnd: Bool
+        let hasFailure: Bool
+    }
+    struct DebugFailureState: Sendable {
+        let stats: DebugWorkerStats
+        let preparationTokens: [Int] // Exactly three physical preparation slots.
+        let slots: [DebugSlotState] // Exactly three physical playback slots.
+        let leases: [DebugLeaseState] // Exactly three physical native lanes.
     }
 
     /// One-shot test gate immediately before native acquisition. This models an
@@ -132,12 +223,23 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         #if DEBUG
         var debugReadToken = 0
         var debugReadGate: DebugNativeReadGate?
+        let debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?
         #endif
+        #if DEBUG
+        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32,
+             debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?) {
+            self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
+            self.asset = asset; self.track = track; self.totalFrames = totalFrames
+            self.endTime = endTime
+            self.nativeRate = nativeRate; self.nativeChannels = nativeChannels
+        }
+        #else
         init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32) {
             self.asset = asset; self.track = track; self.totalFrames = totalFrames
             self.endTime = endTime
             self.nativeRate = nativeRate; self.nativeChannels = nativeChannels
         }
+        #endif
     }
 
     /// The converter worker alone reads/writes these mailbox fields. A converter
@@ -222,8 +324,15 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private let queue: DispatchQueue
         private var reader: NativeReader?
         private var buffer: AVAudioPCMBuffer?
+        #if DEBUG
+        private let index: Int
+        private var debugActivity: DebugNativeLaneActivityRecorder.Record?
+        #endif
 
         init(index: Int) {
+            #if DEBUG
+            self.index = index
+            #endif
             queue = DispatchQueue(label: "OfflineTikTokPlayer.NativeRead.\(index)", qos: .userInitiated)
         }
         func start(_ description: Description,
@@ -232,7 +341,13 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 let result: Result<Int64, Failure> = autoreleasepool {
                     do {
                         guard reader == nil, buffer == nil else { throw Failure.slotInUse }
+                        #if DEBUG
+                        debugActivity = description.debugNativeLaneActivityRecorder?.record(at: index)
+                        debugActivity?.publish(.construction)
+                        let created = try NativeReader(description: description, debugActivity: debugActivity)
+                        #else
                         let created = try NativeReader(description: description)
+                        #endif
                         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                             sampleRate: description.nativeRate, channels: description.nativeChannels,
                             interleaved: true),
@@ -250,9 +365,24 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let maximum = min(4_096, max(1, maximumFrames))
             queue.async { [self] in
                 let result: Result<NativePacket, Failure> = autoreleasepool {
+                    #if DEBUG
+                    var debugEnteredNativeRead = false
+                    #endif
                     do {
                         guard let reader, let buffer else { throw Failure.cannotDecode }
+                        #if DEBUG
+                        if let debugActivity {
+                            debugActivity.publish(.nativeReadEntered)
+                            debugEnteredNativeRead = true
+                        }
+                        #endif
                         let count = try reader.read(into: buffer, maximumFrames: maximum)
+                        #if DEBUG
+                        if debugEnteredNativeRead {
+                            debugActivity?.publish(.nativeReadReturned)
+                            debugEnteredNativeRead = false
+                        }
+                        #endif
                         let channels = Int(buffer.format.channelCount)
                         guard (0...maximum).contains(count), (1...8).contains(channels),
                               let samples = buffer.floatChannelData?[0],
@@ -260,17 +390,28 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         let owned = Array(UnsafeBufferPointer(start: samples, count: count * channels))
                         return .success(NativePacket(samples: owned, frames: count,
                             reachedEnd: reader.reachedEnd, totalFrames: reader.totalFrames))
-                    } catch { return .failure((error as? Failure) ?? .cannotDecode) }
+                    } catch {
+                        #if DEBUG
+                        if debugEnteredNativeRead { debugActivity?.publish(.nativeReadReturned) }
+                        #endif
+                        return .failure((error as? Failure) ?? .cannotDecode)
+                    }
                 }
                 completion(result)
             }
         }
         func close(completion: @escaping @Sendable () -> Void) {
             queue.async { [self] in
+                #if DEBUG
+                debugActivity?.publish(.close)
+                #endif
                 autoreleasepool {
                     buffer = nil
                     reader = nil // NativeReader.deinit/cancelReading run only here.
                 }
+                #if DEBUG
+                debugActivity = nil
+                #endif
                 completion()
             }
         }
@@ -331,6 +472,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private var sourceSilenceHandler: (@Sendable (Int, SourceSilence) -> Void)?
     private let yieldCount = Atomic<Int64>(0)
     #if DEBUG
+    private let debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?
     private var peakLeasedReaders = 0
     private var positiveInputRanDryBuffersRetained: UInt64 = 0
     private var positiveInputRanDryFramesRetained: UInt64 = 0
@@ -345,6 +487,27 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// Counts only the original eight-discard-buffer yields, never native pending.
     var cooperativeYieldCount: Int64 { yieldCount.load(ordering: .acquiring) }
 
+    #if DEBUG
+    init(renderer: ContinuousPCMRenderer, debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder? = nil) {
+        self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
+        self.renderer = renderer
+        let timer = DispatchSource.makeTimerSource(queue: worker)
+        self.timer = timer
+        timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(2))
+        timer.setEventHandler { [weak self] in self?.pump() }
+        timer.resume()
+    }
+
+    deinit {
+        // Normal owners call shutdown. If a direct caller omits it, retain each
+        // remaining lane through close so SDK reader destruction still occurs
+        // there, and match its outstanding DispatchGroup entry exactly once.
+        let group = readerClosures
+        for lease in leases.compactMap({ $0 }) where !lease.retired {
+            lease.lane.close { group.leave() }
+        }
+    }
+    #else
     init(renderer: ContinuousPCMRenderer) {
         self.renderer = renderer
         let timer = DispatchSource.makeTimerSource(queue: worker)
@@ -363,6 +526,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             lease.lane.close { group.leave() }
         }
     }
+    #endif
 
     /// Metadata loading may suspend; decoding and publishing are serialized.
     /// Token values identify a preparation, never a media URL or persistent ID.
@@ -396,8 +560,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                   (1...8).contains(asbd.pointee.mChannelsPerFrame) else { throw Failure.unsupportedPCM }
             nativeRate = asbd.pointee.mSampleRate; nativeChannels = asbd.pointee.mChannelsPerFrame
         }
+        #if DEBUG
+        let description = Description(asset: asset, track: selected, totalFrames: frames, endTime: end,
+            nativeRate: nativeRate, nativeChannels: nativeChannels,
+            debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder)
+        #else
         let description = Description(asset: asset, track: selected, totalFrames: frames, endTime: end,
             nativeRate: nativeRate, nativeChannels: nativeChannels)
+        #endif
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -473,10 +643,16 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     func debugWorkerStats(_ completion: @escaping @Sendable (DebugWorkerStats) -> Void) {
         worker.async { [self] in
+            completion(debugWorkerStatsNow())
+        }
+    }
+
+    // Worker owner only. The existing stats accessor retains its original fields.
+    private func debugWorkerStatsNow() -> DebugWorkerStats {
             let present = leases.compactMap { $0 }
             let pending = present.filter { $0.readPending }.count
             let packets = present.filter { $0.packet != nil }.count
-            completion(DebugWorkerStats(leasedReaders: present.count,
+            return DebugWorkerStats(leasedReaders: present.count,
                 peakLeasedReaders: peakLeasedReaders,
                 retiredLeasesAwaitingClose: present.filter { $0.retired }.count,
                 startingLeases: present.filter { $0.starting }.count,
@@ -492,7 +668,30 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 injectedPositiveInputRanDryFramesRetained: injectedPositiveInputRanDryFramesRetained,
                 positiveInputRanDryContractInjectionEnabled: positiveInputRanDryContractInjectionEnabled,
                 counterOverflowed: workerCounterOverflowed,
-                shutdownRequested: stopped, readerLeasesClosed: present.isEmpty))
+                shutdownRequested: stopped, readerLeasesClosed: present.isEmpty)
+    }
+
+    func debugFailureState(_ completion: @escaping @Sendable (DebugFailureState) -> Void) {
+        worker.async { [self] in
+            let slotStates = (0..<3).map { index in
+                let slot = slots[index]
+                return DebugSlotState(index: index, token: slot?.token ?? 0, epoch: slot?.epoch ?? 0,
+                    finished: slot?.finished ?? false,
+                    cancelled: slot?.cancellation.value.load(ordering: .acquiring) ?? false,
+                    leaseIndex: slot?.stream?.readerLease?.index ?? -1,
+                    stream: slot?.stream?.debugProgress)
+            }
+            let leaseStates = (0..<3).map { index in
+                let lease = leases[index]
+                return DebugLeaseState(index: index, present: lease != nil,
+                    starting: lease?.starting ?? false, readPending: lease?.readPending ?? false,
+                    retired: lease?.retired ?? false, requestedFrames: lease?.requestedFrames ?? 0,
+                    packetFrames: lease?.packet?.frames ?? 0, packetOffset: lease?.packetOffset ?? 0,
+                    reachedEnd: lease?.reachedEnd ?? false, hasFailure: lease?.failure != nil)
+            }
+            completion(DebugFailureState(stats: debugWorkerStatsNow(),
+                preparationTokens: preparations.map { $0?.token ?? 0 },
+                slots: slotStates, leases: leaseStates))
         }
     }
 
@@ -862,6 +1061,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         #if DEBUG
         var injectNextPositiveHaveDataAsInputRanDry = false
         var onPositiveInputRanDry: ((Int, Bool) -> Void)?
+        var debugProgress: DebugStreamState {
+            DebugStreamState(cursor: cursor, generatedFrames: generatedFrames,
+                outputStart: outputStart, outputCount: outputCount,
+                converterFinished: converterFinished, reachedEnd: eof)
+        }
         #endif
 
         var readerLease: ReaderLease? { native }
@@ -1048,6 +1252,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         #if DEBUG
         private let debugReadToken: Int
         private let debugReadGate: DebugNativeReadGate?
+        private let debugActivity: DebugNativeLaneActivityRecorder.Record?
         #endif
         private let rate: Double
         private let channels: Int
@@ -1060,6 +1265,32 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private(set) var totalFrames: Int64
         var reachedEnd: Bool { eof && sampleCount == 0 && cursor >= totalFrames }
 
+        #if DEBUG
+        init(description: Description, debugActivity: DebugNativeLaneActivityRecorder.Record?) throws {
+            guard let track = description.track else { throw Failure.cannotDecode }
+            #if DEBUG
+            self.debugActivity = debugActivity
+            debugReadToken = description.debugReadToken
+            debugReadGate = description.debugReadGate
+            #endif
+            rate = description.nativeRate; channels = Int(description.nativeChannels)
+            totalFrames = try ContinuousPCMDecoder.frame(description.endTime, rate: rate)
+            reader = try AVAssetReader(asset: description.asset)
+            output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true,
+                AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false
+            ])
+            output.alwaysCopiesSampleData = false
+            guard reader.canAdd(output) else { throw Failure.cannotDecode }
+            reader.add(output)
+            // The default range extends to positive infinity and may expose
+            // decoder postroll outside a compressed asset's presentation.
+            // Request the complete declared asset/track interval explicitly.
+            reader.timeRange = CMTimeRange(start: .zero, duration: description.endTime)
+            debugActivity?.publish(.startReading)
+            guard reader.startReading() else { throw Failure.cannotDecode }
+        }
+        #else
         init(description: Description) throws {
             guard let track = description.track else { throw Failure.cannotDecode }
             #if DEBUG
@@ -1082,6 +1313,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             reader.timeRange = CMTimeRange(start: .zero, duration: description.endTime)
             guard reader.startReading() else { throw Failure.cannotDecode }
         }
+        #endif
 
         deinit { reader.cancelReading() }
 
@@ -1119,11 +1351,20 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private func nextSample() throws {
             #if DEBUG
             debugReadGate?.beforeCopy(token: debugReadToken)
+            debugActivity?.enterCopy()
             #endif
             guard let buffer = output.copyNextSampleBuffer() else {
+                #if DEBUG
+                debugActivity?.publish(.copyReturned)
+                debugActivity?.publish(.parser)
+                #endif
                 guard reader.status == .completed else { throw Failure.cannotDecode }
                 eof = true; return
             }
+            #if DEBUG
+            debugActivity?.publish(.copyReturned)
+            debugActivity?.publish(.parser)
+            #endif
             guard let format = CMSampleBufferGetFormatDescription(buffer),
                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format),
                   asbd.pointee.mFormatID == kAudioFormatLinearPCM,

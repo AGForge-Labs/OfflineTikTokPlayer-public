@@ -63,6 +63,18 @@ final class PlaybackService: NSObject {
     }
     @ObservationIgnored var onDebugVideoSeekStamp: ((DebugVideoSeekStamp) -> Void)?
     @ObservationIgnored private var debugVideoSeekReason: DebugVideoSeekReason = .unattributed
+    struct DebugInitialVideoReadyState: Sendable {
+        let audioVisit: Int64
+        let readyGeneration: Int?
+        let generation: Int
+        let syncingVideoGeneration: Int?
+    }
+    // Timing-only seam: nil preserves the original callback path without an await.
+    @ObservationIgnored var onDebugInitialVideoReady: (@MainActor (Int) async -> Void)? = nil
+    var debugInitialVideoReadyState: DebugInitialVideoReadyState {
+        DebugInitialVideoReadyState(audioVisit: audioVisit, readyGeneration: readyGeneration,
+            generation: generation, syncingVideoGeneration: syncingVideoGeneration)
+    }
     #endif
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
     @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
@@ -535,6 +547,17 @@ final class PlaybackService: NSObject {
                 guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
                 if playerItem.status == .readyToPlay {
                     guard self.readyGeneration != request else { return }
+                    #if DEBUG
+                    if let gate = self.onDebugInitialVideoReady {
+                        await gate(request)
+                        // The real callback may have become stale while the test
+                        // withheld delivery. Never assign readiness to a new item.
+                        guard !Task.isCancelled, self.generation == request,
+                              self.player.currentItem === playerItem,
+                              playerItem.status == .readyToPlay,
+                              self.readyGeneration != request else { return }
+                    }
+                    #endif
                     self.readyGeneration = request
                     self.refreshAudioProcessing()
                     self.clock.updateDuration(playerItem.duration.seconds)

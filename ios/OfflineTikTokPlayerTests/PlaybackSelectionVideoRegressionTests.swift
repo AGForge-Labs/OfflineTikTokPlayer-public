@@ -11,6 +11,8 @@ import PlayerCore
 /// both generated movies, so a decoded asset or advancing audio clock cannot satisfy visibility.
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
+    // Stop targeted arms from creating more owners after an unacknowledged close.
+    private static var targetedFixtureOwnershipLost = false
     /// Real mixer output and actual custom-layer submission, without screenshot or SDK-position probes.
     /// This is selected-frame readiness evidence, not compositor pixels or physical speaker output.
     func testProductionSelectionLatencyAndStreamingContinuityWithoutCapture() async throws {
@@ -140,6 +142,301 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertEqual(audio.renderer.snapshot.underrunFrames, 0,
                        "Startup starvation cannot disappear behind a clean streaming baseline")
         seeks.dumpAndAssert()
+    }
+
+    /// Ordered fresh-fixture control/treatment. The original production benchmark above
+    /// and its readiness, latency, output and streaming oracles remain unchanged.
+    func testPrecomposedOffscreenItemsUseOriginalSelectionBenchmarkWithoutCapture() async throws {
+        for assignBeforeAdoption in [false, true] {
+            let mode = assignBeforeAdoption ? 1 : 0
+            print("PrecompositionDiagnosticArm schema=1 mode=\(mode) stage=begin freshFixture=true builtCompositionLimit=2 installedBaselineLimit=2 extraVideoOutputs=0 compositorPixels=unverified orderedArmsNotCausalProof=true")
+            do {
+                try await runPrecompositionSelectionDiagnostic(assignBeforeAdoption: assignBeforeAdoption)
+                print("PrecompositionDiagnosticArm schema=1 mode=\(mode) stage=end measurementsCompleted=true")
+            } catch PrecompositionDiagnosticFailure.cleanup {
+                throw PrecompositionDiagnosticFailure.cleanup
+            } catch {
+                // The helper has acknowledged cleanup before throwing a setup
+                // failure. The next arm remains fresh, never a retry of this item.
+                XCTFail("Precomposition diagnostic arm aborted after acknowledged cleanup; mode=\(mode)")
+                print("PrecompositionDiagnosticArm schema=1 mode=\(mode) stage=end measurementsCompleted=false")
+            }
+        }
+    }
+
+    private enum PrecompositionDiagnosticFailure: Error {
+        // Initial absence is unknown (-1) when no unique synthetic item exists.
+        case invalidPreparation(phase: Int, stage: Int, initialAbsence: Int)
+        case cleanup
+    }
+
+    private struct PrecompositionDiagnosticPreparation {
+        let phase: Int
+        let item: AVPlayerItem
+        let composition: AVVideoComposition
+        let installedBaseline: AVVideoComposition?
+        let installedGeometryMatches: Bool
+        let buildBegin: Double
+        let buildEnd: Double
+        let assigned: Bool
+    }
+
+    private struct PrecompositionDiagnosticSelection {
+        let phase: Int
+        let selectedItemMatches: Bool
+        let installedBaselineMatches: Bool
+        let selectedCompositionPresent: Bool
+    }
+
+    /// No readiness wait, seek, output attachment or command runs here. The same
+    /// local metadata build is performed in both arms, outside the timed command.
+    private func prepareOffscreenDiagnosticComposition(phase: Int, id: String, outgoingID: String,
+        fixture: SelectionVideoFixture, buffer: PlaybackBuffer, service: PlaybackService,
+        audio: ContinuousAudioPlayer, assignBeforeAdoption: Bool) async throws -> PrecompositionDiagnosticPreparation {
+        let expectedURL = try XCTUnwrap(fixture.savedURLs[id]).standardizedFileURL
+        let matches = buffer.retainedItems.filter {
+            ($0.asset as? AVURLAsset)?.url.standardizedFileURL == expectedURL
+        }
+        let outgoingToken = try XCTUnwrap(audio.entry(for: outgoingID)).token
+        let outgoing = service.audioSnapshot
+        let initialAbsence = matches.count == 1 ? (matches[0].videoComposition == nil ? 1 : 0) : -1
+        guard matches.count == 1, let item = matches.first,
+              buffer.player.currentItem !== item, initialAbsence == 1,
+              service.queue.currentID == outgoingID, service.current?.id == outgoingID,
+              audio.selectedID == outgoingID, outgoing.token == outgoingToken,
+              !outgoing.ended else {
+            XCTFail("Precomposition diagnostic requires one exact offscreen synthetic item and the expected live outgoing source; phase=\(phase)")
+            throw PrecompositionDiagnosticFailure.invalidPreparation(phase: phase, stage: 1, initialAbsence: initialAbsence)
+        }
+        let begin = ProductionSelectionOutputTap.hostSeconds()
+        let composition = try await ContinuousPictureInPicture.makeVideoComposition(for: item.asset)
+        let end = ProductionSelectionOutputTap.hostSeconds()
+        let retained = buffer.retainedItems
+        let sameMatches = retained.filter {
+            ($0.asset as? AVURLAsset)?.url.standardizedFileURL == expectedURL
+        }
+        let outgoingAfter = service.audioSnapshot
+        // The await may allow queue/adoption work. Never assign an item that has
+        // become current or been replaced, and never resume/retry an invalid arm.
+        guard sameMatches.count == 1, sameMatches.first === item,
+              buffer.player.currentItem !== item, item.videoComposition == nil,
+              service.queue.currentID == outgoingID, service.current?.id == outgoingID,
+              audio.selectedID == outgoingID, outgoingAfter.token == outgoingToken,
+              outgoingAfter.visit == outgoing.visit, !outgoingAfter.ended,
+              begin.isFinite, end.isFinite, end >= begin else {
+            XCTFail("Precomposition diagnostic item/outgoing identity changed during local metadata preparation; phase=\(phase)")
+            throw PrecompositionDiagnosticFailure.invalidPreparation(phase: phase, stage: 2, initialAbsence: initialAbsence)
+        }
+        if assignBeforeAdoption { item.videoComposition = composition }
+        // videoComposition is a copying property. Compare later getters with
+        // this actual immediate getter, never with the mutable builder object.
+        let installedBaseline = item.videoComposition
+        let installedGeometryMatches = installedBaseline.map {
+            diagnosticCompositionGeometryMatches($0, composition)
+        } ?? false
+        guard (assignBeforeAdoption ? installedBaseline != nil && installedGeometryMatches : installedBaseline == nil) else {
+            XCTFail("Precomposition diagnostic assignment control did not hold; phase=\(phase)")
+            throw PrecompositionDiagnosticFailure.invalidPreparation(phase: phase, stage: 3, initialAbsence: initialAbsence)
+        }
+        return PrecompositionDiagnosticPreparation(phase: phase, item: item, composition: composition,
+            installedBaseline: installedBaseline, installedGeometryMatches: installedGeometryMatches,
+            buildBegin: begin, buildEnd: end, assigned: assignBeforeAdoption)
+    }
+
+    private func diagnosticCompositionGeometryMatches(_ lhs: AVVideoComposition, _ rhs: AVVideoComposition) -> Bool {
+        guard lhs.renderSize == rhs.renderSize, lhs.instructions.count == 1, rhs.instructions.count == 1 else { return false }
+        let left = lhs.instructions[0].timeRange, right = rhs.instructions[0].timeRange
+        return CMTimeCompare(left.start, right.start) == 0 && CMTimeCompare(left.duration, right.duration) == 0
+    }
+
+    private func runPrecompositionSelectionDiagnostic(assignBeforeAdoption: Bool) async throws {
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            throw PrecompositionDiagnosticFailure.cleanup
+        }
+        let fixture = try await SelectionVideoFixture()
+        var mayRemoveFixture = true
+        defer { if mayRemoveFixture { fixture.remove() } }
+        var references: [(samples: [Float], frequency: Double)] = []
+        for (id, frequency) in [(fixture.aID, 440.0), (fixture.bID, 880.0)] {
+            references.append((try await fixture.decodedTone(id: id), frequency))
+        }
+        let audio = ContinuousAudioPlayer()
+        let tap = ProductionSelectionOutputTap()
+        let seeks = ProductionSelectionSeekRecorder()
+        let buffer = PlaybackBuffer()
+        let service = fixture.service(buffer: buffer, continuousAudio: audio, seekVideo: seeks.seek)
+        #if DEBUG
+        service.onDebugVideoSeekStamp = { [weak seeks] stamp in seeks?.record(stamp) }
+        defer { service.onDebugVideoSeekStamp = nil }
+        #endif
+        let screen = try SelectionVideoScreen(service: service)
+        // From here, deletion requires the decoder's queued cleanup acknowledgement.
+        mayRemoveFixture = false
+        let originalSources = (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+        let originalBytes = audio.renderer.retainedPCMMemoryBytes
+        audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
+            tap.append(buffer, time: time)
+        }
+        var measurements: [ProductionSelectionMeasurement] = []
+        var streams: [ProductionSelectionStream] = []
+        measurements.reserveCapacity(3); streams.reserveCapacity(3)
+        var returnedStart: Int?
+        var returnedEnd: Int?
+        var returnedOrigin: Double?
+        var preparationFailure: Error?
+        var preparations: [PrecompositionDiagnosticPreparation] = []
+        var preparationSelections: [PrecompositionDiagnosticSelection] = []
+        preparations.reserveCapacity(2); preparationSelections.reserveCapacity(2)
+        defer { withExtendedLifetime(preparations) {} }
+        do {
+            for phase in 0..<3 {
+                let id = phase == 1 ? fixture.bID : fixture.aID
+                let frequency = phase == 1 ? 880.0 : 440.0
+                let prepared = phase != 0
+                let preparedBefore: Bool
+                if prepared {
+                    preparedBefore = await waitUntil(timeout: 5) {
+                        service.preparedAudioCount == 2 && audio.entry(for: id) != nil
+                    }
+                } else { preparedBefore = true }
+                if phase > 0 {
+                    // B is staged while A plays. A is examined only after B
+                    // adoption; the helper verifies actual composition absence
+                    // rather than assuming CPP restored the outgoing item.
+                    preparations.append(try await prepareOffscreenDiagnosticComposition(phase: phase,
+                        id: id, outgoingID: phase == 1 ? fixture.aID : fixture.bID,
+                        fixture: fixture, buffer: buffer, service: service, audio: audio,
+                        assignBeforeAdoption: assignBeforeAdoption))
+                }
+                let measurement = await measureProductionSelection(service, screen: screen, fixture: fixture,
+                    audio: audio, tap: tap, seeks: seeks, phase: phase, id: id,
+                    frequency: frequency, prepared: prepared, preparedBefore: preparedBefore) {
+                    switch phase {
+                    case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+                    case 1: service.next()
+                    default: service.previous()
+                    }
+                }
+                measurements.append(measurement)
+                if let preparation = preparations.last, preparation.phase == phase {
+                    let selectedComposition = preparation.item.videoComposition
+                    preparationSelections.append(PrecompositionDiagnosticSelection(phase: phase,
+                        selectedItemMatches: service.player.currentItem === preparation.item,
+                        installedBaselineMatches: preparation.installedBaseline != nil
+                            && selectedComposition === preparation.installedBaseline,
+                        selectedCompositionPresent: selectedComposition != nil))
+                }
+                if phase == 2 {
+                    returnedOrigin = ProductionSelectionOutputTap.hostSeconds()
+                    returnedStart = tap.begin()
+                }
+                let baseline = audio.renderer.snapshot
+                let before = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+                let probe = ProductionRendererProbe(renderer: audio.renderer)
+                try? await Task.sleep(for: .seconds(8))
+                let result = probe.stop()
+                let final = audio.renderer.snapshot
+                let after = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+                streams.append(ProductionSelectionStream(phase: phase, baseline: baseline, final: final,
+                    before: before, after: after, quantum: service.audioRenderQuantumFrames, result: result,
+                    memoryBytes: audio.renderer.retainedPCMMemoryBytes,
+                    sameStorage: originalSources == (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }))
+                if phase == 2 { returnedEnd = tap.stop() }
+            }
+        } catch { preparationFailure = error }
+
+        // No dumps, spectral analysis or assertions interrupt any streaming window.
+        tap.stop(); service.pause()
+        audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
+        audio.graph.engine.stop(); screen.close()
+        let shutdown = ProductionSelectionShutdown()
+        let preparation = ProductionSelectionShutdown()
+        #if DEBUG
+        service.debugStopPreparation { preparation.complete(true) }
+        audio.debugShutdown { shutdown.complete($0) }
+        #endif
+        let cleanupReturned = await waitUntil(timeout: 3) { shutdown.result != nil && preparation.result != nil }
+        mayRemoveFixture = cleanupReturned && shutdown.result == true && preparation.result == true
+        print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
+        XCTAssertTrue(mayRemoveFixture, "Queued decoder cleanup must return before removing only this synthetic fixture")
+        // Invalid preparation still reaches the same acknowledged cleanup. Do not
+        // create the next fixture while this decoder's reader work remains owned.
+        guard mayRemoveFixture else {
+            Self.targetedFixtureOwnershipLost = true
+            fixture.restorePreferences()
+            throw PrecompositionDiagnosticFailure.cleanup
+        }
+        if let preparationFailure {
+            if let failure = preparationFailure as? PrecompositionDiagnosticFailure,
+               case let .invalidPreparation(phase, stage, initialAbsence) = failure {
+                print("PrecompositionDiagnosticPreparationRejected schema=1 mode=\(assignBeforeAdoption ? 1 : 0) phase=\(phase) stage=\(stage) initialAbsence=\(initialAbsence) existingCompositionOverwritten=false cleanupAcknowledged=true")
+            }
+            // Preserve the completed cold/Next contrast when a later retained
+            // item rejects setup. These rows never stand in for all three windows.
+            print("PrecompositionDiagnosticPartialEvidence schema=1 mode=\(assignBeforeAdoption ? 1 : 0) measurements=\(measurements.count) streams=\(streams.count) requiredWindows=3 armCompleted=false cleanupAcknowledged=true")
+            XCTAssertLessThan(measurements.count, 3)
+            for measurement in measurements { assertProductionSelection(measurement, tap: tap) }
+            for stream in streams { assertProductionStream(stream) }
+            seeks.dumpAndAssert()
+            throw preparationFailure
+        }
+        for reference in references {
+            XCTAssertGreaterThanOrEqual(reference.samples.count, 10_000)
+            XCTAssertTrue(ProductionSelectionOutputTap.isTone(reference.samples, rate: 48_000, frequency: reference.frequency))
+            XCTAssertEqual(ProductionSelectionOutputTap.quietRun(reference.samples, rate: 48_000), 0,
+                           "Independently decoded encoded fixtures must contain no 10 ms RMS-silence windows")
+        }
+        XCTAssertEqual(originalBytes, 6_912_000)
+        XCTAssertEqual(Set(originalSources).count, 3)
+        XCTAssertEqual(audio.renderer.sampleRate, 48_000); XCTAssertEqual(audio.renderer.channels, 2)
+        for slot in 0..<3 {
+            XCTAssertEqual(audio.renderer.source(at: slot).prefixCapacityFrames, 96_000)
+            XCTAssertEqual(audio.renderer.source(at: slot).ringCapacityFrames, 192_000)
+        }
+        XCTAssertEqual(measurements.count, 3); XCTAssertEqual(streams.count, 3)
+        XCTAssertLessThanOrEqual(streams.reduce(0) { $0 + $1.result.samples.count }, 384)
+        for measurement in measurements { assertProductionSelection(measurement, tap: tap) }
+        for stream in streams { assertProductionStream(stream) }
+        if measurements.count == 3 {
+            XCTAssertGreaterThan(measurements[0].state.expectedToken, 0)
+            XCTAssertNotEqual(measurements[0].state.expectedToken, measurements[1].state.expectedToken)
+            XCTAssertEqual(measurements[0].state.expectedToken, measurements[2].state.expectedToken,
+                           "Previous must reuse the retained A preparation")
+            XCTAssertGreaterThan(measurements[1].state.audio.visit, measurements[0].state.audio.visit)
+            XCTAssertGreaterThan(measurements[2].state.audio.visit, measurements[1].state.audio.visit)
+        }
+        let returned = tap.samples(from: returnedStart ?? tap.count, to: returnedEnd ?? tap.count)
+        let returnedSeconds = returned.rate > 0 ? Double(returned.values.count) / returned.rate : 0
+        let returnedWall = returned.hosts.first.flatMap { first in returned.hosts.last.map { $0 - first + 1 / max(1, returned.rate) } } ?? 0
+        let returnedQuiet = ProductionSelectionOutputTap.quietRun(returned.values, rate: returned.rate)
+        let returnedHole = ProductionSelectionOutputTap.maximumTimelineHole(returned.hosts, rate: returned.rate)
+        let toneBlocks = ProductionSelectionOutputTap.toneBlocks(returned.values, rate: returned.rate, frequency: 440)
+        let validity = tap.validity()
+        print("ProductionSelectionReturnedOutput seconds=\(returnedSeconds) wallSeconds=\(returnedWall) firstHostOffsetMs=\(((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0)) * 1_000) lastHostOffsetMs=\(((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity)) * 1_000) frames=\(returned.values.count) rate=\(returned.rate) toneBlocks=\(toneBlocks.total) correctToneBlocks=\(toneBlocks.correct) quietMs=\(returnedQuiet * 1_000) maximumHoleMs=\(returnedHole * 1_000) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) retainedFrames=\(tap.count) capacityFrames=576000")
+        XCTAssertGreaterThanOrEqual(returnedSeconds, 7.5); XCTAssertGreaterThanOrEqual(returnedWall, 7.5)
+        XCTAssertTrue(returned.values.allSatisfy { $0.isFinite })
+        XCTAssertGreaterThanOrEqual(toneBlocks.total, 375); XCTAssertEqual(toneBlocks.correct, toneBlocks.total)
+        XCTAssertEqual(returnedQuiet, 0)
+        XCTAssertLessThanOrEqual(returnedHole, 0.5 / max(1, returned.rate))
+        XCTAssertEqual(validity.invalidTimestamps, 0); XCTAssertEqual(validity.droppedFrames, 0)
+        XCTAssertLessThanOrEqual(tap.count, 12 * 48_000)
+        XCTAssertLessThanOrEqual((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0), 0.25)
+        XCTAssertGreaterThanOrEqual((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity), 7.5)
+        XCTAssertEqual(audio.renderer.snapshot.underrunFrames, 0,
+                       "Startup starvation cannot disappear behind a clean streaming baseline")
+        seeks.dumpAndAssert()
+        XCTAssertEqual(preparations.count, 2); XCTAssertEqual(preparationSelections.count, 2)
+        for preparation in preparations {
+            let selection = preparationSelections.first { $0.phase == preparation.phase }
+            print("PrecompositionDiagnosticPreparation schema=1 mode=\(assignBeforeAdoption ? 1 : 0) phase=\(preparation.phase) buildBeginHostSeconds=\(preparation.buildBegin) buildEndHostSeconds=\(preparation.buildEnd) buildSpanMs=\((preparation.buildEnd - preparation.buildBegin) * 1_000) offscreenAtEntry=true offscreenAtReturn=true exactRetainedItem=true initialAbsence=1 assigned=\(preparation.assigned) installedBaselinePresent=\(preparation.installedBaseline != nil) installedGeometryMatches=\(preparation.installedGeometryMatches) selectedItemMatches=\(selection?.selectedItemMatches ?? false) installedBaselineMatches=\(selection?.installedBaselineMatches ?? false) selectedCompositionPresent=\(selection?.selectedCompositionPresent ?? false) retainedBuiltCompositions=\(preparations.count) builtCompositionLimit=2 installedBaselineLimit=2 extraVideoOutputs=0 preparationOutsideCommand=true metadataGetterCostIncludedInBenchmark=false")
+            XCTAssertTrue(selection?.selectedItemMatches == true)
+            XCTAssertTrue(selection?.selectedCompositionPresent == true)
+            if assignBeforeAdoption {
+                XCTAssertTrue(preparation.installedGeometryMatches)
+                XCTAssertTrue(selection?.installedBaselineMatches == true)
+            }
+        }
     }
 
     private func productionSelectionState(_ service: PlaybackService, fixture: SelectionVideoFixture,
@@ -388,6 +685,133 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "restored-B-playing")
     }
 
+    func testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek() async throws {
+        #if DEBUG
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            service.isInteractingWithFeed = true
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await require({
+                let state = service.debugInitialVideoReadyState
+                let sample = service.audioSnapshot
+                return sample.token != 0 && sample.frame > 2_400 && service.preparedAudioCount == 2
+                    && state.readyGeneration == state.generation && state.audioVisit == sample.visit
+                    && state.syncingVideoGeneration == nil && service.isVideoReady
+                    && screen.customVideoLayer?.isReadyForDisplay == true
+            }, "Initial A must finish its real readiness path before the ordering control")
+            let aToken = service.audioSnapshot.token
+            assertSelection(service, fixture: fixture, id: fixture.aID)
+
+            service.next()
+            try await require({
+                let state = service.debugInitialVideoReadyState
+                let sample = service.audioSnapshot
+                return service.queue.currentID == fixture.bID && sample.token != 0 && sample.token != aToken
+                    && sample.frame > 2_400 && service.preparedAudioCount == 2
+                    && state.readyGeneration == state.generation && state.audioVisit == sample.visit
+                    && state.syncingVideoGeneration == nil && service.isVideoReady
+                    && screen.customVideoLayer?.isReadyForDisplay == true
+            }, "Prepared B must settle before holding returned A's real ready callback")
+            assertSelection(service, fixture: fixture, id: fixture.bID)
+            try await require({ buffer.previousMediaID == fixture.aID && buffer.debugPreviousNeedsRewind == false },
+                              "Retained A must finish its real offscreen rewind for the initial zero-start control")
+            let beforeReturn = service.audioSnapshot
+            let returnedGeneration = service.debugInitialVideoReadyState.generation + 1
+            let probe = SelectionInitialReadyOrderingProbe(generation: returnedGeneration)
+            service.onDebugInitialVideoReady = { request in await probe.hold(request: request) }
+            // Record before Previous: the bad seek can precede entry into the held callback.
+            service.onDebugVideoSeekStamp = { stamp in probe.record(stamp) }
+            defer {
+                // This body exits before withOwnedNaturalFixture performs its existing
+                // preparation/decoder acknowledgements and owned-file cleanup.
+                probe.release()
+                service.onDebugInitialVideoReady = nil
+                service.onDebugVideoSeekStamp = nil
+            }
+
+            service.previous()
+            let visitProcessed = await waitUntil(timeout: 1.5) {
+                let state = service.debugInitialVideoReadyState
+                let sample = service.audioSnapshot
+                return probe.isHolding && state.generation == returnedGeneration
+                    && state.readyGeneration != returnedGeneration && sample.token == aToken
+                    && sample.visit > beforeReturn.visit && state.audioVisit == sample.visit
+            }
+            XCTAssertTrue(visitProcessed,
+                          "The real returned-A callback must be held after the service processes its acknowledged visit")
+            guard visitProcessed else { throw SelectionVideoTestFailure.timeout }
+            let heldBaseline = service.audioSnapshot
+            let progressedWhileHeld = await waitUntil(timeout: 0.75) {
+                let state = service.debugInitialVideoReadyState
+                let sample = service.audioSnapshot
+                return probe.isHolding && state.generation == returnedGeneration
+                    && state.readyGeneration != returnedGeneration && state.audioVisit == sample.visit
+                    && sample.token == aToken && sample.visit == heldBaseline.visit
+                    && sample.frame >= heldBaseline.frame + 9_600
+            }
+            let held = service.audioSnapshot
+            let heldState = service.debugInitialVideoReadyState
+            let nativePosition = service.player.currentTime().seconds
+            let drift = abs(nativePosition - Double(held.frame) / 48_000)
+            probe.stopRecording()
+            print("InitialReadyOrdering phase=held generation=\(returnedGeneration) heldCallbacks=\(probe.entered) activeCallbacks=\(probe.active) timedOut=\(probe.timedOut) cancelled=\(probe.cancelled) overflow=\(probe.overflow) visitProcessed=\(visitProcessed) progressed=\(progressedWhileHeld) cachedVisit=\(heldState.audioVisit) renderVisit=\(held.visit) renderFrame=\(held.frame) nativePosition=\(nativePosition) absoluteDrift=\(drift) readyGeneration=\(heldState.readyGeneration.map { String($0) } ?? "missing") syncingGeneration=\(heldState.syncingVideoGeneration.map { String($0) } ?? "missing") seekReasons=\(probe.reasons.map { String($0) }.joined(separator: ",")) dropped=\(probe.dropped) underrunDelta=\(held.underrunFrames - beforeReturn.underrunFrames)")
+            XCTAssertTrue(progressedWhileHeld, "Real PCM must advance 200 ms while initial readiness remains withheld")
+            XCTAssertTrue(probe.isHolding)
+            XCTAssertFalse(probe.timedOut); XCTAssertFalse(probe.cancelled); XCTAssertFalse(probe.overflow)
+            XCTAssertEqual(probe.dropped, 0)
+            XCTAssertEqual(heldState.generation, returnedGeneration)
+            XCTAssertNotEqual(heldState.readyGeneration, returnedGeneration)
+            XCTAssertEqual(heldState.audioVisit, held.visit)
+            XCTAssertEqual(held.token, aToken); XCTAssertEqual(held.visit, heldBaseline.visit)
+            XCTAssertEqual(held.underrunFrames, beforeReturn.underrunFrames)
+            XCTAssertEqual(service.player.currentItem?.status, .readyToPlay)
+            XCTAssertTrue(drift.isFinite)
+            // A premature seek can already have aligned native time. It still fails
+            // the forbidden-reason assertions below. A passing no-seek control must
+            // prove that ordinary drift would otherwise be eligible.
+            if !probe.reasons.contains(PlaybackService.DebugVideoSeekReason.sourceVisit.rawValue)
+                && !probe.reasons.contains(PlaybackService.DebugVideoSeekReason.drift.rawValue) {
+                XCTAssertGreaterThan(drift, 0.080, "A passing control must make ordinary drift eligible before callback delivery")
+            }
+            XCTAssertNil(heldState.syncingVideoGeneration, "Initial callback ownership must not be displaced by a seek")
+            XCTAssertFalse(probe.reasons.contains(PlaybackService.DebugVideoSeekReason.sourceVisit.rawValue),
+                           "A newly acknowledged visit must not seek before its initial ready callback owns the timeline")
+            XCTAssertFalse(probe.reasons.contains(PlaybackService.DebugVideoSeekReason.drift.rawValue),
+                           "Ordinary drift must not seek before the initial ready callback owns the timeline")
+            assertSelection(service, fixture: fixture, id: fixture.aID)
+
+            let submittedBeforeRelease = service.submittedVideoFrameCount
+            probe.release()
+            try await require({
+                let state = service.debugInitialVideoReadyState
+                let sample = service.audioSnapshot
+                guard let frame = service.videoFramePositionSeconds,
+                      let copied = service.copiedVideoFramePositionSeconds else { return false }
+                return state.generation == returnedGeneration && state.readyGeneration == returnedGeneration
+                    && state.syncingVideoGeneration == nil && sample.token == aToken && sample.visit == held.visit
+                    && sample.frame >= held.frame + 2_400 && !sample.ended
+                    && service.submittedVideoFrameCount > submittedBeforeRelease
+                    && frame.isFinite && copied.isFinite && frame >= 0 && copied >= 0
+                    && abs(frame - service.videoRequestedPositionSeconds) <= 0.080
+                    && abs(copied - frame) <= 0.080
+                    && abs(service.player.currentTime().seconds - Double(sample.frame) / 48_000) <= 0.080
+                    && service.isVideoReady && !service.isLoading
+                    && screen.customVideoLayer?.isReadyForDisplay == true
+            }, "Releasing the real callback must produce a fresh selected and aligned custom frame with continued PCM")
+            XCTAssertTrue(service.audioEngineRunning); XCTAssertTrue(service.wantsToPlay)
+            XCTAssertEqual(service.audioSnapshot.underrunFrames, beforeReturn.underrunFrames)
+            assertSelection(service, fixture: fixture, id: fixture.aID)
+            await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "initial-ready-released-returned-A")
+            let final = service.audioSnapshot
+            XCTAssertEqual(final.token, aToken); XCTAssertEqual(final.visit, held.visit)
+            XCTAssertGreaterThan(final.frame, held.frame)
+            XCTAssertEqual(final.underrunFrames, beforeReturn.underrunFrames)
+        }
+        #else
+        XCTFail("Initial-ready ordering controls require DEBUG hooks")
+        #endif
+    }
+
     func testPausedRestoreBlocksFrameAcquisitionUntilTheRealSeekCompletionIsReleased() async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
@@ -509,32 +933,49 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testNaturalBoundaryAtPositiveIncomingOffsetRevealsB() async throws {
-        let fixture = try await SelectionVideoFixture()
-        defer { fixture.remove() }
-        let service = fixture.service()
-        let screen = try SelectionVideoScreen(service: service)
-        defer { service.pause(); screen.close() }
+        try await runNaturalBoundary(traceNativeLaneActivity: false)
+    }
+
+    func testNaturalBoundaryWithNativeLaneActivityRevealsB() async throws {
+        try await runNaturalBoundary(traceNativeLaneActivity: true)
+    }
+
+    private func runNaturalBoundary(traceNativeLaneActivity: Bool) async throws {
+        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceNativeLaneActivity) { fixture, audio, service, screen in
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 },
                           "Both complete Saved sources must be ready")
         let aToken = service.audioSnapshot.token
         let seekPosition = SelectionVideoFixture.duration - 2
         service.seek(seekPosition)
+        #if DEBUG
+        let nativeProbe = traceNativeLaneActivity ? NaturalNativeRunwayProbe() : nil
+        #endif
         // A far seek rebuilds the decoder's original history. Observe real progress with
         // two seconds of runway instead of requiring the main actor to catch A's final
         // 250 ms. A completed natural transition is also valid if scheduling skipped A.
         // This is cold far-seek setup, not a prepared-transition latency limit.
         let reachedRunway = await waitUntil(timeout: 10) {
             let sample = service.audioSnapshot
+            #if DEBUG
+            nativeProbe?.sample(audio: audio, renderer: sample)
+            #endif
             return sample.token == aToken && sample.frame >= Int64((seekPosition + 0.05) * 48_000)
                 || sample.token != 0 && sample.token != aToken && sample.frame > 0
         }
         let sample = service.audioSnapshot
         print("SelectionBoundary phase=runway reached=\(reachedRunway) sourceA=\(sample.token == aToken) frame=\(sample.frame) visit=\(sample.visit) underrunFrames=\(sample.underrunFrames) engineRunning=\(service.audioEngineRunning) wantsToPlay=\(service.wantsToPlay) position=\(service.clock.position) duration=\(service.clock.duration)")
+        #if DEBUG
+        nativeProbe?.sample(audio: audio, renderer: sample, force: true)
+        nativeProbe?.dumpAndAssert(reached: reachedRunway)
+        #endif
         guard reachedRunway else {
             // Keep this an assertion failure, with the original numeric evidence,
             // instead of throwing a setup error through deferred fixture cleanup.
             XCTFail("The real renderer must reach the seek runway or naturally enter B")
+            #if DEBUG
+            await recordNaturalRunwayFailure(audio: audio, expectedToken: aToken)
+            #endif
             return
         }
         // The audio thread continues through the boundary while the main actor is briefly busy.
@@ -548,7 +989,140 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             && service.clock.position > 0 }, "The service must adopt naturally rendered B at a positive offset")
         assertSelection(service, fixture: fixture, id: fixture.bID)
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "natural-B-positive-offset")
+        }
     }
+
+    /// Cleanup runs on normal return and on a retained original error. File removal
+    /// requires both existing acknowledgements; failure retains only this fixture.
+    private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, buffer: PlaybackBuffer? = nil, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
+        PlaybackService, SelectionVideoScreen) async throws -> Void) async throws {
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            throw SelectionVideoTestFailure.timeout
+        }
+        let fixture = try await SelectionVideoFixture()
+        #if DEBUG
+        let activity = traceNativeLaneActivity ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+        let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: activity)
+        #else
+        let audio = ContinuousAudioPlayer()
+        #endif
+        let service = fixture.service(buffer: buffer, continuousAudio: audio)
+        var screen: SelectionVideoScreen?
+        var originalError: Error?
+        do {
+            let created = try SelectionVideoScreen(service: service)
+            screen = created
+            try await body(fixture, audio, service, created)
+        } catch { originalError = error }
+        service.pause(); audio.graph.engine.stop(); screen?.close()
+        #if DEBUG
+        let preparation = ProductionSelectionShutdown()
+        let decoder = ProductionSelectionShutdown()
+        service.debugStopPreparation { preparation.complete(true) }
+        audio.debugShutdown { decoder.complete($0) }
+        let returned = await waitUntil(timeout: 3) { preparation.result != nil && decoder.result != nil }
+        let canRemove = returned && preparation.result == true && decoder.result == true
+        print("NaturalFixtureCleanup schema=1 ownedTasksJoined=\(preparation.result == true) decoderClosed=\(decoder.result == true) removeAllowed=\(canRemove) originalErrorRetained=\(originalError != nil) syntheticFilesRetained=\(!canRemove) sdkInternalQuiescence=unverified olderCancelledTasks=unverified")
+        XCTAssertTrue(canRemove, "Owned task and decoder close acknowledgements must precede synthetic file removal")
+        if canRemove { fixture.remove() }
+        else { Self.targetedFixtureOwnershipLost = true; fixture.restorePreferences() }
+        #else
+        fixture.remove()
+        #endif
+        if let originalError { throw originalError }
+    }
+
+    #if DEBUG
+    /// Independent main-actor observation, at most 128 records of three lane words.
+    /// No sampler task, worker request, SDK query or decode-path clock is added.
+    private final class NaturalNativeRunwayProbe {
+        struct Sample {
+            let begin: UInt64
+            let end: UInt64
+            let renderer: ContinuousPCMRenderer.Snapshot
+            let lanes: [ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?]
+        }
+        private let origin = DispatchTime.now().uptimeNanoseconds
+        private var samples: [Sample] = []
+        private var dropped = 0
+        init() { samples.reserveCapacity(128) }
+        func sample(audio: ContinuousAudioPlayer, renderer: ContinuousPCMRenderer.Snapshot, force: Bool = false) {
+            let begin = DispatchTime.now().uptimeNanoseconds
+            if !force, let last = samples.last, begin - last.begin < 100_000_000 { return }
+            guard samples.count < 128 else { dropped += 1; return }
+            let lanes = (0..<3).map { audio.debugNativeLaneActivitySnapshot(at: $0) }
+            let end = DispatchTime.now().uptimeNanoseconds
+            samples.append(Sample(begin: begin, end: end, renderer: renderer, lanes: lanes))
+        }
+        func dumpAndAssert(reached: Bool) {
+            let gaps = zip(samples, samples.dropFirst()).map { Double($1.begin - $0.begin) / 1_000_000_000 }
+            let acquisition = samples.map { Double($0.end - $0.begin) / 1_000_000_000 }.max() ?? .infinity
+            let first = samples.first.map { Double($0.begin - origin) / 1_000_000_000 } ?? .infinity
+            let elapsed = samples.last.map { Double($0.end - origin) / 1_000_000_000 } ?? -1
+            print("NaturalNativeActivityCoverage schema=1 reached=\(reached) samples=\(samples.count) capacity=128 lanes=3 dropped=\(dropped) firstMs=\(first * 1000) observedSeconds=\(elapsed) maximumGapMs=\((gaps.max() ?? 0) * 1000) maximumAcquisitionMs=\(acquisition * 1000) cadenceMs=100 rendererAndLanesCoherent=false hotClocks=false internalSDKCause=unestablished")
+            XCTAssertGreaterThan(samples.count, 0); XCTAssertLessThanOrEqual(samples.count, 128)
+            XCTAssertEqual(dropped, 0); XCTAssertLessThanOrEqual(first, 0.25)
+            XCTAssertLessThanOrEqual(gaps.max() ?? 0, 0.25); XCTAssertLessThanOrEqual(acquisition, 0.005)
+            if !reached { XCTAssertGreaterThanOrEqual(elapsed, 9.5) }
+            for (ordinal, sample) in samples.enumerated() {
+                XCTAssertEqual(sample.lanes.count, 3)
+                print("NaturalNativeActivityRenderer schema=1 ordinal=\(ordinal) beginNs=\(sample.begin) endNs=\(sample.end) token=\(sample.renderer.token) visit=\(sample.renderer.visit) frame=\(sample.renderer.frame) underrunFrames=\(sample.renderer.underrunFrames) selectionVersion=\(sample.renderer.selectionVersion) coherence=renderer-only-before-lane-reads")
+                for (index, lane) in sample.lanes.enumerated() {
+                    XCTAssertNotNil(lane)
+                    if let lane {
+                        XCTAssertEqual(lane.laneIndex, index); XCTAssertFalse(lane.sequenceOverflowed)
+                        print("NaturalNativeActivity schema=1 ordinal=\(ordinal) lane=\(lane.laneIndex) packedState=\(lane.packedState) copySequence=\(lane.copySequence) stage=\(lane.stageCode) overflowed=\(lane.sequenceOverflowed) coherence=one-packed-word")
+                    }
+                }
+            }
+        }
+    }
+
+    private func naturalFailureEndpoints(audio: ContinuousAudioPlayer, phase: String, expectedToken: Int) -> [String] {
+        let sample = audio.snapshot
+        let selection = audio.debugSelectionState
+        var rows = ["NaturalFailureRenderer schema=1 phase=\(phase) expectedToken=\(expectedToken) token=\(sample.token) frame=\(sample.frame) visit=\(sample.visit) ended=\(sample.ended) underrunFrames=\(sample.underrunFrames) selectionVersion=\(sample.selectionVersion) selectedToken=\(selection.selectedToken) pendingVersion=\(selection.pendingVersion.map { String($0) } ?? "none") selectionPending=\(audio.isSelectionPending(in: sample))"]
+        rows.reserveCapacity(4)
+        for index in 0..<3 {
+            let source = audio.renderer.source(at: index)
+            let token = source.token
+            let request = source.streamRequest
+            let ready = source.availableStreamFrames(for: request.epoch)
+            let writable = source.writableStreamFrames
+            let after = source.streamRequest
+            let tokenAfter = source.token
+            rows.append("NaturalFailureSource schema=1 phase=\(phase) slot=\(index) token=\(token) tokenAfter=\(tokenAfter) epoch=\(request.epoch) startFrame=\(request.startFrame) epochAfter=\(after.epoch) startAfter=\(after.startFrame) requestStable=\(request == after && token == tokenAfter) readyFrames=\(ready) writableFrames=\(writable) totalFrames=\(source.totalFrames) prefixFrames=\(source.prefixFrameCount) coherence=individual-accessors")
+        }
+        return rows
+    }
+
+    private func recordNaturalRunwayFailure(audio: ContinuousAudioPlayer, expectedToken: Int) async {
+        // Called only after the original ten-second runway guard has failed.
+        let before = naturalFailureEndpoints(audio: audio, phase: "before-worker", expectedToken: expectedToken)
+        let mailbox = NaturalFailureStateMailbox()
+        audio.debugDecoderFailureState { mailbox.complete($0) }
+        let returned = await waitUntil(timeout: 1) { mailbox.result != nil }
+        let state = mailbox.result
+        let after = naturalFailureEndpoints(audio: audio, phase: "after-worker", expectedToken: expectedToken)
+        for row in before { print(row) }
+        print("NaturalFailureWorker schema=1 returnedWithinOneSecond=\(returned) snapshotAvailable=\(state != nil) nativePhaseAvailable=false sdkWaitEstablished=false")
+        if let state {
+            let stats = state.stats
+            print("NaturalFailureWorkerStats schema=1 leased=\(stats.leasedReaders) peakLeased=\(stats.peakLeasedReaders) retired=\(stats.retiredLeasesAwaitingClose) starting=\(stats.startingLeases) preparations=\(stats.pendingPreparations) pendingReads=\(stats.readJobsAwaitingAcceptanceOrClose) packets=\(stats.mailboxPackets) occupiedPackets=\(stats.pendingOrMailboxPacketSlots) overflowed=\(stats.counterOverflowed) shutdown=\(stats.shutdownRequested) closed=\(stats.readerLeasesClosed) preparationTokens=\(state.preparationTokens.map { String($0) }.joined(separator: ",")) coherence=worker-owned-fields")
+            for slot in state.slots {
+                print("NaturalFailureSlot schema=1 slot=\(slot.index) token=\(slot.token) workerEpoch=\(slot.epoch) finished=\(slot.finished) cancelled=\(slot.cancelled) lease=\(slot.leaseIndex) hasStream=\(slot.stream != nil) coherence=worker-owned-fields")
+                if let stream = slot.stream {
+                    print("NaturalFailureStream schema=1 slot=\(slot.index) cursor=\(stream.cursor) generatedFrames=\(stream.generatedFrames) outputStart=\(stream.outputStart) outputCount=\(stream.outputCount) converterFinished=\(stream.converterFinished) eof=\(stream.reachedEnd) coherence=worker-owned-fields")
+                }
+            }
+            for lease in state.leases {
+                print("NaturalFailureLease schema=1 lane=\(lease.index) present=\(lease.present) starting=\(lease.starting) readPending=\(lease.readPending) retired=\(lease.retired) demandFrames=\(lease.requestedFrames) packetFrames=\(lease.packetFrames) packetOffset=\(lease.packetOffset) eof=\(lease.reachedEnd) hasFailure=\(lease.hasFailure) coherence=worker-owned-fields")
+            }
+        }
+        for row in after { print(row) }
+    }
+    #endif
 
     func testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause() async throws {
         let fixture = try await SelectionVideoFixture()
@@ -1154,6 +1728,15 @@ private final class ProductionSelectionShutdown: @unchecked Sendable {
     func complete(_ result: Bool) { lock.lock(); value = result; lock.unlock() }
 }
 
+#if DEBUG
+private final class NaturalFailureStateMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: ContinuousPCMDecoder.DebugFailureState?
+    var result: ContinuousPCMDecoder.DebugFailureState? { lock.lock(); defer { lock.unlock() }; return value }
+    func complete(_ result: ContinuousPCMDecoder.DebugFailureState) { lock.lock(); value = result; lock.unlock() }
+}
+#endif
+
 enum SelectionVideoIdentity: String { case a, b }
 private enum SelectionVideoTestFailure: Error {
     case timeout, sample, capture, unsafeCapturePath
@@ -1267,6 +1850,10 @@ final class SelectionVideoFixture {
             do { try manager.removeItem(at: owned) }
             catch { print("SelectionFixture cleanupErrorCode=\((error as NSError).code)") }
         }
+        restorePreferences()
+    }
+
+    func restorePreferences() {
         if let previousSpeakerSound { UserDefaults.standard.set(previousSpeakerSound, forKey: "speakerSound") }
         else { UserDefaults.standard.removeObject(forKey: "speakerSound") }
         if let previousAutomaticPiP { UserDefaults.standard.set(previousAutomaticPiP, forKey: "automaticPiP") }
@@ -1274,6 +1861,43 @@ final class SelectionVideoFixture {
     }
 
 }
+
+#if DEBUG
+@MainActor
+private final class SelectionInitialReadyOrderingProbe {
+    let generation: Int
+    private(set) var entered = 0, active = 0, dropped = 0
+    private(set) var timedOut = false, cancelled = false, overflow = false
+    private(set) var reasons: [Int] = []
+    private var released = false, recording = true
+    private var deadline: Double?
+    var isHolding: Bool { active > 0 && !released && !timedOut && !cancelled }
+
+    init(generation: Int) { self.generation = generation; reasons.reserveCapacity(32) }
+
+    func hold(request: Int) async {
+        guard request == generation, !released else { return }
+        guard entered < 8 else { overflow = true; return }
+        entered += 1; active += 1
+        defer { active -= 1 }
+        if deadline == nil { deadline = ProcessInfo.processInfo.systemUptime + 3 }
+        while !released, ProcessInfo.processInfo.systemUptime < (deadline ?? 0) {
+            do { try await Task.sleep(for: .milliseconds(10)) }
+            catch { cancelled = true; return }
+        }
+        if !released { timedOut = true }
+    }
+
+    func record(_ stamp: PlaybackService.DebugVideoSeekStamp) {
+        guard recording, stamp.generation == generation else { return }
+        if reasons.count < 32 { reasons.append(stamp.reason.rawValue) }
+        else { dropped += 1 }
+    }
+
+    func stopRecording() { recording = false }
+    func release() { released = true }
+}
+#endif
 
 @MainActor
 private final class SelectionVideoSeekScheduler {

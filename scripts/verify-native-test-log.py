@@ -32,6 +32,14 @@ SPLIT_CASE = re.compile(
     r"Test Case '([^']+)'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[\] <<<< VRP >>>> signalled err=-?\d+ at <>:\d+")
 RESULT_SUFFIX = re.compile(r" (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+# One observed framework line was split inside the word LoudnessManager by a
+# complete XCTest terminal record. Validate the exact adjacent diagnostic tail;
+# do not relax CASE's word boundary or strip arbitrary process output.
+AQ_WORD_CASE = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessMan"
+    r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+AQ_WORD_TAIL = re.compile(r"ager\.mm:1215  IsHardwareSupported: no plist loaded, returning false")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 FAILURE = re.compile(r"\*\* TEST(?: [A-Z]+)* FAILED \*\*")
 
@@ -209,6 +217,7 @@ def verify_log(text, expected):
     starts, outcomes = Counter(), defaultdict(Counter)
     observed, problems, successes, last_case = set(), [], [], 0
     pending = None
+    pending_word = None
     for number, line in enumerate(text.splitlines(), 1):
         if SUCCESS.fullmatch(line):
             successes.append(number)
@@ -216,6 +225,13 @@ def verify_log(text, expected):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
+        if pending_word is not None:
+            raw, status, header_line = pending_word
+            pending_word = None
+            if AQ_WORD_TAIL.fullmatch(clean):
+                event, reconstructed = (raw, status), True
+            else:
+                problems.append(f"Unfinished AQ word interleave at line {header_line}: {raw}")
         if pending is not None:
             raw, header_line = pending
             pending = None
@@ -225,6 +241,13 @@ def verify_log(text, expected):
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
+            word = AQ_WORD_CASE.fullmatch(clean)
+            if word:
+                pending_word = (*word.groups(), number)
+                continue
+            if "LoudnessManTest Case '" in clean:
+                problems.append(f"Malformed AQ word interleave at line {number}")
+                continue
             match = CASE.search(line)
             if match:
                 event = match.groups()
@@ -238,6 +261,8 @@ def verify_log(text, expected):
                         problems.append(f"Malformed native/UI case at line {number}: {header.group(1)}")
                 elif RESULT_SUFFIX.fullmatch(clean):
                     problems.append(f"Orphan case result suffix at line {number}")
+                elif AQ_WORD_TAIL.fullmatch(clean):
+                    problems.append(f"Orphan AQ word interleave tail at line {number}")
                 continue
         raw, status = event
         parsed = CASE_ID.fullmatch(raw)
@@ -264,6 +289,9 @@ def verify_log(text, expected):
     if pending is not None:
         raw, header_line = pending
         problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
+    if pending_word is not None:
+        raw, status, header_line = pending_word
+        problems.append(f"Unfinished AQ word interleave at line {header_line}: {raw}")
     if len(successes) != 1:
         problems.append(f"Expected exactly one TEST SUCCEEDED marker; found {len(successes)}")
     elif successes[0] <= last_case:
