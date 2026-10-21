@@ -50,7 +50,7 @@ def test_first_frame_seek_grace_accepts_only_the_reviewed_scoped_diagnostic(pref
 def test_first_frame_seek_grace_rejects_scope_execution_or_evidence_extensions(preflight, change):
     config = copy.deepcopy(seek_grace_workflow())
     job = config["jobs"]["natural"]
-    checkout, run, gate, calibration = job["steps"]
+    checkout, run, gate, calibration = job["steps"][:4]
     identity = "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDebugPausedVideoReanchorRejectsUserActionsBeforeFirstFrame"
     if change == "wrong_branch": config["on"]["push"]["branches"] = ["fix/playback-start-latency"]
     elif change == "extra_branch": config["on"]["push"]["branches"].append("main")
