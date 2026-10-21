@@ -15,6 +15,23 @@ printf '' | xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/nat
 cat artifacts/native/swift-driver-plan.log
 grep -Fq 'SWIFTC_MAXIMUM_DETERMINISM overriding -j' artifacts/native/swift-driver-plan.log
 python3 scripts/generate-ios-project.py --check
+# A fresh hosted VM has not started CoreSimulator during preceding test classes.
+# Bound that service startup separately; keep the existing destination resolver
+# and all application/test deadlines unchanged.
+python3 - <<'PY'
+import subprocess
+import time
+started = time.monotonic()
+try:
+    result = subprocess.run(['xcrun', 'simctl', 'list', 'devices', 'available', '--json'],
+                            capture_output=True, timeout=60, check=False)
+except subprocess.TimeoutExpired:
+    print('FreshNaturalSimulatorPreflight status=timeout deadlineSeconds=60', flush=True)
+    raise SystemExit(2) from None
+print(f'FreshNaturalSimulatorPreflight status=returned returnCode={result.returncode} elapsedSeconds={time.monotonic() - started:.6f}', flush=True)
+if result.returncode:
+    raise SystemExit(result.returncode)
+PY
 destination='platform=iOS Simulator,name=iPhone 17 Pro Max'
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
 python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 > "$worker_log" &
