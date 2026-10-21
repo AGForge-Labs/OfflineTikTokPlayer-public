@@ -22,6 +22,92 @@ def workflow():
     return yaml.load((ROOT / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
+def sampler_workflow():
+    return yaml.load((ROOT / ".github/workflows/native-sampler-capability.yml").read_text(encoding="utf-8"),
+                     Loader=yaml.BaseLoader)
+
+
+def test_sampler_capability_is_only_the_exact_public_documentation_job(preflight):
+    config = sampler_workflow()
+    assert config["on"] == {"push": {"branches": ["diagnostic/native-sampler-capability"],
+                                     "paths": [".github/workflows/native-sampler-capability.yml"]}}
+    assert config["permissions"] == {}
+    preflight.validate_native_sampler_capability_workflow(config)
+
+
+@pytest.mark.parametrize("change", [
+    "playback_branch", "extra_branch", "wrong_path", "extra_path", "manual_trigger", "schedule",
+    "private_guard", "repository_guard", "runner", "timeout", "missing_timeout", "extra_job", "matrix",
+    "extra_step", "read_permissions", "write_permissions", "null_permissions", "list_permissions", "job_permissions", "workflow_env", "job_env",
+    "environment", "step_env", "step_shell", "continue_on_error", "checkout", "artifact", "secret",
+    "profile_target", "network", "signing", "arbitrary_command", "name_expression",
+])
+def test_sampler_capability_rejects_any_execution_or_scope_extension(preflight, change):
+    config = copy.deepcopy(sampler_workflow())
+    job = config["jobs"]["documentation"]
+    step = job["steps"][0]
+    if change == "playback_branch": config["on"]["push"]["branches"] = ["fix/playback-start-latency"]
+    elif change == "extra_branch": config["on"]["push"]["branches"].append("fix/playback-start-latency")
+    elif change == "wrong_path": config["on"]["push"]["paths"] = ["scripts/**"]
+    elif change == "extra_path": config["on"]["push"]["paths"].append("ios/**")
+    elif change == "manual_trigger": config["on"]["workflow_dispatch"] = {}
+    elif change == "schedule": config["on"]["schedule"] = [{"cron": "0 * * * *"}]
+    elif change == "private_guard": job["if"] = "true"
+    elif change == "repository_guard": job["if"] = job["if"].replace("OfflineTikTokPlayer-public", "OfflineTikTokPlayer-private")
+    elif change == "runner": job["runs-on"] = "macos-26-xlarge"
+    elif change == "timeout": job["timeout-minutes"] = "4"
+    elif change == "missing_timeout": job.pop("timeout-minutes")
+    elif change == "extra_job": config["jobs"]["another"] = copy.deepcopy(job)
+    elif change == "matrix": job["strategy"] = {"matrix": {"value": ["1", "2"]}}
+    elif change == "extra_step": job["steps"].append({"run": "true"})
+    elif change == "read_permissions": config["permissions"] = {"contents": "read"}
+    elif change == "write_permissions": config["permissions"] = {"contents": "write"}
+    elif change == "null_permissions": config["permissions"] = None
+    elif change == "list_permissions": config["permissions"] = []
+    elif change == "job_permissions": job["permissions"] = {"id-token": "write"}
+    elif change == "workflow_env": config["env"] = {"PYTHONPATH": "unreviewed"}
+    elif change == "job_env": job["env"] = {"PAGER": "unreviewed"}
+    elif change == "environment": job["environment"] = {"name": "release"}
+    elif change == "step_env": step["env"] = {"KEY": "${{ github.token }}"}
+    elif change == "step_shell": step["shell"] = "python"
+    elif change == "continue_on_error": step["continue-on-error"] = "true"
+    elif change == "checkout": job["steps"].insert(0, {"uses": "actions/checkout@" + "a" * 40})
+    elif change == "artifact": job["steps"].append({"uses": "actions/upload-artifact@" + "a" * 40})
+    elif change == "secret": step["run"] += "\n${{ secrets.APPLE_PRIVATE_DELIVERY }}\n"
+    elif change == "profile_target": step["run"] = step["run"].replace("['/usr/bin/sample', '-h']", "['/usr/bin/sample', '123', '1']")
+    elif change == "network": step["run"] += "\n/usr/bin/curl https://example.invalid\n"
+    elif change == "signing": step["run"] += "\ncodesign --sign example unsigned.app\n"
+    elif change == "arbitrary_command": step["run"] += "\nprintf extra\n"
+    elif change == "name_expression": step["name"] = "${{ github.token }}"
+    with pytest.raises(ValueError):
+        preflight.validate_native_sampler_capability_workflow(config)
+
+
+@pytest.mark.parametrize("name,allowed", [
+    ("native-sampler-capability.yml", True), ("native-sampler-capability.yaml", False),
+    ("native-sampler-capability.YML", False), ("renamed-sampler.yml", False),
+    ("playback-validation.yml", False), ("public-testflight.yml", False),
+])
+def test_sampler_capability_exception_is_routed_only_by_its_exact_filename(preflight, tmp_path, name, allowed):
+    directory = tmp_path / ".github/workflows"
+    directory.mkdir(parents=True)
+    (directory / name).write_text((ROOT / ".github/workflows/native-sampler-capability.yml").read_text(encoding="utf-8"),
+                                 encoding="utf-8")
+    draft = tmp_path / ".github/workflow-drafts/native-check.yml"
+    draft.parent.mkdir(parents=True)
+    draft.write_text((ROOT / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), encoding="utf-8")
+    commands = []
+    runner = lambda args, **kwargs: commands.append(args)
+    if allowed:
+        complete = preflight.run_checks(tmp_path, runner=runner, platform="linux")
+        assert len(commands) == 5
+        assert len(complete) == 6
+    else:
+        with pytest.raises(ValueError):
+            preflight.run_checks(tmp_path, runner=runner, platform="linux")
+        assert commands == []
+
+
 def test_public_playback_validation_is_standard_unsigned_and_private_guarded(preflight):
     config = yaml.load((ROOT / ".github/workflows/playback-validation.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     preflight.validate_public_workflow(config)
