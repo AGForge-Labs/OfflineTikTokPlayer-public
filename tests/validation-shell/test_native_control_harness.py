@@ -85,7 +85,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         return value
 
     def runtime_host(self, name):
-        owner = "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests"
+        owner = "PlaybackSelectionVideoRegressionTests"
         return dict(schema=1, simulatorUDID=SIMULATOR, pid=31, bundleIdentifier=self.ns["BUNDLE"],
                     moduleNonce=str(uuid.uuid5(uuid.NAMESPACE_URL, "native-control/" + name)),
                     testName="-[%s %s]" % (owner, name))
@@ -318,11 +318,40 @@ class NativeControlHarnessTests(unittest.TestCase):
         path = self.ns["raw_log"](1, name)
         for label, text in (("failed", self.log(name, "failed")), ("skipped", self.log(name, "skipped")),
                             ("missing-terminal", self.log(name).replace(" passed (0.001 seconds).", " unfinished.")),
-                            ("missing-success", self.log(name).replace("** TEST SUCCEEDED **", ""))):
+                            ("missing-success", self.log(name).replace("** TEST SUCCEEDED **", "")),
+                            ("wrong-native-module", self.log(name).replace(
+                                "Test Case '-[OfflineTikTokPlayerTests.", "Test Case '-[WrongModule."))):
             with self.subTest(label=label):
                 path.write_text(text)
                 status, _output = self.mode("verify-one", 1, name, SOURCE, TREE, SIMULATOR)
                 self.assertEqual(status, 1)
+
+    def test_observed_runtime_basename_receipt_and_exact_name_guards(self):
+        # Retained F run39632207053 line2671: self.name omits the module,
+        # while the independent XCTest terminal identity retains its module.
+        name = "testProductionSelectionLatencyAndStreamingContinuityWithoutCapture"
+        identity = self.ns["PREFIX"] + name
+        observed = dict(schema=1, simulatorUDID="6EEDD2B9-6E06-4333-91B6-8661FDCCBA47", pid=6749,
+                        bundleIdentifier="dev.galaxybigbird.OfflineTikTokPlayer",
+                        moduleNonce="0f8a21a3-02e6-4e7e-b86c-c12f75a52462",
+                        testName="-[PlaybackSelectionVideoRegressionTests " + name + "]")
+        for prefix in ("", "2026-10-21T16:13:50.2195340Z "):
+            with self.subTest(prefix=bool(prefix)):
+                parsed = self.ns["runtime_host"](prefix + "NativeRuntimeHost " + json.dumps(observed),
+                                                  identity, observed["simulatorUDID"])
+                self.assertEqual(parsed["pid"], observed["pid"])
+                self.assertEqual(parsed["moduleNonce"], observed["moduleNonce"])
+        for wrong in ("-[OtherClass " + name + "]",
+                      "-[PlaybackSelectionVideoRegressionTests testDifferentMethod]",
+                      "-[OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests " + name + "]",
+                      "-[PlaybackSelectionVideoRegressionTests " + name + "] trailing",
+                      "[PlaybackSelectionVideoRegressionTests " + name + "]",
+                      "-[PlaybackSelectionVideoRegressionTests " + name + " extra]"):
+            with self.subTest(testName=wrong):
+                changed = dict(observed, testName=wrong)
+                with self.assertRaises(ValueError):
+                    self.ns["runtime_host"]("NativeRuntimeHost " + json.dumps(changed),
+                                            identity, observed["simulatorUDID"])
 
     @unittest.skipUnless(os.name == "posix", "The launcher contract uses Bash")
     def test_benchmark_builds_one_immutable_plan_before_testing_and_fails_closed(self):

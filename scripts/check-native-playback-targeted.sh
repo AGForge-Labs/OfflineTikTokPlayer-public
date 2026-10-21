@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=1ac3de09a02b5463f383483c2c63e6c58eb5d52d
+expected_code_source=d417121de0d30bc6dbabd1eb46fd49c19d114455
 expected_ios_tree=b3128730940eb36df8fa05959b946e7fd838d842
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -86,7 +86,9 @@ def runtime_host(log, identity, simulator):
         require(value['bundleIdentifier'] == BUNDLE, 'Runtime app bundle mismatch')
         require(type(value['pid']) is int and 0 < value['pid'] <= 2147483647, 'Runtime process identity unavailable')
         owner, method = identity.split('/', 1)
-        require(value['testName'] == '-[%s %s]' % (owner, method), 'Runtime XCTest identity mismatch')
+        require(owner == PREFIX[:-1]
+                and value['testName'] == '-[PlaybackSelectionVideoRegressionTests %s]' % method,
+                'Runtime XCTest identity mismatch')
         value['moduleNonce'] = canonical_uuid(value['moduleNonce'])
         return value
     except (ValueError, TypeError, KeyError):
