@@ -169,7 +169,7 @@ def main():
         arguments.udid = str(uuid.UUID(arguments.udid)).upper()
     except ValueError:
         parser.error("--udid must be a Simulator UUID")
-    deadline = time.monotonic() + min(1200, arguments.lifetime)
+    deadline = time.monotonic() + min(1800, arguments.lifetime)
     DEADLINE = deadline
     target = None
     next_lookup = 0.0

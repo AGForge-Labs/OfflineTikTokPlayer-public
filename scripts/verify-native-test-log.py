@@ -41,6 +41,8 @@ AQ_WORD_CASE = re.compile(
     r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
 AQ_WORD_TAIL = re.compile(r"ager\.mm:1215  IsHardwareSupported: no plist loaded, returning false")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
+EXECUTE_SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST EXECUTE SUCCEEDED \*\*\s*$")
+ANY_SUCCESS = re.compile(r"\*\* TEST(?: [A-Z]+)* SUCCEEDED \*\*")
 FAILURE = re.compile(r"\*\* TEST(?: [A-Z]+)* FAILED \*\*")
 
 
@@ -213,14 +215,20 @@ def source_manifest(repo_root, selection_only=False):
     return discovered
 
 
-def verify_log(text, expected):
+def verify_log(text, expected, *, invocation="test"):
+    if invocation not in ("test", "test-without-building"):
+        raise EvidenceError("Unsupported native test invocation")
+    success = SUCCESS if invocation == "test" else EXECUTE_SUCCESS
+    success_label = "TEST SUCCEEDED" if invocation == "test" else "TEST EXECUTE SUCCEEDED"
     starts, outcomes = Counter(), defaultdict(Counter)
     observed, problems, successes, last_case = set(), [], [], 0
     pending = None
     pending_word = None
     for number, line in enumerate(text.splitlines(), 1):
-        if SUCCESS.fullmatch(line):
+        if success.fullmatch(line):
             successes.append(number)
+        elif ANY_SUCCESS.search(line):
+            problems.append(f"Unexpected or malformed success marker for {invocation} at line {number}")
         if FAILURE.search(line):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
@@ -291,9 +299,9 @@ def verify_log(text, expected):
         raw, status, header_line = pending_word
         problems.append(f"Unfinished AQ word interleave at line {header_line}: {raw}")
     if len(successes) != 1:
-        problems.append(f"Expected exactly one TEST SUCCEEDED marker; found {len(successes)}")
+        problems.append(f"Expected exactly one {success_label} marker; found {len(successes)}")
     elif successes[0] <= last_case:
-        problems.append("TEST SUCCEEDED marker must follow every native/UI case result")
+        problems.append(f"{success_label} marker must follow every native/UI case result")
     missing = sorted(identity for identity in expected if outcomes[identity]["passed"] == 0)
     unexpected = sorted(observed - expected)
     duplicates = sorted(identity for identity in observed if starts[identity] > 1 or sum(outcomes[identity].values()) > 1)
@@ -310,10 +318,12 @@ def main(argv=None):
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--log", required=True, type=Path, help="fresh, raw stdout/stderr log from one xcodebuild test invocation")
     parser.add_argument("--selection-only", action="store_true", help="expect only the four explicit selection-regression classes; no UI tests")
+    parser.add_argument("--invocation", choices=("test", "test-without-building"), default="test",
+                        help="exact xcodebuild action whose success marker must finish this log")
     args = parser.parse_args(argv)
     try:
         expected = source_manifest(args.repo_root, args.selection_only)
-        verify_log(args.log.read_text(encoding="utf-8", errors="replace"), expected)
+        verify_log(args.log.read_text(encoding="utf-8", errors="replace"), expected, invocation=args.invocation)
     except (OSError, UnicodeError, EvidenceError) as error:
         print(f"Native test evidence failed: {error}", file=sys.stderr)
         return 1

@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=e7bb5ae5e98d3f60705bb9de04e5ac803b98cc32
-expected_ios_tree=45af21c3d68352f2ad2b787a7b3c6637e3b6ec26
+expected_code_source=37decd420486354bef315eb5c27394f03682a679
+expected_ios_tree=7a49566358722644118a2d908f630a62c5c42d48
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -276,7 +276,7 @@ try:
         read_receipt(source, tree, simulator)
         text = raw_log(ordinal, name).read_text()
         runtime_host(text, PREFIX + name, simulator)
-        verifier().verify_log(text, {PREFIX + name})
+        verifier().verify_log(text, {PREFIX + name}, invocation='test-without-building')
         print('NativeIsolatedControl ordinal=%d identity=%s native=1 ui=0' % (ordinal, PREFIX + name))
     elif mode == 'verify-controls':
         require(len(args) == 2, 'Final aggregate requires the exact source pins')
@@ -297,7 +297,7 @@ try:
                 host = runtime_host(text, identity, receipt['simulator'])
                 require(host['moduleNonce'] not in runtime_nonces, 'Runtime process nonce reused across controls')
                 runtime_nonces.add(host['moduleNonce'])
-                module.verify_log(text, {identity})
+                module.verify_log(text, {identity}, invocation='test-without-building')
                 seen.add(identity)
                 print('NativeIsolatedControlVerified ordinal=%d identity=%s native=1 ui=0' % (ordinal, identity))
             except (OSError, ValueError) as error:
@@ -321,7 +321,18 @@ if [ "$1" = --verify-source ]; then exit 0; fi
 if [ "$1" = --verify-controls ]; then evidence_tool verify-controls "$expected_code_source" "$expected_ios_tree"; exit 0; fi
 mode="$1"
 case "$mode" in
-  benchmark) cases=(testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture testProductionSelectionLatencyAndStreamingContinuityWithoutCapture testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation) ;;
+  benchmark) cases=(
+    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
+    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation
+    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testOffscreenPreparationInstallsActualGeometryAndSingleStagedOutput
+    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testPreparedResourcesSurviveABAReturnWithoutOutputPullBeforeActivation
+    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedInstallEligibilityConsumesPlanWithoutMutatingItem
+    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased
+    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRetirementPreservesExternallyReplacedComposition
+    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRepeatedBufferTransitionsBoundActualAttachedOutputs
+  ) ;;
   controls) cases=(testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
@@ -369,12 +380,13 @@ if [ "$mode" = benchmark ]; then
   generated_plan="$(evidence_tool generated-plan)"
   test_plan="$(evidence_tool plan-path "$generated_plan")"
   arguments=()
-  for name in "${cases[@]}"; do arguments+=("-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name"); done
+  for name in "${cases[@]}"; do arguments+=("-only-testing:$name"); done
   set +e
   xcodebuild -xctestrun "$test_plan" \
     -destination "platform=iOS Simulator,id=$simulator_id" \
     -resultBundlePath "artifacts/native/Targeted-$mode-$(date +%Y%m%d-%H%M%S).xcresult" \
     -jobs 1 -parallel-testing-enabled NO "${arguments[@]}" \
+    -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
     SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
     CODE_SIGNING_ALLOWED=NO test-without-building 2>&1 | tee "$native_log"
   pipeline_status=("${PIPESTATUS[@]}")
@@ -391,7 +403,7 @@ evidence_tool initialize-controls
 # This is the same bounded helper used by the existing natural pixel tests.
 # It is absent during both benchmarks and never launches an app.
 evidence_tool boundary "$simulator_id" before-01
-python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 &
+python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1800 &
 capture_pid=$!
 overall_status=0
 ordinal=0
@@ -412,6 +424,7 @@ for name in "${cases[@]}"; do
     -resultBundlePath "artifacts/native/Targeted-control-$ordinal-$(date +%Y%m%d-%H%M%S).xcresult" \
     -jobs 1 -parallel-testing-enabled NO \
     "-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name" \
+    -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
     SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
     CODE_SIGNING_ALLOWED=NO test-without-building 2>&1 | tee "$case_log"
   pipeline_status=("${PIPESTATUS[@]}")

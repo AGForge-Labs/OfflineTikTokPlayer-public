@@ -27,10 +27,10 @@ jobs:
           python3 tests/validation-shell/test_check_ios_shell.py
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_native_control_harness.py
-      - name: Default SDK and traced production benchmarks before causal controls
+      - name: Default SDK and traced production benchmarks and PiP resource regressions before causal controls
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require both benchmarks and both diagnostic unit identities
+      - name: Require both benchmarks and both diagnostic units and six PiP resource identities
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -45,10 +45,18 @@ jobs:
               'testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
               'testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
               'testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation')}
-          if len(expected) != 4 or not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('Default or original benchmark missing from pinned source')
-          evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected)
-          print('Targeted benchmarks and diagnostic units native=4 ui=0; original guards retained; no physical-output/full acceptance claim')
+          resource_prefix = 'OfflineTikTokPlayerTests.ContinuousPictureInPictureResourceTests/'
+          expected.update(resource_prefix + name for name in (
+              'testOffscreenPreparationInstallsActualGeometryAndSingleStagedOutput',
+              'testPreparedResourcesSurviveABAReturnWithoutOutputPullBeforeActivation',
+              'testRejectedInstallEligibilityConsumesPlanWithoutMutatingItem',
+              'testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased',
+              'testRetirementPreservesExternallyReplacedComposition',
+              'testRepeatedBufferTransitionsBoundActualAttachedOutputs'))
+          if len(expected) != 10 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('A benchmark or diagnostic unit or PiP resource test is missing from pinned source')
+          evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected, invocation='test-without-building')
+          print('Targeted benchmarks and diagnostic units and PiP resources native=10 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
       - name: Eight ordered controls using benchmark-built products
         if: ${{ always() && steps.source_pin.outcome == 'success' }}

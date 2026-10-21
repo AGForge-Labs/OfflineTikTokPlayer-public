@@ -1,3 +1,4 @@
+import importlib.util
 import re
 import subprocess
 import sys
@@ -58,14 +59,19 @@ class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.expected = current_manifest()
+        spec = importlib.util.spec_from_file_location("native_invocation_evidence", SCRIPT)
+        cls.verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.verifier)
 
-    def check_log(self, lines, *, root=ROOT, selection_only=False):
+    def check_log(self, lines, *, root=ROOT, selection_only=False, invocation=None):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "xcodebuild.log"
             log.write_text("\n".join(lines) + "\n", encoding="utf-8")
             args = [sys.executable, str(SCRIPT), "--repo-root", str(root), "--log", str(log)]
             if selection_only:
                 args.append("--selection-only")
+            if invocation is not None:
+                args.extend(("--invocation", invocation))
             return subprocess.run(args, capture_output=True, text=True, check=False)
 
     def full_log(self):
@@ -138,6 +144,57 @@ class NativeTestEvidenceTests(unittest.TestCase):
         self.assertNotEqual(self.check_log(summary + ["** TEST SUCCEEDED **"]).returncode, 0)
         result = self.check_log(self.full_log()[:-1] + summary + ["** TEST SUCCEEDED **"])
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_literal_execute_success_requires_explicit_invocation(self):
+        # Retained39643110262 lines3912/4053/4076, excluding unrelated framework output.
+        identity = ("OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/"
+                    "testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek")
+        started = ("Test Case '-[OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests "
+                   "testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek]' started.")
+        passed = ("Test Case '-[OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests "
+                  "testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek]' passed (10.392 seconds).")
+        for lines in ((started, passed, "** TEST EXECUTE SUCCEEDED **"),
+                      ("2026-10-21T17:34:53.9802640Z " + started,
+                       "2026-10-21T17:35:04.0590810Z " + passed,
+                       "2026-10-21T17:35:05.5860610Z ** TEST EXECUTE SUCCEEDED **")):
+            text = "\n".join(lines)
+            self.verifier.verify_log(text, {identity}, invocation="test-without-building")
+            with self.assertRaises(ValueError):
+                self.verifier.verify_log(text, {identity})
+
+    def test_cli_invocation_keeps_exact_marker_and_complete_identity_gates(self):
+        cases = self.full_log()[:-1]
+        for invocation, marker, wrong in (
+                (None, "** TEST SUCCEEDED **", "** TEST EXECUTE SUCCEEDED **"),
+                ("test", "** TEST SUCCEEDED **", "** TEST EXECUTE SUCCEEDED **"),
+                ("test-without-building", "** TEST EXECUTE SUCCEEDED **", "** TEST SUCCEEDED **")):
+            with self.subTest(invocation=invocation):
+                valid = self.check_log(cases + [marker], invocation=invocation)
+                self.assertEqual(valid.returncode, 0, valid.stderr)
+                for lines in (cases + [wrong], cases + [marker, wrong],
+                              [line for line in cases if TARGETS[1] not in line] + [marker],
+                              cases + [case_line(self.expected[0]), marker],
+                              [case_line(self.expected[0], "failed")] + cases + [marker],
+                              [case_line(self.expected[0], "skipped")] + cases + [marker]):
+                    rejected = self.check_log(lines, invocation=invocation)
+                    self.assertNotEqual(rejected.returncode, 0)
+        self.assertNotEqual(self.check_log(cases + ["** TEST SUCCEEDED **"], invocation="unknown").returncode, 0)
+
+    def test_each_invocation_rejects_early_duplicate_malformed_and_failed_markers(self):
+        identity = self.expected[0]
+        cases = [case_line(identity, "started"), case_line(identity)]
+        for invocation, marker, wrong in (
+                ("test", "** TEST SUCCEEDED **", "** TEST EXECUTE SUCCEEDED **"),
+                ("test-without-building", "** TEST EXECUTE SUCCEEDED **", "** TEST SUCCEEDED **")):
+            for lines in (cases, [marker] + cases, cases + [marker, marker], cases + [wrong, marker],
+                          cases + ["prefix " + marker, marker], cases + ["** TEST BUILD SUCCEEDED **", marker],
+                          cases + ["** TEST FAILED **", marker],
+                          cases + ["** TEST EXECUTE FAILED **", marker]):
+                with self.subTest(invocation=invocation, lines=lines):
+                    with self.assertRaises(ValueError):
+                        self.verifier.verify_log("\n".join(lines), {identity}, invocation=invocation)
+        with self.assertRaises(ValueError):
+            self.verifier.verify_log("\n".join(cases + ["** TEST SUCCEEDED **"]), {identity}, invocation="unknown")
 
     def test_accepts_only_adjacent_interleaved_case_result_with_process_diagnostic(self):
         for timestamp in (False, True):

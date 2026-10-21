@@ -20,11 +20,15 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = Path(os.environ.get("NATIVE_CONTROL_HARNESS_SOURCE", ROOT / "scripts/check-native-playback-targeted.sh"))
 VERIFIER = ROOT / "scripts/verify-native-test-log.py"
+CAPTURE_HELPER = Path(os.environ.get("SIMULATOR_CAPTURE_HELPER_SOURCE", ROOT / "scripts/capture-simulator-test-frames.py"))
 REAL_SUBPROCESS_RUN = subprocess.run
 SIMULATOR = "11111111-2222-4333-8444-555555555555"
 CONTAINER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 OTHER_CONTAINER = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 SOURCE, TREE = "1" * 40, "2" * 40
+NATIVE_TEST_TIMEOUTS = (("-test-timeouts-enabled", "YES"),
+                        ("-default-test-execution-time-allowance", "120"),
+                        ("-maximum-test-execution-time-allowance", "120"))
 
 
 class NativeControlHarnessTests(unittest.TestCase):
@@ -97,7 +101,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         return ("Test Case '-[%s %s]' started.\n" % (owner, name)
                 + host
                 + "Test Case '-[%s %s]' %s (0.001 seconds).\n" % (owner, name, status)
-                + "** TEST SUCCEEDED **\n")
+                + "** TEST EXECUTE SUCCEEDED **\n")
 
     def mode(self, name, *arguments):
         output, error = io.StringIO(), io.StringIO()
@@ -156,6 +160,31 @@ class NativeControlHarnessTests(unittest.TestCase):
         self.write_manifest(self.cases[:-1])
         with self.assertRaises(ValueError):
             self.ns["verifier"]()
+        # Exercise the real helper parser/deadline without SDK commands or waiting.
+        capture_spec = importlib.util.spec_from_file_location("native_capture_lifetime_unit", CAPTURE_HELPER)
+        capture = importlib.util.module_from_spec(capture_spec)
+        capture_spec.loader.exec_module(capture)
+        for requested, effective in ((None, 1200), ("60", 60), ("1800", 1800),
+                                     ("1801", 1800), ("99999", 1800)):
+            with self.subTest(requested=requested):
+                argv = ["capture-helper", "--udid", SIMULATOR]
+                if requested is not None:
+                    argv += ["--lifetime", requested]
+                clock = types.SimpleNamespace(
+                    monotonic=mock.Mock(side_effect=[100.0, 100.0 + effective]),
+                    sleep=mock.Mock(side_effect=AssertionError("Real waiting is forbidden")))
+                with mock.patch.object(sys, "argv", argv), mock.patch.object(capture, "time", clock), \
+                        mock.patch.object(capture, "locate", side_effect=AssertionError("SDK lookup is forbidden")) as lookup:
+                    self.assertEqual(capture.main(), 0)
+                    self.assertEqual(capture.DEADLINE, 100.0 + effective)
+                    lookup.assert_not_called()
+                    clock.sleep.assert_not_called()
+        for invalid in ("0", "-1", "nan", "inf"):
+            with self.subTest(invalid_lifetime=invalid):
+                with mock.patch.object(sys, "argv", ["capture-helper", "--udid", SIMULATOR, "--lifetime", invalid]), \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as rejected:
+                    capture.main()
+                self.assertEqual(rejected.exception.code, 2)
 
     def test_receipt_rejects_missing_or_changed_plan_and_wrong_source(self):
         receipt = self.make_receipt()
@@ -276,7 +305,8 @@ class NativeControlHarnessTests(unittest.TestCase):
         path = self.ns["raw_log"](1, name)
         good = self.log(name)
         for label, text, accepted in (("valid", good, True), ("wrong", self.log(self.cases[-1]), False),
-                                      ("duplicate", good + good, False), ("failed", self.log(name, "failed"), False)):
+                                      ("duplicate", good + good, False), ("failed", self.log(name, "failed"), False),
+                                      ("wrong-invocation", good.replace("** TEST EXECUTE SUCCEEDED **", "** TEST SUCCEEDED **"), False)):
             with self.subTest(label=label):
                 path.write_text(text)
                 status, _output = self.mode("verify-one", 1, name, SOURCE, TREE, SIMULATOR)
@@ -288,10 +318,10 @@ class NativeControlHarnessTests(unittest.TestCase):
         path = self.ns["raw_log"](1, name)
         good = self.runtime_host(name)
         invalid = [("missing", self.log(name, runtime=False)),
-                   ("duplicate", self.log(name).replace("** TEST SUCCEEDED **",
-                    "NativeRuntimeHost " + json.dumps(good) + "\n** TEST SUCCEEDED **")),
-                   ("malformed", self.log(name, runtime=False).replace("** TEST SUCCEEDED **",
-                    "NativeRuntimeHost {broken}\n** TEST SUCCEEDED **"))]
+                   ("duplicate", self.log(name).replace("** TEST EXECUTE SUCCEEDED **",
+                    "NativeRuntimeHost " + json.dumps(good) + "\n** TEST EXECUTE SUCCEEDED **")),
+                   ("malformed", self.log(name, runtime=False).replace("** TEST EXECUTE SUCCEEDED **",
+                    "NativeRuntimeHost {broken}\n** TEST EXECUTE SUCCEEDED **"))]
         for field, value in (("simulatorUDID", "unknown"), ("simulatorUDID", CONTAINER),
                              ("simulatorUDID", SIMULATOR.replace("-", "")),
                              ("bundleIdentifier", "dev.wrong.App"), ("testName", self.cases[-1]),
@@ -304,8 +334,8 @@ class NativeControlHarnessTests(unittest.TestCase):
         changed = dict(good); changed["extra"] = "not permitted"
         invalid.append(("extra-field", self.log(name, runtime=changed)))
         duplicate_key = json.dumps(good)[:-1] + ', "pid": 31}'
-        invalid.append(("duplicate-json-key", self.log(name, runtime=False).replace("** TEST SUCCEEDED **",
-                        "NativeRuntimeHost " + duplicate_key + "\n** TEST SUCCEEDED **")))
+        invalid.append(("duplicate-json-key", self.log(name, runtime=False).replace("** TEST EXECUTE SUCCEEDED **",
+                        "NativeRuntimeHost " + duplicate_key + "\n** TEST EXECUTE SUCCEEDED **")))
         for label, text in [("valid", self.log(name))] + invalid:
             with self.subTest(label=label):
                 path.write_text(text)
@@ -318,7 +348,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         path = self.ns["raw_log"](1, name)
         for label, text in (("failed", self.log(name, "failed")), ("skipped", self.log(name, "skipped")),
                             ("missing-terminal", self.log(name).replace(" passed (0.001 seconds).", " unfinished.")),
-                            ("missing-success", self.log(name).replace("** TEST SUCCEEDED **", "")),
+                            ("missing-success", self.log(name).replace("** TEST EXECUTE SUCCEEDED **", "")),
                             ("wrong-native-module", self.log(name).replace(
                                 "Test Case '-[OfflineTikTokPlayerTests.", "Test Case '-[WrongModule."))):
             with self.subTest(label=label):
@@ -360,12 +390,19 @@ class NativeControlHarnessTests(unittest.TestCase):
         start = shell.index('if [ "$mode" = benchmark ]; then\n')
         end = shell.index('\nfi\n\ntest_plan=', start) + len('\nfi')
         benchmark = shell[start:end]
-        names = shlex.split(re.search(r"benchmark\) cases=\((.*?)\) ;;", shell).group(1))
-        self.assertEqual(names, [
-            'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-            'testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-            'testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
-            'testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation'])
+        names = shlex.split(re.search(r"benchmark\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
+        expected_selectors = [
+            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
+            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation',
+            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testOffscreenPreparationInstallsActualGeometryAndSingleStagedOutput',
+            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testPreparedResourcesSurviveABAReturnWithoutOutputPullBeforeActivation',
+            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedInstallEligibilityConsumesPlanWithoutMutatingItem',
+            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased',
+            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRetirementPreservesExternallyReplacedComposition',
+            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRepeatedBufferTransitionsBoundActualAttachedOutputs']
+        self.assertEqual(names, expected_selectors)
         fake_xcode = '''import json, os, sys
 from pathlib import Path
 root = Path(os.environ['HARNESS_UNIT_ROOT'])
@@ -435,11 +472,15 @@ raise SystemExit(17 if os.environ['HARNESS_UNIT_SCENARIO'] == 'tee-failure' and 
                     self.assertEqual(len(commands), 2)
                     testing = commands[1]
                     self.assertIn('test-without-building', testing)
+                    for flag, value in NATIVE_TEST_TIMEOUTS:
+                        self.assertEqual(testing.count(flag), 1)
+                        index = testing.index(flag)
+                        self.assertEqual(testing[index:index + 2], [flag, value])
                     self.assertNotIn('-project', testing); self.assertNotIn('-scheme', testing)
                     self.assertEqual(testing[testing.index('-xctestrun') + 1],
                                      'artifacts/DerivedData/Build/Products/Owned.xctestrun')
-                    self.assertEqual({arg for arg in testing if arg.startswith('-only-testing:')},
-                                     {'-only-testing:' + self.ns['PREFIX'].replace('.', '/', 1) + name for name in names})
+                    self.assertEqual([arg for arg in testing if arg.startswith('-only-testing:')],
+                                     ['-only-testing:' + selector for selector in expected_selectors])
                 else:
                     self.assertEqual(len(commands), 1)
                 if scenario in ('valid', 'benchmark-failure'):
@@ -489,6 +530,10 @@ raise SystemExit(17 if os.environ['HARNESS_UNIT_SCENARIO'] == 'tee-failure' and 
     @unittest.skipUnless(os.name == "posix", "The launcher contract uses Bash")
     def test_unknown_runtime_identity_stops_later_controls_after_boundary_and_status(self):
         shell = HARNESS.read_text(encoding="utf-8").replace("\r\n", "\n")
+        capture = re.search(r'^python3 scripts/capture-simulator-test-frames\.py --udid "\$simulator_id" --lifetime \d+ &$',
+                            shell, re.MULTILINE)
+        self.assertIsNotNone(capture, "The controls require their exact bounded capture-helper launch")
+        capture_launch = capture.group(0) + "\ncapture_pid=$!\n"
         start = shell.index('for name in "${cases[@]}"; do\n')
         end = shell.index('\ndone\n', start) + len('\ndone')
         loop = shell[start:end]
@@ -502,21 +547,25 @@ raise SystemExit(17 if os.environ['HARNESS_UNIT_SCENARIO'] == 'tee-failure' and 
                     'expected_code_source=' + SOURCE, 'expected_ios_tree=' + TREE,
                     'simulator_id=' + SIMULATOR, 'test_plan=unused', 'overall_status=0', 'ordinal=0',
                     'cases=(' + ' '.join(shlex.quote(name) for name in self.cases) + ')',
-                    'xcodebuild() { printf "launch %s\\n" "$ordinal" >> events; return 65; }',
+                    'xcodebuild() { printf "launch %s\\n" "$ordinal" >> events; '
+                    'printf "%s\\n" "$@" > "xcode-args-$ordinal"; return 65; }',
                     'tee() { while IFS= read -r line; do :; done; }',
+                    'python3() { printf "%s\\n" "$@" > capture-args; }',
                     'evidence_tool() {', '  case "$1" in',
                     '    read-plan) return 0 ;;',
                     '    verify-one) printf "verify %s\\n" "$ordinal" >> events; return "$HARNESS_UNIT_VERIFY_STATUS" ;;',
                     '    boundary) printf "boundary %s\\n" "$ordinal" >> events; return 0 ;;',
                     '    *) return 91 ;;', '  esac', '}', ''))
                 script = root / "control-loop.sh"
-                script.write_text(preamble + loop + '\n')
+                script.write_text(preamble + capture_launch + loop + '\nwait "$capture_pid"\n')
                 environment = dict(os.environ, HARNESS_UNIT_ROOT=str(root),
                                    HARNESS_UNIT_VERIFY_STATUS=str(verify_status))
                 result = REAL_SUBPROCESS_RUN(['/bin/bash', str(script)], env=environment,
                                              text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 expected = 1 if verify_status == 2 else len(self.cases)
+                self.assertEqual((root / "capture-args").read_text().splitlines(),
+                                 ["scripts/capture-simulator-test-frames.py", "--udid", SIMULATOR, "--lifetime", "1800"])
                 events = (root / "events").read_text().splitlines()
                 self.assertEqual(events, [event + " " + str(ordinal)
                     for ordinal in range(1, expected + 1) for event in ("launch", "verify", "boundary")])
@@ -524,6 +573,13 @@ raise SystemExit(17 if os.environ['HARNESS_UNIT_SCENARIO'] == 'tee-failure' and 
                 self.assertEqual(len(rows), expected)
                 for row in rows:
                     self.assertEqual(row.split('\t')[2:], ["65", "0", str(verify_status), "0"])
+                for ordinal in range(1, expected + 1):
+                    arguments = (root / ("xcode-args-%d" % ordinal)).read_text().splitlines()
+                    self.assertIn("test-without-building", arguments)
+                    for flag, value in NATIVE_TEST_TIMEOUTS:
+                        self.assertEqual(arguments.count(flag), 1)
+                        index = arguments.index(flag)
+                        self.assertEqual(arguments[index:index + 2], [flag, value])
 
 
 if __name__ == "__main__":
