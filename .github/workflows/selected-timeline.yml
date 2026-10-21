@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Unsigned focused native adoption regression with one build job
+      - name: Unsigned matched production-path benchmark with one build job
         run: bash scripts/check-selected-timeline.sh
       - name: Verify the focused identity without claiming full playback acceptance
         if: always()
@@ -25,9 +25,9 @@ jobs:
           spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
           evidence = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(evidence)
-          expected = {'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testAdoptionCannotAcquireTheDepartingTimelineBeforeActivation'}
+          expected = {'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
           if not expected.issubset(evidence.source_manifest(Path('.'))):
               raise SystemExit('Focused native identity missing from this source')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('SCOPED selected-timeline native=1 ui=0; full playback acceptance NOT RUN')
+          print('SCOPED production-path benchmark native=1 ui=0; compositor/full playback acceptance NOT RUN')
           PY
