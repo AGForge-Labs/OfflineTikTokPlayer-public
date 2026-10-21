@@ -185,6 +185,20 @@ struct PlaybackDiagnosticJournal {
         return Array(storage[nextIndex...]) + Array(storage[..<nextIndex])
     }
 
+    #if DEBUG
+    struct DebugCachedSnapshot {
+        let capacity: Int
+        let droppedEvents: UInt64
+        let originUptime: Double?
+        let entries: [Entry]
+    }
+    /// Copies existing control-thread values only; does not sample or record.
+    var debugCachedSnapshot: DebugCachedSnapshot {
+        DebugCachedSnapshot(capacity: capacity, droppedEvents: droppedEvents,
+                            originUptime: originUptime, entries: entries)
+    }
+    #endif
+
     mutating func record(_ phase: PlaybackDiagnosticPhase, snapshot: PlaybackDiagnosticSnapshot,
                          error: PlaybackDiagnosticError? = nil,
                          uptime: Double = ProcessInfo.processInfo.systemUptime) {

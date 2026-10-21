@@ -16,6 +16,60 @@ final class ContinuousPictureInPicture: NSObject {
     #if DEBUG
     /// Observes the actual SDK request without replacing its result.
     var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
+    enum DebugRenderStage: Int, Sendable {
+        case attempt = 0, hasNewFalse = 1, hasNewTrue = 2, copied = 3, enqueued = 4
+        case seekBegin = 5, compositionAssigned = 6, outputAttached = 7, seekBlocked = 8
+    }
+    struct DebugRenderStamp: Sendable {
+        let stage: DebugRenderStage
+        // 0 before any seek, 1 while a seek is active, 2 after that first seek.
+        let region: Int
+        let ticket: PresentationTicket?
+        let presentationRevision: Int
+        let ownershipUnchanged: Bool
+        let nativeSeekTicket: UInt64?
+        let entryNs: UInt64, returnNs: UInt64
+        let requestedSeconds: Double?, sampleSeconds: Double?
+        // Cached values at entry; seekBegin therefore preserves the pre-flush proof.
+        let copiedPTS: Double?, submittedPTS: Double?, submittedCount: UInt64
+    }
+    var onDebugRenderStamp: ((DebugRenderStamp) -> Void)?
+    private var debugRenderRevision: Int?
+    private var debugBeforeMask: UInt16 = 0, debugDuringMask: UInt16 = 0, debugAfterMask: UInt16 = 0
+    private var debugRenderSawSeek = false
+    private func debugTraceRender(_ stage: DebugRenderStage, requested: CMTime? = nil,
+                                  sample: CMTime? = nil, sourceTicket: PresentationTicket? = nil,
+                                  _ operation: () -> Void = {}) {
+        guard let observer = onDebugRenderStamp else { operation(); return }
+        let revision = sourceTicket?.generation ?? presentationRevision
+        if debugRenderRevision != revision {
+            debugRenderRevision = revision
+            debugBeforeMask = 0; debugDuringMask = 0; debugAfterMask = 0; debugRenderSawSeek = false
+        }
+        if activeSeekTicket != nil { debugRenderSawSeek = true }
+        let region = activeSeekTicket != nil ? 1 : (debugRenderSawSeek ? 2 : 0)
+        let bit = UInt16(1) << stage.rawValue
+        let mask = region == 0 ? debugBeforeMask : (region == 1 ? debugDuringMask : debugAfterMask)
+        guard mask & bit == 0 else { operation(); return }
+        if region == 0 { debugBeforeMask |= bit }
+        else if region == 1 { debugDuringMask |= bit }
+        else { debugAfterMask |= bit }
+        let ticket = sourceTicket ?? currentItem.map { PresentationTicket(generation: revision, item: ObjectIdentifier($0)) }
+        let activeSeek = activeSeekTicket
+        let seek = activeSeekTicket ?? (debugRenderSawSeek ? seekTicket : nil)
+        let copied = lastCopiedFramePositionSeconds, submitted = lastFramePositionSeconds
+        let count = submittedFrameCount
+        let entered = DispatchTime.now().uptimeNanoseconds
+        operation()
+        let returned = DispatchTime.now().uptimeNanoseconds
+        observer(DebugRenderStamp(stage: stage, region: region, ticket: ticket, presentationRevision: revision,
+            ownershipUnchanged: revision == presentationRevision
+                && ticket?.item == currentItem.map { ObjectIdentifier($0) } && activeSeek == activeSeekTicket,
+            nativeSeekTicket: seek, entryNs: entered, returnNs: returned,
+            requestedSeconds: requested.flatMap { $0.isNumeric ? CMTimeGetSeconds($0) : nil },
+            sampleSeconds: sample.flatMap { $0.isNumeric ? CMTimeGetSeconds($0) : nil },
+            copiedPTS: copied, submittedPTS: submitted, submittedCount: count))
+    }
     #endif
     enum Event: Int {
         case willStart = 0
@@ -165,8 +219,15 @@ final class ContinuousPictureInPicture: NSObject {
                 guard let self, !self.invalidated, self.itemGeneration == generation,
                       self.currentItem === item else { return }
                 if existingComposition == nil {
+                    #if DEBUG
+                    self.debugTraceRender(.compositionAssigned) {
+                        item.videoComposition = composition
+                        self.installedComposition = composition
+                    }
+                    #else
                     item.videoComposition = composition
                     self.installedComposition = composition
+                    #endif
                 }
                 self.orientationPrepared = true
                 self.attachOutput(to: item)
@@ -217,8 +278,15 @@ final class ContinuousPictureInPicture: NSObject {
         ])
         // The AVPlayer can continue to render its ordinary inline layer underneath this layer.
         output.suppressesPlayerRendering = false
+        #if DEBUG
+        debugTraceRender(.outputAttached) {
+            item.add(output)
+            videoOutput = output
+        }
+        #else
         item.add(output)
         videoOutput = output
+        #endif
         renderFrame()
         if frameFeedEnabled && playbackState.read().isPlaying { startFrameTimer() }
     }
@@ -306,7 +374,11 @@ final class ContinuousPictureInPicture: NSObject {
     func beginSeek() -> UInt64 {
         seekTicket &+= 1
         activeSeekTicket = seekTicket
+        #if DEBUG
+        debugTraceRender(.seekBegin) { flushForSeek() }
+        #else
         flushForSeek()
+        #endif
         return seekTicket
     }
 
@@ -336,6 +408,7 @@ final class ContinuousPictureInPicture: NSObject {
         installedTimeline = nil
         #if DEBUG
         onFrameAcquisition = nil
+        onDebugRenderStamp = nil
         #endif
         activeSeekTicket = nil
         preparationTask?.cancel()
@@ -378,11 +451,21 @@ final class ContinuousPictureInPicture: NSObject {
 
     private func renderFrame() {
         guard !invalidated, frameFeedEnabled, let videoOutput, let timebase else { return }
+        #if DEBUG
+        let debugSourceTicket = onDebugRenderStamp == nil ? nil
+            : currentItem.map { PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0)) }
+        #endif
         guard activeSeekTicket == nil else {
+            #if DEBUG
+            debugTraceRender(.seekBlocked, sourceTicket: debugSourceTicket)
+            #endif
             blockedFrameAcquisitionCount &+= 1
             return
         }
         guard presentationActive else { return }
+        #if DEBUG
+        debugTraceRender(.attempt, sourceTicket: debugSourceTicket)
+        #endif
         if displayLayer.status == .failed {
             if !hasReportedFrameFailure {
                 onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)
@@ -398,12 +481,21 @@ final class ContinuousPictureInPicture: NSObject {
         #if DEBUG
         if let item = currentItem { onFrameAcquisition?(item, requestedTime) }
         #endif
+        #if DEBUG
+        let hasNew = videoOutput.hasNewPixelBuffer(forItemTime: requestedTime)
+        debugTraceRender(hasNew ? .hasNewTrue : .hasNewFalse, requested: requestedTime, sourceTicket: debugSourceTicket)
+        guard hasNew else { return }
+        #else
         guard videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
+        #endif
         var displayTime = CMTime.invalid
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
         if !displayTime.isNumeric { displayTime = requestedTime }
         lastCopiedFramePositionSeconds = CMTimeGetSeconds(displayTime)
+        #if DEBUG
+        debugTraceRender(.copied, requested: requestedTime, sample: displayTime, sourceTicket: debugSourceTicket)
+        #endif
         // A stopped clock cannot advance to a future sample. Do not let an output
         // replay from before a backwards seek pin this epoch ahead of its target.
         // Past samples remain valid for sources with long or variable frame durations.
@@ -443,6 +535,9 @@ final class ContinuousPictureInPicture: NSObject {
         lastEnqueuedTime = displayTime
         lastFramePositionSeconds = CMTimeGetSeconds(displayTime)
         submittedFrameCount &+= 1
+        #if DEBUG
+        debugTraceRender(.enqueued, requested: requestedTime, sample: displayTime, sourceTicket: debugSourceTicket)
+        #endif
     }
 
     private func reportFrameFailure(_ status: OSStatus) {

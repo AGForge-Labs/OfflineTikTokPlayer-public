@@ -99,6 +99,24 @@ final class PlaybackService: NSObject {
         let timelineInstalled: Bool, anchorHostSeconds: Double?, anchorPosition: Double?
     }
     @ObservationIgnored var onDebugVideoStartupStamp: ((DebugVideoStartupStamp) -> Void)?
+    struct DebugVideoRenderStamp: Sendable {
+        let render: ContinuousPictureInPicture.DebugRenderStamp
+        let generation: Int, presentationRequest: Int?
+        let presentationMatches: Bool
+        let audioToken: Int, audioVisit: Int64
+    }
+    @ObservationIgnored var onDebugVideoRenderStamp: ((DebugVideoRenderStamp) -> Void)? {
+        didSet {
+            guard onDebugVideoRenderStamp != nil else { continuousPiP.onDebugRenderStamp = nil; return }
+            continuousPiP.onDebugRenderStamp = { [weak self] stamp in
+                guard let self, let observer = self.onDebugVideoRenderStamp else { return }
+                observer(DebugVideoRenderStamp(render: stamp, generation: self.generation,
+                    presentationRequest: self.videoPresentation?.request,
+                    presentationMatches: self.videoPresentation?.ticket == stamp.ticket,
+                    audioToken: self.audioToken, audioVisit: self.audioVisit))
+            }
+        }
+    }
     private func debugTraceVideoStartup(_ kind: DebugVideoStartupKind, request: Int,
         installed: Bool = false, anchorHostSeconds: Double? = nil, anchorPosition: Double? = nil,
         _ operation: () -> Void) {
@@ -163,6 +181,12 @@ final class PlaybackService: NSObject {
     }
     @ObservationIgnored private var presentationPolicy = PlaybackPresentationPolicy()
     @ObservationIgnored private var diagnostics = PlaybackDiagnosticJournal(capacity: 128)
+    #if DEBUG
+    /// Existing cached journal only: no SDK reads, clocks, file export or new entry.
+    var debugCachedPlaybackDiagnostics: PlaybackDiagnosticJournal.DebugCachedSnapshot {
+        diagnostics.debugCachedSnapshot
+    }
+    #endif
     @ObservationIgnored private let continuousPiP = ContinuousPictureInPicture()
     @ObservationIgnored private var pipSkipCompletion: (() -> Void)?
     @ObservationIgnored private var pipSkipDeadline = 0.0

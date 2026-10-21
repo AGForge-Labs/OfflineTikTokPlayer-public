@@ -36,6 +36,66 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation() throws {
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2))
+        func buffer(left: Float, right: Float) throws -> AVAudioPCMBuffer {
+            let result = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 480))
+            result.frameLength = 480
+            let channels = try XCTUnwrap(result.floatChannelData)
+            for frame in 0..<480 { channels[0][frame] = left; channels[1][frame] = right }
+            return result
+        }
+        func time(_ frame: Int) -> AVAudioTime {
+            AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: 100 + Double(frame) / 48_000))
+        }
+        for stereoSilent in [true, false] {
+            let tap = ProductionSelectionOutputTap()
+            let pcm = try buffer(left: stereoSilent ? 0 : 0.25, right: stereoSilent ? 0 : -0.25)
+            XCTAssertEqual(tap.begin(auditChannels: true), 0)
+            tap.append(pcm, time: time(0))
+            let end = tap.stop()
+            XCTAssertEqual(tap.stop(), end)
+            let audit = tap.channelAudit()
+            let mono = tap.samples(from: 0, to: end)
+            XCTAssertEqual(mono.values.count, 480)
+            XCTAssertTrue(mono.values.allSatisfy { $0 == 0 })
+            // Both arms still fail the benchmark's original zero-quiet acceptance.
+            XCTAssertEqual(ProductionSelectionOutputTap.quietRun(mono.values, rate: mono.rate), 0.01)
+            XCTAssertFalse(ProductionSelectionOutputTap.isTone(mono.values, rate: mono.rate, frequency: 440))
+            XCTAssertEqual(audit.observedFrames, 480); XCTAssertEqual(audit.minimumRunFrames, 480)
+            XCTAssertEqual(audit.monoZeroFrames, 480)
+            XCTAssertEqual(audit.stereoZeroFrames, stereoSilent ? 480 : 0)
+            XCTAssertEqual(audit.leftSquareSum, stereoSilent ? 0 : 30)
+            XCTAssertEqual(audit.rightSquareSum, stereoSilent ? 0 : 30)
+            XCTAssertEqual(audit.nonfiniteFrames, 0)
+            XCTAssertEqual(audit.qualifiedRuns, 1); XCTAssertEqual(audit.retainedRuns, 1)
+            XCTAssertEqual(audit.droppedRuns, 0); XCTAssertFalse(audit.overflow)
+            let run = try XCTUnwrap(audit.run(at: 0))
+            XCTAssertEqual(run.frames, 480); XCTAssertEqual(run.firstFrame, 0); XCTAssertEqual(run.endFrame, 480)
+            XCTAssertEqual(run.stereoZeroFrames, stereoSilent ? 480 : 0)
+            XCTAssertEqual(run.leftSquareSum, stereoSilent ? 0 : 30)
+            XCTAssertEqual(run.rightSquareSum, stereoSilent ? 0 : 30)
+            XCTAssertNil(audit.run(at: 1)); XCTAssertNil(audit.run(at: 4))
+        }
+        let overflowTap = ProductionSelectionOutputTap()
+        let zero = try buffer(left: 0, right: 0), tone = try buffer(left: 0.25, right: 0.25)
+        overflowTap.begin(auditChannels: true)
+        for ordinal in 0..<5 {
+            overflowTap.append(zero, time: time(ordinal * 960))
+            overflowTap.append(tone, time: time(ordinal * 960 + 480))
+        }
+        overflowTap.stop()
+        let overflow = overflowTap.channelAudit()
+        XCTAssertEqual(overflow.observedFrames, 4_800); XCTAssertEqual(overflow.monoZeroFrames, 2_400)
+        XCTAssertEqual(overflow.qualifiedRuns, 5); XCTAssertEqual(overflow.retainedRuns, 4)
+        XCTAssertEqual(overflow.droppedRuns, 1); XCTAssertTrue(overflow.overflow)
+        for ordinal in 0..<4 {
+            let run = try XCTUnwrap(overflow.run(at: ordinal))
+            XCTAssertEqual(run.firstFrame, ordinal * 960); XCTAssertEqual(run.frames, 480)
+        }
+        XCTAssertNil(overflow.run(at: 4))
+    }
+
     private func runProductionSelectionBenchmark(traceVideoSeeks: Bool) async throws {
         try recordRuntimeHost()
         guard !Self.targetedFixtureOwnershipLost else {
@@ -65,9 +125,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 seeks?.record(stamp); startup?.recordSeek(stamp)
             }
             service.onDebugVideoStartupStamp = { [weak startup] stamp in startup?.record(stamp) }
+            service.onDebugVideoRenderStamp = { [weak startup] stamp in startup?.recordRender(stamp) }
         }
         defer {
-            if traceVideoSeeks { service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil }
+            if traceVideoSeeks {
+                service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil
+                service.onDebugVideoRenderStamp = nil
+            }
         }
         #endif
         let screen = try SelectionVideoScreen(service: service)
@@ -106,7 +170,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             measurements.append(measurement)
             if phase == 2 {
                 returnedOrigin = ProductionSelectionOutputTap.hostSeconds()
-                returnedStart = tap.begin()
+                returnedStart = tap.begin(auditChannels: true)
             }
             let baseline = audio.renderer.snapshot
             let before = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
@@ -170,6 +234,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let toneBlocks = ProductionSelectionOutputTap.toneBlocks(returned.values, rate: returned.rate, frequency: 440)
         let validity = tap.validity()
         print("ProductionSelectionReturnedOutput seconds=\(returnedSeconds) wallSeconds=\(returnedWall) firstHostOffsetMs=\(((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0)) * 1_000) lastHostOffsetMs=\(((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity)) * 1_000) frames=\(returned.values.count) rate=\(returned.rate) toneBlocks=\(toneBlocks.total) correctToneBlocks=\(toneBlocks.correct) quietMs=\(returnedQuiet * 1_000) maximumHoleMs=\(returnedHole * 1_000) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) retainedFrames=\(tap.count) capacityFrames=576000")
+        let channelAudit = tap.channelAudit()
+        print("ProductionSelectionReturnedChannelAudit schema=1 minimumRunFrames=\(channelAudit.minimumRunFrames) observedFrames=\(channelAudit.observedFrames) monoZeroFrames=\(channelAudit.monoZeroFrames) stereoZeroFrames=\(channelAudit.stereoZeroFrames) leftSquareSum=\(channelAudit.leftSquareSum) rightSquareSum=\(channelAudit.rightSquareSum) nonfiniteFrames=\(channelAudit.nonfiniteFrames) qualifiedRuns=\(channelAudit.qualifiedRuns) retainedRuns=\(channelAudit.retainedRuns) capacity=4 droppedRuns=\(channelAudit.droppedRuns) overflow=\(channelAudit.overflow) exactMonoZero=true playbackAcceptance=unchanged")
+        XCTAssertEqual(channelAudit.observedFrames, returned.values.count)
+        XCTAssertEqual(channelAudit.nonfiniteFrames, 0)
+        XCTAssertLessThanOrEqual(channelAudit.retainedRuns, 4)
+        XCTAssertEqual(channelAudit.droppedRuns, 0)
+        XCTAssertFalse(channelAudit.overflow)
+        for ordinal in 0..<4 {
+            guard let run = channelAudit.run(at: ordinal) else { continue }
+            let firstOffset = returnedOrigin.map { (run.firstHost - $0) * 1_000 }
+            let endOffset = returnedOrigin.map { (run.endHost - $0) * 1_000 }
+            print("ProductionSelectionReturnedChannelRun schema=1 ordinal=\(ordinal) firstFrame=\(run.firstFrame - channelAudit.firstFrame) endFrame=\(run.endFrame - channelAudit.firstFrame) frames=\(run.frames) startOffsetMs=\(firstOffset.map { String($0) } ?? "unknown") endOffsetMs=\(endOffset.map { String($0) } ?? "unknown") leftSquareSum=\(run.leftSquareSum) rightSquareSum=\(run.rightSquareSum) stereoZeroFrames=\(run.stereoZeroFrames)")
+        }
+        #if DEBUG
+        let cachedJournal = service.debugCachedPlaybackDiagnostics
+        print("ProductionSelectionCachedJournal schema=1 capacity=\(cachedJournal.capacity) retained=\(cachedJournal.entries.count) dropped=\(cachedJournal.droppedEvents) originPresent=\(cachedJournal.originUptime == nil ? 0 : 1) originUptime=\(cachedJournal.originUptime ?? 0) traceVideoSeeks=\(traceVideoSeeks ? 1 : 0) cachedOnly=1 newRecordCalls=0")
+        XCTAssertEqual(cachedJournal.capacity, 128)
+        XCTAssertLessThanOrEqual(cachedJournal.entries.count, 128)
+        for (ordinal, entry) in cachedJournal.entries.prefix(128).enumerated() {
+            let s = entry.snapshot
+            print("ProductionSelectionCachedJournalEntry schema=1 ordinal=\(ordinal) sequence=\(entry.sequence) elapsedSeconds=\(entry.elapsedSeconds) phase=\(entry.phase.rawValue) generation=\(s.generation) audioRequested=\(s.audioRequested ? 1 : 0) audioPermitted=\(s.audioPermitted ? 1 : 0) audioInterrupted=\(s.audioInterrupted ? 1 : 0) interruptionReasonPresent=\(s.interruptionReason == nil ? 0 : 1) interruptionReason=\(s.interruptionReason ?? 0) interruptionOptionsPresent=\(s.interruptionOptions == nil ? 0 : 1) interruptionOptions=\(s.interruptionOptions ?? 0) wasSuspendedPresent=\(s.wasSuspended == nil ? 0 : 1) wasSuspended=\(s.wasSuspended == true ? 1 : 0) routeReasonPresent=\(s.routeChangeReason == nil ? 0 : 1) routeReason=\(s.routeChangeReason ?? 0) engineRunning=\(s.engineRunning ? 1 : 0) audioOnly=\(s.audioOnlySelected ? 1 : 0) presentation=\(s.presentation.rawValue) pipeline=\(s.pipeline.rawValue) positionPresent=\(s.positionSeconds == nil ? 0 : 1) positionSeconds=\(s.positionSeconds ?? 0) durationPresent=\(s.durationSeconds == nil ? 0 : 1) durationSeconds=\(s.durationSeconds ?? 0) ratePresent=\(s.playbackRate == nil ? 0 : 1) playbackRate=\(s.playbackRate ?? 0) retainedItems=\(s.retainedItems) preparedPCMBytes=\(s.preparedPCMBytes) underrunFrames=\(s.underrunFrames) outputRoute=\(s.outputRoute.rawValue) sampleRatePresent=\(s.sampleRate == nil ? 0 : 1) sampleRate=\(s.sampleRate ?? 0) ioBufferPresent=\(s.ioBufferSeconds == nil ? 0 : 1) ioBufferSeconds=\(s.ioBufferSeconds ?? 0) outputLatencyPresent=\(s.outputLatencySeconds == nil ? 0 : 1) outputLatencySeconds=\(s.outputLatencySeconds ?? 0) pipActive=\(s.pipActive ? 1 : 0) pipPossible=\(s.pipPossible ? 1 : 0) pipSuspended=\(s.pipSuspended ? 1 : 0) sourceFramesPresent=\(s.sourceFrames == nil ? 0 : 1) sourceFrames=\(s.sourceFrames ?? 0) leadingFramesPresent=\(s.sourceLeadingBelowMinus60DBFrames == nil ? 0 : 1) leadingFrames=\(s.sourceLeadingBelowMinus60DBFrames ?? 0) trailingFramesPresent=\(s.sourceTrailingBelowMinus60DBFrames == nil ? 0 : 1) trailingFrames=\(s.sourceTrailingBelowMinus60DBFrames ?? 0) errorPresent=\(entry.error == nil ? 0 : 1) errorFamily=\(entry.error?.family.rawValue ?? 0) errorCode=\(entry.error?.code ?? 0)")
+        }
+        #endif
         let anomalies = ProductionSelectionOutputTap.anomalyLocations(returned, origin: returnedOrigin, frequency: 440)
         print("ProductionSelectionReturnedAnomalySummary schema=1 available=\(anomalies.available) originHostSeconds=\(returnedOrigin.map { String($0) } ?? "unknown") monitorStopHostSeconds=unknown quietCount=\(anomalies.quietCount) badToneCount=\(anomalies.badToneCount) retainedRecords=\(anomalies.records.count) perKindCapacity=4 droppedAnomalyCount=\(anomalies.droppedAnomalyCount) indices=recording-relative endFrame=exclusive")
         for record in anomalies.records {
@@ -192,6 +279,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             #if DEBUG
             XCTAssertNil(service.onDebugVideoSeekStamp, "The default production benchmark must leave the seek observer unset")
             XCTAssertNil(service.onDebugVideoStartupStamp)
+            XCTAssertNil(service.onDebugVideoRenderStamp)
             #endif
             seeks.assertUnused()
         }
@@ -1780,11 +1868,17 @@ private final class ProductionVideoStartupTrace {
     }
     private var events: [Event] = []
     private var dropped = 0, overflow = false
+    // Three phases x three seek regions x nine first-only scalar stages. No item/image ownership.
+    private var renderSlots: [PlaybackService.DebugVideoRenderStamp?] = []
+    private var renderConflicts = 0, renderOwnershipFailures = 0
     #endif
     init(serviceTracing: Bool) {
         self.serviceTracing = serviceTracing
         #if DEBUG
-        if serviceTracing { events.reserveCapacity(32) }
+        if serviceTracing {
+            events.reserveCapacity(32)
+            renderSlots = Array(repeating: nil, count: 81)
+        }
         #endif
     }
     func beginPoll() { layerReady = nil }
@@ -1830,6 +1924,42 @@ private final class ProductionVideoStartupTrace {
         guard serviceTracing else { return }
         append(.seek(phase, DispatchTime.now().uptimeNanoseconds, stamp))
     }
+    func recordRender(_ stamp: PlaybackService.DebugVideoRenderStamp) {
+        guard serviceTracing, (0..<3).contains(phase), (0..<3).contains(stamp.render.region),
+              (0..<9).contains(stamp.render.stage.rawValue) else { badPhase = true; return }
+        let index = phase * 27 + stamp.render.region * 9 + stamp.render.stage.rawValue
+        guard renderSlots[index] == nil else {
+            if renderConflicts < Int.max { renderConflicts += 1 } else { overflow = true }
+            return
+        }
+        renderSlots[index] = stamp
+        if stamp.render.ticket == nil || !stamp.render.ownershipUnchanged || !stamp.presentationMatches {
+            if renderOwnershipFailures < Int.max { renderOwnershipFailures += 1 } else { overflow = true }
+        }
+    }
+    private func dumpRenderRows() {
+        print("ProductionSelectionRenderSummary schema=1 enabled=\(serviceTracing) phases=3 regions=3 stages=9 capacity=81 conflicts=\(renderConflicts) ownershipFailures=\(renderOwnershipFailures) storage=scalar-first-only")
+        guard serviceTracing else { return }
+        for phase in 0..<3 {
+            var observedCopy = false, observedEnqueue = false
+            for region in 0..<3 {
+                // A missing stage is unavailable, never a false SDK result or proof of idle.
+                let offset = phase * 27 + region * 9
+                var observedMask: UInt16 = 0
+                for stage in 0..<9 where renderSlots[offset + stage] != nil { observedMask |= UInt16(1) << stage }
+                print("ProductionSelectionRenderRegion schema=1 phase=\(phase) region=\(region) observedMask=\(observedMask) firstSeekOnly=true")
+                for stage in 0..<9 {
+                    guard let s = renderSlots[offset + stage] else { continue }
+                    if stage == 3 { observedCopy = true }
+                    if stage == 4 { observedEnqueue = true }
+                    let r = s.render
+                    print("ProductionSelectionRenderStage schema=1 phase=\(phase) region=\(region) stage=\(stage) entryNs=\(r.entryNs) returnNs=\(r.returnNs) presentationRevision=\(r.presentationRevision) ownershipUnchanged=\(r.ownershipUnchanged) nativeSeekTicket=\(r.nativeSeekTicket.map { String($0) } ?? "unknown") request=\(s.presentationRequest.map { String($0) } ?? "unknown") generation=\(s.generation) presentationMatches=\(s.presentationMatches) token=\(s.audioToken) visit=\(s.audioVisit) requested=\(r.requestedSeconds.map { String($0) } ?? "unknown") samplePTS=\(r.sampleSeconds.map { String($0) } ?? "unknown") cachedCopiedPTS=\(r.copiedPTS.map { String($0) } ?? "unknown") cachedSubmittedPTS=\(r.submittedPTS.map { String($0) } ?? "unknown") submittedCount=\(r.submittedCount)")
+                }
+            }
+            XCTAssertTrue(observedCopy, "The traced selection must retain its actual copy observation")
+            XCTAssertTrue(observedEnqueue, "The traced selection must retain its actual enqueue observation")
+        }
+    }
     #endif
     func dumpAndAssert() {
         for phase in 0..<3 {
@@ -1849,6 +1979,8 @@ private final class ProductionVideoStartupTrace {
             }
         }
         XCTAssertEqual(dropped, 0); XCTAssertFalse(overflow)
+        dumpRenderRows()
+        XCTAssertEqual(renderConflicts, 0); XCTAssertEqual(renderOwnershipFailures, 0)
         #endif
     }
 }
@@ -1975,6 +2107,29 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         let startOffsetMs: Double?, endOffsetMs: Double?
         let rms: Double
     }
+    struct ChannelRun {
+        let firstFrame: Int, firstHost: Double
+        var endFrame: Int, endHost: Double
+        var leftSquareSum: Double, rightSquareSum: Double
+        var stereoZeroFrames: Int
+        var frames: Int { endFrame - firstFrame }
+    }
+    struct ChannelAudit {
+        let firstFrame: Int, minimumRunFrames: Int, observedFrames: Int
+        let monoZeroFrames: Int, stereoZeroFrames: Int, nonfiniteFrames: Int
+        let leftSquareSum: Double, rightSquareSum: Double
+        let qualifiedRuns: Int, retainedRuns: Int, droppedRuns: Int, overflow: Bool
+        let first: ChannelRun?, second: ChannelRun?, third: ChannelRun?, fourth: ChannelRun?
+        func run(at ordinal: Int) -> ChannelRun? {
+            switch ordinal {
+            case 0: return first
+            case 1: return second
+            case 2: return third
+            case 3: return fourth
+            default: return nil
+            }
+        }
+    }
     private let lock = NSLock()
     private let capacity = 12 * 48_000
     private var values: [Float] = []
@@ -1983,14 +2138,89 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     private var enabled = false
     private var invalidTimestamps = 0
     private var droppedFrames = 0
+    // Protected by the existing tap lock; no extra PCM storage or hot allocation.
+    private var auditEnabled = false
+    private var auditFirstFrame = 0, auditMinimumRunFrames = 0, auditObservedFrames = 0
+    private var auditMonoZeroFrames = 0, auditStereoZeroFrames = 0, auditNonfiniteFrames = 0
+    private var auditLeftSquareSum = 0.0, auditRightSquareSum = 0.0
+    private var auditQualifiedRuns = 0, auditDroppedRuns = 0
+    private var auditOverflow = false
+    private var auditPending: ChannelRun?
+    private var auditFirst: ChannelRun?, auditSecond: ChannelRun?, auditThird: ChannelRun?, auditFourth: ChannelRun?
 
     init() { values.reserveCapacity(capacity); hosts.reserveCapacity(capacity) }
     static func hostSeconds() -> Double { CMClockGetTime(CMClockGetHostTimeClock()).seconds }
     var count: Int { lock.lock(); defer { lock.unlock() }; return values.count }
     @discardableResult
-    func begin() -> Int { lock.lock(); defer { lock.unlock() }; enabled = true; return values.count }
+    func begin(auditChannels: Bool = false) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        if auditEnabled { finishChannelRun() }
+        enabled = true; auditEnabled = auditChannels
+        if auditChannels {
+            auditFirstFrame = values.count; auditMinimumRunFrames = 0; auditObservedFrames = 0
+            auditMonoZeroFrames = 0; auditStereoZeroFrames = 0; auditNonfiniteFrames = 0
+            auditLeftSquareSum = 0; auditRightSquareSum = 0
+            auditQualifiedRuns = 0; auditDroppedRuns = 0; auditOverflow = false
+            auditPending = nil; auditFirst = nil; auditSecond = nil; auditThird = nil; auditFourth = nil
+        }
+        return values.count
+    }
     @discardableResult
-    func stop() -> Int { lock.lock(); defer { lock.unlock() }; enabled = false; return values.count }
+    func stop() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        enabled = false
+        if auditEnabled { finishChannelRun(); auditEnabled = false }
+        return values.count
+    }
+
+    func channelAudit() -> ChannelAudit {
+        lock.lock(); defer { lock.unlock() }
+        return ChannelAudit(firstFrame: auditFirstFrame, minimumRunFrames: auditMinimumRunFrames,
+            observedFrames: auditObservedFrames, monoZeroFrames: auditMonoZeroFrames,
+            stereoZeroFrames: auditStereoZeroFrames, nonfiniteFrames: auditNonfiniteFrames,
+            leftSquareSum: auditLeftSquareSum, rightSquareSum: auditRightSquareSum,
+            qualifiedRuns: auditQualifiedRuns, retainedRuns: min(4, auditQualifiedRuns),
+            droppedRuns: auditDroppedRuns, overflow: auditOverflow,
+            first: auditFirst, second: auditSecond, third: auditThird, fourth: auditFourth)
+    }
+
+    /// Called only under the existing append/stop lock.
+    private func finishChannelRun() {
+        guard let run = auditPending else { return }
+        auditPending = nil
+        guard auditMinimumRunFrames > 0, run.frames >= auditMinimumRunFrames else { return }
+        switch auditQualifiedRuns {
+        case 0: auditFirst = run
+        case 1: auditSecond = run
+        case 2: auditThird = run
+        case 3: auditFourth = run
+        default: auditDroppedRuns += 1; auditOverflow = true
+        }
+        auditQualifiedRuns += 1
+    }
+
+    private func auditChannels(left: Float, right: Float, mono: Float, frame: Int,
+                               host: Double, rate: Double) {
+        auditObservedFrames += 1
+        if auditMinimumRunFrames == 0 { auditMinimumRunFrames = Int(rate * 0.01) }
+        guard left.isFinite, right.isFinite, mono.isFinite else {
+            auditNonfiniteFrames += 1; finishChannelRun(); return
+        }
+        guard mono == 0 else { finishChannelRun(); return }
+        let leftSquare = Double(left) * Double(left), rightSquare = Double(right) * Double(right)
+        let stereoZero = left == 0 && right == 0 ? 1 : 0
+        auditMonoZeroFrames += 1; auditStereoZeroFrames += stereoZero
+        auditLeftSquareSum += leftSquare; auditRightSquareSum += rightSquare
+        if auditPending == nil {
+            auditPending = ChannelRun(firstFrame: frame, firstHost: host, endFrame: frame,
+                endHost: host, leftSquareSum: 0, rightSquareSum: 0, stereoZeroFrames: 0)
+        }
+        auditPending?.endFrame = frame + 1
+        auditPending?.endHost = host + 1 / rate
+        auditPending?.leftSquareSum += leftSquare
+        auditPending?.rightSquareSum += rightSquare
+        auditPending?.stereoZeroFrames += stereoZero
+    }
 
     func append(_ buffer: AVAudioPCMBuffer, time: AVAudioTime) {
         lock.lock(); defer { lock.unlock() }
@@ -2011,8 +2241,11 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
             let left = channels[0][buffer.format.isInterleaved ? frame * channelCount : frame]
             let right = channelCount > 1
                 ? (buffer.format.isInterleaved ? channels[0][frame * channelCount + 1] : channels[1][frame]) : left
-            values.append((left + right) * 0.5)
-            hosts.append(start + Double(frame) / actualRate)
+            let mono = (left + right) * 0.5
+            let host = start + Double(frame) / actualRate
+            if auditEnabled { auditChannels(left: left, right: right, mono: mono, frame: values.count, host: host, rate: actualRate) }
+            values.append(mono)
+            hosts.append(host)
         }
     }
 
