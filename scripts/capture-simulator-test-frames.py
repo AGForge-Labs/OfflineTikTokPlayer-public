@@ -305,7 +305,11 @@ class WorkerTraceWatcher:
             self.stage_code = 6
             sample_started = time.monotonic()
             try:
-                result = self._command(["/usr/bin/sample", str(payload["processID"]), "1", "-file", str(report)], timeout=4)
+                # The installed macOS manual documents milliseconds here. The
+                # one-second window targets a prolonged worker scope at a
+                # nominal ten observations, avoiding the default 1,000 pauses.
+                # Keep the same command deadline, ownership and output gates.
+                result = self._command(["/usr/bin/sample", str(payload["processID"]), "1", "100", "-file", str(report)], timeout=4)
             finally:
                 sample_elapsed = time.monotonic() - sample_started
             native_returncode = result.returncode

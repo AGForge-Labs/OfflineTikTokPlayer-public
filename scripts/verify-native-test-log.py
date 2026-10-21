@@ -54,6 +54,15 @@ SPLIT_DIAGNOSTIC_TIMESTAMP_CASE = re.compile(
     r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000"
     r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\."
     r"[A-Za-z_]\w* [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+# In the observed 2026 AQ record, the terminal interrupts the timestamp after
+# its first digit. Neither an arbitrary prefix nor a later continuation counts.
+SPLIT_DIAGNOSTIC_FIRST_DIGIT_CASE = re.compile(
+    r"2Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\."
+    r"[A-Za-z_]\w* [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+LOUDNESS_DIAGNOSTIC_FIRST_DIGIT_TAIL = re.compile(
+    r"026-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000 "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215 {2}"
+    r"IsHardwareSupported: no plist loaded, returning false", re.ASCII)
 SPLIT_DIAGNOSTIC_NAME_CASE = re.compile(
     r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000 "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManage"
@@ -278,9 +287,13 @@ def verify_log(text, expected):
             if ordinary_tail:
                 continue
             timestamp_split = SPLIT_DIAGNOSTIC_TIMESTAMP_CASE.fullmatch(clean)
+            first_digit_split = SPLIT_DIAGNOSTIC_FIRST_DIGIT_CASE.fullmatch(clean)
             name_split = SPLIT_DIAGNOSTIC_NAME_CASE.fullmatch(clean)
             if timestamp_split:
                 pending = (timestamp_split.group(1), number, LOUDNESS_DIAGNOSTIC_TAIL, timestamp_split.group(2))
+                continue
+            if first_digit_split:
+                pending = (first_digit_split.group(1), number, LOUDNESS_DIAGNOSTIC_FIRST_DIGIT_TAIL, first_digit_split.group(2))
                 continue
             if name_split:
                 pending = (name_split.group(1), number, LOUDNESS_DIAGNOSTIC_NAME_TAIL, name_split.group(2))
@@ -309,6 +322,7 @@ def verify_log(text, expected):
                     problems.append(f"Malformed native/UI case prefix at line {number}")
                 elif (RESULT_SUFFIX.fullmatch(clean) or IDENTITY_RESULT_SUFFIX.fullmatch(clean)
                       or METHOD_RESULT_SUFFIX.fullmatch(clean) or LOUDNESS_DIAGNOSTIC_TAIL.fullmatch(clean)
+                      or LOUDNESS_DIAGNOSTIC_FIRST_DIGIT_TAIL.fullmatch(clean)
                       or LOUDNESS_DIAGNOSTIC_NAME_TAIL.fullmatch(clean)):
                     problems.append(f"Orphan case result suffix at line {number}")
                 continue

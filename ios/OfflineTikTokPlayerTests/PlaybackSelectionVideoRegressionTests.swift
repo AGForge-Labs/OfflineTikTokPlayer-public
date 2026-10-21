@@ -964,7 +964,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 }
 
 enum SelectionVideoIdentity: String { case a, b }
-private enum SelectionVideoTestFailure: Error {
+enum SelectionVideoTestFailure: Error {
     case timeout, sample, capture, unsafeCapturePath
     case simulatorCaptureUnavailable
     case simulatorCaptureRejected(Int)

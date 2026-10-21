@@ -130,11 +130,11 @@ def _mock_worker_commands(monkeypatch, watcher, executable, report=WORKER_SAMPLE
                                  "dev.galaxybigbird.OfflineTikTokPlayer", "app"]
             assert timeout == 1
             return subprocess.CompletedProcess(arguments, 0, str(application or executable.parent) + "\n", "PRIVATE_STDERR")
-        assert arguments[:4] == ["/usr/bin/sample", "4321", "1", "-file"]
+        assert arguments[:5] == ["/usr/bin/sample", "4321", "1", "100", "-file"]
         assert timeout <= 4
         if failure is not None:
             raise failure
-        Path(arguments[4]).write_text(report, encoding="utf-8")
+        Path(arguments[5]).write_text(report, encoding="utf-8")
         return subprocess.CompletedProcess(arguments, 0, "PRIVATE_STDOUT", "PRIVATE_STDERR")
 
     monkeypatch.setattr(watcher, "_command", command)
@@ -520,7 +520,7 @@ def test_worker_trace_stop_interrupts_and_kills_pending_command(tmp_path, monkey
 
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Pending())
     with pytest.raises(module.WorkerTraceStopped):
-        watcher._command(["/usr/bin/sample", "4321", "1", "-file", "synthetic"], timeout=4)
+        watcher._command(["/usr/bin/sample", "4321", "1", "100", "-file", "synthetic"], timeout=4)
     assert killed == [True]
 
 

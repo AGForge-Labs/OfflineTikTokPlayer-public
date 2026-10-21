@@ -8,7 +8,12 @@ final class OfflineDownloadsIsolationTests: XCTestCase {
     func testDeferredLocalRemovalPreservesTheOriginalThrownError() async throws {
         let manager = FileManager.default
         let source = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
-        for control in DeferredRemovalControl.allCases {
+        let combinations = DeferredRemovalControl.allCases.flatMap { control in
+            DeferredRemovalErrorKind.allCases.map { (control, $0) }
+        }
+        // These errors are caught in-process. This does not exercise XCTest's
+        // serialization of an error escaping an async test method.
+        for (control, errorKind) in combinations {
             let temporary = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
             try manager.createDirectory(at: temporary, withIntermediateDirectories: true)
             let root = temporary.appendingPathComponent("Downloads", isDirectory: true)
@@ -39,22 +44,41 @@ final class OfflineDownloadsIsolationTests: XCTestCase {
             }
 
             let original = DeferredRemovalSentinel()
+            let thrown: Error
+            switch errorKind {
+            case .referenceSentinel: thrown = original
+            case .videoTimeout: thrown = SelectionVideoTestFailure.timeout
+            }
             var deferredCleanupRan = false
             do {
-                try await throwOriginalError(original) {
+                try await throwOriginalError(thrown) {
                     deferredCleanupRan = true
                     if control != .noCleanup {
                         downloads.shutdownLocalSession()
                         downloads.remove(id)
                     }
                 }
-                XCTFail("The original sentinel must be thrown for \(control.rawValue)")
+                XCTFail("The original \(errorKind.rawValue) must be thrown for \(control.rawValue)")
             } catch {
-                if let caught = error as? DeferredRemovalSentinel {
-                    XCTAssertTrue(caught === original, "Cleanup must preserve the exact error object for \(control.rawValue)")
-                    XCTAssertEqual(caught.identity, original.identity)
-                } else {
-                    XCTFail("Cleanup replaced the original typed error for \(control.rawValue) with \(String(reflecting: type(of: error)))")
+                switch errorKind {
+                case .referenceSentinel:
+                    if let caught = error as? DeferredRemovalSentinel {
+                        XCTAssertTrue(caught === original, "Cleanup must preserve the exact error object for \(control.rawValue)")
+                        XCTAssertEqual(caught.identity, original.identity)
+                    } else {
+                        XCTFail("Cleanup replaced the original typed error for \(control.rawValue) with \(String(reflecting: type(of: error)))")
+                    }
+                case .videoTimeout:
+                    XCTAssertTrue(type(of: error) == SelectionVideoTestFailure.self,
+                                  "Cleanup must preserve the real timeout enum type for \(control.rawValue)")
+                    if let caught = error as? SelectionVideoTestFailure {
+                        switch caught {
+                        case .timeout: break
+                        default: XCTFail("Cleanup replaced the actual timeout case for \(control.rawValue)")
+                        }
+                    } else {
+                        XCTFail("Cleanup replaced the real timeout enum for \(control.rawValue)")
+                    }
                 }
             }
             XCTAssertTrue(deferredCleanupRan, "The throwing helper must run its defer for \(control.rawValue)")
@@ -69,7 +93,7 @@ final class OfflineDownloadsIsolationTests: XCTestCase {
         }
     }
 
-    private func throwOriginalError(_ original: DeferredRemovalSentinel, cleanup: () -> Void) async throws {
+    private func throwOriginalError(_ original: Error, cleanup: () -> Void) async throws {
         defer { cleanup() }
         throw original
     }
@@ -138,6 +162,10 @@ final class OfflineDownloadsIsolationTests: XCTestCase {
 
 private enum DeferredRemovalControl: String, CaseIterable {
     case noCleanup, missingCheckpoint, existingCheckpoint
+}
+
+private enum DeferredRemovalErrorKind: String, CaseIterable {
+    case referenceSentinel, videoTimeout
 }
 
 private final class DeferredRemovalSentinel: Error, Sendable {
