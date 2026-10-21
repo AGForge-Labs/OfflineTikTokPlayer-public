@@ -14,9 +14,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Unsigned controlled native-read independence with one build job
+      - name: Unsigned decoder independence and parity with one build job
         run: bash scripts/check-native-reader-isolation.sh
-      - name: Require the exact native independence identity
+      - name: Require all eighteen exact decoder identities
         if: always()
         run: |
           python3 - <<'PY'
@@ -25,9 +25,10 @@ jobs:
           spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
           evidence = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(evidence)
-          expected = {'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testHeldNeighbourNativeReadDoesNotPreventPreparedCurrentSourceRefill'}
-          if not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('Controlled independence identity missing from source')
+          expected = {identity for identity in evidence.source_manifest(Path('.'))
+                      if identity.startswith('OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/')}
+          if len(expected) != 18:
+              raise SystemExit('Decoder identity count must equal eighteen')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('SCOPED native-read independence native=1 ui=0; SDK wait cause/full playback acceptance NOT ESTABLISHED')
+          print('SCOPED decoder independence/parity native=18 ui=0; SDK wait cause/full playback acceptance NOT ESTABLISHED')
           PY
