@@ -11,6 +11,9 @@ struct OfflineTikTokPlayerApp: App {
         WindowGroup {
             RootView().environment(model).preferredColorScheme(.dark)
                 .tint(.cyan)
+                #if DEBUG
+                .onAppear { AppModel.debugHostInstance = model }
+                #endif
                 .task { model.playback.restore() }
                 .task(id: scenePhase == .active && model.network.isConnected) {
                     guard scenePhase == .active, model.network.isConnected, model.account.hasSavedConnection else { return }

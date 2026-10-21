@@ -258,6 +258,9 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     private var underrun: Int64 = 0
     private var consumedCommandVersion = 0
     private var nextStateVersion = 0
+    #if DEBUG
+    private let debugUnderrunState = DebugUnderrunState()
+    #endif
 
     public init(sampleRate: Double = 48_000, channels: Int = 2,
                 prefixFrames: Int = 96_000, ringFrames: Int = 192_000) {
@@ -345,6 +348,9 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
 
     public func render(interleaved output: UnsafeMutableBufferPointer<Float>, frameCount: Int) {
         guard frameCount > 0, frameCount <= output.count / channels, let base = output.baseAddress else { return }
+        #if DEBUG
+        let classifyUnderruns = debugUnderrunState.enabled.load(ordering: .acquiring)
+        #endif
         // Initialize only the requested span. Silence here is pause/EOF/starvation,
         // never an implicit boundary fade or a fabricated source trim.
         for index in 0..<(frameCount * channels) { base[index] = 0 }
@@ -353,9 +359,35 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
             let shouldEnhance = enhance.load(ordering: .acquiring)
             var outputFrame = 0
             while outputFrame < frameCount {
+                #if DEBUG
+                let source: ContinuousPCMSource
+                if classifyUnderruns {
+                    guard let candidate = find(activeToken) else {
+                        let frames = Int64(frameCount - outputFrame)
+                        underrun += frames
+                        debugUnderrunState.record(.init(reason: .sourceMissing, observed: 0, expected: Int64(activeToken)),
+                            token: activeToken, visit: visit, cursor: cursor, frames: frames, total: underrun)
+                        break
+                    }
+                    if let failure = candidate.debugAcquire(token: activeToken) {
+                        let frames = Int64(frameCount - outputFrame)
+                        underrun += frames
+                        debugUnderrunState.record(failure, token: activeToken, visit: visit,
+                            cursor: cursor, frames: frames, total: underrun)
+                        break
+                    }
+                    source = candidate
+                } else {
+                    guard let candidate = find(activeToken), candidate.acquire(token: activeToken) else {
+                        underrun += Int64(frameCount - outputFrame); break
+                    }
+                    source = candidate
+                }
+                #else
                 guard let source = find(activeToken), source.acquire(token: activeToken) else {
                     underrun += Int64(frameCount - outputFrame); break
                 }
+                #endif
                 let total = source.totalFrames
                 if cursor >= total {
                     let next = source.successor.load(ordering: .acquiring)
@@ -380,16 +412,39 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     continue
                 }
                 var starved = false
+                #if DEBUG
+                var copyFailure: DebugUnderrunFailure?
+                #endif
                 // Hold the single-reader claim for this source span. Decoder ring
                 // writes remain independent; retirement never races a live span.
                 while outputFrame < frameCount, cursor < total {
                     let destination = base.advanced(by: outputFrame * channels)
+                    #if DEBUG
+                    if classifyUnderruns {
+                        if let failure = source.debugCopyFrame(cursor, into: destination) {
+                            copyFailure = failure; starved = true; break
+                        }
+                    } else {
+                        guard source.copyFrame(cursor, into: destination) else { starved = true; break }
+                    }
+                    #else
                     guard source.copyFrame(cursor, into: destination) else { starved = true; break }
+                    #endif
                     if shouldEnhance { speaker.process(UnsafeMutableBufferPointer(start: destination, count: channels)) }
                     cursor += 1; outputFrame += 1
                 }
                 source.release()
-                if starved { underrun += Int64(frameCount - outputFrame); break }
+                if starved {
+                    let frames = Int64(frameCount - outputFrame)
+                    underrun += frames
+                    #if DEBUG
+                    if let copyFailure {
+                        debugUnderrunState.record(copyFailure, token: activeToken, visit: visit,
+                            cursor: cursor, frames: frames, total: underrun)
+                    }
+                    #endif
+                    break
+                }
             }
         }
         publishSnapshot()
@@ -438,3 +493,159 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         }
     }
 }
+
+#if DEBUG
+extension ContinuousPCMRenderer {
+    public enum DebugUnderrunReason: Int, Sendable {
+        case sourceMissing = 1, sourceBusy = 2, sourceTokenChanged = 3
+        case epochMismatch = 4, positionMismatch = 5, unpublishedFrame = 6
+    }
+    public struct DebugUnderrunEvent: Sendable {
+        public let reason: DebugUnderrunReason
+        public let token: Int
+        public let visit: Int64
+        public let cursor: Int64
+        public let observed: Int64
+        public let expected: Int64
+        public let frames: Int64
+    }
+    public struct DebugUnderrunSnapshot: Sendable {
+        fileprivate let missing: Int64
+        fileprivate let busy: Int64
+        fileprivate let changed: Int64
+        fileprivate let epoch: Int64
+        fileprivate let position: Int64
+        fileprivate let unpublished: Int64
+        public let last: DebugUnderrunEvent?
+        public let overflowed: Bool
+        public let totalUnderrunFrames: Int64
+        public func frames(for reason: DebugUnderrunReason) -> Int64 {
+            switch reason {
+            case .sourceMissing: return missing
+            case .sourceBusy: return busy
+            case .sourceTokenChanged: return changed
+            case .epochMismatch: return epoch
+            case .positionMismatch: return position
+            case .unpublishedFrame: return unpublished
+            }
+        }
+    }
+    public var debugUnderrunDiagnosticsEnabled: Bool {
+        get { debugUnderrunState.enabled.load(ordering: .acquiring) }
+        set { debugUnderrunState.enabled.store(newValue, ordering: .releasing) }
+    }
+    public var debugUnderrunDiagnostics: DebugUnderrunSnapshot? { debugUnderrunState.read() }
+}
+
+private struct DebugUnderrunFailure {
+    let reason: ContinuousPCMRenderer.DebugUnderrunReason
+    let observed: Int64
+    let expected: Int64
+}
+
+extension ContinuousPCMSource {
+    /// DEBUG control only. OFF and Release retain the original Boolean path.
+    /// The operands come from the failed operation, with no diagnostic reread.
+    fileprivate func debugAcquire(token: Int) -> DebugUnderrunFailure? {
+        let claimed = access.compareExchange(expected: 0, desired: 1, ordering: .acquiringAndReleasing)
+        guard claimed.exchanged else {
+            return .init(reason: .sourceBusy, observed: Int64(claimed.original), expected: 0)
+        }
+        let actual = readyToken.load(ordering: .sequentiallyConsistent)
+        guard actual == token else {
+            release()
+            return .init(reason: .sourceTokenChanged, observed: Int64(actual), expected: Int64(token))
+        }
+        return nil
+    }
+
+    fileprivate func debugCopyFrame(_ frame: Int64, into output: UnsafeMutablePointer<Float>) -> DebugUnderrunFailure? {
+        if frame < Int64(prefixCount.load(ordering: .relaxed)) {
+            output.update(from: prefix.advanced(by: Int(frame) * channels), count: channels)
+            return nil
+        }
+        let epoch = committedEpoch.load(ordering: .acquiring)
+        guard epoch == renderedEpoch else {
+            return .init(reason: .epochMismatch, observed: Int64(epoch), expected: Int64(renderedEpoch))
+        }
+        let read = readPosition.load(ordering: .relaxed)
+        guard read == frame else {
+            return .init(reason: .positionMismatch, observed: read, expected: frame)
+        }
+        let write = writePosition.load(ordering: .acquiring)
+        guard write > frame else {
+            return .init(reason: .unpublishedFrame, observed: write, expected: frame)
+        }
+        output.update(from: ring.advanced(by: Int(frame % Int64(ringCapacityFrames)) * channels), count: channels)
+        readPosition.store(frame + 1, ordering: .releasing)
+        return nil
+    }
+}
+
+/// Fixed numeric storage, one render writer, bounded three-attempt readers.
+/// No render-time allocation, clock, lock, SDK call, dispatch or console output.
+private final class DebugUnderrunState: @unchecked Sendable {
+    let enabled = Atomic<Bool>(false)
+    private let sequence = Atomic<UInt64>(0)
+    private let missing = Atomic<Int64>(0), busy = Atomic<Int64>(0), changed = Atomic<Int64>(0)
+    private let epoch = Atomic<Int64>(0), position = Atomic<Int64>(0), unpublished = Atomic<Int64>(0)
+    private let reason = Atomic<Int>(0), token = Atomic<Int>(0)
+    private let visit = Atomic<Int64>(0), cursor = Atomic<Int64>(0)
+    private let observed = Atomic<Int64>(0), expected = Atomic<Int64>(0), frames = Atomic<Int64>(0)
+    private let total = Atomic<Int64>(0), overflowed = Atomic<Bool>(false)
+    private var writerSequence: UInt64 = 0
+
+    func record(_ failure: DebugUnderrunFailure, token: Int, visit: Int64,
+                cursor: Int64, frames: Int64, total: Int64) {
+        let next = writerSequence.addingReportingOverflow(2)
+        writerSequence = next.partialValue
+        sequence.store(writerSequence &- 1, ordering: .sequentiallyConsistent)
+        if next.overflow { overflowed.store(true, ordering: .sequentiallyConsistent) }
+        switch failure.reason {
+        case .sourceMissing: add(frames, to: missing)
+        case .sourceBusy: add(frames, to: busy)
+        case .sourceTokenChanged: add(frames, to: changed)
+        case .epochMismatch: add(frames, to: epoch)
+        case .positionMismatch: add(frames, to: position)
+        case .unpublishedFrame: add(frames, to: unpublished)
+        }
+        reason.store(failure.reason.rawValue, ordering: .sequentiallyConsistent)
+        self.token.store(token, ordering: .sequentiallyConsistent)
+        self.visit.store(visit, ordering: .sequentiallyConsistent)
+        self.cursor.store(cursor, ordering: .sequentiallyConsistent)
+        observed.store(failure.observed, ordering: .sequentiallyConsistent)
+        expected.store(failure.expected, ordering: .sequentiallyConsistent)
+        self.frames.store(frames, ordering: .sequentiallyConsistent)
+        self.total.store(total, ordering: .sequentiallyConsistent)
+        sequence.store(writerSequence, ordering: .sequentiallyConsistent)
+    }
+
+    private func add(_ value: Int64, to counter: borrowing Atomic<Int64>) {
+        let sum = counter.load(ordering: .relaxed).addingReportingOverflow(value)
+        counter.store(sum.overflow ? .max : sum.partialValue, ordering: .sequentiallyConsistent)
+        if sum.overflow { overflowed.store(true, ordering: .sequentiallyConsistent) }
+    }
+
+    func read() -> ContinuousPCMRenderer.DebugUnderrunSnapshot? {
+        for _ in 0..<3 {
+            let version = sequence.load(ordering: .sequentiallyConsistent)
+            if version & 1 != 0 { continue }
+            let code = reason.load(ordering: .sequentiallyConsistent)
+            let last = ContinuousPCMRenderer.DebugUnderrunReason(rawValue: code).map {
+                ContinuousPCMRenderer.DebugUnderrunEvent(reason: $0,
+                    token: token.load(ordering: .sequentiallyConsistent), visit: visit.load(ordering: .sequentiallyConsistent),
+                    cursor: cursor.load(ordering: .sequentiallyConsistent), observed: observed.load(ordering: .sequentiallyConsistent),
+                    expected: expected.load(ordering: .sequentiallyConsistent), frames: frames.load(ordering: .sequentiallyConsistent))
+            }
+            let value = ContinuousPCMRenderer.DebugUnderrunSnapshot(
+                missing: missing.load(ordering: .sequentiallyConsistent), busy: busy.load(ordering: .sequentiallyConsistent),
+                changed: changed.load(ordering: .sequentiallyConsistent), epoch: epoch.load(ordering: .sequentiallyConsistent),
+                position: position.load(ordering: .sequentiallyConsistent), unpublished: unpublished.load(ordering: .sequentiallyConsistent),
+                last: last, overflowed: overflowed.load(ordering: .sequentiallyConsistent),
+                totalUnderrunFrames: total.load(ordering: .sequentiallyConsistent))
+            if version == sequence.load(ordering: .sequentiallyConsistent) { return value }
+        }
+        return nil
+    }
+}
+#endif

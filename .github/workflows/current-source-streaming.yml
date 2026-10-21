@@ -1,0 +1,37 @@
+name: Current-source streaming diagnostic
+on:
+  push:
+    branches: [diagnostic/current-source-streaming]
+    paths: ['.github/workflows/current-source-streaming.yml', 'scripts/check-current-source-streaming.sh']
+permissions:
+  contents: read
+jobs:
+  streaming:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Run portable regressions and three native streaming cases
+        run: bash scripts/check-current-source-streaming.sh
+      - name: Verify scoped identities without accepting the full application
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('native_evidence', 'scripts/verify-native-test-log.py')
+          verifier = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(verifier)
+          expected = {
+              'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testStreamingCurrentSourceNativeReadWithoutCapture',
+              'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testStagedNativeInputMatchesCompleteCallbackPresentationsAcrossCodecsAndRateRatios',
+              'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testResampledStreamingLoopAndSeekRebuildTheOriginalConverterHistory',
+          }
+          if not expected.issubset(verifier.source_manifest(Path('.'))):
+              raise SystemExit('Scoped identities are missing from this immutable checkout')
+          verifier.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
+          print('SCOPED current-source streaming identities verified: native=3 ui=0; visibility/natural/full acceptance NOT RUN')
+          PY

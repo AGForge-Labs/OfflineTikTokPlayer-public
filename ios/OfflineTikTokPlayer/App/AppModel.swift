@@ -6,6 +6,11 @@ enum AppSheet: String, Identifiable { case settings; var id: String { rawValue }
 
 @MainActor @Observable
 final class AppModel {
+    #if DEBUG
+    // Weak identity of the actual app host, set by its root view. Native
+    // diagnostics can distinguish its idle decoder from leaked fixture work.
+    static weak var debugHostInstance: AppModel?
+    #endif
     let account: MicrosoftAccount
     let cloud: OneDriveClient
     let network: NetworkStatus

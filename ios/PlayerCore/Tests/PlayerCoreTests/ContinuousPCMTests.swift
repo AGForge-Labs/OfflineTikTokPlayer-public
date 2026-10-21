@@ -286,6 +286,200 @@ final class ContinuousPCMTests: XCTestCase {
         XCTAssertEqual(render(renderer, frames: 3), first)
     }
 
+    #if DEBUG
+    func testDebugUnderrunDistinguishesUncommittedEpochFromCommittedEmptyStream() throws {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
+        XCTAssertFalse(renderer.debugUnderrunDiagnosticsEnabled)
+        let zero = try XCTUnwrap(renderer.debugUnderrunDiagnostics)
+        XCTAssertNil(zero.last)
+        XCTAssertFalse(zero.overflowed)
+        XCTAssertEqual(zero.frames(for: .epochMismatch), 0)
+        renderer.debugUnderrunDiagnosticsEnabled = true
+        let source = renderer.source(at: 0)
+        XCTAssertTrue([Float(1), 2].withUnsafeBufferPointer {
+            source.prepare(token: 1, totalFrames: 8, prefix: $0)
+        })
+        let original = source.streamRequest
+        XCTAssertTrue(source.beginStream(epoch: original.epoch))
+        XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer {
+            source.append(interleaved: $0, epoch: original.epoch)
+        }, 3)
+        renderer.select(token: 1); renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 4), [1, 2, 3, 4])
+
+        renderer.select(token: 1, frame: 2)
+        XCTAssertEqual(render(renderer, frames: 2), [0, 0])
+        let restarted = source.streamRequest
+        XCTAssertNotEqual(restarted.epoch, original.epoch)
+        XCTAssertEqual(source.availableStreamFrames, 1, "Old physical PCM remains, but is not committed for this visit")
+        let uncommitted = try XCTUnwrap(renderer.debugUnderrunDiagnostics)
+        let epochFailure = try XCTUnwrap(uncommitted.last)
+        XCTAssertEqual(epochFailure.reason, .epochMismatch)
+        XCTAssertEqual(epochFailure.token, 1)
+        XCTAssertEqual(epochFailure.visit, renderer.snapshot.visit)
+        XCTAssertEqual(epochFailure.cursor, 2)
+        XCTAssertEqual(epochFailure.observed, 0)
+        XCTAssertEqual(epochFailure.expected, Int64(restarted.epoch))
+        XCTAssertEqual(epochFailure.frames, 2)
+        XCTAssertEqual(uncommitted.frames(for: .epochMismatch), 2)
+        XCTAssertEqual(uncommitted.frames(for: .unpublishedFrame), 0)
+        XCTAssertEqual(uncommitted.totalUnderrunFrames, renderer.snapshot.underrunFrames)
+
+        XCTAssertTrue(source.beginStream(epoch: restarted.epoch))
+        XCTAssertEqual(source.availableStreamFrames(for: restarted.epoch), 0)
+        XCTAssertEqual(render(renderer, frames: 3), [0, 0, 0])
+        let empty = try XCTUnwrap(renderer.debugUnderrunDiagnostics)
+        let emptyFailure = try XCTUnwrap(empty.last)
+        XCTAssertEqual(emptyFailure.reason, .unpublishedFrame)
+        XCTAssertEqual(emptyFailure.cursor, 2)
+        XCTAssertEqual(emptyFailure.observed, 2)
+        XCTAssertEqual(emptyFailure.expected, 2, "Write position must be strictly greater than this cursor")
+        XCTAssertEqual(emptyFailure.frames, 3)
+        XCTAssertEqual(empty.frames(for: .epochMismatch), 2)
+        XCTAssertEqual(empty.frames(for: .unpublishedFrame), 3)
+        XCTAssertEqual(empty.frames(for: .positionMismatch), 0)
+        XCTAssertFalse(empty.overflowed)
+        XCTAssertEqual(renderer.snapshot.frame, 2)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 5)
+        XCTAssertEqual(empty.totalUnderrunFrames, renderer.snapshot.underrunFrames)
+    }
+
+    func testDebugUnderrunIdentifiesDuplicateSameEpochResetWithBufferedPCM() throws {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
+        let source = renderer.source(at: 0)
+        XCTAssertTrue([Float(1), 2].withUnsafeBufferPointer {
+            source.prepare(token: 1, totalFrames: 6, prefix: $0)
+        })
+        let request = source.streamRequest
+        XCTAssertTrue(source.beginStream(epoch: request.epoch))
+        XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer {
+            source.append(interleaved: $0, epoch: request.epoch)
+        }, 3)
+        renderer.select(token: 1); renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 3), [1, 2, 3])
+        XCTAssertEqual(renderer.snapshot.frame, 3)
+
+        // Exercise the actual public reset API, rather than modifying private
+        // ring state. This is a guard classification control, not proof that
+        // the serial decoder repeats a committed epoch in production.
+        XCTAssertTrue(source.beginStream(epoch: request.epoch))
+        XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer {
+            source.append(interleaved: $0, epoch: request.epoch)
+        }, 3)
+        renderer.debugUnderrunDiagnosticsEnabled = true
+        XCTAssertEqual(render(renderer, frames: 2), [0, 0])
+        XCTAssertEqual(source.availableStreamFrames(for: request.epoch), 3)
+        let diagnostics = try XCTUnwrap(renderer.debugUnderrunDiagnostics)
+        let failure = try XCTUnwrap(diagnostics.last)
+        XCTAssertEqual(failure.reason, .positionMismatch)
+        XCTAssertEqual(failure.token, 1)
+        XCTAssertEqual(failure.cursor, 3)
+        XCTAssertEqual(failure.observed, 2)
+        XCTAssertEqual(failure.expected, 3)
+        XCTAssertEqual(failure.frames, 2)
+        XCTAssertEqual(diagnostics.frames(for: .positionMismatch), 2)
+        XCTAssertEqual(diagnostics.frames(for: .epochMismatch), 0)
+        XCTAssertEqual(diagnostics.frames(for: .unpublishedFrame), 0)
+        XCTAssertFalse(diagnostics.overflowed)
+        XCTAssertEqual(renderer.snapshot.frame, 3)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 2)
+    }
+
+    func testDebugUnderrunDiagnosticsPreserveStreamedWarmReversalAndRecovery() throws {
+        func sequence(diagnosticsEnabled: Bool) throws -> (samples: [Float], state: [Int64], counts: [Int64], bytes: Int) {
+            let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 2, ringFrames: 3)
+            renderer.debugUnderrunDiagnosticsEnabled = diagnosticsEnabled
+            let sourceA = renderer.source(at: 0), sourceB = renderer.source(at: 1)
+            XCTAssertTrue([Float(1), 0].withUnsafeBufferPointer {
+                sourceA.prepare(token: 1, totalFrames: 7, prefix: $0)
+            })
+            XCTAssertTrue([Float(21), 22].withUnsafeBufferPointer {
+                sourceB.prepare(token: 2, totalFrames: 5, prefix: $0)
+            })
+            let originalA = sourceA.streamRequest, originalB = sourceB.streamRequest
+            XCTAssertTrue(sourceA.beginStream(epoch: originalA.epoch))
+            XCTAssertTrue(sourceB.beginStream(epoch: originalB.epoch))
+            XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer {
+                sourceA.append(interleaved: $0, epoch: originalA.epoch)
+            }, 3)
+            XCTAssertEqual([Float(23), 0, 25].withUnsafeBufferPointer {
+                sourceB.append(interleaved: $0, epoch: originalB.epoch)
+            }, 3)
+            renderer.select(token: 1); renderer.setPlaying(true)
+            var samples = render(renderer, frames: 4)
+            renderer.select(token: 2)
+            samples += render(renderer, frames: 3)
+            let warmedA = sourceA.streamRequest
+            XCTAssertNotEqual(warmedA.epoch, originalA.epoch)
+            renderer.select(token: 1)
+            samples += render(renderer, frames: 4)
+            XCTAssertEqual(sourceA.streamRequest.epoch, warmedA.epoch, "Returning preserves the requested warm visit even before refill")
+            XCTAssertEqual(renderer.snapshot.frame, 2, "Starvation must not skip the pending source samples")
+            XCTAssertTrue(sourceA.beginStream(epoch: warmedA.epoch))
+            XCTAssertEqual([Float(3), 4, 5].withUnsafeBufferPointer {
+                sourceA.append(interleaved: $0, epoch: warmedA.epoch)
+            }, 3)
+            samples += render(renderer, frames: 3)
+            XCTAssertEqual([Float(6), 7].withUnsafeBufferPointer {
+                sourceA.append(interleaved: $0, epoch: warmedA.epoch)
+            }, 2)
+            samples += render(renderer, frames: 2)
+            samples += render(renderer, frames: 1)
+            let final = renderer.snapshot
+            let diagnostics = try XCTUnwrap(renderer.debugUnderrunDiagnostics)
+            XCTAssertFalse(diagnostics.overflowed)
+            if diagnosticsEnabled {
+                XCTAssertEqual(diagnostics.last?.reason, .epochMismatch)
+                XCTAssertEqual(diagnostics.last?.frames, 2)
+            } else {
+                XCTAssertNil(diagnostics.last, "The original Boolean path must not record diagnostics while disabled")
+            }
+            let reasons: [ContinuousPCMRenderer.DebugUnderrunReason] = [
+                .sourceMissing, .sourceBusy, .sourceTokenChanged, .epochMismatch, .positionMismatch, .unpublishedFrame,
+            ]
+            return (samples, [Int64(final.token), final.frame, final.visit, final.underrunFrames, final.ended ? 1 : 0],
+                    reasons.map { diagnostics.frames(for: $0) }, renderer.retainedPCMMemoryBytes)
+        }
+        let disabled = try sequence(diagnosticsEnabled: false)
+        let enabled = try sequence(diagnosticsEnabled: true)
+        XCTAssertEqual(disabled.samples, [1, 0, 3, 4, 21, 22, 23, 1, 0, 0, 0, 3, 4, 5, 6, 7, 0])
+        XCTAssertEqual(enabled.samples, disabled.samples)
+        XCTAssertEqual(enabled.state, disabled.state)
+        XCTAssertEqual(enabled.state, [1, 7, 3, 2, 1])
+        XCTAssertEqual(disabled.counts, [0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(enabled.counts, [0, 0, 0, 2, 0, 0])
+        XCTAssertEqual(enabled.bytes, disabled.bytes)
+        XCTAssertEqual(enabled.bytes, 60)
+    }
+
+    func testDebugUnderrunDoesNotCountPauseEOFOrEncodedZeros() throws {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 8, ringFrames: 3)
+        renderer.debugUnderrunDiagnosticsEnabled = true
+        prepare(renderer, slot: 0, token: 1, samples: [0, 1, 0])
+        renderer.select(token: 1)
+        XCTAssertEqual(render(renderer, frames: 3), [0, 0, 0])
+        XCTAssertEqual(renderer.snapshot.frame, 0)
+        renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 5), [0, 1, 0, 0, 0])
+        XCTAssertEqual(renderer.snapshot.frame, 3)
+        XCTAssertTrue(renderer.snapshot.ended)
+        renderer.setPlaying(false)
+        XCTAssertEqual(render(renderer, frames: 2), [0, 0])
+        renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 1), [0])
+        let diagnostics = try XCTUnwrap(renderer.debugUnderrunDiagnostics)
+        let reasons: [ContinuousPCMRenderer.DebugUnderrunReason] = [
+            .sourceMissing, .sourceBusy, .sourceTokenChanged, .epochMismatch, .positionMismatch, .unpublishedFrame,
+        ]
+        for reason in reasons {
+            XCTAssertEqual(diagnostics.frames(for: reason), 0)
+        }
+        XCTAssertNil(diagnostics.last)
+        XCTAssertFalse(diagnostics.overflowed)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+    #endif
+
     private func prepare(_ renderer: ContinuousPCMRenderer, slot: Int, token: Int, samples: [Float]) {
         XCTAssertTrue(samples.withUnsafeBufferPointer {
             renderer.source(at: slot).prepare(token: token, totalFrames: Int64(samples.count / renderer.channels), prefix: $0)

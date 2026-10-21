@@ -11,6 +11,248 @@ import PlayerCore
 /// both generated movies, so a decoded asset or advancing audio clock cannot satisfy visibility.
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
+    func testStreamingCurrentSourceNativeReadWithoutCapture() async throws {
+        #if DEBUG
+        let hostAppeared = await waitUntil(timeout: 3) { AppModel.debugHostInstance != nil }
+        guard hostAppeared, let host = AppModel.debugHostInstance else {
+            XCTFail("The actual app host identity must appear before streaming controls")
+            throw SelectionVideoTestFailure.timeout
+        }
+        let initiallyQuiescent = await waitUntil(timeout: 3) {
+            streamingHostIdle(host) && streamingOnlyHostRemains(ContinuousPCMDecoder.lifecycleSnapshot())
+        }
+        let initialLifetime = ContinuousPCMDecoder.lifecycleSnapshot()
+        let hostIdle = streamingHostIdle(host)
+        let globalQuiescent = initiallyQuiescent && hostIdle && streamingOnlyHostRemains(initialLifetime)
+        print("SelectionStreamingCurrentGlobalQuiescence quiescent=\(globalQuiescent) hostOwned=\(AppModel.debugHostInstance === host) hostIdle=\(hostIdle) hostScope=identified-logical-idle-endpoints maximumWaitSeconds=3 stableReread=\(initialLifetime.stableReread) created=\(initialLifetime.createdInstances) deinitEntered=\(initialLifetime.deinitEnteredInstances) shutdownCompleted=\(initialLifetime.shutdownCompletedInstances) live=\(initialLifetime.liveInstances.map(String.init) ?? "unavailable")")
+        guard globalQuiescent else {
+            XCTFail("Earlier decoder work must quiesce before the first streaming fixture is created")
+            throw SelectionVideoTestFailure.timeout
+        }
+        let arms: [(ContinuousPCMDecoder.NativeInputPlacement, Bool)] = [
+            (.converterCallback, false), (.stagedBeforeConversion, false),
+            (.stagedBeforeConversion, true), (.converterCallback, true)
+        ]
+        for (index, arm) in arms.enumerated() {
+            let fixture = try await SelectionVideoFixture()
+            var witness: SelectionDecoderLifetimeWitness?, setupFailed = false
+            do {
+                try await measureStreamingCurrentSource(fixture: fixture, placement: arm.0,
+                    diagnostics: arm.1, arm: index, witness: &witness)
+            } catch { setupFailed = true; XCTFail("Streaming arm setup/observation failed") }
+            guard let witness else {
+                fixture.remove(); XCTFail("The streaming arm must publish its lifetime witness")
+                throw SelectionVideoTestFailure.timeout
+            }
+            let fixtureQuiescent = await waitUntil(timeout: 3) {
+                let state = witness.recorder.lifecycleSnapshot()
+                return witness.service == nil && witness.audio == nil && state.shutdownRequested
+                    && state.shutdownCompleted && state.deinitEntered && streamingHostIdle(host)
+                    && streamingOnlyHostRemains(ContinuousPCMDecoder.lifecycleSnapshot())
+            }
+            let lifetime = witness.recorder.lifecycleSnapshot()
+            let global = ContinuousPCMDecoder.lifecycleSnapshot(), hostStillIdle = streamingHostIdle(host)
+            let quiescent = fixtureQuiescent && hostStillIdle && streamingOnlyHostRemains(global)
+            print("SelectionStreamingCurrentLifetime arm=\(index) label=\(witness.label) workerID=\(witness.recorder.workerIdentifier) serviceAlive=\(witness.service != nil) audioAlive=\(witness.audio != nil) shutdownRequested=\(lifetime.shutdownRequested) shutdownCompleted=\(lifetime.shutdownCompleted) deinitEntered=\(lifetime.deinitEntered) quiescent=\(quiescent) hostOwned=\(AppModel.debugHostInstance === host) hostIdle=\(hostStillIdle) hostScope=identified-logical-idle-endpoints globalStable=\(global.stableReread) globalLive=\(global.liveInstances.map(String.init) ?? "unavailable") globalCreated=\(global.createdInstances) globalDeinitEntered=\(global.deinitEnteredInstances) globalShutdownCompleted=\(global.shutdownCompletedInstances) maximumWaitSeconds=3 fixtureCleanupDeferred=\(!quiescent)")
+            guard quiescent else {
+                // Do not delete files under an outstanding reader or start a
+                // second arm. The failed process owns at most this fixture.
+                XCTFail("Previous streaming arm still owns decoder work; later arms are not run")
+                throw SelectionVideoTestFailure.timeout
+            }
+            fixture.remove()
+            if setupFailed { throw SelectionVideoTestFailure.timeout }
+        }
+        #else
+        throw XCTSkip("The staged-input and renderer-reason controls require DEBUG")
+        #endif
+    }
+
+    #if DEBUG
+    private func streamingHostIdle(_ host: AppModel) -> Bool {
+        let playback = host.playback
+        return AppModel.debugHostInstance === host && !playback.wantsToPlay && !playback.audioEngineRunning && playback.preparedAudioCount == 0
+            && playback.audioSnapshot.token == 0 && !playback.isLoading
+            && playback.current == nil && playback.queue.currentID == nil
+    }
+
+    private func streamingOnlyHostRemains(_ state: ContinuousPCMDecoder.LifecycleSnapshot) -> Bool {
+        state.stableReread && state.liveInstances == 1 && state.createdInstances > 0
+            && state.createdInstances - 1 == state.deinitEnteredInstances
+            && state.shutdownCompletedInstances == state.deinitEnteredInstances
+    }
+
+    private func measureStreamingCurrentSource(fixture: SelectionVideoFixture,
+        placement: ContinuousPCMDecoder.NativeInputPlacement, diagnostics: Bool, arm: Int,
+        witness: inout SelectionDecoderLifetimeWitness?) async throws {
+        let audio = ContinuousAudioPlayer(nativeInputPlacement: placement)
+        audio.renderer.debugUnderrunDiagnosticsEnabled = diagnostics
+        let retainedBytes = audio.renderer.retainedPCMMemoryBytes
+        XCTAssertEqual(retainedBytes, 3 * (96_000 + 192_000) * 2 * MemoryLayout<Float>.stride)
+        let tap = SelectionOutputTap(), seeks = SelectionLatencySeekProbe()
+        let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
+        seeks.service = service
+        let staged = { if case .stagedBeforeConversion = placement { return true }; return false }()
+        let label = "stream-current-\(staged ? "staged" : "callback")-diagnostics-\(diagnostics ? "on" : "off")"
+        witness = SelectionDecoderLifetimeWitness(service: service, audio: audio, label: label)
+        let screen = try SelectionVideoScreen(service: service)
+        var results: [(String, SelectionProducerProbe.Result)] = []
+        var summaries: [String] = []
+        var returnedTapStart: Int?, returnedTapOrigin: Double?
+        results.reserveCapacity(3); summaries.reserveCapacity(16)
+        audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
+            tap.append(buffer, time: time)
+        }
+        defer {
+            tap.stop(); service.pause()
+            audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
+            audio.graph.engine.stop(); screen.close()
+            seeks.dump()
+            for (windowLabel, result) in results { result.dump(label: windowLabel) }
+            for summary in summaries { print(summary) }
+            XCTAssertEqual(tap.validity().invalidTimestamps, 0)
+            XCTAssertEqual(tap.validity().droppedFrames, 0, "The existing twelve-second tap may not overflow")
+            if let first = returnedTapStart, let origin = returnedTapOrigin {
+                let output = tap.samples(since: first)
+                let quiet = SelectionOutputTap.quietRun(output.values, rate: output.rate)
+                let hole = SelectionOutputTap.maximumTimelineHole(output.hosts, rate: output.rate)
+                XCTAssertGreaterThan(output.rate, 0)
+                XCTAssertGreaterThanOrEqual(output.values.count, Int(output.rate * 7.5))
+                XCTAssertLessThanOrEqual((output.hosts.first ?? .infinity) - origin, 0.25)
+                XCTAssertGreaterThanOrEqual((output.hosts.last ?? -.infinity) - origin, 7.5)
+                XCTAssertTrue(SelectionOutputTap.isTone(output.values, rate: output.rate, frequency: 440))
+                XCTAssertEqual(quiet, 0, "Returned A may add no ten-millisecond quiet window")
+                XCTAssertLessThanOrEqual(hole, 0.5 / max(1, output.rate))
+                print("SelectionStreamingCurrentOutput label=\(label)-returned-A displayIdentity=UNMEASURED fullApplicationAcceptance=false samples=\(output.values.count) sampleRate=\(output.rate) quietSeconds=\(quiet) maximumTimelineHoleSeconds=\(hole) firstHostOffset=\((output.hosts.first ?? .infinity) - origin) lastHostOffset=\((output.hosts.last ?? -.infinity) - origin)")
+            }
+        }
+        summaries.append("SelectionStreamingCurrentScope arm=\(arm) label=\(label) stagedInput=\(staged) rendererDiagnostics=\(diagnostics) displayIdentity=UNMEASURED capture=false fullApplicationAcceptance=false prefixFrames=96000 ringFrames=192000 retainedPCMBytes=\(retainedBytes) observationSeconds=8 maximumProbeResults=3 maximumProbeRecords=384 tapCapacitySeconds=12 nativeSamplePurpose=none")
+        service.isInteractingWithFeed = true
+        for id in [fixture.aID, fixture.bID] {
+            let source = try await fixture.decodedTone(id: id, startSeconds: 0)
+            XCTAssertEqual(SelectionOutputTap.quietRun(source, rate: 48_000), 0)
+        }
+        let phase = 100 + arm * 10
+        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phase,
+            id: fixture.aID, frequency: 440, prepared: false, sourceQuiet: 0) {
+                service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            }
+        assertSelection(service, fixture: fixture, id: fixture.aID)
+        let aToken = try XCTUnwrap(audio.entry(for: fixture.aID)).token
+        _ = try await observeStreamingCurrentSource(service, audio: audio, tap: nil,
+            expectedToken: aToken, label: label + "-cold-A", diagnostics: diagnostics, results: &results, summaries: &summaries)
+        assertSelection(service, fixture: fixture, id: fixture.aID)
+        try await require({ service.preparedAudioCount == 2 }, "B must be prepared before timing Next")
+        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phase + 1,
+            id: fixture.bID, frequency: 880, prepared: true, sourceQuiet: 0) { service.next() }
+        assertSelection(service, fixture: fixture, id: fixture.bID)
+        let bToken = try XCTUnwrap(audio.entry(for: fixture.bID)).token
+        _ = try await observeStreamingCurrentSource(service, audio: audio, tap: nil,
+            expectedToken: bToken, label: label + "-next-B", diagnostics: diagnostics, results: &results, summaries: &summaries)
+        assertSelection(service, fixture: fixture, id: fixture.bID)
+        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phase + 2,
+            id: fixture.aID, frequency: 440, prepared: true, sourceQuiet: 0) { service.previous() }
+        assertSelection(service, fixture: fixture, id: fixture.aID)
+        let stagedBefore = audio.producerProgressRecorder.debugStagedNativeReadCount
+        let returnedToken = try XCTUnwrap(audio.entry(for: fixture.aID)).token
+        let captured = try await observeStreamingCurrentSource(service, audio: audio, tap: tap,
+            expectedToken: returnedToken, label: label + "-returned-A", diagnostics: diagnostics, results: &results, summaries: &summaries)
+        returnedTapStart = captured.index; returnedTapOrigin = captured.origin
+        let stagedAfter = audio.producerProgressRecorder.debugStagedNativeReadCount
+        if staged { XCTAssertGreaterThan(stagedAfter, stagedBefore) }
+        else { XCTAssertEqual(stagedAfter, stagedBefore) }
+        summaries.append("SelectionStreamingCurrentNativeInput label=\(label)-returned-A stagedInput=\(staged) beforeCompletedReads=\(stagedBefore) afterCompletedReads=\(stagedAfter) counterScope=decoder-worker-all-streams countMeaning=completed-including-EOF")
+        XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, retainedBytes)
+        XCTAssertEqual(results.count, 3)
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, 0, "Readiness failures may not disappear behind a clean observation baseline")
+        assertSelection(service, fixture: fixture, id: fixture.aID)
+    }
+
+    private func observeStreamingCurrentSource(_ service: PlaybackService, audio: ContinuousAudioPlayer,
+        tap: SelectionOutputTap?, expectedToken: Int, label: String, diagnostics: Bool,
+        results: inout [(String, SelectionProducerProbe.Result)], summaries: inout [String]) async throws
+        -> (index: Int?, origin: Double?) {
+        let before = try streamingReasonBoundary(audio.renderer, label: label, boundary: "before",
+            diagnostics: diagnostics, summaries: &summaries)
+        guard expectedToken > 0, before.audio.token == expectedToken, !before.audio.ended else {
+            XCTFail("The renderer must own the expected source before its streaming observation")
+            throw SelectionVideoTestFailure.timeout
+        }
+        XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
+        let origin = tap.map { _ in SelectionOutputTap.hostSeconds() }, index = tap?.begin()
+        let probe = SelectionProducerProbe(context: SelectionProducerContext(renderer: audio.renderer,
+            producer: audio.producerProgressRecorder), durationSeconds: 8, capacity: 128)
+        var stopped = false
+        defer {
+            tap?.stop()
+            if !stopped { results.append((label, probe.stop())) }
+        }
+        try await Task.sleep(for: .seconds(8))
+        let result = probe.stop(); stopped = true; tap?.stop()
+        precondition(results.count < 3); results.append((label, result))
+        let after = try streamingReasonBoundary(audio.renderer, label: label, boundary: "after",
+            diagnostics: diagnostics, summaries: &summaries)
+        XCTAssertNotNil(result.initial)
+        if let initial = result.initial {
+            XCTAssertEqual(initial.token, before.audio.token); XCTAssertEqual(initial.visit, before.audio.visit)
+            XCTAssertEqual(initial.underrunFrames, before.audio.underrunFrames); XCTAssertFalse(initial.ended)
+        }
+        XCTAssertEqual(result.dropped, 0); XCTAssertEqual(result.skipped, 0)
+        XCTAssertEqual(after.audio.token, before.audio.token); XCTAssertEqual(after.audio.visit, before.audio.visit)
+        XCTAssertFalse(after.audio.ended)
+        XCTAssertEqual(after.audio.underrunFrames, before.audio.underrunFrames)
+        XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
+        summaries.append(assertNaturalProducerWindow(result, baseline: before.audio,
+            quantum: service.audioRenderQuantumFrames, seconds: 8, label: label))
+        if diagnostics, let first = before.reasons, let last = after.reasons {
+            XCTAssertFalse(first.overflowed); XCTAssertFalse(last.overflowed)
+            if !first.overflowed && !last.overflowed {
+                var total: Int64 = 0, valid = true
+                for code in 1...6 {
+                    let reason = ContinuousPCMRenderer.DebugUnderrunReason(rawValue: code)!
+                    let delta = last.frames(for: reason).subtractingReportingOverflow(first.frames(for: reason))
+                    let sum = total.addingReportingOverflow(delta.partialValue)
+                    valid = valid && !delta.overflow && delta.partialValue >= 0 && !sum.overflow
+                    total = sum.partialValue
+                }
+                XCTAssertTrue(valid, "Reason differences must be nonnegative and representable")
+                if valid { XCTAssertEqual(total, after.audio.underrunFrames - before.audio.underrunFrames) }
+            }
+        }
+        return (index, origin)
+    }
+
+    private func streamingReasonBoundary(_ renderer: ContinuousPCMRenderer, label: String, boundary: String,
+        diagnostics: Bool, summaries: inout [String]) throws
+        -> (audio: ContinuousPCMRenderer.Snapshot, reasons: ContinuousPCMRenderer.DebugUnderrunSnapshot?) {
+        let begin = DispatchTime.now().uptimeNanoseconds
+        let actualEnabled = renderer.debugUnderrunDiagnosticsEnabled
+        let first = renderer.diagnosticSnapshot, rawReasons = renderer.debugUnderrunDiagnostics
+        let second = renderer.diagnosticSnapshot
+        let end = DispatchTime.now().uptimeNanoseconds
+        let stable = first != nil && second != nil && first?.token == second?.token
+            && first?.visit == second?.visit && first?.underrunFrames == second?.underrunFrames
+        XCTAssertTrue(stable, "Reason accounting needs stable bounded renderer endpoints; no retries")
+        XCTAssertEqual(actualEnabled, diagnostics)
+        let accountingValid = diagnostics && actualEnabled && stable && rawReasons != nil && rawReasons?.overflowed == false
+            && rawReasons?.totalUnderrunFrames == second?.underrunFrames
+        if diagnostics {
+            XCTAssertTrue(accountingValid, "Enabled reason accounting needs coherent nonoverflowing totals matching the renderer")
+        }
+        // OFF counters are unaccounted; an internally coherent zero snapshot
+        // must not become evidence that the original path had no failures.
+        let reasons = accountingValid ? rawReasons : nil
+        let counters = reasons.map { snapshot in (1...6).map { code in
+            "reason\(code)Frames=\(snapshot.frames(for: ContinuousPCMRenderer.DebugUnderrunReason(rawValue: code)!))"
+        }.joined(separator: " ") } ?? "reasonCounts=unavailable"
+        let event = reasons?.last
+        precondition(summaries.count < 16)
+        summaries.append("SelectionStreamingCurrentReason label=\(label) boundary=\(boundary) enabled=\(diagnostics) actualEnabled=\(actualEnabled) beginNs=\(begin) endNs=\(end) rendererStable=\(stable) snapshotAvailable=\(rawReasons != nil) accountingValid=\(accountingValid) overflowed=\(rawReasons?.overflowed ?? false) rendererUnderruns=\(second?.underrunFrames ?? -1) accountedUnderruns=\(reasons?.totalUnderrunFrames ?? -1) \(counters) lastAvailable=\(event != nil) lastReason=\(event?.reason.rawValue ?? 0) lastToken=\(event?.token ?? 0) lastVisit=\(event?.visit ?? 0) lastCursor=\(event?.cursor ?? -1) lastObserved=\(event?.observed ?? -1) lastExpected=\(event?.expected ?? -1) lastFrames=\(event?.frames ?? 0) offInterpretation=unaccounted-not-zero")
+        guard let second else { throw SelectionVideoTestFailure.timeout }
+        return (second, reasons)
+    }
+    #endif
+
     func testCommandToEngineToneAndSelectedCustomFrameLatency() async throws {
         var witnesses: [SelectionDecoderLifetimeWitness] = []
         witnesses.reserveCapacity(8)
