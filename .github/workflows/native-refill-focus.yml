@@ -14,19 +14,31 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 3
       - name: Require exact committed app and test source
         id: source_pin
         run: bash scripts/check-native-refill-focus.sh --verify-source
       - name: Preserve strict native evidence and both harness regression routes
+        id: harness
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
+          mkdir -p artifacts
           python3 tests/validation-shell/test_check_ios_shell.py
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_native_control_harness.py
           python3 tests/validation-shell/test_native_refill_focus_harness.py
+      - name: Initialize read-only simulator inventory within sixty seconds
+        id: simulator_inventory
+        if: ${{ always() && steps.harness.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          subprocess.run(['xcrun', 'simctl', 'list', 'devices', 'available', '--json'],
+                         capture_output=True, text=True, check=True, timeout=60)
+          print('Read-only simulator inventory initialized; exact destination and host guards remain required.')
+          PY
       - name: Compile once then run four fixed fresh-host singleton controls without capture
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        if: ${{ always() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_inventory.outcome == 'success' }}
         run: bash scripts/check-native-refill-focus.sh controls
       - name: Require four exact singleton identities and all native and host receipts
         if: ${{ always() && steps.source_pin.outcome == 'success' }}

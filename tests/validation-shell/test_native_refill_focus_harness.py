@@ -41,6 +41,21 @@ class NativeRefillFocusHarnessTests(unittest.TestCase):
             return receipt
         self.fixture.make_receipt = build_receipt
 
+    def test_clean_checkout_setup_precedes_harness_and_native_execution(self):
+        text = WORKFLOW.read_text()
+        self.assertIn('fetch-depth: 3', text)
+        harness = text.index('python3 tests/validation-shell/test_check_ios_shell.py')
+        self.assertLess(text.index('mkdir -p artifacts'), harness)
+        self.assertIn('id: harness', text)
+        warmup = text.index('id: simulator_inventory')
+        self.assertGreater(warmup, harness)
+        self.assertIn("['xcrun', 'simctl', 'list', 'devices', 'available', '--json']", text)
+        self.assertIn('timeout=60', text)
+        self.assertIn("steps.harness.outcome == 'success'", text)
+        self.assertIn("steps.simulator_inventory.outcome == 'success'", text)
+        self.assertNotIn("'boot'", text)
+        self.assertNotIn("'launch'", text)
+
     def test_fixed_four_inventory_and_source_membership(self):
         f = self.fixture
         self.assertEqual(f.cases, EXPECTED)
