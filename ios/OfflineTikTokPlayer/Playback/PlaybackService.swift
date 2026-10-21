@@ -46,6 +46,8 @@ final class PlaybackService: NSObject {
         let nativeSeekTicket: UInt64
         let requestedPosition: Double
         let force: Bool
+        // The existing ordinary-drift guard read; forced requests do not read it.
+        let ordinaryDriftVideoPositionSeconds: Double?
         // Cached actor-owned state, not another renderer/native snapshot.
         let cachedSelected: Bool
         let selectedMatchesQueue: Bool
@@ -804,7 +806,18 @@ final class PlaybackService: NSObject {
               let item = player.currentItem, item.status == .readyToPlay else { return }
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         let position = continuousAudio.presentationPosition(at: hostTime)
+        #if DEBUG
+        let ordinaryDriftVideoPositionSeconds: Double?
+        if force {
+            ordinaryDriftVideoPositionSeconds = nil
+        } else {
+            let sampledPosition = item.currentTime().seconds
+            ordinaryDriftVideoPositionSeconds = sampledPosition
+            guard abs(sampledPosition - position) > 0.080 else { return }
+        }
+        #else
         guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
+        #endif
         let request = generation
         syncingVideoGeneration = request
         let videoSeek = continuousPiP.beginSeek()
@@ -812,6 +825,7 @@ final class PlaybackService: NSObject {
         if let observer = onDebugVideoSeekStamp {
             observer(DebugVideoSeekStamp(reason: reason, request: request, generation: generation,
                 nativeSeekTicket: videoSeek, requestedPosition: position, force: force,
+                ordinaryDriftVideoPositionSeconds: ordinaryDriftVideoPositionSeconds,
                 cachedSelected: continuousAudio.isSelected,
                 selectedMatchesQueue: continuousAudio.selectedID == queue.currentID,
                 cachedAudioToken: audioToken, cachedAudioVisit: audioVisit,

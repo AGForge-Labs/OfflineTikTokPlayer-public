@@ -1034,6 +1034,8 @@ private final class ProductionSelectionSeekRecorder: @unchecked Sendable {
     struct Event {
         let phase: Int
         let target: Double
+        let forwardedTimeValue: CMTimeValue
+        let forwardedTimeTimescale: CMTimeScale
         let entered: Double
         var returnHostSeconds: Double?
         var completed: Double?
@@ -1073,7 +1075,8 @@ private final class ProductionSelectionSeekRecorder: @unchecked Sendable {
         #endif
         if events.count < 32 {
             index = events.count
-            var event = Event(phase: currentPhase, target: time.seconds, entered: entered)
+            var event = Event(phase: currentPhase, target: time.seconds,
+                              forwardedTimeValue: time.value, forwardedTimeTimescale: time.timescale, entered: entered)
             #if DEBUG
             event.stamp = stamp
             #endif
@@ -1130,7 +1133,14 @@ private final class ProductionSelectionSeekRecorder: @unchecked Sendable {
                 XCTAssertNotEqual(stamp.reason, .unattributed)
                 XCTAssertGreaterThan(stamp.nativeSeekTicket, 0)
                 XCTAssertTrue(stamp.requestedPosition.isFinite)
-                XCTAssertEqual(stamp.requestedPosition, event.target, accuracy: 0.5 / 48_000 + 1e-9)
+                // Reconstruct the original application request exactly as forwarded.
+                // The actual integer fields were retained from CMTime, never from target.seconds.
+                let expectedTime = CMTime(seconds: stamp.requestedPosition, preferredTimescale: 48_000)
+                print("ProductionSelectionSeekExactTime schema=1 ordinal=\(index) phase=\(event.phase) expectedValue=\(expectedTime.value) expectedTimescale=\(expectedTime.timescale) forwardedValue=\(event.forwardedTimeValue) forwardedTimescale=\(event.forwardedTimeTimescale) force=\(stamp.force) ordinaryDriftVideoPositionSeconds=\(stamp.ordinaryDriftVideoPositionSeconds.map { String($0) } ?? "not-read") ordinarySignedDriftSeconds=\(stamp.ordinaryDriftVideoPositionSeconds.map { String($0 - stamp.requestedPosition) } ?? "not-read")")
+                XCTAssertEqual(expectedTime.value, event.forwardedTimeValue)
+                XCTAssertEqual(expectedTime.timescale, event.forwardedTimeTimescale)
+                if stamp.force { XCTAssertNil(stamp.ordinaryDriftVideoPositionSeconds) }
+                else { XCTAssertNotNil(stamp.ordinaryDriftVideoPositionSeconds) }
             }
             #endif
         }
