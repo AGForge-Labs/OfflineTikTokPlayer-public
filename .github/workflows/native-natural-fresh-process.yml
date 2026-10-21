@@ -1,0 +1,39 @@
+name: Fresh-process natural playback diagnostic
+on:
+  push:
+    branches: [diagnostic/native-natural-fresh-process]
+    paths: ['.github/workflows/native-natural-fresh-process.yml', 'scripts/check-natural-fresh-process.sh']
+permissions:
+  contents: read
+jobs:
+  natural:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Run exact natural controls in a fresh test process
+        run: bash scripts/check-natural-fresh-process.sh
+      - name: Verify the three scoped identities without accepting the full application
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('native_evidence', 'scripts/verify-native-test-log.py')
+          verifier = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(verifier)
+          expected = {
+              'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testMatchedNaturalBoundaryProducerTraceAndCaptureControls',
+              'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testMatchedNaturalBoundaryWithStagedNativeInputAndCaptureControls',
+              'OfflineTikTokPlayerTests.ZZZWorkerTraceCalibrationTests/testKnownWorkerWaitPublishesBoundedSamplerCalibration',
+          }
+          assert expected.issubset(verifier.source_manifest(Path('.')))
+          verifier.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
+          print('SCOPED diagnostic identities verified: native=3 ui=0; not full-suite acceptance')
+          PY
+      - name: Report calibrated sampler availability separately
+        if: always()
+        run: python3 scripts/verify-native-worker-trace.py --log artifacts/native/worker-trace.log
