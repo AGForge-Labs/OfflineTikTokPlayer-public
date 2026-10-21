@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=da866ce5064a1968fb192b85b8031eb5be6962b1
-expected_ios_tree=5a7a28c05d9e28dad97fd1245e215d414c446d2c
+expected_code_source=847533d58b31f91ed91ef81f7668c8ce31269dec
+expected_ios_tree=66e25f512367af71904bdbb401c7e73d1d361bd8
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -17,13 +17,217 @@ verify_source() {
   git diff --quiet -- ios
   git diff --cached --quiet -- ios
 }
-test "$#" -eq 1 || { printf '%s\n' 'Usage: check-native-playback-targeted.sh --verify-source|benchmark|controls' >&2; exit 2; }
+
+# Local standard-library evidence operations only. No Saved data, credentials,
+# or media bytes are opened. Raw process inventory is never printed or saved.
+evidence_tool() {
+  python3 - "$@" <<'PY'
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = Path.cwd().resolve()
+NATIVE = ROOT / 'artifacts/native'
+PRODUCTS = ROOT / 'artifacts/DerivedData/Build/Products'
+RECEIPT = NATIVE / 'native-playback-build.json'
+CONTROL_ROOT = NATIVE / 'native-playback-controls'
+STATUSES = CONTROL_ROOT / 'statuses.tsv'
+BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
+EXECUTABLE = 'OfflineTikTokPlayer'
+PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
+CASES = (
+    'testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek',
+    'testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
+    'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
+    'testNaturalBoundaryWithNativeLaneActivityRevealsB',
+    'testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner',
+    'testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
+    'testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
+)
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+def verifier():
+    require(len(CASES) == 7 and len(set(CASES)) == 7, 'Expected seven distinct isolated controls')
+    spec = importlib.util.spec_from_file_location('evidence', ROOT / 'scripts/verify-native-test-log.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    require({PREFIX + name for name in CASES}.issubset(module.source_manifest(ROOT)),
+            'An isolated control is absent from the pinned source manifest')
+    return module
+
+def raw_log(ordinal, name):
+    require(1 <= ordinal <= len(CASES) and name == CASES[ordinal - 1], 'Control order/identity mismatch')
+    return CONTROL_ROOT / ('%02d-%s.log' % (ordinal, name))
+
+def plan_info():
+    plans = sorted(PRODUCTS.glob('*.xctestrun'))
+    require(len(plans) == 1, 'Expected exactly one benchmark-produced xctestrun; no rebuild fallback')
+    plan = plans[0]
+    require(not plan.is_symlink() and plan.is_file() and plan.resolve().parent == PRODUCTS.resolve(),
+            'Unexpected xctestrun ownership')
+    size = plan.stat().st_size
+    require(0 < size <= 16 * 1024 * 1024, 'Unexpected xctestrun size')
+    return {'path': plan.relative_to(ROOT).as_posix(), 'size': size,
+            'sha256': hashlib.sha256(plan.read_bytes()).hexdigest()}
+
+def read_receipt(source, tree, simulator):
+    require(RECEIPT.is_file() and not RECEIPT.is_symlink() and RECEIPT.stat().st_size <= 4096,
+            'Missing or unsafe benchmark build receipt')
+    receipt = json.loads(RECEIPT.read_text())
+    require(receipt.get('schema') == 1 and receipt.get('source') == source and receipt.get('iosTree') == tree,
+            'Benchmark build receipt source mismatch')
+    require(receipt.get('simulator') == simulator and receipt.get('run') == os.environ.get('GITHUB_RUN_ID')
+            and receipt.get('attempt') == os.environ.get('GITHUB_RUN_ATTEMPT'), 'Benchmark build receipt run mismatch')
+    require(receipt.get('plan') == plan_info(), 'Compiled test plan changed after benchmark')
+    return receipt
+
+def command(arguments, timeout, deadline=None):
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        require(timeout > 0, 'App-host boundary deadline elapsed')
+    return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout, check=False)
+
+def app_executable(simulator, deadline=None):
+    lookup = command(['xcrun', 'simctl', 'get_app_container', simulator, BUNDLE, 'app'], 5, deadline)
+    require(lookup.returncode == 0, 'Could not establish exact installed app ownership')
+    bundle = Path(lookup.stdout.strip())
+    require(bundle.is_absolute() and bundle.name == EXECUTABLE + '.app' and bundle.is_dir()
+            and not bundle.is_symlink(), 'Unexpected app container')
+    with (bundle / 'Info.plist').open('rb') as stream:
+        info = plistlib.load(stream)
+    require(info.get('CFBundleIdentifier') == BUNDLE and info.get('CFBundleExecutable') == EXECUTABLE,
+            'Installed app identity mismatch')
+    # The only accepted process container family belongs to this exact UDID.
+    tail = bundle.parts[-7:]
+    require(len(tail) == 7 and tail[0].upper() == simulator.upper()
+            and tail[1:5] == ('data', 'Containers', 'Bundle', 'Application')
+            and str(uuid.UUID(tail[5])).upper() == tail[5].upper(), 'Unexpected Simulator app container family')
+    return bundle / EXECUTABLE, bundle.parents[1]
+
+def owned_processes(simulator, deadline=None):
+    current, application_root = app_executable(simulator, deadline)
+    listing = command(['/bin/ps', '-ww', '-axo', 'pid=,command='], 2, deadline)
+    require(listing.returncode == 0, 'Could not establish exact app process absence')
+    found = []
+    # Read only ps-reported candidate executables. No directory scan, basename
+    # kill, or ownership cache from an unsuccessful container lookup is used.
+    for row in listing.stdout.splitlines():
+        fields = row.strip().split(None, 1)
+        if len(fields) != 2:
+            continue
+        pid, text = fields
+        match = re.match(r'^(/.+?/OfflineTikTokPlayer\.app/OfflineTikTokPlayer)(?:\s|$)', text)
+        if not match:
+            require(not re.match(r'^(?:OfflineTikTokPlayer)(?:\s|$)', text), 'Unqualified app executable prevents absence proof')
+            continue
+        executable = Path(match.group(1))
+        if executable.parent.parent.parent != application_root:
+            continue
+        require(executable.parent.parent.name.upper() == str(uuid.UUID(executable.parent.parent.name)).upper(),
+                'Malformed app process container identity')
+        with (executable.parent / 'Info.plist').open('rb') as stream:
+            info = plistlib.load(stream)
+        require(info.get('CFBundleIdentifier') == BUNDLE and info.get('CFBundleExecutable') == EXECUTABLE,
+                'Unresolved app process ownership')
+        require(pid.isdigit() and len(found) < 4, 'Unexpected app process inventory')
+        found.append(int(pid))
+    return found
+
+def boundary(simulator, label):
+    require(label == 'before-01' or label in {'after-%02d' % n for n in range(1, len(CASES) + 1)}, 'Unknown boundary label')
+    before = owned_processes(simulator, time.monotonic() + 7)
+    requested, terminate_rc = bool(before), -1
+    if requested:
+        result = command(['xcrun', 'simctl', 'terminate', simulator, BUNDLE], 5)
+        terminate_rc = result.returncode
+    # Two adjacent absent observations; no claim about SDK/service quiescence.
+    deadline, absent_count, after = time.monotonic() + 3, 0, before
+    while time.monotonic() < deadline:
+        after = owned_processes(simulator, deadline)
+        absent_count = absent_count + 1 if not after else 0
+        if absent_count == 2:
+            print('NativeControlBoundary label=%s before=%d after=0 terminateRequested=%d terminateRC=%d gracefulCleanupClaim=false' %
+                  (label, len(before), requested, terminate_rc))
+            return
+        time.sleep(0.1)
+    raise ValueError('Exact own app host remains or absence is unconfirmed; later controls must not run')
+
+try:
+    mode, *args = sys.argv[1:]
+    if mode == 'initialize-build':
+        require(not RECEIPT.exists(), 'Refusing stale benchmark build receipt')
+        require(not list(PRODUCTS.glob('*.xctestrun')), 'Fresh job must not reuse a preexisting test plan')
+    elif mode == 'record-build':
+        source, tree, simulator, native_status, tee_status = args
+        receipt = {'schema': 1, 'source': source, 'iosTree': tree, 'simulator': simulator,
+                   'run': os.environ.get('GITHUB_RUN_ID'), 'attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+                   'plan': plan_info(), 'benchmarkNativeExit': int(native_status), 'benchmarkTeeExit': int(tee_status)}
+        RECEIPT.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+        print('NativeCompiledProductReceipt schema=1 planCount=1 reusedForControls=true noRebuildFallback=true')
+    elif mode == 'read-plan':
+        receipt = read_receipt(*args)
+        print(receipt['plan']['path'])
+    elif mode == 'initialize-controls':
+        CONTROL_ROOT.mkdir(parents=True, exist_ok=True)
+        require(not STATUSES.exists(), 'Refusing stale isolated control statuses')
+        for ordinal, name in enumerate(CASES, 1):
+            raw_log(ordinal, name).write_text('')
+        STATUSES.write_text('')
+    elif mode == 'boundary':
+        boundary(*args)
+    elif mode == 'verify-one':
+        ordinal, name = int(args[0]), args[1]
+        verifier().verify_log(raw_log(ordinal, name).read_text(), {PREFIX + name})
+        print('NativeIsolatedControl ordinal=%d identity=%s native=1 ui=0' % (ordinal, PREFIX + name))
+    elif mode == 'verify-controls':
+        require(len(args) == 2, 'Final aggregate requires the exact source pins')
+        receipt = json.loads(RECEIPT.read_text())
+        read_receipt(args[0], args[1], receipt['simulator'])
+        module, errors, seen = verifier(), [], set()
+        rows = STATUSES.read_text().splitlines() if STATUSES.is_file() else []
+        if len(rows) != len(CASES):
+            errors.append('Expected seven isolated command receipts; found %d' % len(rows))
+        for ordinal, name in enumerate(CASES, 1):
+            identity = PREFIX + name
+            try:
+                require(ordinal <= len(rows), 'Missing isolated command receipt')
+                fields = rows[ordinal - 1].split('\t')
+                require(len(fields) == 6 and fields[:2] == [str(ordinal), name], 'Wrong, duplicate, or reordered command receipt')
+                require(all(value == '0' for value in fields[2:]), 'Native/tee/evidence/host-boundary exit is nonzero: ' + ','.join(fields[2:]))
+                module.verify_log(raw_log(ordinal, name).read_text(), {identity})
+                seen.add(identity)
+                print('NativeIsolatedControlVerified ordinal=%d identity=%s native=1 ui=0' % (ordinal, identity))
+            except (OSError, ValueError) as error:
+                errors.append('%s: %s' % (identity, error))
+        require(len(seen) == 7 and not errors, '\n'.join(errors) or 'Missing unique control identity')
+        print('Targeted isolated controls native=7 ui=0; seven raw singleton logs; original guards retained; no full/device acceptance claim')
+    else:
+        raise ValueError('Unknown local evidence operation')
+except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+    print('Native isolated harness: ' + str(error), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+test "$#" -eq 1 || { printf '%s\n' 'Usage: check-native-playback-targeted.sh --verify-source|benchmark|controls|--verify-controls' >&2; exit 2; }
 verify_source
 if [ "$1" = --verify-source ]; then exit 0; fi
+if [ "$1" = --verify-controls ]; then evidence_tool verify-controls "$expected_code_source" "$expected_ios_tree"; exit 0; fi
 mode="$1"
 case "$mode" in
   benchmark) cases=(testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture testProductionSelectionLatencyAndStreamingContinuityWithoutCapture) ;;
-  controls) cases=(testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek) ;;
+  controls) cases=(testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
@@ -47,16 +251,68 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-if [ "$mode" = controls ]; then
-  python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 &
-  capture_pid=$!
-fi
-arguments=()
-for name in "${cases[@]}"; do arguments+=("-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name"); done
 printf '%s\n' "NativePlaybackTargetedScope mode=$mode appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=${#cases[@]} expectedUI=0 maximumBuildJobs=1 physicalOutput=unverified fullAcceptance=false"
-xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
-  -destination "platform=iOS Simulator,id=$simulator_id" \
-  -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Targeted-$mode-$(date +%Y%m%d-%H%M%S).xcresult" \
-  -jobs 1 -parallel-testing-enabled NO "${arguments[@]}" \
-  SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
-  CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+if [ "$mode" = benchmark ]; then
+  evidence_tool initialize-build
+  arguments=()
+  for name in "${cases[@]}"; do arguments+=("-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name"); done
+  set +e
+  xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+    -destination "platform=iOS Simulator,id=$simulator_id" \
+    -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Targeted-$mode-$(date +%Y%m%d-%H%M%S).xcresult" \
+    -jobs 1 -parallel-testing-enabled NO "${arguments[@]}" \
+    SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+    CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  receipt_status=0
+  evidence_tool record-build "$expected_code_source" "$expected_ios_tree" "$simulator_id" "${pipeline_status[0]}" "${pipeline_status[1]}" || receipt_status=$?
+  if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
+  if [ "${pipeline_status[1]}" -ne 0 ]; then exit "${pipeline_status[1]}"; fi
+  exit "$receipt_status"
+fi
+
+test_plan="$(evidence_tool read-plan "$expected_code_source" "$expected_ios_tree" "$simulator_id")"
+evidence_tool initialize-controls
+# This is the same bounded helper used by the existing natural pixel tests.
+# It is absent during both benchmarks and never launches an app.
+evidence_tool boundary "$simulator_id" before-01
+python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 &
+capture_pid=$!
+overall_status=0
+ordinal=0
+for name in "${cases[@]}"; do
+  ordinal=$((ordinal + 1))
+  # Revalidate the original plan before every invocation. No alternate products,
+  # test-plan rewriting, or build fallback is permitted.
+  plan_status=0
+  evidence_tool read-plan "$expected_code_source" "$expected_ios_tree" "$simulator_id" > /dev/null || plan_status=$?
+  if [ "$plan_status" -ne 0 ]; then
+    if [ "$overall_status" -eq 0 ]; then overall_status="$plan_status"; fi
+    break
+  fi
+  case_log="$(printf 'artifacts/native/native-playback-controls/%02d-%s.log' "$ordinal" "$name")"
+  set +e
+  xcodebuild -xctestrun "$test_plan" \
+    -destination "platform=iOS Simulator,id=$simulator_id" \
+    -resultBundlePath "artifacts/native/Targeted-control-$ordinal-$(date +%Y%m%d-%H%M%S).xcresult" \
+    -jobs 1 -parallel-testing-enabled NO \
+    "-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name" \
+    SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+    CODE_SIGNING_ALLOWED=NO test-without-building 2>&1 | tee "$case_log"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  verify_status=0
+  evidence_tool verify-one "$ordinal" "$name" || verify_status=$?
+  boundary_status=0
+  evidence_tool boundary "$simulator_id" "$(printf 'after-%02d' "$ordinal")" || boundary_status=$?
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ordinal" "$name" "${pipeline_status[0]}" "${pipeline_status[1]}" "$verify_status" "$boundary_status" >> artifacts/native/native-playback-controls/statuses.tsv
+  for status in "${pipeline_status[0]}" "${pipeline_status[1]}" "$verify_status" "$boundary_status"; do
+    if [ "$overall_status" -eq 0 ] && [ "$status" -ne 0 ]; then overall_status="$status"; fi
+  done
+  if [ "$boundary_status" -ne 0 ]; then break; fi
+done
+aggregate_status=0
+evidence_tool verify-controls "$expected_code_source" "$expected_ios_tree" || aggregate_status=$?
+if [ "$overall_status" -ne 0 ]; then exit "$overall_status"; fi
+exit "$aggregate_status"
