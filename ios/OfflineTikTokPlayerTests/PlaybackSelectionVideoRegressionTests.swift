@@ -55,6 +55,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             label: "getter-arm-phase-\(phaseBase)"))
         let captureOwnershipProbe = phaseBase == 60
         let screen = try SelectionVideoScreen(service: service, captureOwnershipProbe: captureOwnershipProbe)
+        var lateProducerResult: SelectionProducerProbe.Result?
+        var lateProducerFinal: ContinuousPCMRenderer.Snapshot?
+        var lateProducerArm: String?, lateProducerStop: String?
+        var lateProducerSeconds = 0.0
+        var lateProducerQuantum = 0
         audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
             tap.append(buffer, time: time)
         }
@@ -63,6 +68,21 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
             audio.graph.engine.stop(); screen.close()
             seeks.dump()
+            if let result = lateProducerResult {
+                let label = "manual-phase72-capture"
+                print("SelectionLateProducerScope phase=72 label=\(label) captureLabel=latency-returned-A-capture-ownership-after-control workerID=\(result.workerIdentifier) purpose=1 requestedSeconds=45 capacity=512 intervalMs=100 leftCensoredUntilNewEntry=true")
+                print("SelectionLateProducerBoundary phase=72 label=\(label) captureLabel=latency-returned-A-capture-ownership-after-control workerID=\(result.workerIdentifier) \(lateProducerArm ?? "armMissing=true") \(lateProducerStop ?? "stopMissing=true") probeOriginNs=\(result.origin) initialValid=\(result.initial != nil) initialToken=\(result.initial?.token ?? 0) initialVisit=\(result.initial?.visit ?? 0) initialFrame=\(result.initial?.frame ?? -1) initialUnderruns=\(result.initial?.underrunFrames ?? -1) skipped=\(result.skipped) dropped=\(result.dropped) nativeSampleRequestID=\(result.nativeSampleRequestID ?? "none")")
+                result.dump(label: label)
+                XCTAssertNotNil(result.initial); XCTAssertNotNil(lateProducerFinal)
+                XCTAssertEqual(result.dropped, 0); XCTAssertEqual(result.skipped, 0)
+                if let initial = result.initial, let final = lateProducerFinal {
+                    XCTAssertEqual(final.underrunFrames, initial.underrunFrames, "Phase 72 capture must not add producer starvation")
+                    XCTAssertEqual(final.token, initial.token); XCTAssertEqual(final.visit, initial.visit)
+                    XCTAssertFalse(initial.ended); XCTAssertFalse(final.ended)
+                    print(assertNaturalProducerWindow(result, baseline: initial,
+                        quantum: lateProducerQuantum, seconds: min(45, lateProducerSeconds), label: label))
+                }
+            }
             #if DEBUG
             let counts = service.debugStartupSeekGraceCounts
             print("SelectionStartupSeekGraceSummary phaseBase=\(phaseBase) enabled=\(startupSeekGraceControl) deferredCount=\(counts.deferredCount) deadlineExpiredCount=\(counts.deadlineExpiredCount) frameAvailableCount=\(counts.frameAvailableCount) saturated=\(counts.saturated) deferredZero=inconclusive")
@@ -108,7 +128,36 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                       id: fixture.aID, frequency: 440, prepared: true, sourceQuiet: sourceQuiet) { service.previous() }
         if captureOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase + 2) }
         assertSelection(service, fixture: fixture, id: fixture.aID)
-        await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-returned-A" + labelSuffix)
+        if phaseBase == 70 {
+            let recorder = audio.producerProgressRecorder
+            var probe: SelectionProducerProbe?, priorTrace: Bool?
+            defer {
+                if let active = probe, let priorTrace {
+                    let begin = DispatchTime.now().uptimeNanoseconds
+                    lateProducerResult = active.stop(); probe = nil
+                    recorder.setTracingEnabled(priorTrace)
+                    let restoredTrace = recorder.snapshot().tracingEnabled
+                    XCTAssertEqual(restoredTrace, priorTrace)
+                    lateProducerFinal = audio.renderer.diagnosticSnapshot
+                    lateProducerQuantum = service.audioRenderQuantumFrames
+                    let end = DispatchTime.now().uptimeNanoseconds
+                    lateProducerSeconds = Double(begin - (lateProducerResult?.origin ?? begin)) / 1_000_000_000
+                    lateProducerStop = "stopBeginNs=\(begin) stopEndNs=\(end) restoredTrace=\(restoredTrace) quantumFrames=\(lateProducerQuantum) finalValid=\(lateProducerFinal != nil) finalToken=\(lateProducerFinal?.token ?? 0) finalVisit=\(lateProducerFinal?.visit ?? 0) finalFrame=\(lateProducerFinal?.frame ?? -1) finalUnderruns=\(lateProducerFinal?.underrunFrames ?? -1) observationSeconds=\(lateProducerSeconds)"
+                }
+            }
+            await assertVisibleFrame(service, screen: screen, identity: .a,
+                label: "latency-returned-A" + labelSuffix, beforeCapture: { ready in
+                    let begin = DispatchTime.now().uptimeNanoseconds
+                    let before = recorder.snapshot(); priorTrace = before.tracingEnabled
+                    recorder.setTracingEnabled(true)
+                    probe = SelectionProducerProbe(context: SelectionProducerContext(renderer: audio.renderer,
+                        producer: recorder, nativeSamplePurpose: 1), durationSeconds: 45, capacity: 512)
+                    let end = DispatchTime.now().uptimeNanoseconds
+                    lateProducerArm = "armBeginNs=\(begin) armEndNs=\(end) priorTrace=\(before.tracingEnabled) beforeSequence=\(before.phaseSequence) beforePhase=\(before.phase.rawValue) beforeEnteredNs=\(before.phaseEnteredUptimeNanoseconds) beforeCoherent=\(before.coherent) readiness=\(ready)"
+                })
+        } else {
+            await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-returned-A" + labelSuffix)
+        }
         let validity = tap.validity()
         XCTAssertEqual(validity.invalidTimestamps, 0, "Engine-output timing requires valid host timestamps; no callback-wall-time fallback")
         XCTAssertEqual(validity.droppedFrames, 0, "The bounded tap must retain all measured PCM")
@@ -1178,12 +1227,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     @discardableResult
     private func assertVisibleFrame(_ service: PlaybackService, screen: SelectionVideoScreen,
                                     identity: SelectionVideoIdentity, label: String,
+                                    beforeCapture: ((Bool) -> Void)? = nil,
                                     file: StaticString = #filePath, line: UInt = #line) async -> SelectionVideoPixels? {
         let ready = await waitUntil {
             service.isVideoReady && (service.surface.playerLayer.isReadyForDisplay
                 || screen.customVideoLayer?.isReadyForDisplay == true)
         }
         XCTAssertTrue(ready, "The selected real video must become ready; an audio clock is insufficient", file: file, line: line)
+        beforeCapture?(ready)
         do {
             let pixels = try await screen.capture(label: label, test: self)
             pixels.log(label: label, identity: identity)
