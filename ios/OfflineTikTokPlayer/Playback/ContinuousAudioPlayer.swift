@@ -11,6 +11,8 @@ final class ContinuousAudioPlayer {
     private let decoder: ContinuousPCMDecoder
     #if DEBUG
     private nonisolated let debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder?
+    private var debugActivePreparationCalls = 0
+    private var debugPreparationCounterOverflowed = false
     #endif
     private var entries: [String: Entry] = [:]
     private var preparing: [String: Task<Entry, Error>] = [:]
@@ -40,6 +42,21 @@ final class ContinuousAudioPlayer {
     var isSelected: Bool { selectedID != nil }
 
     #if DEBUG
+    struct DebugPreparationState: Sendable {
+        let activeCalls: Int
+        let sharedTasks: Int
+        let reservedSlots: Int
+        let nextToken: Int
+        let counterOverflowed: Bool
+    }
+    var debugPreparationState: DebugPreparationState {
+        DebugPreparationState(activeCalls: debugActivePreparationCalls,
+            sharedTasks: preparing.count, reservedSlots: reservedSlots.count,
+            nextToken: nextToken, counterOverflowed: debugPreparationCounterOverflowed)
+    }
+    func debugSetNativeReadGate(_ gate: ContinuousPCMDecoder.DebugNativeReadGate) {
+        decoder.debugSetNativeReadGate(gate)
+    }
     /// Direct independent scalar record read; it does not cohere with the worker snapshot.
     nonisolated func debugNativeLaneActivitySnapshot(at laneIndex: Int) -> ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot? {
         debugNativeLaneActivityRecorder?.snapshot(at: laneIndex)
@@ -87,6 +104,12 @@ final class ContinuousAudioPlayer {
     }
 
     func prepare(id: String, url: URL, currentPriority: Bool = false) async throws -> Entry {
+        #if DEBUG
+        let debugCallCounted = debugActivePreparationCalls < Int.max
+        if debugCallCounted { debugActivePreparationCalls += 1 }
+        else { debugPreparationCounterOverflowed = true }
+        defer { if debugCallCounted { debugActivePreparationCalls -= 1 } }
+        #endif
         if let entry = entries[id], !failedTokens.contains(entry.token) { return entry }
         if let task = preparing[id] { return try await task.value }
         var available: Int?

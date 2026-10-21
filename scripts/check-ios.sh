@@ -55,6 +55,7 @@ xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlaye
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Tests-$(date +%Y%m%d-%H%M%S).xcresult" \
   -jobs 1 -parallel-testing-enabled NO \
+  -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
   "$@" SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
   CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
 if [ "$validation_mode" = selection-only ]; then

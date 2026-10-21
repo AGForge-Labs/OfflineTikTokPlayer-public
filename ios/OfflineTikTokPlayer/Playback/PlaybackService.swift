@@ -94,6 +94,8 @@ final class PlaybackService: NSObject {
     }
     // Timing-only seam: nil preserves the original callback path without an await.
     @ObservationIgnored var onDebugInitialVideoReady: (@MainActor (Int) async -> Void)? = nil
+    // Timing-only control of service adoption; the real renderer and ready callback continue.
+    @ObservationIgnored var shouldDebugDeferAudioVisit: (@MainActor (Int) -> Bool)? = nil
     var debugInitialVideoReadyState: DebugInitialVideoReadyState {
         DebugInitialVideoReadyState(audioVisit: audioVisit, readyGeneration: readyGeneration,
             generation: generation, syncingVideoGeneration: syncingVideoGeneration)
@@ -164,6 +166,15 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private weak var observedItem: AVPlayerItem?
     @ObservationIgnored private var videoPresentation: (request: Int, ticket: ContinuousPictureInPicture.PresentationTicket)?
     @ObservationIgnored private var pendingInitialZeroStart: (request: Int, ticket: ContinuousPictureInPicture.PresentationTicket)?
+    private struct InitialZeroVisitOwnership {
+        let request: Int
+        let mediaID: String
+        let token: Int
+        let baselineVisit: Int64
+        var ticket: ContinuousPictureInPicture.PresentationTicket?
+    }
+    // One record: a successful zero-selection candidate becomes an item-ticket owner.
+    @ObservationIgnored private var initialZeroVisitOwnership: InitialZeroVisitOwnership?
     @ObservationIgnored private var explicitVideoSeekGeneration: Int?
     @ObservationIgnored private var readyGeneration: Int?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
@@ -402,6 +413,7 @@ final class PlaybackService: NSObject {
     func seek(_ seconds: Double) {
         explicitVideoSeekGeneration = generation
         pendingInitialZeroStart = nil
+        initialZeroVisitOwnership = nil
         if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
            let version = continuousAudio.seek(seek.target) {
             pendingAudioSeek = (seek, version)
@@ -447,6 +459,7 @@ final class PlaybackService: NSObject {
                              audioAlreadySelected: Bool = false) {
         pendingAudioSeek = nil; completePiPSkip()
         pendingInitialZeroStart = nil
+        initialZeroVisitOwnership = nil
         if !audioAlreadySelected { audioLoadingID = queue.currentID }
         reachedPreparedEnd = adopting?.reachedEnd ?? false
         if reachedPreparedEnd {
@@ -599,6 +612,14 @@ final class PlaybackService: NSObject {
         if position == 0, !rewind, explicitVideoSeekGeneration != request,
            let ticket = currentVideoPresentation(for: playerItem, request: request) {
             pendingInitialZeroStart = (request, ticket)
+            if var owner = initialZeroVisitOwnership, owner.request == request,
+               owner.mediaID == queue.currentID,
+               continuousAudio.entry(for: owner.mediaID)?.token == owner.token {
+                owner.ticket = ticket
+                initialZeroVisitOwnership = owner
+            } else { initialZeroVisitOwnership = nil }
+        } else {
+            initialZeroVisitOwnership = nil
         }
         refreshAudioProcessing()
         audioCheckTask = Task { [weak self, weak playerItem] in
@@ -647,13 +668,24 @@ final class PlaybackService: NSObject {
                     } else {
                         let ticket = self.currentVideoPresentation(for: playerItem, request: request)
                         var installed = false
+                        var playbackAnchor: (host: CMTime, position: Double)?
                         if self.syncingVideoGeneration != request, let ticket {
                             let host = CMClockGetTime(CMClockGetHostTimeClock())
+                            let desired = self.continuousAudio.presentationPosition(at: host)
                             installed = self.continuousPiP.installTimeline(ticket,
-                                positionSeconds: self.continuousAudio.presentationPosition(at: host),
+                                positionSeconds: desired,
                                 durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay)
+                            if installed { playbackAnchor = (host, desired) }
                         }
-                        if self.intent.canPlay, self.videoAllowed { self.player.playImmediately(atRate: 1) }
+                        if self.intent.canPlay, self.videoAllowed {
+                            if installed, let ticket, let anchor = playbackAnchor,
+                               self.currentVideoPresentation(for: playerItem, request: request) == ticket {
+                                self.player.setRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
+                                                    atHostTime: anchor.host)
+                            } else {
+                                self.player.playImmediately(atRate: 1)
+                            }
+                        }
                         if installed, let ticket,
                            self.currentVideoPresentation(for: playerItem, request: request) == ticket {
                             _ = self.continuousPiP.activate(ticket)
@@ -681,6 +713,23 @@ final class PlaybackService: NSObject {
               owner.request == generation, explicitVideoSeekGeneration != generation,
               let item = observedItem else { return false }
         return currentVideoPresentation(for: item, request: owner.request) == owner.ticket
+    }
+
+    /// Consume before any visit side effects. Missed/intervening visits fall back
+    /// to the existing correction path; readiness never consumes this proof.
+    private func consumeInitialZeroVisit(_ sample: ContinuousPCMRenderer.Snapshot,
+                                         entry: ContinuousAudioPlayer.Entry, changedSource: Bool) -> Bool {
+        let owner = initialZeroVisitOwnership
+        initialZeroVisitOwnership = nil
+        guard let owner, let ticket = owner.ticket, changedSource,
+              owner.request == generation, owner.baselineVisit < Int64.max,
+              sample.visit == owner.baselineVisit + 1, sample.token == owner.token,
+              entry.token == owner.token, entry.id == owner.mediaID,
+              queue.currentID == owner.mediaID, continuousAudio.selectedID == owner.mediaID,
+              explicitVideoSeekGeneration != generation, pendingAudioSeek == nil,
+              intent.canPlay, videoAllowed, !sample.ended,
+              let item = observedItem else { return false }
+        return currentVideoPresentation(for: item, request: owner.request) == ticket
     }
 
     private func currentVideoPresentation(for item: AVPlayerItem, request: Int)
@@ -792,9 +841,17 @@ final class PlaybackService: NSObject {
     }
 
     private func selectContinuousAudio(id: String, position: Double) {
-        audioVisit = continuousAudio.snapshot.visit
-        audioToken = continuousAudio.snapshot.token
-        if continuousAudio.select(id: id, position: position) { audioLoadingID = nil }
+        initialZeroVisitOwnership = nil
+        let baseline = continuousAudio.snapshot
+        audioVisit = baseline.visit; audioToken = baseline.token
+        if continuousAudio.select(id: id, position: position) {
+            audioLoadingID = nil
+            if position == 0, explicitVideoSeekGeneration != generation, baseline.visit < Int64.max,
+               id == queue.currentID, let entry = continuousAudio.entry(for: id), entry.token != baseline.token {
+                initialZeroVisitOwnership = InitialZeroVisitOwnership(request: generation,
+                    mediaID: id, token: entry.token, baselineVisit: baseline.visit, ticket: nil)
+            }
+        }
     }
 
     private func resumeContinuousAudio() {
@@ -845,9 +902,13 @@ final class PlaybackService: NSObject {
             lastUnderrun = sample.underrunFrames; recordDiagnostic(.rendererUnderrun)
         }
         if sample.visit != audioVisit {
+            #if DEBUG
+            if shouldDebugDeferAudioVisit?(generation) == true { return }
+            #endif
             let changedSource = sample.token != audioToken
+            let ownedInitialVisit = consumeInitialZeroVisit(sample, entry: entry, changedSource: changedSource)
             audioVisit = sample.visit; audioToken = sample.token
-            continuousPiP.flushForSeek()
+            if !ownedInitialVisit { continuousPiP.flushForSeek() }
             continuousAudio.adoptRendered(id: entry.id)
             if changedSource, entry.id != queue.currentID {
                 var following = queue
@@ -857,7 +918,7 @@ final class PlaybackService: NSObject {
                 queue = following
                 let video = buffer.advance(to: entry.id)
                 loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
-            } else if !(changedSource && initialZeroStartOwnsPendingReady) {
+            } else if !ownedInitialVisit {
                 #if DEBUG
                 synchronizeVideoToAudio(force: true, reason: .sourceVisit)
                 #else

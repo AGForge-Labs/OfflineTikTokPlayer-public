@@ -13,6 +13,19 @@ import PlayerCore
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     // Stop targeted arms from creating more owners after an unacknowledged close.
     private static var targetedFixtureOwnershipLost = false
+    // One test-module nonce per app process, not an operating-system birth timestamp.
+    private static let runtimeHostModuleNonce = UUID().uuidString.lowercased()
+
+    private func recordRuntimeHost() throws {
+        let process = ProcessInfo.processInfo
+        let receipt: [String: Any] = ["schema": 1,
+            "simulatorUDID": process.environment["SIMULATOR_UDID"] ?? "unknown",
+            "pid": Int(process.processIdentifier),
+            "bundleIdentifier": Bundle.main.bundleIdentifier ?? "unknown",
+            "moduleNonce": Self.runtimeHostModuleNonce, "testName": self.name]
+        let data = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+        print("NativeRuntimeHost " + String(decoding: data, as: UTF8.self))
+    }
     /// Real mixer output and actual custom-layer submission, without screenshot or SDK-position probes.
     /// This is selected-frame readiness evidence, not compositor pixels or physical speaker output.
     func testProductionSelectionLatencyAndStreamingContinuityWithoutCapture() async throws {
@@ -24,6 +37,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     private func runProductionSelectionBenchmark(traceVideoSeeks: Bool) async throws {
+        try recordRuntimeHost()
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             return
@@ -972,6 +986,123 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek() async throws {
+        #if DEBUG
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            service.isInteractingWithFeed = true
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await require({ self.explicitInitialReadySourceSettled(service, screen: screen)
+                && service.preparedAudioCount == 2 && buffer.hasPrepared(fixture.bID) },
+                "Initial A and prepared B must settle before the ready-before-visit control")
+            let aToken = service.audioSnapshot.token
+            assertSelection(service, fixture: fixture, id: fixture.aID)
+            service.next()
+            try await require({ service.queue.currentID == fixture.bID && service.audioSnapshot.token != aToken
+                && self.explicitInitialReadySourceSettled(service, screen: screen)
+                && service.preparedAudioCount == 2 }, "Prepared B must settle before returning to A")
+            assertSelection(service, fixture: fixture, id: fixture.bID)
+            try await require({ buffer.previousMediaID == fixture.aID && buffer.debugPreviousNeedsRewind == false },
+                              "Retained A must finish its real offscreen rewind before Previous")
+            let before = service.audioSnapshot
+            let oldVisit = service.debugInitialVideoReadyState.audioVisit
+            XCTAssertEqual(oldVisit, before.visit)
+            XCTAssertEqual(audio.selectedID, fixture.bID)
+            XCTAssertEqual(audio.entry(for: fixture.aID)?.token, aToken)
+            let request = service.debugInitialVideoReadyState.generation + 1
+            let probe = SelectionInitialReadyOrderingProbe(generation: request)
+            var holdAdoption = true, gateTimedOut = false, gateOverflow = false
+            var blockedAttempts = 0
+            let gateDeadline = ProcessInfo.processInfo.systemUptime + 3
+            service.shouldDebugDeferAudioVisit = { generation in
+                guard generation == request, holdAdoption else { return false }
+                guard ProcessInfo.processInfo.systemUptime < gateDeadline else {
+                    gateTimedOut = true; return false
+                }
+                if blockedAttempts < 128 { blockedAttempts += 1 }
+                else { gateOverflow = true }
+                return true
+            }
+            service.onDebugVideoSeekStamp = { stamp in probe.record(stamp) }
+            defer {
+                // Release before the existing owned preparation/decoder cleanup on every exit.
+                holdAdoption = false
+                service.shouldDebugDeferAudioVisit = nil
+                service.onDebugVideoSeekStamp = nil
+            }
+
+            // Keep the real initial-ready callback unmodified and unheld. Only the
+            // main-actor visit adoption is deferred; native PCM continues rendering A.
+            service.previous()
+            let readyBeforeVisit = await waitUntil(timeout: 1.5) {
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return blockedAttempts > 0 && !gateTimedOut && !gateOverflow
+                    && state.generation == request && state.readyGeneration == request
+                    && state.audioVisit == oldVisit && sample.token == aToken && sample.visit > oldVisit
+                    && state.syncingVideoGeneration == nil && !sample.ended
+                    && audio.selectedID == fixture.aID && service.wantsToPlay && service.audioEngineRunning
+            }
+            XCTAssertTrue(readyBeforeVisit,
+                          "Real returned-A readiness must finish while only its first visit adoption is held")
+            guard readyBeforeVisit else { throw SelectionVideoTestFailure.timeout }
+            let readySample = service.audioSnapshot
+            let progressedWhileHeld = await waitUntil(timeout: 0.75) {
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return !gateTimedOut && !gateOverflow && state.readyGeneration == request
+                    && state.audioVisit == oldVisit && sample.token == aToken && sample.visit == readySample.visit
+                    && sample.frame >= readySample.frame + 9_600 && !sample.ended
+            }
+            let held = service.audioSnapshot
+            XCTAssertTrue(progressedWhileHeld, "Actual A PCM must continue for 200 ms before service visit adoption")
+            XCTAssertEqual(held.underrunFrames, before.underrunFrames)
+            XCTAssertFalse(gateTimedOut); XCTAssertFalse(gateOverflow)
+            XCTAssertTrue(probe.reasons.isEmpty, "The qualified zero-start readiness must not require a seek")
+            assertSelection(service, fixture: fixture, id: fixture.aID)
+            guard progressedWhileHeld, !gateTimedOut, !gateOverflow else { throw SelectionVideoTestFailure.timeout }
+
+            let submitted = service.submittedVideoFrameCount
+            holdAdoption = false
+            let adopted = await waitUntil(timeout: 1.5) {
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return state.generation == request && state.readyGeneration == request
+                    && state.audioVisit == held.visit && sample.token == aToken && sample.visit == held.visit
+                    && sample.frame > held.frame && !sample.ended
+            }
+            XCTAssertTrue(adopted, "The next real poll must acknowledge the exact held A visit after release")
+            XCTAssertFalse(probe.reasons.contains(PlaybackService.DebugVideoSeekReason.sourceVisit.rawValue),
+                           "A ready zero-start must not be replaced by a forced seek on its first acknowledged visit")
+            guard adopted else { throw SelectionVideoTestFailure.timeout }
+            try await require({
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                guard let frame = service.videoFramePositionSeconds,
+                      let copied = service.copiedVideoFramePositionSeconds else { return false }
+                return state.generation == request && state.readyGeneration == request
+                    && state.audioVisit == held.visit && state.syncingVideoGeneration == nil
+                    && sample.token == aToken && sample.visit == held.visit && !sample.ended
+                    && sample.frame >= held.frame + 2_400 && service.submittedVideoFrameCount > submitted
+                    && service.isVideoReady && !service.isLoading && screen.customVideoLayer?.isReadyForDisplay == true
+                    && frame.isFinite && copied.isFinite && frame >= 0 && copied >= 0
+                    && abs(frame - service.videoRequestedPositionSeconds) <= 0.080 && abs(copied - frame) <= 0.080
+                    && abs(service.player.currentTime().seconds - Double(sample.frame) / 48_000) <= 0.080
+            }, "The acknowledged visit must reveal fresh selected and aligned A frames with continued PCM")
+            assertSelection(service, fixture: fixture, id: fixture.aID)
+            await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "ready-before-first-visit-returned-A")
+            let final = service.audioSnapshot
+            probe.stopRecording()
+            print("ReadyBeforeFirstVisitControl schema=1 request=\(request) readyBeforeVisit=\(readyBeforeVisit) oldVisit=\(oldVisit) heldVisit=\(held.visit) blockedAttempts=\(blockedAttempts) gateTimedOut=\(gateTimedOut) gateOverflow=\(gateOverflow) progressedWhileHeld=\(progressedWhileHeld) adopted=\(adopted) seekReasons=\(probe.reasons.map { String($0) }.joined(separator: ",")) dropped=\(probe.dropped) underrunDelta=\(final.underrunFrames - before.underrunFrames) latencyAcceptance=false heldAdoption=diagnostic-only")
+            XCTAssertFalse(probe.reasons.contains(PlaybackService.DebugVideoSeekReason.sourceVisit.rawValue))
+            XCTAssertEqual(probe.dropped, 0)
+            XCTAssertEqual(final.token, aToken); XCTAssertEqual(final.visit, held.visit)
+            XCTAssertFalse(final.ended); XCTAssertGreaterThan(final.frame, held.frame)
+            XCTAssertEqual(final.underrunFrames, before.underrunFrames)
+            XCTAssertEqual(audio.selectedID, fixture.aID)
+            XCTAssertTrue(service.wantsToPlay); XCTAssertTrue(service.audioEngineRunning)
+        }
+        #else
+        XCTFail("Ready-before-first-visit ordering controls require DEBUG hooks")
+        #endif
+    }
+
     func testPausedRestoreBlocksFrameAcquisitionUntilTheRealSeekCompletionIsReleased() async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
@@ -1191,6 +1322,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     /// requires both existing acknowledgements; failure retains only this fixture.
     private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, buffer: PlaybackBuffer? = nil, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
         PlaybackService, SelectionVideoScreen) async throws -> Void) async throws {
+        try recordRuntimeHost()
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             throw SelectionVideoTestFailure.timeout
