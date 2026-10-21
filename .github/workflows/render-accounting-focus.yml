@@ -2,7 +2,7 @@ name: Native render accounting fresh-host controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/render-accounting-focus.yml', 'scripts/check-render-accounting-focus.sh']
+    paths: ['.github/workflows/render-accounting-focus.yml', 'scripts/check-render-accounting-focus.sh', 'scripts/run-owned-xcodebuild.py']
 permissions:
   contents: read
 jobs:
@@ -14,13 +14,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 3
       - name: Require exact committed app and test source
         id: source_pin
         run: bash scripts/check-render-accounting-focus.sh --verify-source
       - name: Preserve strict native evidence and existing and new harness regressions
         id: harness
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           mkdir -p artifacts
           python3 tests/validation-shell/test_check_ios_shell.py
@@ -28,9 +28,10 @@ jobs:
           python3 tests/validation-shell/test_native_control_harness.py
           python3 tests/validation-shell/test_native_refill_focus_harness.py
           python3 tests/validation-shell/test_render_accounting_harness.py
+          python3 tests/validation-shell/test_owned_xcodebuild_deadline.py
       - name: Initialize read-only simulator inventory within sixty seconds
         id: simulator_inventory
-        if: ${{ always() && steps.harness.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import subprocess
@@ -38,9 +39,14 @@ jobs:
                          capture_output=True, text=True, check=True, timeout=60)
           print('Read-only simulator inventory initialized; exact destination and host guards remain required.')
           PY
-      - name: Compile once then run two fixed render-accounting singleton controls without capture
-        if: ${{ always() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_inventory.outcome == 'success' }}
+      - name: Compile immutable unsigned products within a twelve minute owned-command deadline
+        id: build
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_inventory.outcome == 'success' }}
+        run: bash scripts/check-render-accounting-focus.sh build
+      - name: Run two fixed fresh-host singletons with five minute owned-command deadlines
+        id: native
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: bash scripts/check-render-accounting-focus.sh controls
       - name: Require two exact singleton identities and all native and host receipts
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-render-accounting-focus.sh --verify-controls

@@ -313,20 +313,24 @@ except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
 PY
 }
 
-test "$#" -eq 1 || { printf '%s\n' 'Usage: check-render-accounting-focus.sh --verify-source|controls|--verify-controls' >&2; exit 2; }
+test "$#" -eq 1 || { printf '%s\n' 'Usage: check-render-accounting-focus.sh --verify-source|build|controls|--verify-controls' >&2; exit 2; }
 verify_source
 if [ "$1" = --verify-source ]; then exit 0; fi
 if [ "$1" = --verify-controls ]; then evidence_tool verify-controls "$expected_code_source" "$expected_ios_tree"; exit 0; fi
-test "$1" = controls || { printf '%s\n' 'Only the two fixed render-accounting controls are supported.' >&2; exit 2; }
+case "$1" in build|controls) ;; *) printf '%s\n' 'Only the fixed build and two render-accounting controls are supported.' >&2; exit 2 ;; esac
+phase="$1"
 cases=(
   testDefaultProductionRenderAccountingBaseline
   testDefaultProductionRenderAccountingEnabled
 )
 export SWIFTC_MAXIMUM_DETERMINISM=1
 mkdir -p artifacts/render-accounting-focus
+if [ "$phase" = build ]; then
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode on macOS is required.' >&2; exit 2; }
-printf '' | xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/render-accounting-focus/targeted-swift-plan.log 2>&1
+driver_status=0
+python3 scripts/run-owned-xcodebuild.py --phase driver -- xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/render-accounting-focus/targeted-swift-plan.log 2>&1 || driver_status=$?
 cat artifacts/render-accounting-focus/targeted-swift-plan.log
+if [ "$driver_status" -ne 0 ]; then exit "$driver_status"; fi
 grep -Fq 'SWIFTC_MAXIMUM_DETERMINISM overriding -j' artifacts/render-accounting-focus/targeted-swift-plan.log
 python3 scripts/generate-ios-project.py --check
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
@@ -337,7 +341,7 @@ evidence_tool initialize-build
 build_log=artifacts/render-accounting-focus/native-playback-build.log
 : > "$build_log"
 set +e
-xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+python3 scripts/run-owned-xcodebuild.py --phase build -- xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/render-accounting-focus/Focus-build-$(date +%Y%m%d-%H%M%S).xcresult" \
   -jobs 1 -parallel-testing-enabled NO \
@@ -350,6 +354,11 @@ if [ "${build_pipeline_status[1]}" -ne 0 ]; then exit "${build_pipeline_status[1
 generated_plan="$(evidence_tool generated-plan)"
 test_plan="$(evidence_tool plan-path "$generated_plan")"
 evidence_tool record-build "$expected_code_source" "$expected_ios_tree" "$simulator_id" "${build_pipeline_status[0]}" "${build_pipeline_status[1]}" "$generated_plan"
+exit 0
+fi
+# The native step cannot compile or invent a destination: it requires the exact
+# successful build receipt and unchanged compiled plan from the earlier step.
+simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
 test_plan="$(evidence_tool read-plan "$expected_code_source" "$expected_ios_tree" "$simulator_id")"
 evidence_tool initialize-controls
 # No screenshot/profile helper is started. Each completed singleton is followed
@@ -369,7 +378,7 @@ for name in "${cases[@]}"; do
   fi
   case_log="$(printf 'artifacts/render-accounting-focus/native-playback-controls/%02d-%s.log' "$ordinal" "$name")"
   set +e
-  xcodebuild -xctestrun "$test_plan" \
+  python3 scripts/run-owned-xcodebuild.py --phase "$(printf 'case-%02d' "$ordinal")" -- xcodebuild -xctestrun "$test_plan" \
     -destination "platform=iOS Simulator,id=$simulator_id" \
     -resultBundlePath "artifacts/render-accounting-focus/Focus-control-$ordinal-$(date +%Y%m%d-%H%M%S).xcresult" \
     -jobs 1 -parallel-testing-enabled NO \
