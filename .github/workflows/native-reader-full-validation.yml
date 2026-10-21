@@ -48,7 +48,7 @@ jobs:
         run: |
           bash scripts/check-native-reader-full-validation.sh --verify-source
           bash scripts/check-ios.sh
-      - name: Require all 106 native and one UI identities
+      - name: Require all 108 native and one UI identities
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -60,8 +60,8 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          if len(native) != 106 or len(ui) != 1 or native | ui != expected:
-              raise SystemExit(f'Pinned full manifest must equal native=106 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
+          if len(native) != 108 or len(ui) != 1 or native | ui != expected:
+              raise SystemExit(f'Pinned full manifest must equal native=108 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('FULL source-manifest evidence native=106 ui=1; original guards retained; physical-device acceptance remains separate')
+          print('FULL source-manifest evidence native=108 ui=1; original guards retained; physical-device acceptance remains separate')
           PY
