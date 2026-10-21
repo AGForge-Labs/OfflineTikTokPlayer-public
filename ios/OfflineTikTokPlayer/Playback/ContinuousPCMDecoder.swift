@@ -19,6 +19,66 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let hasAudio: Bool
     }
 
+    struct LifecycleSnapshot: Sendable {
+        let createdInstances: Int64
+        // Counts entry to Swift deinit, not completed SDK resource destruction.
+        let deinitEnteredInstances: Int64
+        let shutdownRequestCalls: Int64
+        let shutdownRequestedInstances: Int64
+        let shutdownCompletedInstances: Int64
+        let liveInstances: Int64?
+        // Two identical bounded reads, not a transactional/coherent snapshot.
+        let stableReread: Bool
+    }
+
+    struct RecorderLifecycleSnapshot: Sendable {
+        let shutdownRequested: Bool
+        let shutdownCompleted: Bool
+        let deinitEntered: Bool
+    }
+
+    private struct LifecycleRead: Equatable {
+        let created: Int64
+        let deinitEntered: Int64
+        let requestCalls: Int64
+        let requested: Int64
+        let completed: Int64
+    }
+
+    private enum LifecycleCounters {
+        static let created = Atomic<Int64>(0)
+        static let deinitEntered = Atomic<Int64>(0)
+        static let requestCalls = Atomic<Int64>(0)
+        static let requested = Atomic<Int64>(0)
+        static let completed = Atomic<Int64>(0)
+
+        static func read() -> LifecycleRead {
+            LifecycleRead(created: created.load(ordering: .sequentiallyConsistent),
+                deinitEntered: deinitEntered.load(ordering: .sequentiallyConsistent),
+                requestCalls: requestCalls.load(ordering: .sequentiallyConsistent),
+                requested: requested.load(ordering: .sequentiallyConsistent),
+                completed: completed.load(ordering: .sequentiallyConsistent))
+        }
+    }
+
+    /// Fixed process-wide counters contain no registry, object references or
+    /// source identities. Multiple threads can initialize/deinitialize decoders;
+    /// repeat agreement does not turn these independent atomics into a transaction.
+    static func lifecycleSnapshot() -> LifecycleSnapshot {
+        let first = LifecycleCounters.read(), second = LifecycleCounters.read()
+        let stable = first == second
+        var live: Int64?
+        if stable, second.created >= 0, second.deinitEntered >= 0,
+           second.created >= second.deinitEntered {
+            let difference = second.created.subtractingReportingOverflow(second.deinitEntered)
+            if !difference.overflow { live = difference.partialValue }
+        }
+        return LifecycleSnapshot(createdInstances: second.created,
+            deinitEnteredInstances: second.deinitEntered, shutdownRequestCalls: second.requestCalls,
+            shutdownRequestedInstances: second.requested, shutdownCompletedInstances: second.completed,
+            liveInstances: live, stableReread: stable)
+    }
+
     enum ProgressPhase: Int, Sendable {
         case idle = 0, preparing = 1, pumping = 2, openingStream = 3
         case readerStart = 4, nativeCopy = 5, converting = 6, readerCancel = 7, appending = 8
@@ -145,6 +205,36 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private let firstSlot = SlotCounters()
         private let secondSlot = SlotCounters()
         private let thirdSlot = SlotCounters()
+        // These flags have multiple possible callers and remain independent of
+        // the decode worker's single-writer phase seqlock and tracing switch.
+        private let lifecycleRequested = Atomic<Bool>(false)
+        private let lifecycleCompleted = Atomic<Bool>(false)
+        private let lifecycleDeinitEntered = Atomic<Bool>(false)
+
+        func lifecycleSnapshot() -> RecorderLifecycleSnapshot {
+            RecorderLifecycleSnapshot(shutdownRequested: lifecycleRequested.load(ordering: .sequentiallyConsistent),
+                shutdownCompleted: lifecycleCompleted.load(ordering: .sequentiallyConsistent),
+                deinitEntered: lifecycleDeinitEntered.load(ordering: .sequentiallyConsistent))
+        }
+
+        fileprivate func noteShutdownRequested() {
+            _ = LifecycleCounters.requestCalls.wrappingAdd(1, ordering: .sequentiallyConsistent)
+            if !lifecycleRequested.exchange(true, ordering: .sequentiallyConsistent) {
+                _ = LifecycleCounters.requested.wrappingAdd(1, ordering: .sequentiallyConsistent)
+            }
+        }
+
+        fileprivate func noteShutdownCompleted() {
+            if !lifecycleCompleted.exchange(true, ordering: .sequentiallyConsistent) {
+                _ = LifecycleCounters.completed.wrappingAdd(1, ordering: .sequentiallyConsistent)
+            }
+        }
+
+        fileprivate func noteDeinitEntered() {
+            if !lifecycleDeinitEntered.exchange(true, ordering: .sequentiallyConsistent) {
+                _ = LifecycleCounters.deinitEntered.wrappingAdd(1, ordering: .sequentiallyConsistent)
+            }
+        }
 
         /// Controls diagnostic publication only. Set once before preparing a
         /// fresh fixture; disabled snapshots retain the last published record.
@@ -394,7 +484,21 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         self.timer = timer
         timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(2))
         timer.setEventHandler { [weak self] in self?.pump() }
+        _ = LifecycleCounters.created.wrappingAdd(1, ordering: .sequentiallyConsistent)
         timer.resume()
+    }
+
+    deinit { progressRecorder.noteDeinitEntered() }
+
+    /// Test calibration only: a finite hold on this exact decoder's worker, with
+    /// no reader, audio graph, media or production call site involved.
+    func enqueueLifecycleCalibrationHold(entered: DispatchSemaphore, release: DispatchSemaphore) {
+        worker.async { [self] in
+            progressRecorder.withKnownWorkerWait {
+                entered.signal()
+                _ = release.wait(timeout: .now() + .seconds(12))
+            }
+        }
     }
 
     /// Metadata loading may suspend; decoding and publishing are serialized.
@@ -517,12 +621,16 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     func shutdown() {
+        progressRecorder.noteShutdownRequested()
         worker.async { [self] in
             let previous = progressRecorder.enter(.retiringSlots, token: 0, slot: -1, epoch: 0)
             defer { progressRecorder.restore(previous) }
             stopped = true
             timer?.setEventHandler {}; timer?.cancel(); timer = nil
             slots = [nil, nil, nil]
+            // Only this existing cleanup body has returned from releasing slots.
+            // This is not proof that all SDK-internal/autoreleased state is gone.
+            progressRecorder.noteShutdownCompleted()
         }
     }
 

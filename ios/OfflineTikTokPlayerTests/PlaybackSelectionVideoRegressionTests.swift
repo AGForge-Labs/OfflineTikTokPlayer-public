@@ -554,19 +554,53 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         // Trace-on includes phase publication and conditional kernel observations;
         // trace-off skips the kernel reader entirely.
         // Every arm keeps the same independent snapshot sampler and bounds.
+        var witnesses: [SelectionDecoderLifetimeWitness] = []
+        witnesses.reserveCapacity(4)
         for condition in [(trace: false, capture: false), (trace: true, capture: false),
                           (trace: false, capture: true), (trace: true, capture: true)] {
-            do { try await measureNaturalProducer(trace: condition.trace, capture: condition.capture) }
+            let conditionLabel = "trace-\(condition.trace)-capture-\(condition.capture)"
+            logDecoderLifetimes(boundary: "before-\(conditionLabel)", witnesses: witnesses)
+            do { try await measureNaturalProducer(trace: condition.trace, capture: condition.capture, witnesses: &witnesses) }
             catch { XCTFail("Matched natural setup failed: \(error)") }
+            // The helper's strong screen/service/audio locals are now out of
+            // scope. Witnesses retain only its numeric recorder and weak owners.
+            logDecoderLifetimes(boundary: "after-\(conditionLabel)", witnesses: witnesses)
         }
+        XCTAssertLessThanOrEqual(witnesses.count, 4)
     }
 
-    private func measureNaturalProducer(trace: Bool, capture: Bool) async throws {
+    private func logDecoderLifetimes(boundary: String, witnesses: [SelectionDecoderLifetimeWitness]) {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let global = ContinuousPCMDecoder.lifecycleSnapshot()
+        var lines: [String] = []
+        lines.reserveCapacity(4)
+        for (arm, witness) in witnesses.prefix(4).enumerated() {
+            let lifetime = witness.recorder.lifecycleSnapshot()
+            let phase = witness.recorder.snapshot()
+            let now = DispatchTime.now().uptimeNanoseconds
+            let age = phase.tracingEnabled && phase.coherent && phase.phase != .idle
+                && phase.phaseEnteredUptimeNanoseconds > 0 && now >= phase.phaseEnteredUptimeNanoseconds
+                ? Double(now - phase.phaseEnteredUptimeNanoseconds) / 1_000_000 : -1
+            lines.append("SelectionDecoderLifetimeWitness boundary=\(boundary) arm=\(arm) label=\(witness.label) workerID=\(witness.recorder.workerIdentifier) serviceAlive=\(witness.service != nil) audioAlive=\(witness.audio != nil) shutdownRequested=\(lifetime.shutdownRequested) shutdownCompleted=\(lifetime.shutdownCompleted) deinitEntered=\(lifetime.deinitEntered) trace=\(phase.tracingEnabled) coherent=\(phase.coherent) phase=\(phase.phase.rawValue) phaseSequence=\(phase.phaseSequence) phaseAgeMs=\(age) token=\(phase.token) slot=\(phase.slot) epoch=\(phase.epoch)")
+        }
+        let ended = DispatchTime.now().uptimeNanoseconds
+        print("SelectionDecoderLifetime boundary=\(boundary) created=\(global.createdInstances) deinitEntered=\(global.deinitEnteredInstances) live=\(global.liveInstances.map(String.init) ?? "unavailable") shutdownCalls=\(global.shutdownRequestCalls) shutdownRequested=\(global.shutdownRequestedInstances) shutdownCompleted=\(global.shutdownCompletedInstances) stableReread=\(global.stableReread) acquisitionNs=\(ended >= started ? ended - started : 0) witnesses=\(witnesses.count)")
+        for line in lines { print(line) }
+    }
+
+    private func measureNaturalProducer(trace: Bool, capture: Bool,
+        witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
+        // Fixture generation has yielded before the next decoder is created;
+        // this separates immediate scope-release from survival into a later arm.
+        logDecoderLifetimes(boundary: "fixture-ready-before-new-decoder-trace-\(trace)-capture-\(capture)", witnesses: witnesses)
         let audio = ContinuousAudioPlayer()
         audio.producerProgressRecorder.setTracingEnabled(trace)
         let service = fixture.service(continuousAudio: audio)
+        precondition(witnesses.count < 4)
+        witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
+            label: "matched-natural-trace-\(trace)-capture-\(capture)"))
         let screen = try SelectionVideoScreen(service: service)
         let label = "matched-natural-trace-\(trace)-capture-\(capture)"
         let setupStart = ProcessInfo.processInfo.systemUptime
@@ -1083,6 +1117,20 @@ final class SelectionVideoFixture {
         else { UserDefaults.standard.removeObject(forKey: "automaticPiP") }
     }
 
+}
+
+@MainActor
+private final class SelectionDecoderLifetimeWitness {
+    weak var service: PlaybackService?
+    weak var audio: ContinuousAudioPlayer?
+    let recorder: ContinuousPCMDecoder.ProgressRecorder
+    let label: String
+
+    init(service: PlaybackService, audio: ContinuousAudioPlayer, label: String) {
+        self.service = service; self.audio = audio
+        self.label = label
+        recorder = audio.producerProgressRecorder
+    }
 }
 
 @MainActor

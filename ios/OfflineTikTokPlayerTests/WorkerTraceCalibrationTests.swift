@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import PlayerCore
 @testable import OfflineTikTokPlayer
 
 /// Lexicographic class ordering keeps this tool calibration after playback
@@ -87,5 +88,96 @@ final class ZZZWorkerTraceCalibrationTests: XCTestCase {
         XCTAssertEqual(recorder.workerThreadState(matching: recorder.snapshot()).statusCode, 3)
         recorder.setTracingEnabled(false)
         XCTAssertEqual(recorder.workerThreadState(matching: recorder.snapshot()).statusCode, 1)
+        try await verifyIdleDecoderLifecycle()
+        try await verifyHeldDecoderLifecycle()
+    }
+
+    private func verifyIdleDecoderLifecycle() async throws {
+        let before = ContinuousPCMDecoder.lifecycleSnapshot()
+        var decoder: ContinuousPCMDecoder? = ContinuousPCMDecoder(renderer: ContinuousPCMRenderer())
+        defer { decoder?.shutdown() }
+        weak var owner = decoder
+        let recorder = try XCTUnwrap(decoder?.progressRecorder)
+        // Lifecycle publication is independent of optional native tracing.
+        recorder.setTracingEnabled(false)
+        decoder?.shutdown()
+        decoder?.shutdown()
+        XCTAssertTrue(recorder.lifecycleSnapshot().shutdownRequested)
+        decoder = nil
+        let completed = try await untilLifecycle {
+            let state = recorder.lifecycleSnapshot()
+            return state.shutdownCompleted && state.deinitEntered && owner == nil
+        }
+        XCTAssertTrue(completed, "An idle decoder must finish shutdown and enter deinit while its recorder remains retained")
+        let state = recorder.lifecycleSnapshot()
+        XCTAssertTrue(state.shutdownRequested)
+        XCTAssertTrue(state.shutdownCompleted)
+        XCTAssertTrue(state.deinitEntered)
+        XCTAssertNil(owner)
+        let after = ContinuousPCMDecoder.lifecycleSnapshot()
+        assertMinimumIncrease(after.createdInstances, from: before.createdInstances, minimum: 1)
+        assertMinimumIncrease(after.shutdownRequestCalls, from: before.shutdownRequestCalls, minimum: 2)
+        assertMinimumIncrease(after.shutdownRequestedInstances, from: before.shutdownRequestedInstances, minimum: 1)
+        assertMinimumIncrease(after.shutdownCompletedInstances, from: before.shutdownCompletedInstances, minimum: 1)
+        assertMinimumIncrease(after.deinitEnteredInstances, from: before.deinitEnteredInstances, minimum: 1)
+        if after.stableReread { XCTAssertNotNil(after.liveInstances, "Stable lifecycle counts must permit checked live-instance arithmetic") }
+        logLifecycle("idle-completed", recorder: recorder)
+    }
+
+    private func verifyHeldDecoderLifecycle() async throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        var decoder: ContinuousPCMDecoder? = ContinuousPCMDecoder(renderer: ContinuousPCMRenderer())
+        defer { decoder?.shutdown(); release.signal() }
+        weak var owner = decoder
+        let recorder = try XCTUnwrap(decoder?.progressRecorder)
+        decoder?.enqueueLifecycleCalibrationHold(entered: entered, release: release)
+        let active = try await untilLifecycle { entered.wait(timeout: .now()) == .success }
+        guard active else { XCTFail("The actual decoder worker did not enter its bounded lifecycle hold"); return }
+        decoder?.shutdown()
+        decoder = nil
+        let pending = recorder.lifecycleSnapshot()
+        XCTAssertTrue(pending.shutdownRequested)
+        XCTAssertFalse(pending.shutdownCompleted)
+        XCTAssertFalse(pending.deinitEntered)
+        XCTAssertNotNil(owner, "Queued shutdown must retain its decoder until the held worker can run it")
+        XCTAssertEqual(recorder.snapshot().phase, .calibrationWait)
+        logLifecycle("held-pending", recorder: recorder)
+        release.signal()
+        let completed = try await untilLifecycle {
+            let state = recorder.lifecycleSnapshot()
+            return state.shutdownCompleted && state.deinitEntered && owner == nil
+        }
+        XCTAssertTrue(completed, "Releasing the worker must allow queued shutdown and deinit to finish")
+        let state = recorder.lifecycleSnapshot()
+        XCTAssertTrue(state.shutdownRequested)
+        XCTAssertTrue(state.shutdownCompleted)
+        XCTAssertTrue(state.deinitEntered)
+        XCTAssertNil(owner)
+        logLifecycle("held-completed", recorder: recorder)
+    }
+
+    private func untilLifecycle(_ condition: () -> Bool) async throws -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if condition() { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
+
+    private func assertMinimumIncrease(_ value: Int64, from previous: Int64, minimum: Int64,
+                                       file: StaticString = #filePath, line: UInt = #line) {
+        let difference = value.subtractingReportingOverflow(previous)
+        XCTAssertFalse(difference.overflow, file: file, line: line)
+        if !difference.overflow {
+            XCTAssertGreaterThanOrEqual(difference.partialValue, minimum, file: file, line: line)
+        }
+    }
+
+    private func logLifecycle(_ phase: String, recorder: ContinuousPCMDecoder.ProgressRecorder) {
+        let global = ContinuousPCMDecoder.lifecycleSnapshot()
+        let state = recorder.lifecycleSnapshot()
+        print("SelectionDecoderLifecycleCalibration phase=\(phase) workerID=\(recorder.workerIdentifier) createdInstances=\(global.createdInstances) deinitEnteredInstances=\(global.deinitEnteredInstances) liveInstances=\(global.liveInstances ?? -1) stableReread=\(global.stableReread) shutdownRequestCalls=\(global.shutdownRequestCalls) shutdownRequestedInstances=\(global.shutdownRequestedInstances) shutdownCompletedInstances=\(global.shutdownCompletedInstances) shutdownRequested=\(state.shutdownRequested) shutdownCompleted=\(state.shutdownCompleted) deinitEntered=\(state.deinitEntered)")
     }
 }
