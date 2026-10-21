@@ -17,7 +17,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/export-compositor-evidence.py"
 SHA = "a" * 40
-IOS_TREE = "04ede18d838c5bb2e2064789dffed9c7c843ee9e"
+IOS_TREE = "f15663a48e48fe25fb66d5506042a1ce49c91459"
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6WQAAAAASUVORK5CYII=")
 NATIVE_JSON = b'{"unknownAppleManifestShape":[{"name":"synthetic capture"}]}\n'

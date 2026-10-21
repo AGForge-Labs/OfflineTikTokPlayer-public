@@ -54,9 +54,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
             label: "getter-arm-phase-\(phaseBase)"))
         let captureOwnershipProbe = phaseBase == 60
+        let extraSceneOwnershipProbe = phaseBase == 50
         let labelSuffix = captureOwnershipProbe ? "-capture-ownership-probe-control" : (phaseBase == 70 ? "-capture-ownership-after-control" : (startupSeekGraceControl ? "-startup-seek-grace-control" : (phaseBase == 50 ? "-native-player-trace-after-control" : (nativePlayerTraceControl ? "-native-player-trace-control" : (pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : ""))))))
         let returnedPhase = phaseBase + 2, returnedCaptureLabel = "latency-returned-A" + labelSuffix
-        let screen = try SelectionVideoScreen(service: service, captureOwnershipProbe: captureOwnershipProbe)
+        let screen = try SelectionVideoScreen(service: service, captureOwnershipProbe: captureOwnershipProbe,
+            extraSceneOwnershipProbe: extraSceneOwnershipProbe)
         var lateProducerResult: SelectionProducerProbe.Result?
         var lateProducerFinal: ContinuousPCMRenderer.Snapshot?
         var lateProducerArm: String?, lateProducerStop: String?
@@ -114,20 +116,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                       id: fixture.aID, frequency: 440, prepared: false, sourceQuiet: sourceQuiet) {
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         }
-        if captureOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase) }
+        if captureOwnershipProbe || extraSceneOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase) }
         assertSelection(service, fixture: fixture, id: fixture.aID)
         await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-cold-A" + labelSuffix)
         try await require({ service.preparedAudioCount == 2 }, "B must be prepared before timing Next")
 
         await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phaseBase + 1,
                                       id: fixture.bID, frequency: 880, prepared: true, sourceQuiet: sourceQuiet) { service.next() }
-        if captureOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase + 1) }
+        if captureOwnershipProbe || extraSceneOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase + 1) }
         assertSelection(service, fixture: fixture, id: fixture.bID)
         await assertVisibleFrame(service, screen: screen, identity: .b, label: "latency-prepared-B" + labelSuffix)
 
         await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phaseBase + 2,
                                       id: fixture.aID, frequency: 440, prepared: true, sourceQuiet: sourceQuiet) { service.previous() }
-        if captureOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase + 2) }
+        if captureOwnershipProbe || extraSceneOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase + 2) }
         assertSelection(service, fixture: fixture, id: fixture.aID)
         do {
             let recorder = audio.producerProgressRecorder
@@ -2255,6 +2257,20 @@ private struct SelectionCaptureRendererObservation {
 }
 
 @MainActor
+private final class SelectionSceneHostingController: UIHostingController<SelectionVideoHarness> {
+    private(set) var appeared: UInt64 = 0, disappeared: UInt64 = 0
+    private(set) var appearanceSaturated = false
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if appeared == .max { appearanceSaturated = true } else { appeared += 1 }
+    }
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        if disappeared == .max { appearanceSaturated = true } else { disappeared += 1 }
+    }
+}
+
+@MainActor
 private final class SelectionVideoScreen {
     let window: UIWindow
     let service: PlaybackService
@@ -2266,6 +2282,9 @@ private final class SelectionVideoScreen {
     private static var nextCaptureNonce: UInt32 = 0
     private let ownershipOrdinal: UInt32
     private let ownershipStamp: SelectionCaptureStampView?
+    private let captureOwnershipProbe: Bool
+    private let extraSceneOwnershipProbe: Bool
+    private weak var initialProbeScene: UIWindowScene?
     private var ownershipPhase = -1
     private var latencyFinishedUptime = 0.0
     private var producerResults: [(String, SelectionProducerProbe.Result)] = []
@@ -2277,12 +2296,15 @@ private final class SelectionVideoScreen {
 
     init(service: PlaybackService, producerContext: SelectionProducerContext? = nil,
          producerWindowSeconds: Double = 8, producerSampleCapacity: Int = 128,
-         captureOwnershipProbe: Bool = false) throws {
+         captureOwnershipProbe: Bool = false, extraSceneOwnershipProbe: Bool = false) throws {
         self.service = service
         self.producerContext = producerContext
         self.producerWindowSeconds = producerWindowSeconds
         self.producerSampleCapacity = producerSampleCapacity
-        if captureOwnershipProbe {
+        self.captureOwnershipProbe = captureOwnershipProbe
+        self.extraSceneOwnershipProbe = extraSceneOwnershipProbe
+        precondition(!captureOwnershipProbe || !extraSceneOwnershipProbe)
+        if captureOwnershipProbe || extraSceneOwnershipProbe {
             ownershipOrdinal = Self.issueIdentifier(&Self.nextOwnershipOrdinal) ?? 0
             ownershipStamp = SelectionCaptureStampView(frame: .zero)
         } else { ownershipOrdinal = 0; ownershipStamp = nil }
@@ -2292,10 +2314,18 @@ private final class SelectionVideoScreen {
         window = UIWindow(windowScene: scene)
         window.frame = scene.coordinateSpace.bounds
         window.windowLevel = .alert + 1
-        window.rootViewController = UIHostingController(rootView: SelectionVideoHarness(service: service))
+        if extraSceneOwnershipProbe {
+            window.rootViewController = SelectionSceneHostingController(rootView: SelectionVideoHarness(service: service))
+        } else {
+            window.rootViewController = UIHostingController(rootView: SelectionVideoHarness(service: service))
+        }
         window.makeKeyAndVisible()
         window.rootViewController?.view.layoutIfNeeded()
         if let ownershipStamp { window.addSubview(ownershipStamp) }
+        if extraSceneOwnershipProbe {
+            initialProbeScene = scene
+            logSceneOwnership(boundary: "init", label: "setup", phase: 50)
+        }
     }
 
     private static func issueIdentifier(_ value: inout UInt32) -> UInt32? {
@@ -2349,6 +2379,13 @@ private final class SelectionVideoScreen {
             let state = ownershipState(surface: surface, stamp: stamp)
             return (nonce, state, begin, ProcessInfo.processInfo.systemUptime)
         }
+        var sceneAfterLogged = false
+        if extraSceneOwnershipProbe { logSceneOwnership(boundary: "before", label: label, phase: ownershipPhase) }
+        defer {
+            if extraSceneOwnershipProbe && !sceneAfterLogged {
+                logSceneOwnership(boundary: "after", label: label, phase: ownershipPhase, failed: true)
+            }
+        }
         CATransaction.flush()
         let image: UIImage
         let scaleX: CGFloat
@@ -2373,6 +2410,10 @@ private final class SelectionVideoScreen {
         guard drewHierarchy else { throw SelectionVideoTestFailure.capture }
         scaleX = 1; scaleY = 1
         #endif
+        if extraSceneOwnershipProbe {
+            logSceneOwnership(boundary: "after", label: label, phase: ownershipPhase)
+            sceneAfterLogged = true
+        }
         let attachment = XCTAttachment(image: image)
         attachment.name = "Selected-video-composite-" + label
         attachment.lifetime = .keepAlways
@@ -2391,14 +2432,17 @@ private final class SelectionVideoScreen {
             let ownershipAfter = ownershipState(surface: points, stamp: stamp)
             // Probe-only, post-image SDK observation. This is not renderer state
             // at the image's acquisition instant and never triggers recovery.
-            let rendererBegin = ProcessInfo.processInfo.systemUptime
-            let renderer = customVideoLayer
-            let rendererStatus = renderer?.status.rawValue
-            let rendererRequiresFlush = renderer?.requiresFlushToResumeDecoding
-            let rendererErrorCode = renderer?.error.map { ($0 as NSError).code }
-            let rendererObservation = SelectionCaptureRendererObservation(begin: rendererBegin,
-                end: ProcessInfo.processInfo.systemUptime, present: renderer != nil,
-                status: rendererStatus, requiresFlush: rendererRequiresFlush, errorCode: rendererErrorCode)
+            var rendererObservation: SelectionCaptureRendererObservation?
+            if captureOwnershipProbe {
+                let rendererBegin = ProcessInfo.processInfo.systemUptime
+                let renderer = customVideoLayer
+                let rendererStatus = renderer?.status.rawValue
+                let rendererRequiresFlush = renderer?.requiresFlushToResumeDecoding
+                let rendererErrorCode = renderer?.error.map { ($0 as NSError).code }
+                rendererObservation = SelectionCaptureRendererObservation(begin: rendererBegin,
+                    end: ProcessInfo.processInfo.systemUptime, present: renderer != nil,
+                    status: rendererStatus, requiresFlush: rendererRequiresFlush, errorCode: rendererErrorCode)
+            }
             let stampPixels = CGRect(x: ownershipBefore.stamp.minX * scaleX, y: ownershipBefore.stamp.minY * scaleY,
                 width: ownershipBefore.stamp.width * scaleX, height: ownershipBefore.stamp.height * scaleY).integral
             let imageBounds = CGRect(x: 0, y: 0, width: cg.width, height: cg.height)
@@ -2411,14 +2455,22 @@ private final class SelectionVideoScreen {
             if nonce == 0 || ownershipOrdinal == 0 { verdict = .identifierExhausted }
             else if !geometryValid { verdict = .invalidGeometry }
             else if geometryChanged || !ownershipBefore.visibleOwner || !ownershipAfter.visibleOwner
-                || !(60...62).contains(ownershipPhase) || latencyFinishedUptime <= 0 || prepBegin < latencyFinishedUptime { verdict = .stateMismatch }
+                || !(captureOwnershipProbe ? 60...62 : 50...52).contains(ownershipPhase)
+                || latencyFinishedUptime <= 0 || prepBegin < latencyFinishedUptime { verdict = .stateMismatch }
             else { verdict = decoded.verdict }
             let decodeEnd = ProcessInfo.processInfo.systemUptime
-            logOwnership(label: label, phase: ownershipPhase, ordinal: ownershipOrdinal, nonce: nonce,
-                before: ownershipBefore, after: ownershipAfter, image: cg, surfacePixels: rect, stampPixels: stampPixels,
-                scaleX: scaleX, scaleY: scaleY, geometryValid: geometryValid, geometryChanged: geometryChanged,
-                verdict: verdict, decoded: decoded, prepBegin: prepBegin, prepEnd: prepEnd,
-                decodeBegin: decodeBegin, decodeEnd: decodeEnd, renderer: rendererObservation)
+            if let rendererObservation {
+                logOwnership(label: label, phase: ownershipPhase, ordinal: ownershipOrdinal, nonce: nonce,
+                    before: ownershipBefore, after: ownershipAfter, image: cg, surfacePixels: rect, stampPixels: stampPixels,
+                    scaleX: scaleX, scaleY: scaleY, geometryValid: geometryValid, geometryChanged: geometryChanged,
+                    verdict: verdict, decoded: decoded, prepBegin: prepBegin, prepEnd: prepEnd,
+                    decodeBegin: decodeBegin, decodeEnd: decodeEnd, renderer: rendererObservation)
+            } else if extraSceneOwnershipProbe {
+                logSceneMarker(label: label, nonce: nonce, before: ownershipBefore, after: ownershipAfter,
+                    image: cg, surfacePixels: rect, stampPixels: stampPixels, scaleX: scaleX, scaleY: scaleY,
+                    geometryValid: geometryValid, geometryChanged: geometryChanged, verdict: verdict, decoded: decoded,
+                    prepBegin: prepBegin, prepEnd: prepEnd, decodeBegin: decodeBegin, decodeEnd: decodeEnd)
+            }
             XCTAssertEqual(verdict, .owned, "The same returned compositor image must identify this capture window; original video pixels are still checked")
         }
         guard let cg = fullCompositorImage, rect.width > 0, rect.height > 0,
@@ -2426,7 +2478,7 @@ private final class SelectionVideoScreen {
               let cropped = cg.cropping(to: rect) else { throw SelectionVideoTestFailure.capture }
         var pixels = try SelectionVideoPixels(cropped, scaleX: Double(scaleX), scaleY: Double(scaleY), captureBefore: before)
         pixels.captureAfter = captureState()
-        if let (nonce, _, _, _) = ownershipPreparation {
+        if captureOwnershipProbe, let (nonce, _, _, _) = ownershipPreparation {
             let scanBegin = ProcessInfo.processInfo.systemUptime
             let fractionA = pixels.fraction(.a), fractionB = pixels.fraction(.b)
             let scanEnd = ProcessInfo.processInfo.systemUptime
@@ -2443,6 +2495,54 @@ private final class SelectionVideoScreen {
             surfaceWindowMatches: service.surface.window === window, surfaceHidden: service.surface.isHidden,
             stampWindowMatches: stamp.window === window, stampHidden: stamp.isHidden,
             windowBounds: window.bounds, surface: surface, stamp: stamp.frame)
+    }
+
+    /// Endpoint-only UIKit observations; no transition observers, refocusing or
+    /// scene selection changes. Counts inspect at most eight scenes/16 windows.
+    private func logSceneOwnership(boundary: String, label: String, phase: Int, failed: Bool = false) {
+        let begin = ProcessInfo.processInfo.systemUptime
+        let scenes = UIApplication.shared.connectedScenes
+        var overflow = scenes.count > 8, windowCount = 0, mainCandidates = 0
+        var sceneConnected = false, sceneListsWindow = false, selectedKeyWindows = 0, otherKeyWindows = 0
+        let selected = window.windowScene
+        for scene in scenes.prefix(8) {
+            guard let candidate = scene as? UIWindowScene else { continue }
+            if candidate === selected { sceneConnected = true }
+            if candidate.activationState == .foregroundActive && candidate.session.role == .windowApplication
+                && candidate.screen === UIScreen.main { mainCandidates += 1 }
+            let windows = candidate.windows
+            let remaining = max(0, 16 - windowCount)
+            if windows.count > remaining { overflow = true }
+            for candidateWindow in windows.prefix(remaining) {
+                if candidate === selected && candidateWindow === window { sceneListsWindow = true }
+                if candidateWindow.isKeyWindow {
+                    if candidate === selected { selectedKeyWindows += 1 }
+                    if candidateWindow !== window { otherKeyWindows += 1 }
+                }
+            }
+            windowCount = min(17, windowCount + windows.count)
+        }
+        let root = window.rootViewController, host = window.rootViewController?.viewIfLoaded
+        let hostingTypeMatches = root is UIHostingController<SelectionVideoHarness>
+        let appearance = root as? SelectionSceneHostingController
+        let selectedRoleCode = selected?.session.role == .windowApplication ? 1 : 0
+        let fields = "failed=\(failed) endpointOnly=true transitionObservers=0 maximumScenes=8 maximumWindows=16 connectedScenes=\(scenes.count) windowCountCapped17=\(windowCount) overflow=\(overflow) activeMainCandidates=\(mainCandidates) applicationState=\(UIApplication.shared.applicationState.rawValue) scenePresent=\(selected != nil) sceneMatchesInitial=\(selected != nil && selected === initialProbeScene) sceneConnected=\(sceneConnected) sceneListsWindow=\(sceneListsWindow) sceneActivation=\(selected?.activationState.rawValue ?? -1) sceneRoleCode=\(selectedRoleCode) sceneMainScreen=\(selected?.screen === UIScreen.main) selectedKeyWindows=\(selectedKeyWindows) otherKeyWindows=\(otherKeyWindows) windowKey=\(window.isKeyWindow) windowHidden=\(window.isHidden) windowAlpha=\(window.alpha) windowX=\(window.frame.minX) windowY=\(window.frame.minY) windowW=\(window.frame.width) windowH=\(window.frame.height) hostingPresent=\(root != nil) hostingTypeMatches=\(hostingTypeMatches) hostingLoaded=\(root?.isViewLoaded == true) hostingWindowMatches=\(host?.window === window) hostingHidden=\(host?.isHidden ?? true) hostingAlpha=\(host?.alpha ?? -1) appearanceObserved=\(appearance != nil) appearedCount=\(appearance?.appeared ?? 0) disappearedCount=\(appearance?.disappeared ?? 0) appearanceSaturated=\(appearance?.appearanceSaturated ?? false) surfaceSuperviewPresent=\(service.surface.superview != nil) surfaceWindowMatches=\(service.surface.window === window) surfaceHidden=\(service.surface.isHidden) surfaceAlpha=\(service.surface.alpha) stampWindowMatches=\(ownershipStamp?.window === window) stampHidden=\(ownershipStamp?.isHidden ?? true) stampAlpha=\(ownershipStamp?.alpha ?? -1)"
+        let end = ProcessInfo.processInfo.systemUptime
+        XCTAssertFalse(overflow, "Scene ownership evidence must fit eight scenes and 16 windows")
+        guard captureLogs.count < 128 else { droppedDiagnostics += 1; return }
+        captureLogs.append("SelectionCaptureSceneOwnership kind=state boundary=\(boundary) phase=\(phase) label=\(label) ordinal=\(ownershipOrdinal) nonce=\(ownershipStamp?.nonce ?? 0) begin=\(begin) end=\(end) \(fields) workScope=bounded-UIKit-queries-and-field-string-construction-excludes-final-prefix-append")
+    }
+
+    private func logSceneMarker(label: String, nonce: UInt32, before: SelectionCaptureOwnershipState,
+        after: SelectionCaptureOwnershipState, image: CGImage, surfacePixels: CGRect, stampPixels: CGRect,
+        scaleX: CGFloat, scaleY: CGFloat, geometryValid: Bool, geometryChanged: Bool,
+        verdict: SelectionCaptureStampCodec.Verdict, decoded: SelectionCaptureStampCodec.Result,
+        prepBegin: Double, prepEnd: Double, decodeBegin: Double, decodeEnd: Double) {
+        guard captureLogs.count < 128 else { droppedDiagnostics += 1; return }
+        func rect(_ prefix: String, _ value: CGRect) -> String {
+            "\(prefix)X=\(value.minX) \(prefix)Y=\(value.minY) \(prefix)W=\(value.width) \(prefix)H=\(value.height)"
+        }
+        captureLogs.append("SelectionCaptureSceneOwnership kind=marker phase=\(ownershipPhase) label=\(label) ordinal=\(ownershipOrdinal) nonce=\(nonce) decodedNonce=\(decoded.decodedNonce.map { String($0) } ?? "unavailable") verdictCode=\(verdict.rawValue) codecVerdictCode=\(decoded.verdict.rawValue) sentinel=\(SelectionCaptureStampCodec.sentinel) sentinelValid=\(decoded.sentinelValid) complementValid=\(decoded.complementValid) orientation=\(decoded.orientation) sameCGImage=true imageWidth=\(image.width) imageHeight=\(image.height) scaleX=\(scaleX) scaleY=\(scaleY) geometryValid=\(geometryValid) geometryChanged=\(geometryChanged) marginPoints=8 windowKeyBefore=\(before.key) windowKeyAfter=\(after.key) windowHiddenBefore=\(before.hidden) windowHiddenAfter=\(after.hidden) surfaceWindowBefore=\(before.surfaceWindowMatches) surfaceWindowAfter=\(after.surfaceWindowMatches) stampWindowBefore=\(before.stampWindowMatches) stampWindowAfter=\(after.stampWindowMatches) \(rect("windowBefore", before.windowBounds)) \(rect("windowAfter", after.windowBounds)) \(rect("surfaceBefore", before.surface)) \(rect("surfaceAfter", after.surface)) \(rect("stampBefore", before.stamp)) \(rect("stampAfter", after.stamp)) \(rect("surfacePixels", surfacePixels)) \(rect("stampPixels", stampPixels)) latencyFinishedUptime=\(latencyFinishedUptime) prepBegin=\(prepBegin) prepEnd=\(prepEnd) decodeBegin=\(decodeBegin) decodeEnd=\(decodeEnd) decoderBytes=384 rendererGetterCount=0 additionalABScans=0 workScope=stamp-preparation-and-same-image-decode-excludes-scene-endpoint-rows-gpu-attachment-log")
     }
 
     private func logOwnership(label: String, phase: Int, ordinal: UInt32, nonce: UInt32,
