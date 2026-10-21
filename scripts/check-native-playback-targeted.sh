@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=c14f358c222783d80a9fa8628aff10eb1b027465
-expected_ios_tree=66e25f512367af71904bdbb401c7e73d1d361bd8
+expected_code_source=ed300b654f3bf94c17fdeb24012ae49f4ae0650b
+expected_ios_tree=0e278307d6b3d0bffd8414ab129d8c72185fb2fe
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -98,51 +98,86 @@ def command(arguments, timeout, deadline=None):
         require(timeout > 0, 'App-host boundary deadline elapsed')
     return subprocess.run(arguments, capture_output=True, text=True, timeout=timeout, check=False)
 
-def app_executable(simulator, deadline=None):
-    lookup = command(['xcrun', 'simctl', 'get_app_container', simulator, BUNDLE, 'app'], 5, deadline)
-    require(lookup.returncode == 0, 'Could not establish exact installed app ownership')
-    bundle = Path(lookup.stdout.strip())
-    require(bundle.is_absolute() and bundle.name == EXECUTABLE + '.app' and bundle.is_dir()
-            and not bundle.is_symlink(), 'Unexpected app container')
-    with (bundle / 'Info.plist').open('rb') as stream:
-        info = plistlib.load(stream)
-    require(info.get('CFBundleIdentifier') == BUNDLE and info.get('CFBundleExecutable') == EXECUTABLE,
-            'Installed app identity mismatch')
-    # The only accepted process container family belongs to this exact UDID.
-    tail = bundle.parts[-7:]
-    require(len(tail) == 7 and tail[0].upper() == simulator.upper()
-            and tail[1:5] == ('data', 'Containers', 'Bundle', 'Application')
-            and str(uuid.UUID(tail[5])).upper() == tail[5].upper(), 'Unexpected Simulator app container family')
-    return bundle / EXECUTABLE, bundle.parents[1]
-
 def owned_processes(simulator, deadline=None):
-    current, application_root = app_executable(simulator, deadline)
-    listing = command(['/bin/ps', '-ww', '-axo', 'pid=,command='], 2, deadline)
-    require(listing.returncode == 0, 'Could not establish exact app process absence')
-    found = []
-    # Read only ps-reported candidate executables. No directory scan, basename
-    # kill, or ownership cache from an unsuccessful container lookup is used.
-    for row in listing.stdout.splitlines():
-        fields = row.strip().split(None, 1)
-        if len(fields) != 2:
-            continue
-        pid, text = fields
-        match = re.match(r'^(/.+?/OfflineTikTokPlayer\.app/OfflineTikTokPlayer)(?:\s|$)', text)
-        if not match:
-            require(not re.match(r'^(?:OfflineTikTokPlayer)(?:\s|$)', text), 'Unqualified app executable prevents absence proof')
-            continue
-        executable = Path(match.group(1))
-        if executable.parent.parent.parent != application_root:
-            continue
-        require(executable.parent.parent.name.upper() == str(uuid.UUID(executable.parent.parent.name)).upper(),
-                'Malformed app process container identity')
-        with (executable.parent / 'Info.plist').open('rb') as stream:
-            info = plistlib.load(stream)
-        require(info.get('CFBundleIdentifier') == BUNDLE and info.get('CFBundleExecutable') == EXECUTABLE,
-                'Unresolved app process ownership')
-        require(pid.isdigit() and len(found) < 4, 'Unexpected app process inventory')
-        found.append(int(pid))
-    return found
+    device_rc, ps_rc, state_code, category = -1, -1, 0, 1
+    try:
+        require(str(uuid.UUID(simulator)).upper() == simulator.upper(), 'Invalid Simulator identity')
+        lookup = command(['xcrun', 'simctl', 'list', 'devices', '--json'], 5, deadline)
+        device_rc = lookup.returncode
+        require(device_rc == 0, 'Device lookup failed')
+        category = 2
+        require(len(lookup.stdout) <= 262144, 'Device inventory exceeds bound')
+        payload = json.loads(lookup.stdout)
+        groups = payload.get('devices') if isinstance(payload, dict) else None
+        require(isinstance(groups, dict) and len(groups) <= 64, 'Malformed device inventory')
+        devices = []
+        for group in groups.values():
+            require(isinstance(group, list) and len(devices) + len(group) <= 512, 'Malformed device inventory')
+            devices.extend(group)
+        matches = [device for device in devices if isinstance(device, dict)
+                   and isinstance(device.get('udid'), str) and device['udid'].upper() == simulator.upper()]
+        require(len(matches) == 1, 'Device identity is missing or ambiguous')
+        device = matches[0]
+        state_code = {'Booted': 1, 'Shutdown': 2, 'Creating': 3, 'Deleting': 4}.get(device.get('state'), 0)
+        raw_data = device.get('dataPath')
+        require(isinstance(raw_data, str) and 0 < len(raw_data) <= 4096, 'Missing device data path')
+        data = Path(raw_data)
+        require(data.is_absolute() and data.name == 'data' and data.parent.name.upper() == simulator.upper()
+                and str(uuid.UUID(data.parent.name)).upper() == simulator.upper()
+                and not data.is_symlink() and data.is_dir() and data.resolve(strict=True) == data,
+                'Unresolved device data ownership')
+        application_root = data / 'Containers' / 'Bundle' / 'Application'
+        require(not application_root.is_symlink() and application_root.resolve() == application_root,
+                'Unresolved application family')
+        category = 3
+        listing = command(['/bin/ps', '-ww', '-axo', 'pid=,command='], 2, deadline)
+        ps_rc = listing.returncode
+        require(ps_rc == 0, 'Process lookup failed')
+        category = 4
+        require(len(listing.stdout) <= 1048576, 'Process inventory exceeds bound')
+        rows = listing.stdout.splitlines()
+        require(len(rows) <= 4096, 'Process inventory exceeds bound')
+        found = []
+        # Inspect only ps-reported candidates. No installation, boot, directory
+        # scan, PID termination or cached device family is needed for absence.
+        for row in rows:
+            fields = row.strip().split(None, 1)
+            if len(fields) != 2:
+                continue
+            pid, text = fields
+            match = re.match(r'^(/.+?/OfflineTikTokPlayer\.app/OfflineTikTokPlayer)(?:\s|$)', text)
+            if not match:
+                require('OfflineTikTokPlayer.app/OfflineTikTokPlayer' not in text
+                        and not re.match(r'^OfflineTikTokPlayer(?:\s|$)', text), 'Ambiguous app executable')
+                continue
+            executable = Path(match.group(1))
+            family = executable.parent.parent.parent
+            if family != application_root:
+                require(family.resolve() != application_root
+                        and (len(family.parents) < 4 or family.parents[3].name.upper() != simulator.upper()),
+                        'Ambiguous selected-device app family')
+                continue
+            require(str(uuid.UUID(executable.parent.parent.name)).upper() == executable.parent.parent.name.upper(),
+                    'Malformed app container identity')
+            plist = executable.parent / 'Info.plist'
+            require(not executable.is_symlink() and executable.is_file() and executable.resolve(strict=True) == executable
+                    and not plist.is_symlink() and plist.is_file() and plist.stat().st_size <= 65536,
+                    'Unresolved process bundle files')
+            with plist.open('rb') as stream:
+                info = plistlib.load(stream)
+            require(isinstance(info, dict) and info.get('CFBundleIdentifier') == BUNDLE
+                    and info.get('CFBundleExecutable') == EXECUTABLE,
+                    'Unresolved app process identity')
+            require(pid.isdigit() and 0 < int(pid) <= 2147483647 and int(pid) not in found and len(found) < 4,
+                    'Ambiguous app process inventory')
+            found.append(int(pid))
+        category = 6 if found else 5
+        return found
+    except (OSError, ValueError, TypeError, KeyError, plistlib.InvalidFileException, subprocess.SubprocessError):
+        raise ValueError('App-host ownership unavailable; numeric category reported') from None
+    finally:
+        print('NativeControlOwnership deviceLookupRC=%d stateCode=%d psRC=%d categoryCode=%d' %
+              (device_rc, state_code, ps_rc, category))
 
 def boundary(simulator, label):
     require(label == 'before-01' or label in {'after-%02d' % n for n in range(1, len(CASES) + 1)}, 'Unknown boundary label')

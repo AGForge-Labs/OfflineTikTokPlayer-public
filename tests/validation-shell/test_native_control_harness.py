@@ -110,14 +110,21 @@ class NativeControlHarnessTests(unittest.TestCase):
         return bundle
 
     @contextlib.contextmanager
-    def fake_sdk(self, bundle, inventories, *, fallback="", lookup_code=0, ps_code=0):
+    def fake_sdk(self, bundle, inventories, *, fallback="", lookup_code=0, ps_code=0,
+                 app_lookup_code=None, device_payload=None, device_state="Booted"):
         calls, pending = [], iter(inventories)
+        if device_payload is None:
+            device_payload = {"devices": {"test-runtime": [{"udid": SIMULATOR,
+                "dataPath": str(bundle.parents[4]), "state": device_state}]}}
         def run(arguments, **_kwargs):
             calls.append(list(arguments))
             if len(calls) > 128:
                 raise AssertionError("Fake command bound exceeded")
             if arguments[:3] == ["xcrun", "simctl", "get_app_container"]:
-                return subprocess.CompletedProcess(arguments, lookup_code, str(bundle) + "\n", "")
+                code = lookup_code if app_lookup_code is None else app_lookup_code
+                return subprocess.CompletedProcess(arguments, code, str(bundle) + "\n", "")
+            if arguments == ["xcrun", "simctl", "list", "devices", "--json"]:
+                return subprocess.CompletedProcess(arguments, lookup_code, json.dumps(device_payload), "")
             if arguments == ["/bin/ps", "-ww", "-axo", "pid=,command="]:
                 return subprocess.CompletedProcess(arguments, ps_code, next(pending, fallback), "")
             if arguments == ["xcrun", "simctl", "terminate", SIMULATOR, self.ns["BUNDLE"]]:
@@ -169,7 +176,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         with self.fake_sdk(current, [inventory]) as calls:
             self.assertEqual(self.ns["owned_processes"](SIMULATOR), [11, 12])
         self.assertFalse(any("terminate" in call for call in calls))
-        self.assertEqual(calls[0], ["xcrun", "simctl", "get_app_container", SIMULATOR, self.ns["BUNDLE"], "app"])
+        self.assertEqual(calls[0], ["xcrun", "simctl", "list", "devices", "--json"])
 
     @unittest.skipUnless(os.name == "posix", "Simulator executable inventory uses POSIX absolute paths")
     def test_unknown_ownership_fails_before_any_termination(self):
@@ -203,6 +210,55 @@ class NativeControlHarnessTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.ns["boundary"](SIMULATOR, label)
         self.assertEqual(sum("terminate" in call for call in calls), 1)
+
+    @unittest.skipUnless(os.name == "posix", "Simulator executable inventory uses POSIX absolute paths")
+    def test_absent_app_without_container_lookup_can_prove_two_absent_hosts(self):
+        data = self.root / "Devices" / SIMULATOR / "data"
+        data.mkdir(parents=True)
+        bundle = data / "Containers/Bundle/Application" / CONTAINER / "OfflineTikTokPlayer.app"
+        self.assertFalse(bundle.exists())
+        for state in ("Booted", "Shutdown"):
+            with self.subTest(state=state):
+                output = io.StringIO()
+                with self.fake_sdk(bundle, ["", "", ""], app_lookup_code=1, device_state=state) as calls, \
+                        contextlib.redirect_stdout(output):
+                    self.ns["boundary"](SIMULATOR, "before-01")
+                self.assertEqual(sum(call[0] == "/bin/ps" for call in calls), 3)
+                self.assertEqual(sum(call[:4] == ["xcrun", "simctl", "list", "devices"] for call in calls), 3)
+                self.assertFalse(any("terminate" in call or "get_app_container" in call for call in calls))
+                self.assertNotIn(str(self.root), output.getvalue())
+                self.assertRegex(output.getvalue(), r"NativeControlOwnership deviceLookupRC=0 stateCode=[0-9]+ psRC=0 categoryCode=[0-9]+")
+
+    @unittest.skipUnless(os.name == "posix", "Simulator executable inventory uses POSIX absolute paths")
+    def test_unknown_device_family_or_candidate_never_authorizes_termination(self):
+        bundle = self.app()
+        data = bundle.parents[4]
+        device = {"udid": SIMULATOR, "dataPath": str(data), "state": "Shutdown"}
+        for mutation in ("missing-device", "duplicate-device", "wrong-tail", "symlink-data", "family-alias", "missing-plist", "quoted-process"):
+            with self.subTest(mutation=mutation):
+                self.app()
+                selected = dict(device)
+                inventory = "11 %s/OfflineTikTokPlayer\n" % bundle
+                devices = [selected]
+                link = self.root / "data-link"
+                alias = self.root / "application-alias"
+                if mutation == "missing-device": devices = []
+                elif mutation == "duplicate-device": devices.append(dict(selected))
+                elif mutation == "wrong-tail": selected["dataPath"] = str(self.root)
+                elif mutation == "symlink-data":
+                    link.symlink_to(data, target_is_directory=True)
+                    selected["dataPath"] = str(link)
+                elif mutation == "family-alias":
+                    alias.symlink_to(data / "Containers/Bundle/Application", target_is_directory=True)
+                    inventory = "11 %s/%s/OfflineTikTokPlayer.app/OfflineTikTokPlayer\n" % (alias, CONTAINER)
+                elif mutation == "missing-plist": (bundle / "Info.plist").unlink()
+                elif mutation == "quoted-process": inventory = '11 "%s/OfflineTikTokPlayer"\n' % bundle
+                with self.fake_sdk(bundle, [inventory], device_payload={"devices": {"test-runtime": devices}}) as calls:
+                    with self.assertRaises((OSError, ValueError)):
+                        self.ns["boundary"](SIMULATOR, "before-01")
+                self.assertFalse(any("terminate" in call for call in calls))
+                link.unlink(missing_ok=True)
+                alias.unlink(missing_ok=True)
 
     def test_singleton_logs_reject_wrong_duplicate_and_failed_cases(self):
         name = self.cases[0]
