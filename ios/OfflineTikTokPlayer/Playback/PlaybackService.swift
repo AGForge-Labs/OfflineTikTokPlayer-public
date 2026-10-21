@@ -145,10 +145,10 @@ final class PlaybackService: NSObject {
         automaticPiP = UserDefaults.standard.bool(forKey: "automaticPiP")
         speakerSound = UserDefaults.standard.object(forKey: "speakerSound") as? Bool ?? true
         super.init()
-        continuousAudio.onSourceSilence { [weak self] _, analysis in
+        self.continuousAudio.onSourceSilence { [weak self] _, analysis in
             Task { @MainActor in self?.recordDiagnostic(.sourceTimelineAnalyzed, sourceSilence: analysis) }
         }
-        continuousAudio.onDecodeFailure { [weak self] token, _ in
+        self.continuousAudio.onDecodeFailure { [weak self] token, _ in
             Task { @MainActor in
                 guard let self else { return }
                 let selected = self.continuousAudio.invalidateForRetry(token: token)
