@@ -15,7 +15,7 @@ import tempfile
 import time
 
 
-IOS_TREE = "a5e7d8fd6841ed4bfff9958e448b786c0102d249"
+IOS_TREE = "04ede18d838c5bb2e2064789dffed9c7c843ee9e"
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 MAX_FILES, MAX_IMAGES = 32, 24
 MAX_TOTAL_BYTES, MAX_PNG_BYTES = 32 * 1024 * 1024, 8 * 1024 * 1024
