@@ -13,13 +13,15 @@ import PlayerCore
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testCommandToEngineToneAndSelectedCustomFrameLatency() async throws {
         var witnesses: [SelectionDecoderLifetimeWitness] = []
-        witnesses.reserveCapacity(6)
+        witnesses.reserveCapacity(8)
         for condition in [(nativeGetters: false, phaseBase: 0, reanchor: false, nativePlayerTrace: false, startupSeekGrace: false),
                           (nativeGetters: true, phaseBase: 10, reanchor: false, nativePlayerTrace: false, startupSeekGrace: false),
                           (nativeGetters: false, phaseBase: 20, reanchor: true, nativePlayerTrace: false, startupSeekGrace: false),
                           (nativeGetters: false, phaseBase: 30, reanchor: false, nativePlayerTrace: true, startupSeekGrace: false),
                           (nativeGetters: false, phaseBase: 40, reanchor: false, nativePlayerTrace: true, startupSeekGrace: true),
-                          (nativeGetters: false, phaseBase: 50, reanchor: false, nativePlayerTrace: true, startupSeekGrace: false)] {
+                          (nativeGetters: false, phaseBase: 50, reanchor: false, nativePlayerTrace: true, startupSeekGrace: false),
+                          (nativeGetters: false, phaseBase: 60, reanchor: false, nativePlayerTrace: true, startupSeekGrace: false),
+                          (nativeGetters: false, phaseBase: 70, reanchor: false, nativePlayerTrace: true, startupSeekGrace: false)] {
             defer {
                 logDecoderLifetimes(boundary: "getter-arm-after-phase-\(condition.phaseBase)", witnesses: witnesses)
             }
@@ -48,10 +50,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertFalse(startupSeekGraceControl, "The startup native-seek grace requires DEBUG")
         #endif
         seeks.service = service
-        precondition(witnesses.count < 6)
+        precondition(witnesses.count < 8)
         witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
             label: "getter-arm-phase-\(phaseBase)"))
-        let screen = try SelectionVideoScreen(service: service)
+        let captureOwnershipProbe = phaseBase == 60
+        let screen = try SelectionVideoScreen(service: service, captureOwnershipProbe: captureOwnershipProbe)
         audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
             tap.append(buffer, time: time)
         }
@@ -71,11 +74,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             #endif
         }
         service.isInteractingWithFeed = true
-        let arm = startupSeekGraceControl ? "startup-seek-grace-control" : (phaseBase == 50 ? "native-player-trace-after-control" : (nativePlayerTraceControl ? "native-player-trace-control" : (pausedVideoReanchorControl ? "paused-video-reanchor-control" : (nativeVideoGetterControl ? "native-getter-control" : "primary"))))
-        let labelSuffix = startupSeekGraceControl ? "-startup-seek-grace-control" : (phaseBase == 50 ? "-native-player-trace-after-control" : (nativePlayerTraceControl ? "-native-player-trace-control" : (pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : ""))))
+        let arm = captureOwnershipProbe ? "capture-ownership-probe-control" : (phaseBase == 70 ? "capture-ownership-after-control" : (startupSeekGraceControl ? "startup-seek-grace-control" : (phaseBase == 50 ? "native-player-trace-after-control" : (nativePlayerTraceControl ? "native-player-trace-control" : (pausedVideoReanchorControl ? "paused-video-reanchor-control" : (nativeVideoGetterControl ? "native-getter-control" : "primary"))))))
+        let labelSuffix = captureOwnershipProbe ? "-capture-ownership-probe-control" : (phaseBase == 70 ? "-capture-ownership-after-control" : (startupSeekGraceControl ? "-startup-seek-grace-control" : (phaseBase == 50 ? "-native-player-trace-after-control" : (nativePlayerTraceControl ? "-native-player-trace-control" : (pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : ""))))))
         print("SelectionLatency scope=engineMixerTap-not-physical-speaker arm=\(arm) phaseBase=\(phaseBase) videoNativeGetters=\(nativeVideoGetterControl) outputLimitMs=100 customReadyLimitMs=250 silenceWindowMs=10 importHashVerification=already-verified")
         print("SelectionNativePlayerTraceScope phaseBase=\(phaseBase) enabled=\(nativePlayerTraceControl) nativeGetters=\(nativeVideoGetterControl) reanchor=\(pausedVideoReanchorControl) maximumEventsPerPhase=256 publication=post-call-or-policy-decision itemEndClock=handler-delivery pauseClock=entry-return-inclusive design=fresh-ordered-cohort-not-causal-proof")
         print("SelectionStartupSeekGraceScope phaseBase=\(phaseBase) enabled=\(startupSeekGraceControl) maximumMs=250 until=first-current-epoch-frame-or-deadline nativeGetters=\(nativeVideoGetterControl) reanchor=\(pausedVideoReanchorControl) nativePlayerTrace=\(nativePlayerTraceControl) maximumEventsPerPhase=256 deferredZero=inconclusive design=fresh-ordered-ABA-not-causal-proof")
+        print("SelectionCaptureOwnershipScope phaseBase=\(phaseBase) enabled=\(captureOwnershipProbe) maximumStampViews=1 decoderBytes=384 nonceBits=32 sentinelBits=32 complementBits=32 orientations=2 maximumCaptureLogs=128 design=fresh-ordered-OFF-ON-OFF-not-causal-proof")
         if pausedVideoReanchorControl {
             print("SelectionReanchorScope phaseBase=\(phaseBase) eligiblePhase=22 maximumAttempts=1 acceptedZero=inconclusive design=fresh-ordered-cohort-not-causal-proof publicationCost=includes-intentional-reanchor-and-reentrancy")
         }
@@ -89,17 +93,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                       id: fixture.aID, frequency: 440, prepared: false, sourceQuiet: sourceQuiet) {
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         }
+        if captureOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase) }
         assertSelection(service, fixture: fixture, id: fixture.aID)
         await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-cold-A" + labelSuffix)
         try await require({ service.preparedAudioCount == 2 }, "B must be prepared before timing Next")
 
         await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phaseBase + 1,
                                       id: fixture.bID, frequency: 880, prepared: true, sourceQuiet: sourceQuiet) { service.next() }
+        if captureOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase + 1) }
         assertSelection(service, fixture: fixture, id: fixture.bID)
         await assertVisibleFrame(service, screen: screen, identity: .b, label: "latency-prepared-B" + labelSuffix)
 
         await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phaseBase + 2,
                                       id: fixture.aID, frequency: 440, prepared: true, sourceQuiet: sourceQuiet) { service.previous() }
+        if captureOwnershipProbe { screen.noteCaptureLatencyFinished(phase: phaseBase + 2) }
         assertSelection(service, fixture: fixture, id: fixture.aID)
         await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-returned-A" + labelSuffix)
         let validity = tap.validity()
@@ -253,6 +260,30 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertFalse(PlaybackService.debugStartupSeekGraceTicketMatches(captured: exhausted, current: exhausted))
         XCTAssertEqual(PlaybackService.debugNextStartupSeekGraceTicket(exhausted), exhausted,
             "A saturated ticket must disable eligibility permanently instead of wrapping")
+        // Actual CGImage codec controls; these do not claim a compositor or
+        // video-rendering RED. The original source-pixel gates stay independent.
+        func stampControlImage(nonce: UInt32?, flipped: Bool = false) throws -> CGImage {
+            let context = try XCTUnwrap(CGContext(data: nil, width: 112, height: 32,
+                bitsPerComponent: 8, bytesPerRow: 112 * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
+            context.clear(CGRect(x: 0, y: 0, width: 112, height: 32))
+            if flipped { context.translateBy(x: 0, y: 32); context.scaleBy(x: 1, y: -1) }
+            if let nonce { SelectionCaptureStampCodec.draw(in: context, bounds: CGRect(x: 8, y: 8, width: 96, height: 16), nonce: nonce) }
+            return try XCTUnwrap(context.makeImage())
+        }
+        let stampRect = CGRect(x: 8, y: 8, width: 96, height: 16)
+        let stampImage = try stampControlImage(nonce: 37)
+        let ownedStamp = SelectionCaptureStampCodec.decode(stampImage, rect: stampRect, expectedNonce: 37)
+        XCTAssertEqual(ownedStamp.verdict, .owned)
+        XCTAssertEqual(ownedStamp.decodedNonce, 37)
+        XCTAssertTrue(ownedStamp.sentinelValid && ownedStamp.complementValid)
+        XCTAssertEqual(SelectionCaptureStampCodec.decode(stampImage, rect: stampRect, expectedNonce: 38).verdict, .stale)
+        XCTAssertEqual(SelectionCaptureStampCodec.decode(try stampControlImage(nonce: 37, flipped: true),
+            rect: stampRect, expectedNonce: 37).verdict, .owned)
+        XCTAssertEqual(SelectionCaptureStampCodec.decode(try stampControlImage(nonce: nil),
+            rect: stampRect, expectedNonce: 37).verdict, .missing)
+        XCTAssertEqual(SelectionCaptureStampCodec.decode(stampImage,
+            rect: CGRect(x: -1, y: 8, width: 96, height: 16), expectedNonce: 37).verdict, .invalidGeometry)
         #else
         XCTFail("The explicit reanchor control requires the Debug test configuration")
         #endif
@@ -2065,6 +2096,114 @@ private final class SelectionProducerProbe: @unchecked Sendable {
     deinit { timer.cancel() }
 }
 
+/// Samples only the stamp region of the actual returned compositor CGImage.
+/// The owned RGBA scratch is 384 bytes; this is not an SDK/image/RSS bound.
+private enum SelectionCaptureStampCodec {
+    static let columns = 24, rows = 4
+    static let sentinel: UInt32 = 0xA659_C3D2
+    enum Verdict: Int, Equatable { case owned = 1, stale = 2, missing = 3, invalidGeometry = 4, decodeFailure = 5, stateMismatch = 6, identifierExhausted = 7 }
+    struct Result {
+        let verdict: Verdict
+        var decodedNonce: UInt32? = nil
+        var sentinelValid = false
+        var complementValid = false
+        var orientation = -1
+    }
+
+    static func draw(in context: CGContext, bounds: CGRect, nonce: UInt32) {
+        context.saveGState(); defer { context.restoreGState() }
+        context.setShouldAntialias(false)
+        for index in 0..<96 {
+            let word = index < 32 ? sentinel : (index < 64 ? nonce : ~nonce)
+            let one = word & (UInt32(1) << (31 - index % 32)) != 0
+            context.setFillColor(red: one ? 1 : 0, green: one ? 1 : 0, blue: one ? 0 : 1, alpha: 1)
+            context.fill(CGRect(x: bounds.minX + CGFloat(index % columns) * bounds.width / CGFloat(columns),
+                y: bounds.minY + CGFloat(index / columns) * bounds.height / CGFloat(rows),
+                width: bounds.width / CGFloat(columns), height: bounds.height / CGFloat(rows)))
+        }
+    }
+
+    static func finite(_ rect: CGRect) -> Bool {
+        [rect.minX, rect.minY, rect.width, rect.height].allSatisfy { $0.isFinite }
+            && rect.width > 0 && rect.height > 0
+    }
+
+    static func decode(_ image: CGImage, rect: CGRect, expectedNonce: UInt32) -> Result {
+        guard finite(rect), rect.width >= CGFloat(columns * 2), rect.height >= CGFloat(rows * 2),
+              CGRect(x: 0, y: 0, width: image.width, height: image.height).contains(rect) else { return Result(verdict: .invalidGeometry) }
+        guard expectedNonce > 0 else { return Result(verdict: .identifierExhausted) }
+        guard let cropped = image.cropping(to: rect) else { return Result(verdict: .decodeFailure) }
+        var storage = [UInt8](repeating: 0, count: columns * rows * 4)
+        let rendered = storage.withUnsafeMutableBytes { raw -> Bool in
+            guard let context = CGContext(data: raw.baseAddress, width: columns, height: rows,
+                bitsPerComponent: 8, bytesPerRow: columns * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+            context.interpolationQuality = .none
+            context.setBlendMode(.copy)
+            context.draw(cropped, in: CGRect(x: 0, y: 0, width: columns, height: rows))
+            return true
+        }
+        guard rendered else { return Result(verdict: .decodeFailure) }
+        var found: Result?
+        var sawSentinel = false
+        // Two fixed row orientations handle bitmap-coordinate direction. Never
+        // search the screenshot or choose an orientation by the expected nonce.
+        for orientation in 0..<2 {
+            var words = [UInt32](repeating: 0, count: 3)
+            var validColors = true
+            for index in 0..<96 {
+                let row = orientation == 0 ? index / columns : rows - 1 - index / columns
+                let offset = (row * columns + index % columns) * 4
+                let r = storage[offset], g = storage[offset + 1], b = storage[offset + 2]
+                let one = r > 200 && g > 200 && b < 60
+                let zero = r < 60 && g < 60 && b > 200
+                guard one || zero else { validColors = false; break }
+                words[index / 32] = (words[index / 32] << 1) | (one ? 1 : 0)
+            }
+            guard validColors, words[0] == sentinel else { continue }
+            sawSentinel = true
+            guard words[2] == ~words[1], words[1] > 0 else { continue }
+            guard found == nil else { return Result(verdict: .decodeFailure, sentinelValid: true, complementValid: true) }
+            found = Result(verdict: words[1] == expectedNonce ? .owned : .stale,
+                decodedNonce: words[1], sentinelValid: true, complementValid: true, orientation: orientation)
+        }
+        return found ?? Result(verdict: .missing, sentinelValid: sawSentinel)
+    }
+}
+
+@MainActor
+private final class SelectionCaptureStampView: UIView {
+    var nonce: UInt32 = 0
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false; isOpaque = true; isHidden = true
+        accessibilityElementsHidden = true
+    }
+    required init?(coder: NSCoder) { fatalError("Test-only stamp has no coder initializer") }
+    override func draw(_ rect: CGRect) {
+        if let context = UIGraphicsGetCurrentContext() { SelectionCaptureStampCodec.draw(in: context, bounds: bounds, nonce: nonce) }
+    }
+}
+
+private struct SelectionCaptureOwnershipState {
+    let key: Bool, hidden: Bool, surfaceWindowMatches: Bool, surfaceHidden: Bool, stampWindowMatches: Bool, stampHidden: Bool
+    let windowBounds: CGRect, surface: CGRect, stamp: CGRect
+    var validGeometry: Bool {
+        SelectionCaptureStampCodec.finite(windowBounds) && SelectionCaptureStampCodec.finite(surface)
+            && SelectionCaptureStampCodec.finite(stamp) && windowBounds.contains(surface) && windowBounds.insetBy(dx: 8, dy: 8).contains(stamp)
+            && !surface.insetBy(dx: -8, dy: -8).intersects(stamp)
+    }
+    var visibleOwner: Bool { key && !hidden && surfaceWindowMatches && !surfaceHidden && stampWindowMatches && !stampHidden }
+}
+
+private struct SelectionCaptureRendererObservation {
+    let begin: Double, end: Double
+    let present: Bool
+    let status: Int?
+    let requiresFlush: Bool?
+    let errorCode: Int?
+}
+
 @MainActor
 private final class SelectionVideoScreen {
     let window: UIWindow
@@ -2073,6 +2212,12 @@ private final class SelectionVideoScreen {
     private let producerContext: SelectionProducerContext?
     private let producerWindowSeconds: Double
     private let producerSampleCapacity: Int
+    private static var nextOwnershipOrdinal: UInt32 = 0
+    private static var nextCaptureNonce: UInt32 = 0
+    private let ownershipOrdinal: UInt32
+    private let ownershipStamp: SelectionCaptureStampView?
+    private var ownershipPhase = -1
+    private var latencyFinishedUptime = 0.0
     private var producerResults: [(String, SelectionProducerProbe.Result)] = []
     private var captureLogs: [String] = []
     private var droppedDiagnostics = 0
@@ -2081,11 +2226,16 @@ private final class SelectionVideoScreen {
     }
 
     init(service: PlaybackService, producerContext: SelectionProducerContext? = nil,
-         producerWindowSeconds: Double = 8, producerSampleCapacity: Int = 128) throws {
+         producerWindowSeconds: Double = 8, producerSampleCapacity: Int = 128,
+         captureOwnershipProbe: Bool = false) throws {
         self.service = service
         self.producerContext = producerContext
         self.producerWindowSeconds = producerWindowSeconds
         self.producerSampleCapacity = producerSampleCapacity
+        if captureOwnershipProbe {
+            ownershipOrdinal = Self.issueIdentifier(&Self.nextOwnershipOrdinal) ?? 0
+            ownershipStamp = SelectionCaptureStampView(frame: .zero)
+        } else { ownershipOrdinal = 0; ownershipStamp = nil }
         producerResults.reserveCapacity(40); captureLogs.reserveCapacity(128)
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
@@ -2095,10 +2245,22 @@ private final class SelectionVideoScreen {
         window.rootViewController = UIHostingController(rootView: SelectionVideoHarness(service: service))
         window.makeKeyAndVisible()
         window.rootViewController?.view.layoutIfNeeded()
+        if let ownershipStamp { window.addSubview(ownershipStamp) }
+    }
+
+    private static func issueIdentifier(_ value: inout UInt32) -> UInt32? {
+        guard value < .max else { return nil }
+        value += 1; return value // Never wrap or reuse an exhausted identifier.
+    }
+
+    func noteCaptureLatencyFinished(phase: Int) {
+        guard ownershipStamp != nil else { return }
+        ownershipPhase = phase; latencyFinishedUptime = ProcessInfo.processInfo.systemUptime
     }
 
     func close() {
         window.isHidden = true
+        ownershipStamp?.removeFromSuperview()
         window.rootViewController = nil
         previousKeyWindow?.makeKey()
         for line in captureLogs { print(line) }
@@ -2123,6 +2285,20 @@ private final class SelectionVideoScreen {
         logCapture(label: label, phase: "before", started: started, failed: false)
         defer { logCapture(label: label, phase: "after", started: started, failed: !completed) }
         window.rootViewController?.view.layoutIfNeeded()
+        let ownershipPreparation = ownershipStamp.map { stamp -> (UInt32, SelectionCaptureOwnershipState, Double, Double) in
+            let begin = ProcessInfo.processInfo.systemUptime
+            let nonce = Self.issueIdentifier(&Self.nextCaptureNonce) ?? 0
+            let surface = service.surface.convert(service.surface.bounds, to: window)
+            let area = window.bounds.insetBy(dx: 8, dy: 8)
+            let candidates = [CGRect(x: area.minX, y: area.minY, width: 96, height: 16),
+                              CGRect(x: area.minX, y: area.maxY - 16, width: 96, height: 16)]
+            let rect = candidates.first { window.bounds.contains($0) && !surface.insetBy(dx: -8, dy: -8).intersects($0) }
+            stamp.frame = rect ?? .zero; stamp.nonce = nonce
+            stamp.isHidden = rect == nil || nonce == 0 || ownershipOrdinal == 0
+            stamp.setNeedsDisplay(); stamp.layer.displayIfNeeded()
+            let state = ownershipState(surface: surface, stamp: stamp)
+            return (nonce, state, begin, ProcessInfo.processInfo.systemUptime)
+        }
         CATransaction.flush()
         let image: UIImage
         let scaleX: CGFloat
@@ -2156,13 +2332,84 @@ private final class SelectionVideoScreen {
         let points = service.surface.convert(service.surface.bounds, to: window)
         let rect = CGRect(x: points.minX * scaleX, y: points.minY * scaleY,
                           width: points.width * scaleX, height: points.height * scaleY).integral
-        guard let cg = image.cgImage, rect.width > 0, rect.height > 0,
+        // Bind once: ownership sampling and the unchanged video crop below use
+        // this exact immutable CGImage from the returned global compositor image.
+        let fullCompositorImage = image.cgImage
+        if let (nonce, ownershipBefore, prepBegin, prepEnd) = ownershipPreparation,
+           let stamp = ownershipStamp, let cg = fullCompositorImage {
+            let decodeBegin = ProcessInfo.processInfo.systemUptime
+            let ownershipAfter = ownershipState(surface: points, stamp: stamp)
+            // Probe-only, post-image SDK observation. This is not renderer state
+            // at the image's acquisition instant and never triggers recovery.
+            let rendererBegin = ProcessInfo.processInfo.systemUptime
+            let renderer = customVideoLayer
+            let rendererStatus = renderer?.status.rawValue
+            let rendererRequiresFlush = renderer?.requiresFlushToResumeDecoding
+            let rendererErrorCode = renderer?.error.map { ($0 as NSError).code }
+            let rendererObservation = SelectionCaptureRendererObservation(begin: rendererBegin,
+                end: ProcessInfo.processInfo.systemUptime, present: renderer != nil,
+                status: rendererStatus, requiresFlush: rendererRequiresFlush, errorCode: rendererErrorCode)
+            let stampPixels = CGRect(x: ownershipBefore.stamp.minX * scaleX, y: ownershipBefore.stamp.minY * scaleY,
+                width: ownershipBefore.stamp.width * scaleX, height: ownershipBefore.stamp.height * scaleY).integral
+            let imageBounds = CGRect(x: 0, y: 0, width: cg.width, height: cg.height)
+            let geometryValid = ownershipBefore.validGeometry && ownershipAfter.validGeometry
+                && imageBounds.contains(stampPixels) && imageBounds.contains(rect) && !stampPixels.intersects(rect)
+            let geometryChanged = ownershipBefore.windowBounds != ownershipAfter.windowBounds
+                || ownershipBefore.surface != ownershipAfter.surface || ownershipBefore.stamp != ownershipAfter.stamp
+            let decoded = SelectionCaptureStampCodec.decode(cg, rect: stampPixels, expectedNonce: nonce)
+            let verdict: SelectionCaptureStampCodec.Verdict
+            if nonce == 0 || ownershipOrdinal == 0 { verdict = .identifierExhausted }
+            else if !geometryValid { verdict = .invalidGeometry }
+            else if geometryChanged || !ownershipBefore.visibleOwner || !ownershipAfter.visibleOwner
+                || !(60...62).contains(ownershipPhase) || latencyFinishedUptime <= 0 || prepBegin < latencyFinishedUptime { verdict = .stateMismatch }
+            else { verdict = decoded.verdict }
+            let decodeEnd = ProcessInfo.processInfo.systemUptime
+            logOwnership(label: label, phase: ownershipPhase, ordinal: ownershipOrdinal, nonce: nonce,
+                before: ownershipBefore, after: ownershipAfter, image: cg, surfacePixels: rect, stampPixels: stampPixels,
+                scaleX: scaleX, scaleY: scaleY, geometryValid: geometryValid, geometryChanged: geometryChanged,
+                verdict: verdict, decoded: decoded, prepBegin: prepBegin, prepEnd: prepEnd,
+                decodeBegin: decodeBegin, decodeEnd: decodeEnd, renderer: rendererObservation)
+            XCTAssertEqual(verdict, .owned, "The same returned compositor image must identify this capture window; original video pixels are still checked")
+        }
+        guard let cg = fullCompositorImage, rect.width > 0, rect.height > 0,
               CGRect(x: 0, y: 0, width: cg.width, height: cg.height).contains(rect),
               let cropped = cg.cropping(to: rect) else { throw SelectionVideoTestFailure.capture }
         var pixels = try SelectionVideoPixels(cropped, scaleX: Double(scaleX), scaleY: Double(scaleY), captureBefore: before)
         pixels.captureAfter = captureState()
+        if let (nonce, _, _, _) = ownershipPreparation {
+            let scanBegin = ProcessInfo.processInfo.systemUptime
+            let fractionA = pixels.fraction(.a), fractionB = pixels.fraction(.b)
+            let scanEnd = ProcessInfo.processInfo.systemUptime
+            if captureLogs.count < 128 {
+                captureLogs.append("SelectionCaptureOwnershipPixels phase=\(ownershipPhase) label=\(label) nonce=\(nonce) width=\(pixels.width) height=\(pixels.height) fractionA=\(fractionA) fractionB=\(fractionB) scanBegin=\(scanBegin) scanEnd=\(scanEnd) scanScope=additional-original-cropped-byte-scans-excludes-acquisition-log")
+            } else { droppedDiagnostics += 1 }
+        }
         completed = true
         return pixels
+    }
+
+    private func ownershipState(surface: CGRect, stamp: SelectionCaptureStampView) -> SelectionCaptureOwnershipState {
+        SelectionCaptureOwnershipState(key: window.isKeyWindow, hidden: window.isHidden,
+            surfaceWindowMatches: service.surface.window === window, surfaceHidden: service.surface.isHidden,
+            stampWindowMatches: stamp.window === window, stampHidden: stamp.isHidden,
+            windowBounds: window.bounds, surface: surface, stamp: stamp.frame)
+    }
+
+    private func logOwnership(label: String, phase: Int, ordinal: UInt32, nonce: UInt32,
+        before: SelectionCaptureOwnershipState, after: SelectionCaptureOwnershipState,
+        image: CGImage, surfacePixels: CGRect, stampPixels: CGRect, scaleX: CGFloat, scaleY: CGFloat,
+        geometryValid: Bool, geometryChanged: Bool, verdict: SelectionCaptureStampCodec.Verdict,
+        decoded: SelectionCaptureStampCodec.Result, prepBegin: Double, prepEnd: Double,
+        decodeBegin: Double, decodeEnd: Double, renderer: SelectionCaptureRendererObservation) {
+        guard captureLogs.count < 128 else { droppedDiagnostics += 1; return }
+        func rect(_ prefix: String, _ value: CGRect) -> String {
+            "\(prefix)X=\(value.minX) \(prefix)Y=\(value.minY) \(prefix)W=\(value.width) \(prefix)H=\(value.height)"
+        }
+        // Clock brackets include counter/geometry/stamp drawing and post-image
+        // sampling/state queries respectively. They exclude string construction,
+        // this bounded append, the existing transaction flush, GPU/capture work,
+        // screenshot/attachment allocations and any compositor perturbation.
+        captureLogs.append("SelectionCaptureOwnership phase=\(phase) label=\(label) ordinal=\(ordinal) nonce=\(nonce) decodedNonce=\(decoded.decodedNonce.map { String($0) } ?? "unavailable") verdictCode=\(verdict.rawValue) codecVerdictCode=\(decoded.verdict.rawValue) sentinel=\(SelectionCaptureStampCodec.sentinel) sentinelValid=\(decoded.sentinelValid) complementValid=\(decoded.complementValid) orientation=\(decoded.orientation) sameCGImage=true imageWidth=\(image.width) imageHeight=\(image.height) scaleX=\(scaleX) scaleY=\(scaleY) windowKeyBefore=\(before.key) windowKeyAfter=\(after.key) windowHiddenBefore=\(before.hidden) windowHiddenAfter=\(after.hidden) surfaceWindowBefore=\(before.surfaceWindowMatches) surfaceWindowAfter=\(after.surfaceWindowMatches) surfaceHiddenBefore=\(before.surfaceHidden) surfaceHiddenAfter=\(after.surfaceHidden) stampWindowBefore=\(before.stampWindowMatches) stampWindowAfter=\(after.stampWindowMatches) stampHiddenBefore=\(before.stampHidden) stampHiddenAfter=\(after.stampHidden) geometryValid=\(geometryValid) geometryChanged=\(geometryChanged) marginPoints=8 stampDisjointBefore=\(!before.surface.insetBy(dx: -8, dy: -8).intersects(before.stamp)) stampDisjointAfter=\(!after.surface.insetBy(dx: -8, dy: -8).intersects(after.stamp)) \(rect("windowBefore", before.windowBounds)) \(rect("windowAfter", after.windowBounds)) \(rect("surfaceBefore", before.surface)) \(rect("surfaceAfter", after.surface)) \(rect("stampBefore", before.stamp)) \(rect("stampAfter", after.stamp)) \(rect("surfacePixels", surfacePixels)) \(rect("stampPixels", stampPixels)) latencyFinishedUptime=\(latencyFinishedUptime) prepBegin=\(prepBegin) prepEnd=\(prepEnd) decodeBegin=\(decodeBegin) decodeEnd=\(decodeEnd) decoderBytes=384 decoderScope=RGBA-sampling-buffer-only workScope=prep-and-post-image-observation-excludes-flush-gpu-capture-attachment-log rendererObservationBegin=\(renderer.begin) rendererObservationEnd=\(renderer.end) rendererLayerPresent=\(renderer.present) rendererStatus=\(renderer.status.map { String($0) } ?? "unavailable") rendererRequiresFlush=\(renderer.requiresFlush.map { String($0) } ?? "unavailable") rendererErrorCode=\(renderer.errorCode.map { String($0) } ?? "unavailable") rendererLayerLookups=1 rendererGetterCount=\(renderer.present ? 3 : 0) rendererScope=additional-post-image-SDK-observation-not-image-instant")
     }
 
     private func captureState() -> SelectionVideoCaptureState {
