@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=847533d58b31f91ed91ef81f7668c8ce31269dec
+expected_code_source=c14f358c222783d80a9fa8628aff10eb1b027465
 expected_ios_tree=66e25f512367af71904bdbb401c7e73d1d361bd8
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -168,11 +168,22 @@ try:
     if mode == 'initialize-build':
         require(not RECEIPT.exists(), 'Refusing stale benchmark build receipt')
         require(not list(PRODUCTS.glob('*.xctestrun')), 'Fresh job must not reuse a preexisting test plan')
+    elif mode == 'generated-plan':
+        require(not args, 'Generated plan takes no arguments')
+        print(json.dumps(plan_info(), sort_keys=True))
+    elif mode == 'plan-path':
+        require(len(args) == 1, 'Plan path requires the captured generated plan')
+        captured_plan = json.loads(args[0])
+        require(captured_plan == plan_info(), 'Compiled test plan changed before benchmark')
+        print(captured_plan['path'])
     elif mode == 'record-build':
-        source, tree, simulator, native_status, tee_status = args
+        source, tree, simulator, native_status, tee_status, captured_json = args
+        captured_plan = json.loads(captured_json)
+        require(captured_plan == plan_info(), 'Compiled test plan changed during benchmark')
+        require(not RECEIPT.exists(), 'Refusing to replace a benchmark build receipt')
         receipt = {'schema': 1, 'source': source, 'iosTree': tree, 'simulator': simulator,
                    'run': os.environ.get('GITHUB_RUN_ID'), 'attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
-                   'plan': plan_info(), 'benchmarkNativeExit': int(native_status), 'benchmarkTeeExit': int(tee_status)}
+                   'plan': captured_plan, 'benchmarkNativeExit': int(native_status), 'benchmarkTeeExit': int(tee_status)}
         RECEIPT.write_text(json.dumps(receipt, sort_keys=True) + '\n')
         print('NativeCompiledProductReceipt schema=1 planCount=1 reusedForControls=true noRebuildFallback=true')
     elif mode == 'read-plan':
@@ -254,19 +265,38 @@ trap cleanup EXIT
 printf '%s\n' "NativePlaybackTargetedScope mode=$mode appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=${#cases[@]} expectedUI=0 maximumBuildJobs=1 physicalOutput=unverified fullAcceptance=false"
 if [ "$mode" = benchmark ]; then
   evidence_tool initialize-build
-  arguments=()
-  for name in "${cases[@]}"; do arguments+=("-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name"); done
+  build_log="artifacts/native/native-playback-build.log"
+  : > "$build_log"
+  # Only build-for-testing promises to emit the immutable xctestrun product.
+  # Build the complete pinned test target; selectors belong to the later run.
   set +e
   xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
     -destination "platform=iOS Simulator,id=$simulator_id" \
-    -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Targeted-$mode-$(date +%Y%m%d-%H%M%S).xcresult" \
+    -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Targeted-build-$(date +%Y%m%d-%H%M%S).xcresult" \
+    -jobs 1 -parallel-testing-enabled NO \
+    SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+    CODE_SIGNING_ALLOWED=NO build-for-testing 2>&1 | tee "$build_log"
+  build_pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  if [ "${build_pipeline_status[0]}" -ne 0 ]; then exit "${build_pipeline_status[0]}"; fi
+  if [ "${build_pipeline_status[1]}" -ne 0 ]; then exit "${build_pipeline_status[1]}"; fi
+  # Capture once before execution, then bind the final receipt to this exact
+  # path/size/hash. A failed build or plan check cannot create a receipt.
+  generated_plan="$(evidence_tool generated-plan)"
+  test_plan="$(evidence_tool plan-path "$generated_plan")"
+  arguments=()
+  for name in "${cases[@]}"; do arguments+=("-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name"); done
+  set +e
+  xcodebuild -xctestrun "$test_plan" \
+    -destination "platform=iOS Simulator,id=$simulator_id" \
+    -resultBundlePath "artifacts/native/Targeted-$mode-$(date +%Y%m%d-%H%M%S).xcresult" \
     -jobs 1 -parallel-testing-enabled NO "${arguments[@]}" \
     SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
-    CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+    CODE_SIGNING_ALLOWED=NO test-without-building 2>&1 | tee "$native_log"
   pipeline_status=("${PIPESTATUS[@]}")
   set -e
   receipt_status=0
-  evidence_tool record-build "$expected_code_source" "$expected_ios_tree" "$simulator_id" "${pipeline_status[0]}" "${pipeline_status[1]}" || receipt_status=$?
+  evidence_tool record-build "$expected_code_source" "$expected_ios_tree" "$simulator_id" "${pipeline_status[0]}" "${pipeline_status[1]}" "$generated_plan" || receipt_status=$?
   if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
   if [ "${pipeline_status[1]}" -ne 0 ]; then exit "${pipeline_status[1]}"; fi
   exit "$receipt_status"

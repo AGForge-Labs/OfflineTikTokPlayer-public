@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -15,8 +17,9 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "scripts/check-native-playback-targeted.sh"
+HARNESS = Path(os.environ.get("NATIVE_CONTROL_HARNESS_SOURCE", ROOT / "scripts/check-native-playback-targeted.sh"))
 VERIFIER = ROOT / "scripts/verify-native-test-log.py"
+REAL_SUBPROCESS_RUN = subprocess.run
 SIMULATOR = "11111111-2222-4333-8444-555555555555"
 CONTAINER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 OTHER_CONTAINER = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
@@ -211,6 +214,104 @@ class NativeControlHarnessTests(unittest.TestCase):
                 path.write_text(text)
                 status, _output = self.mode("verify-one", 1, name)
                 self.assertEqual(status == 0, accepted)
+
+    @unittest.skipUnless(os.name == "posix", "The launcher contract uses Bash")
+    def test_benchmark_builds_one_immutable_plan_before_testing_and_fails_closed(self):
+        shell = HARNESS.read_text(encoding="utf-8").replace("\r\n", "\n")
+        payload = shell.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        start = shell.index('if [ "$mode" = benchmark ]; then\n')
+        end = shell.index('\nfi\n\ntest_plan=', start) + len('\nfi')
+        benchmark = shell[start:end]
+        names = shlex.split(re.search(r"benchmark\) cases=\((.*?)\) ;;", shell).group(1))
+        self.assertEqual(len(names), 2)
+        fake_xcode = '''import json, os, sys
+from pathlib import Path
+root = Path(os.environ['HARNESS_UNIT_ROOT'])
+args = sys.argv[1:]
+with (root / 'commands.jsonl').open('a') as stream:
+    stream.write(json.dumps(args) + '\\n')
+products = root / 'artifacts/DerivedData/Build/Products'
+plan = products / 'Owned.xctestrun'
+scenario = os.environ['HARNESS_UNIT_SCENARIO']
+if 'build-for-testing' in args:
+    products.mkdir(parents=True, exist_ok=True)
+    if scenario != 'missing': plan.write_bytes(b'original compiled plan\\n')
+    if scenario == 'duplicate': (products / 'Other.xctestrun').write_bytes(b'another plan')
+    raise SystemExit(23 if scenario == 'build-failure' else 0)
+if 'test-without-building' in args:
+    if scenario == 'mutated': plan.write_bytes(b'changed after build\\n')
+    raise SystemExit(65 if scenario == 'benchmark-failure' else 0)
+raise SystemExit(89)
+'''
+        fake_tee = '''import os, sys
+from pathlib import Path
+root = Path(os.environ['HARNESS_UNIT_ROOT'])
+count = root / 'tee-count'
+n = int(count.read_text()) + 1 if count.exists() else 1
+count.write_text(str(n))
+data = sys.stdin.buffer.read()
+Path(sys.argv[1]).write_bytes(data)
+sys.stdout.buffer.write(data)
+raise SystemExit(17 if os.environ['HARNESS_UNIT_SCENARIO'] == 'tee-failure' and n == 1 else 0)
+'''
+        scenarios = ("valid", "benchmark-failure", "build-failure", "tee-failure", "missing", "duplicate", "mutated")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                root = Path(directory)
+                (root / "artifacts/native").mkdir(parents=True)
+                (root / "fake-xcode.py").write_text(fake_xcode)
+                (root / "fake-tee.py").write_text(fake_tee)
+                preamble = '\n'.join((
+                    'set -euo pipefail', 'cd "$HARNESS_UNIT_ROOT"',
+                    'mode=benchmark', 'expected_code_source=' + SOURCE, 'expected_ios_tree=' + TREE,
+                    'simulator_id=' + SIMULATOR,
+                    'native_log=artifacts/native/native-playback-benchmark.log',
+                    'cases=(' + ' '.join(shlex.quote(name) for name in names) + ')',
+                    'xcodebuild() { "$HARNESS_UNIT_PYTHON" "$HARNESS_UNIT_ROOT/fake-xcode.py" "$@"; }',
+                    'tee() { "$HARNESS_UNIT_PYTHON" "$HARNESS_UNIT_ROOT/fake-tee.py" "$@"; }',
+                    'evidence_tool() {', '  "$HARNESS_UNIT_PYTHON" - "$@" <<\'PY\'', payload, 'PY', '}', ''))
+                script = root / "benchmark.sh"
+                script.write_text(preamble + benchmark + '\n')
+                environment = dict(os.environ, HARNESS_UNIT_ROOT=str(root), HARNESS_UNIT_PYTHON=sys.executable,
+                                   HARNESS_UNIT_SCENARIO=scenario)
+                # Only this disposable Bash process is real. Every xcodebuild/tee
+                # call is shadowed above; evidence modes perform local file I/O only.
+                result = REAL_SUBPROCESS_RUN(['/bin/bash', str(script)], env=environment,
+                                             text=True, capture_output=True, timeout=10)
+                commands = [json.loads(line) for line in (root / "commands.jsonl").read_text().splitlines()]
+                build = commands[0]
+                self.assertIn('build-for-testing', build)
+                self.assertIn('-project', build); self.assertIn('-scheme', build)
+                self.assertIn('-derivedDataPath', build)
+                self.assertFalse(any(arg.startswith('-only-testing:') for arg in build))
+                for command in commands:
+                    self.assertEqual(command[command.index('-jobs') + 1], '1')
+                    self.assertEqual(command[command.index('-parallel-testing-enabled') + 1], 'NO')
+                    self.assertIn('CODE_SIGNING_ALLOWED=NO', command)
+                receipt = root / 'artifacts/native/native-playback-build.json'
+                if scenario in ('valid', 'benchmark-failure', 'mutated'):
+                    self.assertEqual(len(commands), 2)
+                    testing = commands[1]
+                    self.assertIn('test-without-building', testing)
+                    self.assertNotIn('-project', testing); self.assertNotIn('-scheme', testing)
+                    self.assertEqual(testing[testing.index('-xctestrun') + 1],
+                                     'artifacts/DerivedData/Build/Products/Owned.xctestrun')
+                    self.assertEqual({arg for arg in testing if arg.startswith('-only-testing:')},
+                                     {'-only-testing:' + self.ns['PREFIX'].replace('.', '/', 1) + name for name in names})
+                else:
+                    self.assertEqual(len(commands), 1)
+                if scenario in ('valid', 'benchmark-failure'):
+                    self.assertEqual(result.returncode, 65 if scenario == 'benchmark-failure' else 0,
+                                     result.stdout + result.stderr)
+                    saved = json.loads(receipt.read_text())
+                    self.assertEqual(saved['benchmarkNativeExit'], result.returncode)
+                    self.assertEqual(saved['benchmarkTeeExit'], 0)
+                    self.assertEqual(saved['plan']['path'], 'artifacts/DerivedData/Build/Products/Owned.xctestrun')
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse(receipt.exists(), 'Failed build/plan validation must not authorize controls')
+                    if scenario == 'build-failure': self.assertEqual(result.returncode, 23)
+                    if scenario == 'tee-failure': self.assertEqual(result.returncode, 17)
 
     def test_aggregate_rejects_nonzero_missing_and_duplicate_control_receipts(self):
         self.make_receipt()
