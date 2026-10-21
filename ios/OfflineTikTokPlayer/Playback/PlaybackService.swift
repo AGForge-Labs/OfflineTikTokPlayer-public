@@ -1147,12 +1147,9 @@ final class PlaybackService: NSObject {
                   self.videoPresentation?.request == presentation?.request,
                   self.videoPresentation?.ticket == presentation?.ticket,
                   self.intent.canPlay == canPlay else { return false }
-            // A forced pending seek may legitimately be acknowledged by audio
-            // here. It uses the latest pending target and still skips native read.
-            if force { return true }
-            // A natural boundary can already have changed the render visit
-            // before this decision begins, ahead of the service's queued poll.
-            // An unacknowledged explicit selection still owns its pending goal.
+            // A natural boundary can change the rendered source before service
+            // adoption. Forced targets also need that owner; pending explicit
+            // selections still own their unacknowledged target.
             if !initialSelectionPending {
                 guard let expectedToken, expectedToken > 0, visit.token == expectedToken else { return false }
             }
