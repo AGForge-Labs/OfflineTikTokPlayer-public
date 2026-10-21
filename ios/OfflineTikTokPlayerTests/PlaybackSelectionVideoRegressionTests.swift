@@ -183,7 +183,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 return
             }
             let initialBStatus = queuedB.status.rawValue
-            func ownsPreparedB() -> Bool {
+            @MainActor func ownsPreparedB() -> Bool {
                 let items = buffer.player.items()
                 return service.queue.currentID == fixture.aID && audio.selectedID == fixture.aID
                     && service.player.currentItem === currentA && items.count == 2
