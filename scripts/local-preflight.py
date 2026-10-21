@@ -102,6 +102,51 @@ def validate_public_workflow(config):
         raise ValueError("Only unsigned source and simulator checks are approved.")
 
 
+def validate_native_sampler_capability_workflow(config):
+    """Allow only the reviewed installed-tool documentation job on its own branch."""
+    documentation = r"""python3 - <<'PY'
+import os
+import re
+import subprocess
+import sys
+
+# No checkout, target PID, application, media, credentials or profile.
+# This diagnostic cannot establish playback acceptance.
+environment = dict(os.environ, PAGER='cat', MANPAGER='cat', MANWIDTH='100')
+available = False
+for command in (['/usr/bin/sample', '-h'], ['/usr/bin/man', 'sample']):
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=10, env=environment)
+        data = result.stdout + result.stderr
+        if len(data) > 32_768:
+            raise RuntimeError('Installed tool documentation exceeded its output bound')
+        text = re.sub(r'.\x08', '', data.decode('utf-8', errors='replace'))
+        print('SamplerDocumentation command=' + command[0] + ' returnCode=' + str(result.returncode)
+              + ' bytes=' + str(len(data)), flush=True)
+        print(text, flush=True)
+        useful = ('usage:' in text.lower() and 'sample' in text.lower()) or (
+            result.returncode == 0 and 'SAMPLE' in text and 'NAME' in text)
+        available = available or useful
+    except subprocess.TimeoutExpired:
+        print('SamplerDocumentation command=' + command[0] + ' status=timeout', flush=True)
+sys.exit(0 if available else 1)
+PY
+"""
+    expected = {
+        "name": "Public native sampler capability",
+        "on": {"push": {"branches": ["diagnostic/native-sampler-capability"],
+                        "paths": [".github/workflows/native-sampler-capability.yml"]}},
+        "permissions": {},
+        "jobs": {"documentation": {
+            "if": "${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}",
+            "runs-on": "macos-26", "timeout-minutes": "3",
+            "steps": [{"name": "Read installed sampler documentation only", "run": documentation}],
+        }},
+    }
+    if config != expected:
+        raise ValueError("Sampler capability differs from its reviewed public scope, documentation body or resource policy.")
+
+
 def validate_public_release_workflow(config):
     """A separate strict policy for the explicitly approved release infrastructure.
 
@@ -170,9 +215,10 @@ def run_checks(root, *, runner=subprocess.run, platform=sys.platform):
     active = [path for path in directory.iterdir() if path.suffix.lower() in {".yaml", ".yml"}] if directory.exists() else []
     if active:
         validators = {"playback-validation.yml": validate_public_workflow,
-                      "public-testflight.yml": validate_public_release_workflow}
+                      "public-testflight.yml": validate_public_release_workflow,
+                      "native-sampler-capability.yml": validate_native_sampler_capability_workflow}
         if any(path.name not in validators for path in active):
-            raise ValueError("Only the reviewed public playback and protected release workflows may be present.")
+            raise ValueError("Only the reviewed public validation, protected release and sampler documentation workflows may be present.")
         for path in active:
             validators[path.name](yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader))
     workflow = yaml.load((root / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
