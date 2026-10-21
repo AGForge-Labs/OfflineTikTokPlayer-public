@@ -5,6 +5,75 @@ import PlayerCore
 
 @MainActor
 final class OfflineDownloadsIsolationTests: XCTestCase {
+    func testDeferredLocalRemovalPreservesTheOriginalThrownError() async throws {
+        let manager = FileManager.default
+        let source = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for control in DeferredRemovalControl.allCases {
+            let temporary = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try manager.createDirectory(at: temporary, withIntermediateDirectories: true)
+            let root = temporary.appendingPathComponent("Downloads", isDirectory: true)
+            let cloud = OneDriveClient(account: MicrosoftAccount())
+            let downloads = OfflineDownloads(cloud: cloud, network: NetworkStatus(),
+                storageRoot: root, usesBackgroundSession: false)
+            let id = "local:cleanup-error-identity-" + UUID().uuidString
+            defer {
+                downloads.shutdownLocalSession()
+                downloads.remove(id)
+                do { try manager.removeItem(at: temporary) }
+                catch { XCTFail("Could not remove the owned cleanup fixture for \(control.rawValue): \(error)") }
+            }
+
+            let (_, asset) = try await downloads.importLocal(source, mediaID: id)
+            let saved = root.appendingPathComponent("Offline", isDirectory: true)
+                .appendingPathComponent(asset.sha256 + ".mp4")
+            let checkpoint = root.appendingPathComponent("Transfers", isDirectory: true)
+                .appendingPathComponent(asset.sha256 + ".resume")
+            XCTAssertTrue(downloads.records[id]?.isReady == true)
+            XCTAssertTrue(manager.fileExists(atPath: saved.path))
+            XCTAssertFalse(manager.fileExists(atPath: checkpoint.path))
+            if control == .existingCheckpoint {
+                // Only removal is exercised; these synthetic bytes are never
+                // submitted to URLSession as resume data.
+                try Data("synthetic checkpoint".utf8).write(to: checkpoint, options: .withoutOverwriting)
+                XCTAssertTrue(manager.fileExists(atPath: checkpoint.path))
+            }
+
+            let original = DeferredRemovalSentinel()
+            var deferredCleanupRan = false
+            do {
+                try await throwOriginalError(original) {
+                    deferredCleanupRan = true
+                    if control != .noCleanup {
+                        downloads.shutdownLocalSession()
+                        downloads.remove(id)
+                    }
+                }
+                XCTFail("The original sentinel must be thrown for \(control.rawValue)")
+            } catch {
+                if let caught = error as? DeferredRemovalSentinel {
+                    XCTAssertTrue(caught === original, "Cleanup must preserve the exact error object for \(control.rawValue)")
+                    XCTAssertEqual(caught.identity, original.identity)
+                } else {
+                    XCTFail("Cleanup replaced the original typed error for \(control.rawValue) with \(String(reflecting: type(of: error)))")
+                }
+            }
+            XCTAssertTrue(deferredCleanupRan, "The throwing helper must run its defer for \(control.rawValue)")
+            if control == .noCleanup {
+                XCTAssertTrue(downloads.records[id]?.isReady == true)
+                XCTAssertTrue(manager.fileExists(atPath: saved.path))
+            } else {
+                XCTAssertNil(downloads.records[id])
+                XCTAssertFalse(manager.fileExists(atPath: saved.path))
+            }
+            XCTAssertFalse(manager.fileExists(atPath: checkpoint.path))
+        }
+    }
+
+    private func throwOriginalError(_ original: DeferredRemovalSentinel, cleanup: () -> Void) async throws {
+        defer { cleanup() }
+        throw original
+    }
+
     func testRemovingTheSameImportedHashInOneRootPreservesTheOtherRootAndLedger() async throws {
         let manager = FileManager.default
         let temporary = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -65,4 +134,12 @@ final class OfflineDownloadsIsolationTests: XCTestCase {
         XCTAssertEqual(digest.size, importedSecond.1.byteSize)
         XCTAssertEqual(digest.sha256, importedSecond.1.sha256)
     }
+}
+
+private enum DeferredRemovalControl: String, CaseIterable {
+    case noCleanup, missingCheckpoint, existingCheckpoint
+}
+
+private final class DeferredRemovalSentinel: Error, Sendable {
+    let identity = UUID()
 }

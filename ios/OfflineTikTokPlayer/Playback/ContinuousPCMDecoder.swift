@@ -3,6 +3,7 @@ import AVFoundation
 import AudioToolbox
 import Synchronization
 import PlayerCore
+import Darwin
 
 /// The only producer for the three fixed PCM sources. All AVAssetReader and
 /// buffer work runs on one serial worker; the audio callback never calls here.
@@ -24,6 +25,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         case rendererSnapshot = 9, streamRequest = 10, readerConfiguration = 11
         case converterConstruction = 12, streamReplacement = 13, poolDrain = 14, retiringSlots = 15
         case readerConstruction = 16
+        case calibrationWait = 17
     }
 
     struct SlotProgressSnapshot: Sendable {
@@ -38,6 +40,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     struct ProgressSnapshot: Sendable {
         let tracingEnabled: Bool
+        // Borrowed own-process thread name, used only by workerThreadState.
+        // Never include this field in logs or serialized diagnostic records.
+        fileprivate let threadPort: UInt32
         let phase: ProgressPhase
         let token: Int
         let slot: Int
@@ -60,12 +65,27 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let coherent: Bool
     }
 
+    struct WorkerThreadState: Sendable {
+        // 0 valid, 1 disabled, 2 incoherent, 3 idle, 4 missing port,
+        // 5 phase changed, 6 kernel error, 7 unexpected returned info count.
+        let statusCode: Int
+        // -1 means no kernel query; otherwise the actual thread_info result.
+        let kernelReturnCode: Int32
+        let runState: Int32
+        let userMicros: Int64
+        let systemMicros: Int64
+        let phaseSequence: Int64
+        let acquisitionBeginNs: UInt64
+        let acquisitionEndNs: UInt64
+    }
+
     fileprivate struct ProgressMark {
         let enabled: Bool
         let phase: ProgressPhase
         let token: Int
         let slot: Int
         let epoch: Int
+        let threadPort: UInt32
     }
 
     fileprivate struct ProgressContext {
@@ -107,6 +127,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
         private let tracing = Atomic<Bool>(true)
         private let version = Atomic<Int64>(0)
+        private let workerPort = Atomic<UInt32>(0)
         private let phaseValue = Atomic<Int>(ProgressPhase.idle.rawValue)
         private let tokenValue = Atomic<Int>(0)
         private let slotValue = Atomic<Int>(-1)
@@ -140,9 +161,63 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             return result
         }
 
+        /// Observes only this worker's cached, borrowed pthread Mach port. The
+        /// call neither acquires a send right nor enumerates threads/processes.
+        /// A phase transition before/during this single query fails closed.
+        func workerThreadState(matching snapshot: ProgressSnapshot) -> WorkerThreadState {
+            let begin = DispatchTime.now().uptimeNanoseconds
+            func result(_ status: Int, kernel: Int32 = -1, state: Int32 = 0,
+                        user: Int64 = 0, system: Int64 = 0) -> WorkerThreadState {
+                WorkerThreadState(statusCode: status, kernelReturnCode: kernel,
+                    runState: state, userMicros: user, systemMicros: system,
+                    phaseSequence: snapshot.phaseSequence, acquisitionBeginNs: begin,
+                    acquisitionEndNs: DispatchTime.now().uptimeNanoseconds)
+            }
+            guard snapshot.tracingEnabled, tracing.load(ordering: .acquiring) else { return result(1) }
+            guard snapshot.coherent else { return result(2) }
+            guard snapshot.phase != .idle else { return result(3) }
+            guard snapshot.threadPort != 0 else { return result(4) }
+            guard stillMatches(snapshot) else { return result(5) }
+
+            var info = thread_basic_info_data_t()
+            let expected = mach_msg_type_number_t(MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<integer_t>.size)
+            var count = expected
+            let kernel = withUnsafeMutablePointer(to: &info) { pointer in
+                pointer.withMemoryRebound(to: integer_t.self, capacity: Int(expected)) { words in
+                    thread_info(thread_t(snapshot.threadPort), thread_flavor_t(THREAD_BASIC_INFO), words, &count)
+                }
+            }
+            guard stillMatches(snapshot) else { return result(5, kernel: kernel) }
+            guard kernel == KERN_SUCCESS else { return result(6, kernel: kernel) }
+            guard count == expected else { return result(7, kernel: kernel) }
+            return result(0, kernel: kernel, state: info.run_state,
+                user: Int64(info.user_time.seconds) * 1_000_000 + Int64(info.user_time.microseconds),
+                system: Int64(info.system_time.seconds) * 1_000_000 + Int64(info.system_time.microseconds))
+        }
+
+        private func stillMatches(_ snapshot: ProgressSnapshot) -> Bool {
+            let before = version.load(ordering: .sequentiallyConsistent)
+            guard before & 1 == 0,
+                  tracing.load(ordering: .sequentiallyConsistent),
+                  phaseCount.load(ordering: .sequentiallyConsistent) == snapshot.phaseSequence,
+                  phaseValue.load(ordering: .sequentiallyConsistent) == snapshot.phase.rawValue,
+                  workerPort.load(ordering: .sequentiallyConsistent) == snapshot.threadPort else { return false }
+            return before == version.load(ordering: .sequentiallyConsistent)
+                && tracing.load(ordering: .sequentiallyConsistent)
+        }
+
+        /// Calibration owns a separate sleeping queue; this never runs audio or
+        /// impersonates an AVAssetReader/AVAudioConverter native call.
+        func withKnownWorkerWait(_ operation: () -> Void) {
+            let previous = enter(.calibrationWait, token: 0, slot: -1, epoch: 0)
+            defer { restore(previous) }
+            operation()
+        }
+
         private func readSnapshot() -> ProgressSnapshot {
             let enabled = tracing.load(ordering: .sequentiallyConsistent)
             let before = version.load(ordering: .sequentiallyConsistent)
+            let port = workerPort.load(ordering: .sequentiallyConsistent)
             let phase = ProgressPhase(rawValue: phaseValue.load(ordering: .sequentiallyConsistent)) ?? .idle
             let token = tokenValue.load(ordering: .sequentiallyConsistent)
             let slot = slotValue.load(ordering: .sequentiallyConsistent)
@@ -160,7 +235,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let slot0 = firstSlot.snapshot(), slot1 = secondSlot.snapshot(), slot2 = thirdSlot.snapshot()
             let coherent = before & 1 == 0 && before == version.load(ordering: .sequentiallyConsistent)
                 && enabled == tracing.load(ordering: .sequentiallyConsistent)
-            return ProgressSnapshot(tracingEnabled: enabled, phase: phase, token: token, slot: slot, epoch: epoch,
+            return ProgressSnapshot(tracingEnabled: enabled, threadPort: port, phase: phase, token: token, slot: slot, epoch: epoch,
                 currentTokenAtLastPump: active, phaseEnteredUptimeNanoseconds: entered,
                 phaseSequence: transitions, pumpCount: pumpCount, acceptedFrames: frames,
                 appendCount: appendCount, lastAcceptedUptimeNanoseconds: lastAccepted,
@@ -171,18 +246,19 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
         fileprivate func enter(_ phase: ProgressPhase, token: Int, slot: Int, epoch: Int) -> ProgressMark {
             guard tracing.load(ordering: .acquiring) else {
-                return ProgressMark(enabled: false, phase: .idle, token: 0, slot: -1, epoch: 0)
+                return ProgressMark(enabled: false, phase: .idle, token: 0, slot: -1, epoch: 0, threadPort: 0)
             }
             let previous = ProgressMark(enabled: true, phase: ProgressPhase(rawValue: phaseValue.load(ordering: .relaxed)) ?? .idle,
                 token: tokenValue.load(ordering: .relaxed), slot: slotValue.load(ordering: .relaxed),
-                epoch: epochValue.load(ordering: .relaxed))
+                epoch: epochValue.load(ordering: .relaxed), threadPort: workerPort.load(ordering: .relaxed))
             publish(phase, token: token, slot: slot, epoch: epoch)
             return previous
         }
 
         fileprivate func restore(_ previous: ProgressMark) {
             guard previous.enabled, tracing.load(ordering: .acquiring) else { return }
-            publish(previous.phase, token: previous.token, slot: previous.slot, epoch: previous.epoch)
+            publish(previous.phase, token: previous.token, slot: previous.slot, epoch: previous.epoch,
+                publisherPort: previous.threadPort)
         }
 
         fileprivate func enter(_ phase: ProgressPhase, context: ProgressContext) -> ProgressMark {
@@ -222,9 +298,18 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             return source.streamRequest
         }
 
-        private func publish(_ phase: ProgressPhase, token: Int, slot: Int, epoch: Int) {
-            let now = DispatchTime.now().uptimeNanoseconds
+        private func publish(_ phase: ProgressPhase, token: Int, slot: Int, epoch: Int,
+                             publisherPort: UInt32? = nil) {
+            // Hide the previous phase before querying the actual publisher's
+            // borrowed port. A serialized native callback may use another
+            // thread; an in-progress lookup must never look like an SDK wait.
             beginUpdate()
+            let port: UInt32
+            if phase == .idle { port = 0 }
+            else if let publisherPort { port = publisherPort }
+            else { port = pthread_mach_thread_np(pthread_self()) }
+            let now = DispatchTime.now().uptimeNanoseconds
+            workerPort.store(port, ordering: .sequentiallyConsistent)
             phaseValue.store(phase.rawValue, ordering: .sequentiallyConsistent)
             tokenValue.store(token, ordering: .sequentiallyConsistent)
             slotValue.store(slot, ordering: .sequentiallyConsistent)

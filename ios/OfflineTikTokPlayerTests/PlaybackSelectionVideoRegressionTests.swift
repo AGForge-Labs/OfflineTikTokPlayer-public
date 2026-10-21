@@ -551,6 +551,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testMatchedNaturalBoundaryProducerTraceAndCaptureControls() async throws {
         // Fresh identical histories isolate capture and native-trace overhead.
+        // Trace-on includes phase publication and conditional kernel observations;
+        // trace-off skips the kernel reader entirely.
         // Every arm keeps the same independent snapshot sampler and bounds.
         for condition in [(trace: false, capture: false), (trace: true, capture: false),
                           (trace: false, capture: true), (trace: true, capture: true)] {
@@ -1447,6 +1449,19 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         let producerAcquisitionEnd: UInt64
         let audio: ContinuousPCMRenderer.Snapshot
         let producer: ContinuousPCMDecoder.ProgressSnapshot
+        let kernel: ContinuousPCMDecoder.WorkerThreadState?
+
+        var kernelAcquisitionSeconds: Double? {
+            guard let kernel else { return nil }
+            guard kernel.acquisitionBeginNs > 0, kernel.acquisitionEndNs >= kernel.acquisitionBeginNs else { return .infinity }
+            return Double(kernel.acquisitionEndNs - kernel.acquisitionBeginNs) / 1_000_000_000
+        }
+
+        var kernelAvailable: Bool {
+            guard let kernel, let seconds = kernelAcquisitionSeconds else { return false }
+            return kernel.statusCode == 0 && kernel.kernelReturnCode == 0 && producer.coherent
+                && kernel.phaseSequence == producer.phaseSequence && seconds.isFinite && seconds <= 0.005
+        }
     }
     struct Result: Sendable {
         let origin: UInt64
@@ -1457,6 +1472,7 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         let maximumGap: UInt64
         let durationSeconds: Double
         let capacity: Int
+        let workerIdentifier: String
         let nativeSampleRequestID: String?
         let nativeSampleWriteCode: Int
 
@@ -1466,8 +1482,19 @@ private final class SelectionProducerProbe: @unchecked Sendable {
             else { delta = "missing" }
             let observedMs = samples.last.map { String(Double($0.uptime - origin) / 1_000_000) } ?? "missing"
             print("SelectionProducerWindow label=\(label) requestedSeconds=\(durationSeconds) capacity=\(capacity) observedUntilMs=\(observedMs) samples=\(samples.count) skipped=\(skipped) dropped=\(dropped) maxSamplerGapMs=\(Double(maximumGap) / 1_000_000) underrunDelta=\(delta) nativeSampleRequestID=\(nativeSampleRequestID ?? "none") nativeSampleWriteCode=\(nativeSampleWriteCode)")
+            let kernelObservations = samples.filter { $0.kernel != nil }
+            let kernelCalls = kernelObservations.filter { $0.kernel?.kernelReturnCode != -1 }
+            let maximumKernelAcquisition = kernelCalls.compactMap(\.kernelAcquisitionSeconds).max() ?? 0
+            XCTAssertLessThanOrEqual(maximumKernelAcquisition, 0.005,
+                "A preempted kernel call cannot establish a precise worker-state observation")
+            print("SelectionProducerKernelWindow label=\(label) workerID=\(workerIdentifier) observations=\(kernelObservations.count) calls=\(kernelCalls.count) valid=\(samples.filter { $0.kernelAvailable }.count) unavailable=\(kernelObservations.filter { !$0.kernelAvailable }.count) maximumAcquisitionMs=\(maximumKernelAcquisition * 1_000)")
             for sample in samples {
                 let progress = sample.producer
+                let kernel = sample.kernel
+                let kernelMs = sample.kernelAcquisitionSeconds.map { $0.isFinite ? $0 * 1_000 : -1 } ?? -1
+                // CPU values are cumulative for this observation's worker/phase;
+                // no delta or blocked interval is inferred across phase changes.
+                print("SelectionProducerKernelSample label=\(label) workerID=\(workerIdentifier) elapsedMs=\(Double(sample.uptime - origin) / 1_000_000) observationAttempted=\(kernel != nil) acquisitionBeginNs=\(kernel?.acquisitionBeginNs ?? 0) acquisitionEndNs=\(kernel?.acquisitionEndNs ?? 0) acquisitionMs=\(kernelMs) statusCode=\(kernel?.statusCode ?? -1) kernelReturnCode=\(kernel?.kernelReturnCode ?? -1) available=\(sample.kernelAvailable) runState=\(kernel?.runState ?? 0) userMicros=\(kernel?.userMicros ?? 0) systemMicros=\(kernel?.systemMicros ?? 0) phaseSequence=\(kernel?.phaseSequence ?? -1) producerPhaseSequence=\(progress.phaseSequence)")
                 let age = progress.phaseEnteredUptimeNanoseconds > 0 && sample.producerAcquisitionEnd >= progress.phaseEnteredUptimeNanoseconds
                     ? Double(sample.producerAcquisitionEnd - progress.phaseEnteredUptimeNanoseconds) / 1_000_000 : -1
                 print("SelectionProducerSample label=\(label) elapsedMs=\(Double(sample.uptime - origin) / 1_000_000) audioAcquisitionMs=\(Double(sample.audioAcquisitionEnd - sample.acquisitionBegin) / 1_000_000) producerAcquisitionMs=\(Double(sample.producerAcquisitionEnd - sample.audioAcquisitionEnd) / 1_000_000) nativeTrace=\(progress.tracingEnabled) audioToken=\(sample.audio.token) audioVisit=\(sample.audio.visit) audioFrame=\(sample.audio.frame) ended=\(sample.audio.ended) underrunFrames=\(sample.audio.underrunFrames) phase=\(progress.phase.rawValue) phaseToken=\(progress.token) slot=\(progress.slot) epoch=\(progress.epoch) phaseAgeMs=\(age) phaseSequence=\(progress.phaseSequence) pumpCount=\(progress.pumpCount) currentTokenAtLastPump=\(progress.currentTokenAtLastPump) acceptedFrames=\(progress.acceptedFrames) appendCount=\(progress.appendCount) lastAcceptedNs=\(progress.lastAcceptedUptimeNanoseconds) lastAcceptedToken=\(progress.lastAcceptedToken) lastAcceptedSlot=\(progress.lastAcceptedSlot) lastAcceptedEpoch=\(progress.lastAcceptedEpoch) slot0Token=\(progress.slot0.token) slot0Epoch=\(progress.slot0.epoch) slot0Accepted=\(progress.slot0.acceptedFrames) slot0Appends=\(progress.slot0.appendCount) slot0LastAcceptedNs=\(progress.slot0.lastAcceptedUptimeNanoseconds) slot1Token=\(progress.slot1.token) slot1Epoch=\(progress.slot1.epoch) slot1Accepted=\(progress.slot1.acceptedFrames) slot1Appends=\(progress.slot1.appendCount) slot1LastAcceptedNs=\(progress.slot1.lastAcceptedUptimeNanoseconds) slot2Token=\(progress.slot2.token) slot2Epoch=\(progress.slot2.epoch) slot2Accepted=\(progress.slot2.acceptedFrames) slot2Appends=\(progress.slot2.appendCount) slot2LastAcceptedNs=\(progress.slot2.lastAcceptedUptimeNanoseconds) coherent=\(progress.coherent)")
@@ -1521,12 +1548,16 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         let audioEnd = DispatchTime.now().uptimeNanoseconds
         let producer = context.producer.snapshot()
         let producerEnd = DispatchTime.now().uptimeNanoseconds
+        // Keep the producer snapshot bracket independent of the optional syscall.
+        // A disabled trace does not enter the kernel reader, even to get a status.
+        let kernel: ContinuousPCMDecoder.WorkerThreadState? = producer.tracingEnabled
+            ? context.producer.workerThreadState(matching: producer) : nil
         record(audio: audio, producer: producer, begin: begin,
-            audioEnd: audioEnd, producerEnd: producerEnd)
+            audioEnd: audioEnd, producerEnd: producerEnd, kernel: kernel)
     }
 
     private func record(audio: ContinuousPCMRenderer.Snapshot?, producer: ContinuousPCMDecoder.ProgressSnapshot,
-        begin: UInt64, audioEnd: UInt64, producerEnd: UInt64) {
+        begin: UInt64, audioEnd: UInt64, producerEnd: UInt64, kernel: ContinuousPCMDecoder.WorkerThreadState?) {
         lock.lock(); defer { lock.unlock() }
         guard !stopped else { return }
         guard let audio else { skipped += 1; return }
@@ -1534,7 +1565,7 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         if let previousSample { maximumGap = max(maximumGap, audioEnd - previousSample) }
         previousSample = audioEnd
         samples.append(Sample(uptime: audioEnd, acquisitionBegin: begin, audioAcquisitionEnd: audioEnd,
-            producerAcquisitionEnd: producerEnd, audio: audio, producer: producer))
+            producerAcquisitionEnd: producerEnd, audio: audio, producer: producer, kernel: kernel))
         if baselineUnderruns == nil { baselineUnderruns = audio.underrunFrames }
         guard let purpose = context.nativeSamplePurpose, let identifier = nativeSampleIdentifier,
               !nativeSampleRequested,
@@ -1553,6 +1584,7 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         stopped = true
         return Result(origin: origin, initial: initial, samples: samples, skipped: skipped,
                       dropped: dropped, maximumGap: maximumGap, durationSeconds: durationSeconds, capacity: capacity,
+                      workerIdentifier: context.producer.workerIdentifier,
                       nativeSampleRequestID: nativeSampleRequested ? nativeSampleIdentifier : nil,
                       nativeSampleWriteCode: nativeSampleWriteCode)
     }
