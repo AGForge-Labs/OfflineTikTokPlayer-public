@@ -25,6 +25,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let tap = ProductionSelectionOutputTap()
         let seeks = ProductionSelectionSeekRecorder()
         let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
+        #if DEBUG
+        service.onDebugVideoSeekStamp = { [weak seeks] stamp in seeks?.record(stamp) }
+        defer { service.onDebugVideoSeekStamp = nil }
+        #endif
         let screen = try SelectionVideoScreen(service: service)
         // From here, deletion requires the decoder's queued cleanup acknowledgement.
         mayRemoveFixture = false
@@ -165,6 +169,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         seeks.phase = phase
         let origin = ProductionSelectionOutputTap.hostSeconds()
         command()
+        let commandReturned = ProductionSelectionOutputTap.hostSeconds()
         var cursor = first
         var outgoing: ProductionSelectionOutputTap.Tone?
         var tone: ProductionSelectionOutputTap.Tone?
@@ -199,7 +204,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         let last = tap.stop()
         return ProductionSelectionMeasurement(phase: phase, prepared: prepared, preparedBefore: preparedBefore,
-            frequency: frequency, first: first, last: last, origin: origin, outgoing: outgoing, tone: tone,
+            frequency: frequency, first: first, last: last, origin: origin,
+            commandReturnHostSeconds: commandReturned, outgoing: outgoing, tone: tone,
             displayReady: displayReady, ready: ready, before: before,
             expectedTokenBefore: expectedTokenBefore, beforeSubmitted: submitted,
             state: productionSelectionState(service, fixture: fixture, audio: audio, id: id))
@@ -213,6 +219,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let readyMs = value.ready.map { ($0 - value.origin) * 1_000 }
         let state = value.state
         print("ProductionSelectionLatency phase=\(value.phase) prepared=\(value.prepared) preparedBefore=\(value.preparedBefore) frequency=\(value.frequency) commandHostSeconds=\(value.origin) toneStartMs=\(value.tone.map { String(($0.start - value.origin) * 1_000) } ?? "missing") toneEndMs=\(toneMs.map { String($0) } ?? "missing") customDisplayReadyMs=\(value.displayReady.map { String(($0 - value.origin) * 1_000) } ?? "missing") videoReadyMs=\(readyMs.map { String($0) } ?? "missing") metadataMatches=\(state.metadataMatches) assetMatches=\(state.assetMatches) sourceIDMatches=\(state.sourceIDMatches) expectedToken=\(state.expectedToken) token=\(state.audio.token) visit=\(state.audio.visit) beforeVisit=\(value.before.visit) frame=\(state.audio.frame) ended=\(state.audio.ended) copiedPTS=\(state.copied.map { String($0) } ?? "missing") submittedPTS=\(state.frame.map { String($0) } ?? "missing") requested=\(state.requested) submitted=\(state.submitted) beforeSubmitted=\(value.beforeSubmitted) engineRunning=\(state.engineRunning) wantsPlaying=\(state.wantsPlaying) quietMs=\(quiet * 1_000) maximumHoleMs=\(hole * 1_000) underrunDelta=\(state.audio.underrunFrames - value.before.underrunFrames) producerTracing=absent physicalOutput=unverified compositorPixels=unverified")
+        print("ProductionSelectionCommandReturn schema=1 phase=\(value.phase) commandHostSeconds=\(value.origin) returnHostSeconds=\(value.commandReturnHostSeconds) synchronousCommandSpanMs=\((value.commandReturnHostSeconds - value.origin) * 1_000)")
+        XCTAssertTrue(value.origin.isFinite); XCTAssertTrue(value.commandReturnHostSeconds.isFinite)
+        XCTAssertGreaterThanOrEqual(value.commandReturnHostSeconds, value.origin)
         XCTAssertTrue(value.preparedBefore)
         XCTAssertNotNil(value.tone, "The independently classified target must reach the actual mixer tap")
         XCTAssertNotNil(value.ready, "A fresh, selected and aligned actual custom submission must become ready")
@@ -824,6 +833,7 @@ private struct ProductionSelectionMeasurement {
     let first: Int
     let last: Int
     let origin: Double
+    let commandReturnHostSeconds: Double
     let outgoing: ProductionSelectionOutputTap.Tone?
     let tone: ProductionSelectionOutputTap.Tone?
     let displayReady: Double?
@@ -1018,19 +1028,34 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     }
 }
 
-/// Only seek forwarding timestamps/targets; no native player state getter or event hook.
+/// Seek forwarding timestamps/targets plus optional cached DEBUG decision stamps.
+/// Neither path queries native player state; all output remains post-cleanup.
 private final class ProductionSelectionSeekRecorder: @unchecked Sendable {
     struct Event {
         let phase: Int
         let target: Double
         let entered: Double
+        var returnHostSeconds: Double?
         var completed: Double?
         var finished: Bool?
+        #if DEBUG
+        var stamp: PlaybackService.DebugVideoSeekStamp?
+        #endif
     }
     private let lock = NSLock()
     private var currentPhase = -1
     private var events: [Event] = []
     private var dropped = 0
+    #if DEBUG
+    private var pendingStamp: PlaybackService.DebugVideoSeekStamp?
+    private var stampConflicts = 0
+
+    func record(_ stamp: PlaybackService.DebugVideoSeekStamp) {
+        lock.lock(); defer { lock.unlock() }
+        if pendingStamp != nil { stampConflicts += 1 }
+        pendingStamp = stamp
+    }
+    #endif
     init() { events.reserveCapacity(32) }
     var phase: Int {
         get { lock.lock(); defer { lock.unlock() }; return currentPhase }
@@ -1042,9 +1067,17 @@ private final class ProductionSelectionSeekRecorder: @unchecked Sendable {
         let entered = ProductionSelectionOutputTap.hostSeconds()
         lock.lock()
         let index: Int?
+        #if DEBUG
+        let stamp = pendingStamp
+        pendingStamp = nil
+        #endif
         if events.count < 32 {
             index = events.count
-            events.append(Event(phase: currentPhase, target: time.seconds, entered: entered))
+            var event = Event(phase: currentPhase, target: time.seconds, entered: entered)
+            #if DEBUG
+            event.stamp = stamp
+            #endif
+            events.append(event)
         } else { dropped += 1; index = nil }
         lock.unlock()
         player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [self] finished in
@@ -1058,17 +1091,48 @@ private final class ProductionSelectionSeekRecorder: @unchecked Sendable {
                 } else { dropped += 1 }
             }
         }
+        // Timestamp immediately after the real forwarding call returns. The
+        // native completion may legitimately occur before or after this point.
+        let returned = ProductionSelectionOutputTap.hostSeconds()
+        lock.lock()
+        if let index { events[index].returnHostSeconds = returned }
+        lock.unlock()
     }
 
     func dumpAndAssert() {
-        lock.lock(); let result = events, lost = dropped; lock.unlock()
+        lock.lock()
+        let result = events, lost = dropped
+        #if DEBUG
+        let conflicts = stampConflicts, pending = pendingStamp != nil
+        #endif
+        lock.unlock()
         print("ProductionSelectionSeekSummary events=\(result.count) capacity=32 dropped=\(lost) nativePositionGetters=0 producerTracing=absent")
         XCTAssertLessThanOrEqual(result.count, 32); XCTAssertEqual(lost, 0)
+        #if DEBUG
+        print("ProductionSelectionSeekStampSummary schema=1 conflicts=\(conflicts) pending=\(pending) storage=existing32events-plus-one-pending")
+        XCTAssertEqual(conflicts, 0); XCTAssertFalse(pending)
+        #endif
         for (index, event) in result.enumerated() {
             print("ProductionSelectionSeek ordinal=\(index) phase=\(event.phase) target=\(event.target) enteredHostSeconds=\(event.entered) completedHostSeconds=\(event.completed.map { String($0) } ?? "missing") finished=\(event.finished.map { String($0) } ?? "missing")")
             XCTAssertTrue((0...2).contains(event.phase)); XCTAssertTrue(event.target.isFinite)
             XCTAssertTrue(event.entered.isFinite)
             if let completed = event.completed { XCTAssertGreaterThanOrEqual(completed, event.entered) }
+            print("ProductionSelectionSeekReturn schema=1 ordinal=\(index) phase=\(event.phase) enteredHostSeconds=\(event.entered) returnHostSeconds=\(event.returnHostSeconds.map { String($0) } ?? "missing") forwardingSynchronousSpanMs=\(event.returnHostSeconds.map { String(($0 - event.entered) * 1_000) } ?? "missing")")
+            XCTAssertNotNil(event.returnHostSeconds, "Every forwarded seek must retain its synchronous return timestamp")
+            if let returned = event.returnHostSeconds {
+                XCTAssertTrue(returned.isFinite)
+                XCTAssertGreaterThanOrEqual(returned, event.entered)
+            }
+            #if DEBUG
+            XCTAssertNotNil(event.stamp, "Every forwarded benchmark seek must retain its decision stamp")
+            if let stamp = event.stamp {
+                print("ProductionSelectionSeekReason schema=1 ordinal=\(index) phase=\(event.phase) reason=\(stamp.reason.rawValue) request=\(stamp.request) generation=\(stamp.generation) nativeSeekTicket=\(stamp.nativeSeekTicket) requestedPosition=\(stamp.requestedPosition) force=\(stamp.force) cachedSelected=\(stamp.cachedSelected) selectedMatchesQueue=\(stamp.selectedMatchesQueue) cachedAudioToken=\(stamp.cachedAudioToken) cachedAudioVisit=\(stamp.cachedAudioVisit) observedItemMatches=\(stamp.observedItemMatches) presentationRequestMatches=\(stamp.presentationRequestMatches) readyGeneration=\(stamp.readyGeneration.map { String($0) } ?? "missing") pendingAudioSeek=\(stamp.pendingAudioSeek) audioLoading=\(stamp.audioLoading) canPlay=\(stamp.canPlay) videoAllowed=\(stamp.videoAllowed)")
+                XCTAssertNotEqual(stamp.reason, .unattributed)
+                XCTAssertGreaterThan(stamp.nativeSeekTicket, 0)
+                XCTAssertTrue(stamp.requestedPosition.isFinite)
+                XCTAssertEqual(stamp.requestedPosition, event.target, accuracy: 0.5 / 48_000 + 1e-9)
+            }
+            #endif
         }
     }
 }

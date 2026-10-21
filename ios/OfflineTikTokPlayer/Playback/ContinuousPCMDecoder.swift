@@ -69,10 +69,16 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let maximumOwnedPacketBytes = 131_072
         let maximumOwnedPacketsPerLease = 2
         let maximumOwnedPayloadBytesPerLease = 262_144
-        // Retained in Stream output before source-position discard, not a claim
-        // that those frames have already reached the renderer or speaker.
+        // Effective downstream status, retained before source-position discard.
+        // DEBUG-controlled observations are separated from actual native status.
+        // None of these counts claims renderer-written or speaker output frames.
         let positiveInputRanDryBuffersRetained: UInt64
         let positiveInputRanDryFramesRetained: UInt64
+        let nativePositiveInputRanDryBuffersRetained: UInt64
+        let nativePositiveInputRanDryFramesRetained: UInt64
+        let injectedPositiveInputRanDryBuffersRetained: UInt64
+        let injectedPositiveInputRanDryFramesRetained: UInt64
+        let positiveInputRanDryContractInjectionEnabled: Bool
         let counterOverflowed: Bool
         let shutdownRequested: Bool
         let readerLeasesClosed: Bool
@@ -328,6 +334,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private var peakLeasedReaders = 0
     private var positiveInputRanDryBuffersRetained: UInt64 = 0
     private var positiveInputRanDryFramesRetained: UInt64 = 0
+    private var nativePositiveInputRanDryBuffersRetained: UInt64 = 0
+    private var nativePositiveInputRanDryFramesRetained: UInt64 = 0
+    private var injectedPositiveInputRanDryBuffersRetained: UInt64 = 0
+    private var injectedPositiveInputRanDryFramesRetained: UInt64 = 0
+    private var positiveInputRanDryContractInjectionEnabled = false
     private var workerCounterOverflowed = false
     #endif
 
@@ -453,6 +464,13 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     #if DEBUG
+    /// Default off; applies only to subsequently created Streams. Map one real,
+    /// successful positive haveData result per Stream to the downstream inputRanDry
+    /// contract. PCM, frame length, error and endOfStream are never substituted.
+    func debugSetPositiveInputRanDryContractInjectionEnabled(_ enabled: Bool) {
+        worker.async { [self] in positiveInputRanDryContractInjectionEnabled = enabled }
+    }
+
     func debugWorkerStats(_ completion: @escaping @Sendable (DebugWorkerStats) -> Void) {
         worker.async { [self] in
             let present = leases.compactMap { $0 }
@@ -468,17 +486,34 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 packetAllocationUpperBound: 2 * present.count,
                 positiveInputRanDryBuffersRetained: positiveInputRanDryBuffersRetained,
                 positiveInputRanDryFramesRetained: positiveInputRanDryFramesRetained,
+                nativePositiveInputRanDryBuffersRetained: nativePositiveInputRanDryBuffersRetained,
+                nativePositiveInputRanDryFramesRetained: nativePositiveInputRanDryFramesRetained,
+                injectedPositiveInputRanDryBuffersRetained: injectedPositiveInputRanDryBuffersRetained,
+                injectedPositiveInputRanDryFramesRetained: injectedPositiveInputRanDryFramesRetained,
+                positiveInputRanDryContractInjectionEnabled: positiveInputRanDryContractInjectionEnabled,
                 counterOverflowed: workerCounterOverflowed,
                 shutdownRequested: stopped, readerLeasesClosed: present.isEmpty))
         }
     }
 
-    private func notePositiveInputRanDry(frames: Int) {
+    private func notePositiveInputRanDry(frames: Int, injected: Bool) {
         let buffers = positiveInputRanDryBuffersRetained.addingReportingOverflow(1)
         let samples = positiveInputRanDryFramesRetained.addingReportingOverflow(UInt64(frames))
         positiveInputRanDryBuffersRetained = buffers.overflow ? .max : buffers.partialValue
         positiveInputRanDryFramesRetained = samples.overflow ? .max : samples.partialValue
+        let originalBuffers = injected ? injectedPositiveInputRanDryBuffersRetained : nativePositiveInputRanDryBuffersRetained
+        let originalFrames = injected ? injectedPositiveInputRanDryFramesRetained : nativePositiveInputRanDryFramesRetained
+        let classifiedBuffers = originalBuffers.addingReportingOverflow(1)
+        let classifiedFrames = originalFrames.addingReportingOverflow(UInt64(frames))
+        if injected {
+            injectedPositiveInputRanDryBuffersRetained = classifiedBuffers.overflow ? .max : classifiedBuffers.partialValue
+            injectedPositiveInputRanDryFramesRetained = classifiedFrames.overflow ? .max : classifiedFrames.partialValue
+        } else {
+            nativePositiveInputRanDryBuffersRetained = classifiedBuffers.overflow ? .max : classifiedBuffers.partialValue
+            nativePositiveInputRanDryFramesRetained = classifiedFrames.overflow ? .max : classifiedFrames.partialValue
+        }
         workerCounterOverflowed = workerCounterOverflowed || buffers.overflow || samples.overflow
+            || classifiedBuffers.overflow || classifiedFrames.overflow
     }
 
     /// Queued acknowledgement includes native lane cancellation/release, not just
@@ -575,7 +610,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let stream = try Stream(description: description, startFrame: startFrame, native: lease,
                                     shouldCancel: shouldCancel)
             #if DEBUG
-            stream.onPositiveInputRanDry = { [weak self] frames in self?.notePositiveInputRanDry(frames: frames) }
+            stream.injectNextPositiveHaveDataAsInputRanDry = positiveInputRanDryContractInjectionEnabled
+            stream.onPositiveInputRanDry = { [weak self] frames, injected in
+                self?.notePositiveInputRanDry(frames: frames, injected: injected)
+            }
             #endif
             return stream
         } catch {
@@ -822,7 +860,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private var lastAboveThreshold: Int64?
         private var peak: Float = 0
         #if DEBUG
-        var onPositiveInputRanDry: ((Int) -> Void)?
+        var injectNextPositiveHaveDataAsInputRanDry = false
+        var onPositiveInputRanDry: ((Int, Bool) -> Void)?
         #endif
 
         var readerLease: ReaderLease? { native }
@@ -938,7 +977,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 var conversionError: NSError?
                 let sourceTarget = totalFrames, rate = nativeRate
                 var suppliedSupport = supportFramesSupplied
-                let status = converter.convert(to: output, error: &conversionError) { requested, status in
+                let nativeStatus = converter.convert(to: output, error: &conversionError) { requested, status in
                     do {
                         guard requested > 0 else { status.pointee = .noDataNow; return nil }
                         let count = try native.read(into: input,
@@ -975,12 +1014,20 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 }
                 supportFramesSupplied = suppliedSupport
                 if let inputFailure { throw inputFailure }
-                guard status != .error, conversionError == nil else { throw Failure.cannotDecode }
+                guard nativeStatus != .error, conversionError == nil else { throw Failure.cannotDecode }
+                #if DEBUG
+                let injected = injectNextPositiveHaveDataAsInputRanDry
+                    && nativeStatus == .haveData && output.frameLength > 0
+                if injected { injectNextPositiveHaveDataAsInputRanDry = false }
+                let status: AVAudioConverterOutputStatus = injected ? .inputRanDry : nativeStatus
+                #else
+                let status = nativeStatus
+                #endif
                 if status == .endOfStream { converterFinished = true }
                 outputStart = generatedFrames; outputCount = Int(output.frameLength)
                 generatedFrames += Int64(outputCount)
                 #if DEBUG
-                if status == .inputRanDry, outputCount > 0 { onPositiveInputRanDry?(outputCount) }
+                if status == .inputRanDry, outputCount > 0 { onPositiveInputRanDry?(outputCount, injected) }
                 #endif
                 // The callback only marks demand. SDK work is dispatched after
                 // synchronous convert returns, even if inputRanDry produced PCM.

@@ -32,6 +32,36 @@ final class PlaybackService: NSObject {
     }
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
+    #if DEBUG
+    enum DebugVideoSeekReason: Int, Sendable {
+        case unattributed = 0, readyRestore = 1, readyRewind = 2, sourceVisit = 3, drift = 4
+        case userPausedSeek = 5, latestPausedTarget = 6, foreground = 7
+        case pipRestore = 8, surfaceRestore = 9, preparedPausedSource = 10
+    }
+    struct DebugVideoSeekStamp: Sendable {
+        let reason: DebugVideoSeekReason
+        let request: Int
+        let generation: Int
+        // Application-owned ticket guarding this native seek, not an SDK ID.
+        let nativeSeekTicket: UInt64
+        let requestedPosition: Double
+        let force: Bool
+        // Cached actor-owned state, not another renderer/native snapshot.
+        let cachedSelected: Bool
+        let selectedMatchesQueue: Bool
+        let cachedAudioToken: Int
+        let cachedAudioVisit: Int64
+        let observedItemMatches: Bool
+        let presentationRequestMatches: Bool
+        let readyGeneration: Int?
+        let pendingAudioSeek: Bool
+        let audioLoading: Bool
+        let canPlay: Bool
+        let videoAllowed: Bool
+    }
+    @ObservationIgnored var onDebugVideoSeekStamp: ((DebugVideoSeekStamp) -> Void)?
+    @ObservationIgnored private var debugVideoSeekReason: DebugVideoSeekReason = .unattributed
+    #endif
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
     @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
     @ObservationIgnored private var firstProgressGeneration: Int?
@@ -200,7 +230,11 @@ final class PlaybackService: NSObject {
             guard let self, let restore = self.requestPlayerUI else { completion(false); return }
             restore()
             DispatchQueue.main.async { [weak self] in
+                #if DEBUG
+                self?.synchronizeVideoToAudio(force: true, reason: .pipRestore)
+                #else
                 self?.synchronizeVideoToAudio(force: true)
+                #endif
                 completion(self?.surface.window != nil)
             }
         }
@@ -334,7 +368,11 @@ final class PlaybackService: NSObject {
             if !intent.canPlay {
                 _ = clock.completeSeek(seek, actualPosition: seek.target)
                 pendingAudioSeek = nil
+                #if DEBUG
+                synchronizeVideoToAudio(force: true, reason: .userPausedSeek)
+                #else
                 synchronizeVideoToAudio(force: true)
+                #endif
                 completePiPSkip()
             }
             persist(); updateNowPlaying()
@@ -504,7 +542,11 @@ final class PlaybackService: NSObject {
                     if position > 0 || rewind {
                         // Audio already owns its position. Readiness of a reused
                         // muted video must never rewind the audible PCM cursor.
+                        #if DEBUG
+                        self.synchronizeVideoToAudio(force: true, reason: rewind ? .readyRewind : .readyRestore)
+                        #else
                         self.synchronizeVideoToAudio(force: true)
+                        #endif
                     } else {
                         let ticket = self.currentVideoPresentation(for: playerItem, request: request)
                         var installed = false
@@ -711,7 +753,13 @@ final class PlaybackService: NSObject {
                 queue = following
                 let video = buffer.advance(to: entry.id)
                 loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
-            } else { synchronizeVideoToAudio(force: true) }
+            } else {
+                #if DEBUG
+                synchronizeVideoToAudio(force: true, reason: .sourceVisit)
+                #else
+                synchronizeVideoToAudio(force: true)
+                #endif
+            }
             prepareUpcoming()
         }
         clock.sample(position: Double(sample.frame) / 48_000)
@@ -730,11 +778,28 @@ final class PlaybackService: NSObject {
                 else { pause() }
             }
         }
+        #if DEBUG
+        synchronizeVideoToAudio(reason: .drift)
+        #else
         synchronizeVideoToAudio()
+        #endif
         if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
     }
 
+    #if DEBUG
+    private func synchronizeVideoToAudio(force: Bool = false, reason: DebugVideoSeekReason) {
+        guard onDebugVideoSeekStamp != nil else { synchronizeVideoToAudio(force: force); return }
+        let previous = debugVideoSeekReason
+        debugVideoSeekReason = reason
+        defer { debugVideoSeekReason = previous }
+        synchronizeVideoToAudio(force: force)
+    }
+    #endif
+
     private func synchronizeVideoToAudio(force: Bool = false) {
+        #if DEBUG
+        let reason = debugVideoSeekReason
+        #endif
         guard videoAllowed, continuousAudio.isSelected, audioLoadingID == nil, syncingVideoGeneration != generation,
               let item = player.currentItem, item.status == .readyToPlay else { return }
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
@@ -743,6 +808,19 @@ final class PlaybackService: NSObject {
         let request = generation
         syncingVideoGeneration = request
         let videoSeek = continuousPiP.beginSeek()
+        #if DEBUG
+        if let observer = onDebugVideoSeekStamp {
+            observer(DebugVideoSeekStamp(reason: reason, request: request, generation: generation,
+                nativeSeekTicket: videoSeek, requestedPosition: position, force: force,
+                cachedSelected: continuousAudio.isSelected,
+                selectedMatchesQueue: continuousAudio.selectedID == queue.currentID,
+                cachedAudioToken: audioToken, cachedAudioVisit: audioVisit,
+                observedItemMatches: observedItem === item,
+                presentationRequestMatches: videoPresentation?.request == request,
+                readyGeneration: readyGeneration, pendingAudioSeek: pendingAudioSeek != nil,
+                audioLoading: audioLoadingID != nil, canPlay: intent.canPlay, videoAllowed: videoAllowed))
+        }
+        #endif
         seekVideo(player, CMTime(seconds: position, preferredTimescale: 48_000)) { [weak self, weak item] finished in
             Task { @MainActor in
                 guard let self else { return }
@@ -758,7 +836,11 @@ final class PlaybackService: NSObject {
                 let requestedFrameChanged = abs(position - desired) > 0.5 / 48_000
                 if !self.intent.canPlay,
                    requestedFrameChanged || abs(item.currentTime().seconds - desired) > 0.080 {
+                    #if DEBUG
+                    self.synchronizeVideoToAudio(force: true, reason: .latestPausedTarget)
+                    #else
                     self.synchronizeVideoToAudio(force: true)
+                    #endif
                     return
                 }
                 // The display layer also needs the requested paused/restored position,
@@ -851,7 +933,13 @@ final class PlaybackService: NSObject {
         let interrupted = intent.isInterrupted
         intent.enteredForeground()
         if interrupted { continuousAudio.suspend(); player.pause(); message = "Audio was interrupted. Tap Play to resume." }
-        else { synchronizeVideoToAudio(force: true) }
+        else {
+            #if DEBUG
+            synchronizeVideoToAudio(force: true, reason: .foreground)
+            #else
+            synchronizeVideoToAudio(force: true)
+            #endif
+        }
     }
 
     func handleInterruption(began: Bool, shouldResume: Bool = false) {
@@ -889,7 +977,13 @@ final class PlaybackService: NSObject {
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
         if !videoAllowed { player.pause(); continuousPiP.suspendFrameFeed() }
         else { continuousPiP.resumeFrameFeed() }
-        if actions.restoreInlineVideo { synchronizeVideoToAudio(force: true) }
+        if actions.restoreInlineVideo {
+            #if DEBUG
+            synchronizeVideoToAudio(force: true, reason: .surfaceRestore)
+            #else
+            synchronizeVideoToAudio(force: true)
+            #endif
+        }
     }
 
     private func samplePiPState() {
@@ -925,7 +1019,13 @@ final class PlaybackService: NSObject {
         case .frameFailed: phase = .sampled
         case .sourcePrepared:
             // Composition/output attachment can finish after an initial paused seek.
-            if !intent.canPlay { synchronizeVideoToAudio(force: true) }
+            if !intent.canPlay {
+                #if DEBUG
+                synchronizeVideoToAudio(force: true, reason: .preparedPausedSource)
+                #else
+                synchronizeVideoToAudio(force: true)
+                #endif
+            }
             phase = .sourcePreparationCompleted
         case .sourcePreparationFailed: phase = .sourcePreparationFailed
         }

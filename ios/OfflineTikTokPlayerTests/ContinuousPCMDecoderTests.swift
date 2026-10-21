@@ -205,6 +205,13 @@ final class ContinuousPCMDecoderTests: XCTestCase {
 
     func testPositiveInputRanDryOutputSurvivesReal44100ConversionThroughItsExactTail() async throws {
         #if DEBUG
+        try await assertReal44100ConversionThroughItsExactTail(controlledStatus: false)
+        try await assertReal44100ConversionThroughItsExactTail(controlledStatus: true)
+        #endif
+    }
+
+    #if DEBUG
+    private func assertReal44100ConversionThroughItsExactTail(controlledStatus: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("positive-input-ran-dry-44100.caf")
@@ -233,6 +240,16 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let initial = try await Self.mailboxStats(decoder)
         XCTAssertEqual(initial.positiveInputRanDryBuffersRetained, 0)
         XCTAssertEqual(initial.positiveInputRanDryFramesRetained, 0)
+        XCTAssertEqual(initial.nativePositiveInputRanDryBuffersRetained, 0)
+        XCTAssertEqual(initial.nativePositiveInputRanDryFramesRetained, 0)
+        XCTAssertEqual(initial.injectedPositiveInputRanDryBuffersRetained, 0)
+        XCTAssertEqual(initial.injectedPositiveInputRanDryFramesRetained, 0)
+        XCTAssertFalse(initial.positiveInputRanDryContractInjectionEnabled, "A fresh decoder must default to the unmodified native status path")
+        if controlledStatus {
+            decoder.debugSetPositiveInputRanDryContractInjectionEnabled(true)
+            let armed = try await Self.mailboxStats(decoder)
+            XCTAssertTrue(armed.positiveInputRanDryContractInjectionEnabled)
+        }
         let prepared = try await Self.mailboxPrepare(decoder, url: url, token: 1, slot: 0)
         XCTAssertEqual(prepared.totalFrames, 10_668)
         renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
@@ -255,9 +272,23 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         }
         let final = try await Self.mailboxStats(decoder)
         Self.assertMailboxBounds(final)
-        XCTAssertGreaterThan(final.positiveInputRanDryBuffersRetained, 0,
-                             "This real AVAudioConverter run must exercise positive-output inputRanDry, not silently miss that branch")
-        XCTAssertGreaterThan(final.positiveInputRanDryFramesRetained, 0)
+        if controlledStatus {
+            XCTAssertEqual(final.injectedPositiveInputRanDryBuffersRetained, 1,
+                           "Exactly one real positive haveData result must reach the controlled inputRanDry contract")
+            XCTAssertGreaterThan(final.injectedPositiveInputRanDryFramesRetained, 0)
+            XCTAssertGreaterThan(final.positiveInputRanDryBuffersRetained, 0,
+                                 "The controlled status arm must exercise positive-output inputRanDry without inventing PCM")
+            XCTAssertGreaterThan(final.positiveInputRanDryFramesRetained, 0)
+        } else {
+            XCTAssertEqual(final.injectedPositiveInputRanDryBuffersRetained, 0)
+            XCTAssertEqual(final.injectedPositiveInputRanDryFramesRetained, 0)
+        }
+        XCTAssertEqual(final.positiveInputRanDryContractInjectionEnabled, controlledStatus)
+        let buffers = final.nativePositiveInputRanDryBuffersRetained.addingReportingOverflow(final.injectedPositiveInputRanDryBuffersRetained)
+        let frames = final.nativePositiveInputRanDryFramesRetained.addingReportingOverflow(final.injectedPositiveInputRanDryFramesRetained)
+        XCTAssertFalse(buffers.overflow); XCTAssertFalse(frames.overflow)
+        XCTAssertEqual(final.positiveInputRanDryBuffersRetained, buffers.partialValue)
+        XCTAssertEqual(final.positiveInputRanDryFramesRetained, frames.partialValue)
         XCTAssertGreaterThanOrEqual(final.positiveInputRanDryFramesRetained, final.positiveInputRanDryBuffersRetained)
         assertSamples(actual, equal: expected)
         assertSamples(Array(actual.suffix(64)), equal: Array(expected.suffix(64)))
@@ -270,8 +301,9 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         let closed = try await Self.mailboxShutdown(decoder)
         XCTAssertTrue(closed.readerLeasesClosed); XCTAssertEqual(closed.leasedReaders, 0)
         print("PCM_MAILBOX_CONVERTER nativeRate=44100 outputRate=48000 referenceFrames=10668 actualFrames=\(actual.count / 2) positiveInputRanDryBuffersRetained=\(final.positiveInputRanDryBuffersRetained) positiveInputRanDryFramesRetained=\(final.positiveInputRanDryFramesRetained) sourceReports=\(analyses.count) underruns=\(renderer.snapshot.underrunFrames) retainedCounterMeaning=stream-output-before-cursor-discard")
-        #endif
+        print("PCM_MAILBOX_CONVERTER_STATUS controlledStatus=\(controlledStatus) nativePositiveBuffers=\(final.nativePositiveInputRanDryBuffersRetained) nativePositiveFrames=\(final.nativePositiveInputRanDryFramesRetained) injectedPositiveBuffers=\(final.injectedPositiveInputRanDryBuffersRetained) injectedPositiveFrames=\(final.injectedPositiveInputRanDryFramesRetained) nativeBranchObserved=\(final.nativePositiveInputRanDryBuffersRetained > 0) controlMeaning=one-real-positive-status-substitution-no-PCM-substitution")
     }
+    #endif
 
     func testExactlyPinnedSourceDrainsTrueEOFAndReportsItsRealLeadingAndTrailingZerosOnce() async throws {
         #if DEBUG
