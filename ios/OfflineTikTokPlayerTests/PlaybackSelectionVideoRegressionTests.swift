@@ -961,8 +961,7 @@ private final class SelectionLatencySeekProbe {
                 guard let self, self.phase >= 0 else { return }
                 let observed = SelectionOutputTap.hostSeconds()
                 self.diagnostics.append(.playback(name: event.name, commandMs: (observed - self.origin) * 1_000,
-                    eventUptime: event.uptime, generation: event.generation, position: event.position,
-                    retainedItems: event.retainedItems), phase: self.phase)
+                    eventUptime: event.uptime, generation: event.generation, clockPosition: event.clockPosition), phase: self.phase)
             }
         }
     }
@@ -1035,7 +1034,7 @@ private final class SelectionLatencySeekProbe {
 /// formatting and console I/O happen after releasing the recorder lock in dump().
 private final class SelectionLatencyDiagnostics: @unchecked Sendable {
     enum Event: Sendable {
-        case playback(name: String, commandMs: Double, eventUptime: Double, generation: Int, position: Double, retainedItems: Int)
+        case playback(name: String, commandMs: Double, eventUptime: Double, generation: Int, clockPosition: Double)
         case video(name: String, commandMs: Double, framePosition: Double, requested: Double, playerPosition: Double, playerRate: Double)
         case seekStart(commandMs: Double, requested: Double, playerPosition: Double, playerRate: Double)
         case nativeComplete(commandMs: Double, seekMs: Double, finished: Bool)
@@ -1043,8 +1042,8 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
 
         func line(phase: Int) -> String {
             switch self {
-            case let .playback(name, commandMs, eventUptime, generation, position, retainedItems):
-                return "SelectionLatencyEvent phase=\(phase) name=\(name) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) position=\(position) retainedItems=\(retainedItems)"
+            case let .playback(name, commandMs, eventUptime, generation, clockPosition):
+                return "SelectionLatencyEvent phase=\(phase) name=\(name) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) clockPosition=\(clockPosition)"
             case let .video(name, commandMs, framePosition, requested, playerPosition, playerRate):
                 return "SelectionLatencyVideo phase=\(phase) name=\(name) commandMs=\(commandMs) framePosition=\(framePosition) requested=\(requested) playerPosition=\(playerPosition) playerRate=\(playerRate)"
             case let .seekStart(commandMs, requested, playerPosition, playerRate):
@@ -1304,7 +1303,8 @@ private final class SelectionProducerProbe: @unchecked Sendable {
     init(context: SelectionProducerContext) {
         self.context = context
         initial = context.renderer.diagnosticSnapshot
-        timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "OfflinePlayer.TestProducerProbe", qos: .utility))
+        timer = DispatchSource.makeTimerSource(flags: .strict,
+            queue: DispatchQueue(label: "OfflinePlayer.TestProducerProbe", qos: .utility))
         samples.reserveCapacity(128)
         timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(10))
         timer.setEventHandler { [weak self] in self?.sample() }

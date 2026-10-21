@@ -27,8 +27,7 @@ final class PlaybackService: NSObject {
         let name: String
         let uptime: Double
         let generation: Int
-        let position: Double
-        let retainedItems: Int
+        let clockPosition: Double
     }
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
@@ -999,10 +998,11 @@ final class PlaybackService: NSObject {
     }
 
     private func recordPlaybackEvent(_ name: StaticString) {
-        // Fixed phase names and numerical state only: no media IDs, URLs or titles.
-        os_signpost(.event, log: Self.playbackLog, name: name, "generation=%d retained=%d", generation, buffer.retainedItemCount)
+        // Phase recording must not query native player state or allocate an item
+        // inventory on the playback path. Resource checks remain separate.
+        os_signpost(.event, log: Self.playbackLog, name: name, "generation=%d", generation)
         onPlaybackEvent?(PlaybackEvent(name: String(describing: name), uptime: ProcessInfo.processInfo.systemUptime,
-            generation: generation, position: player.currentTime().seconds, retainedItems: buffer.retainedItemCount))
+            generation: generation, clockPosition: clock.position))
     }
 
     private func installObservers() {
