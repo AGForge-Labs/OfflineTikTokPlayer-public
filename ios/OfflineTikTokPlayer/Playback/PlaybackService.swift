@@ -612,10 +612,16 @@ final class PlaybackService: NSObject {
                     if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
                     self.resumeContinuousAudio()
                     self.recordPlaybackEvent("coldAudioPrepared")
+                    // Audio starts first; video setup still commits before this item joins the queue.
+                    let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: playerItem)
+                    guard !Task.isCancelled, self.generation == request else { return }
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.bufferReplaceAndObserve, request: request)
                     #endif
-                    self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
+                    guard self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil,
+                        videoPreparation: videoPreparation, ifEligible: {
+                            !Task.isCancelled && self.generation == request
+                        }) else { return }
                     self.observeCurrent(playerItem, position: itemPosition, request: request)
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.observedCurrent, request: request)
@@ -665,7 +671,8 @@ final class PlaybackService: NSObject {
 
     private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
         observedItem = playerItem
-        videoPresentation = continuousPiP.setCurrentItem(playerItem).map { (request, $0) }
+        videoPresentation = continuousPiP.setCurrentItem(playerItem,
+            preparedVideo: buffer.resource(for: playerItem)).map { (request, $0) }
         if position == 0, !rewind, explicitVideoSeekGeneration != request,
            let ticket = currentVideoPresentation(for: playerItem, request: request) {
             pendingInitialZeroStart = (request, ticket)
@@ -882,7 +889,12 @@ final class PlaybackService: NSObject {
                     playerItem.preferredForwardBufferDuration = 8
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
-                    self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil), after: active?.id)
+                    let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: playerItem)
+                    guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+                    self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil),
+                        after: active?.id, videoPreparation: videoPreparation, ifEligible: {
+                            !Task.isCancelled && self.generation == request && self.warmRevision == revision
+                        })
                     self.updateAudioSuccessor()
                     self.refreshAudioProcessing()
                 }
@@ -901,7 +913,12 @@ final class PlaybackService: NSObject {
                     _ = await PlaybackPreparation.value(within: .milliseconds(500)) { try? await item.asset.load(.isPlayable) }
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
-                    self.buffer.stagePrevious(.init(mediaID: previous.id, item: item, isLocal: saved != nil || cached != nil))
+                    let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: item)
+                    guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+                    self.buffer.stagePrevious(.init(mediaID: previous.id, item: item, isLocal: saved != nil || cached != nil),
+                        videoPreparation: videoPreparation, ifEligible: {
+                            !Task.isCancelled && self.generation == request && self.warmRevision == revision
+                        })
                     self.refreshAudioProcessing()
                 }
             }
@@ -920,7 +937,12 @@ final class PlaybackService: NSObject {
                     if requireLocal || !self.buffer.hasPrepared(item.id) {
                         let playerItem = AVPlayerItem(url: url)
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
-                        self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal, after: active?.id)
+                        let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: playerItem)
+                        guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
+                        self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal,
+                            after: active?.id, videoPreparation: videoPreparation, ifEligible: {
+                                !Task.isCancelled && self.generation == request && self.warmRevision == revision
+                            })
                         self.updateAudioSuccessor()
                         self.refreshAudioProcessing()
                     }

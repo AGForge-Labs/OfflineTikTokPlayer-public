@@ -444,6 +444,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "657E5F20B00C53BE564A746D";
 		};
+		"363AEF5AFAE832F548AA9594" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "ContinuousPictureInPictureResourceTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"A5C8D0438336CBC9AA4403E0" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "363AEF5AFAE832F548AA9594";
+		};
 		"B20DD8F524202FCC149D08C5" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -630,6 +640,7 @@
 				"BD04BB254D2E5550C4EAD4E6",
 				"BC29A5B77D1436E7B0E55E25",
 				"657E5F20B00C53BE564A746D",
+				"363AEF5AFAE832F548AA9594",
 				"B20DD8F524202FCC149D08C5",
 				"823D92756EFEACD3CFB746BD",
 				"49D98E474BBBDF405BABEA93",
@@ -932,6 +943,7 @@
 				"1246FA662366FC9E833FBED7",
 				"290DEDF05F11AA60B7713D0C",
 				"B413A86E2EEADE9875519E6B",
+				"A5C8D0438336CBC9AA4403E0",
 				"02B25AAD48D6EE8AC0B4FA2E",
 				"4B2F657C42D6DE6915A9FEC0",
 				"60D2911A177E91F7302481E0",

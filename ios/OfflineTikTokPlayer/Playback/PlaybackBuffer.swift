@@ -10,6 +10,7 @@ final class PlaybackBuffer {
         let isLocal: Bool
         var needsRewind = false
         var reachedEnd = false
+        var videoResource: ContinuousPictureInPicture.PreparedVideoResource? = nil
     }
     let player = AVQueuePlayer()
     private var next: Prepared?
@@ -32,6 +33,19 @@ final class PlaybackBuffer {
     var retainedItemCount: Int { retainedItems.count }
     var nextMediaID: String? { next?.mediaID }
     var hasLoopReserve: Bool { loopReserve != nil }
+    private var videoResources: [ContinuousPictureInPicture.PreparedVideoResource] {
+        [active, previous, next, loopReserve].compactMap { $0?.videoResource }
+    }
+    func resource(for item: AVPlayerItem) -> ContinuousPictureInPicture.PreparedVideoResource? {
+        videoResources.first { $0.item === item && $0.isAttached && !$0.isRetired }
+    }
+    private func retireReleased(_ candidates: [ContinuousPictureInPicture.PreparedVideoResource]) {
+        var seen = Set<ObjectIdentifier>()
+        for resource in candidates where seen.insert(ObjectIdentifier(resource)).inserted {
+            // Re-read final slots after each retirement's SDK calls, which may notify observers.
+            if !videoResources.contains(where: { $0 === resource }) { resource.retire() }
+        }
+    }
     func hasPrepared(_ mediaID: String) -> Bool {
         guard let next else { return false }
         return next.mediaID == mediaID && next.item.status != .failed && player.items().dropFirst().first === next.item
@@ -57,7 +71,8 @@ final class PlaybackBuffer {
     private func retainPrevious(before prepared: Prepared) {
         if let active, active.mediaID != prepared.mediaID {
             previous?.item.cancelPendingSeeks()
-            previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal, needsRewind: true)
+            previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal,
+                                needsRewind: true, videoResource: active.videoResource)
         }
     }
 
@@ -78,6 +93,8 @@ final class PlaybackBuffer {
 
     /// KVO may be delivered after a swipe. Always reconcile actual object identity.
     func synchronize() {
+        let oldResources = videoResources
+        defer { retireReleased(oldResources) }
         let prepared: Prepared
         if let next, player.currentItem === next.item {
             prepared = next
@@ -92,7 +109,7 @@ final class PlaybackBuffer {
             // the complete source through the service's guarded rewind, not a tail trim.
             let repeating = last.mediaID == active?.mediaID && last.mediaID == next?.mediaID
             prepared = Prepared(mediaID: last.mediaID, item: last.item, isLocal: last.isLocal,
-                                needsRewind: repeating, reachedEnd: !repeating)
+                                needsRewind: repeating, reachedEnd: !repeating, videoResource: last.videoResource)
             next = nil
             player.pause()
             player.insert(last.item, after: nil)
@@ -102,50 +119,98 @@ final class PlaybackBuffer {
         didAdvance?(prepared)
     }
 
-    func replace(with item: AVPlayerItem?, mediaID: String? = nil, isLocal: Bool = true) {
+    @discardableResult
+    func replace(with item: AVPlayerItem?, mediaID: String? = nil, isLocal: Bool = true,
+                 videoResource: ContinuousPictureInPicture.PreparedVideoResource? = nil,
+                 videoPreparation: ContinuousPictureInPicture.VideoResourcePreparation? = nil,
+                 ifEligible: () -> Bool = { true }) -> Bool {
+        let incoming = videoResource ?? (videoPreparation == nil ? item.flatMap { resource(for: $0) } : nil)
+        let oldResources = videoResources + [incoming].compactMap { $0 }
+        defer { retireReleased(oldResources) }
+        guard ifEligible() else { return false }
         if let active, active.item !== item {
             previous?.item.cancelPendingSeeks()
-            previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal, needsRewind: true)
+            previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal,
+                                needsRewind: true, videoResource: active.videoResource)
         }
-        active = item.flatMap { item in mediaID.map { Prepared(mediaID: $0, item: item, isLocal: isLocal) } }
+        // Publish the final eviction state before installing any additional SDK output.
+        active = nil
         next = nil; loopReserve = nil
         player.removeAllItems()
+        retireReleased(oldResources.filter { $0 !== incoming })
+        guard ifEligible() else { updateEndAction(); return false }
+        let installed = videoPreparation?.install(ifEligible: ifEligible) ?? incoming
+        guard ifEligible() else { installed?.retire(); updateEndAction(); return false }
+        active = item.flatMap { item in mediaID.map {
+            Prepared(mediaID: $0, item: item, isLocal: isLocal, videoResource: installed)
+        } }
         if let item { player.insert(item, after: nil) }
         updateEndAction()
         preparePreviousStart()
+        return true
     }
 
     func discardNext() {
+        let oldResources = videoResources
+        defer { retireReleased(oldResources) }
         for item in player.items().dropFirst() { player.remove(item) }
         next = nil; loopReserve = nil
         updateEndAction()
     }
 
-    func discardPrevious() { previous?.item.cancelPendingSeeks(); previous = nil }
-    func stagePrevious(_ prepared: Prepared) {
-        guard previous?.mediaID != prepared.mediaID else { return }
+    func discardPrevious() {
+        let oldResources = videoResources
+        defer { retireReleased(oldResources) }
+        previous?.item.cancelPendingSeeks(); previous = nil
+    }
+    @discardableResult
+    func stagePrevious(_ prepared: Prepared,
+                       videoPreparation: ContinuousPictureInPicture.VideoResourcePreparation? = nil,
+                       ifEligible: () -> Bool = { true }) -> Bool {
+        let candidates = videoResources + [prepared.videoResource].compactMap { $0 }
+        defer { retireReleased(candidates) }
+        guard ifEligible(), previous?.mediaID != prepared.mediaID else { return false }
         previous?.item.cancelPendingSeeks()
-        previous = prepared
+        previous = nil
+        retireReleased(candidates.filter { $0 !== prepared.videoResource })
+        guard ifEligible() else { return false }
+        var committed = prepared
+        committed.videoResource = videoPreparation?.install(ifEligible: ifEligible) ?? prepared.videoResource
+        guard ifEligible() else { committed.videoResource?.retire(); return false }
+        previous = committed
+        return true
     }
 
-    func stage(_ prepared: Prepared, requireLocal: Bool = false, after mediaID: String? = nil) {
+    @discardableResult
+    func stage(_ prepared: Prepared, requireLocal: Bool = false, after mediaID: String? = nil,
+               videoPreparation: ContinuousPictureInPicture.VideoResourcePreparation? = nil,
+               ifEligible: () -> Bool = { true }) -> Bool {
+        let candidates = videoResources + [prepared.videoResource].compactMap { $0 }
+        defer { retireReleased(candidates) }
+        guard ifEligible() else { return false }
         synchronize()
-        if let mediaID, active?.mediaID != mediaID { return }
-        guard let current = player.currentItem else { return }
-        guard !requireLocal || prepared.isLocal else { return }
+        if let mediaID, active?.mediaID != mediaID { return false }
+        guard let current = player.currentItem else { return false }
+        guard !requireLocal || prepared.isLocal else { return false }
         if let next, next.mediaID == prepared.mediaID, next.item.status != .failed,
            player.items().dropFirst().first === next.item,
-           !(requireLocal && !next.isLocal && prepared.isLocal) { return }
+           !(requireLocal && !next.isLocal && prepared.isLocal) { return false }
         discardNext()
-        guard player.canInsert(prepared.item, after: current) else { return }
+        guard ifEligible(), player.canInsert(prepared.item, after: current) else { return false }
+        var committed = prepared
+        committed.videoResource = videoPreparation?.install(ifEligible: ifEligible) ?? prepared.videoResource
+        guard ifEligible() else { committed.videoResource?.retire(); return false }
         player.insert(prepared.item, after: current)
-        next = prepared
+        next = committed
         updateEndAction()
+        return true
     }
 
     /// Keep the following loop boundary prepared too. This is bounded to exactly
     /// one reserve, and each replica has its own audio-processing tap state.
     func stageLoopReserve(_ prepared: Prepared) {
+        let candidates = videoResources + [prepared.videoResource].compactMap { $0 }
+        defer { retireReleased(candidates) }
         synchronize()
         guard loopReserve == nil, let next, active?.mediaID == prepared.mediaID,
               next.mediaID == prepared.mediaID, player.items().count == 2,
@@ -156,11 +221,14 @@ final class PlaybackBuffer {
     }
 
     func advance(to mediaID: String, allowRemote: Bool = true) -> Prepared? {
+        let oldResources = videoResources
+        defer { retireReleased(oldResources) }
         if !hasPrepared(mediaID), let prepared = previous, prepared.mediaID == mediaID, prepared.item.status != .failed,
            prepared.isLocal || allowRemote {
             player.pause()
             previous = nil
-            replace(with: prepared.item, mediaID: mediaID, isLocal: prepared.isLocal)
+            replace(with: prepared.item, mediaID: mediaID, isLocal: prepared.isLocal,
+                    videoResource: prepared.videoResource)
             return prepared
         }
         guard let prepared = next, prepared.mediaID == mediaID, prepared.item.status != .failed,

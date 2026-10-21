@@ -13,6 +13,106 @@ final class ContinuousPictureInPicture: NSObject {
         fileprivate let generation: Int
         fileprivate let item: ObjectIdentifier
     }
+    /// One output per retained item. Retirement is explicit; no SDK work runs in deinit.
+    @MainActor final class PreparedVideoResource {
+        private(set) weak var item: AVPlayerItem?
+        fileprivate(set) var output: AVPlayerItemVideoOutput?
+        fileprivate(set) var isAttached = false
+        private(set) var isRetired = false
+        private(set) var isBorrowed = false
+        fileprivate var originalComposition: AVVideoComposition?
+        fileprivate var installedComposition: AVVideoComposition?
+        fileprivate init(item: AVPlayerItem) { self.item = item }
+        func borrow(for item: AVPlayerItem) -> Bool {
+            guard self.item === item, isAttached, !isRetired, !isBorrowed, let output else { return false }
+            let attached = item.outputs.contains(where: { $0 === output })
+            guard attached, self.item === item, isAttached, !isRetired, !isBorrowed,
+                  self.output === output else { return false }
+            isBorrowed = true
+            return true
+        }
+        func releaseBorrow() {
+            guard isBorrowed else { return }
+            isBorrowed = false
+            if isRetired { detach() }
+        }
+        func retire() {
+            isRetired = true
+            if !isBorrowed { detach() }
+        }
+        private func detach() {
+            let wasAttached = isAttached, output = self.output
+            let installed = installedComposition, original = originalComposition
+            isAttached = false; self.output = nil
+            installedComposition = nil; originalComposition = nil
+            guard let item else { return }
+            if wasAttached, let output { item.remove(output) }
+            if let installed, item.videoComposition === installed { item.videoComposition = original }
+        }
+    }
+    /// Metadata only until install. Stale tasks cannot leave an attached output across an await.
+    @MainActor final class VideoResourcePreparation {
+        private weak var item: AVPlayerItem?
+        private var original: AVVideoComposition?
+        private var composition: AVVideoComposition?
+        private var consumed = false
+        #if DEBUG
+        fileprivate weak var debugTraceOwner: ContinuousPictureInPicture?
+        #endif
+        fileprivate init(item: AVPlayerItem, original: AVVideoComposition?, composition: AVVideoComposition) {
+            self.item = item; self.original = original; self.composition = composition
+        }
+        func install(ifEligible: () -> Bool = { true }) -> PreparedVideoResource? {
+            guard !consumed else { return nil }
+            consumed = true
+            defer { composition = nil; original = nil }
+            guard let item, let composition, ifEligible(),
+                  item.videoComposition === original else { return nil }
+            let resource = PreparedVideoResource(item: item)
+            if original == nil {
+                resource.originalComposition = original
+                #if DEBUG
+                if let owner = debugTraceOwner {
+                    owner.debugTraceRender(.compositionAssigned) {
+                        item.videoComposition = composition
+                        resource.installedComposition = item.videoComposition
+                    }
+                } else {
+                    item.videoComposition = composition
+                    resource.installedComposition = item.videoComposition
+                }
+                #else
+                item.videoComposition = composition
+                resource.installedComposition = item.videoComposition
+                #endif
+            }
+            guard ifEligible() else { resource.retire(); return nil }
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ])
+            output.suppressesPlayerRendering = false
+            guard ifEligible() else { resource.retire(); return nil }
+            #if DEBUG
+            if let owner = debugTraceOwner {
+                owner.debugTraceRender(.outputAttached) { item.add(output) }
+            } else { item.add(output) }
+            #else
+            item.add(output)
+            #endif
+            resource.output = output; resource.isAttached = true
+            guard ifEligible() else { resource.retire(); return nil }
+            return resource
+        }
+    }
+    static func prepareVideoResource(for item: AVPlayerItem) async throws -> VideoResourcePreparation {
+        let original = item.videoComposition
+        let composition: AVVideoComposition
+        if let original { composition = original }
+        else { composition = try await makeVideoComposition(for: item.asset) }
+        try Task.checkCancellation()
+        return VideoResourcePreparation(item: item, original: original, composition: composition)
+    }
     #if DEBUG
     /// Observes the actual SDK request without replacing its result.
     var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
@@ -32,6 +132,8 @@ final class ContinuousPictureInPicture: NSObject {
         let requestedSeconds: Double?, sampleSeconds: Double?
         // Cached values at entry; seekBegin therefore preserves the pre-flush proof.
         let copiedPTS: Double?, submittedPTS: Double?, submittedCount: UInt64
+        // 0 setup/no current resource, 1 CPP-owned fallback, 2 borrowed buffer preparation.
+        let resourceOwnership: Int
     }
     var onDebugRenderStamp: ((DebugRenderStamp) -> Void)?
     private var debugRenderRevision: Int?
@@ -68,7 +170,8 @@ final class ContinuousPictureInPicture: NSObject {
             nativeSeekTicket: seek, entryNs: entered, returnNs: returned,
             requestedSeconds: requested.flatMap { $0.isNumeric ? CMTimeGetSeconds($0) : nil },
             sampleSeconds: sample.flatMap { $0.isNumeric ? CMTimeGetSeconds($0) : nil },
-            copiedPTS: copied, submittedPTS: submitted, submittedCount: count))
+            copiedPTS: copied, submittedPTS: submitted, submittedCount: count,
+            resourceOwnership: currentResource == nil ? 0 : (currentResourceOwned ? 1 : 2)))
     }
     #endif
     enum Event: Int {
@@ -125,8 +228,8 @@ final class ContinuousPictureInPicture: NSObject {
     private var presentationActive = false
     private var seekTicket: UInt64 = 0
     private var activeSeekTicket: UInt64?
-    private var originalComposition: AVVideoComposition?
-    private var installedComposition: AVVideoComposition?
+    private var currentResource: PreparedVideoResource?
+    private var currentResourceOwned = false
 
     var isReady: Bool { !invalidated && controller != nil && timebase != nil }
     var isFrameFeedSuspended: Bool { !frameFeedEnabled }
@@ -173,17 +276,19 @@ final class ContinuousPictureInPicture: NSObject {
         ]
     }
 
-    /// Exactly one item output is attached at a time; this never prepares additional video items.
+    /// One active output is borrowed here; the buffer can retain prepared outputs for its bounded window.
     @discardableResult
-    func setCurrentItem(_ item: AVPlayerItem?) -> PresentationTicket? {
+    func setCurrentItem(_ item: AVPlayerItem?, preparedVideo: PreparedVideoResource? = nil) -> PresentationTicket? {
         guard !invalidated else { return nil }
         presentationRevision &+= 1
         installedTimeline = nil
         presentationActive = false
         activeSeekTicket = nil
         stopFrameTimer()
+        let adoptionRevision = presentationRevision
         let ticket = item.map { PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0)) }
-        if currentItem === item {
+        if currentItem === item, currentResource?.isRetired != true,
+           preparedVideo == nil || preparedVideo === currentResource {
             // A new service request for the same item needs its own timeline,
             // while its output and in-flight geometry preparation stay reusable.
             flushForSeek()
@@ -195,8 +300,8 @@ final class ContinuousPictureInPicture: NSObject {
         itemGeneration &+= 1
         activeSeekTicket = nil
         let generation = itemGeneration
-        if let videoOutput { currentItem?.remove(videoOutput) }
-        restoreOriginalComposition()
+        releaseCurrentResource()
+        guard !invalidated, presentationRevision == adoptionRevision else { return nil }
         currentItem = item
         videoOutput = nil
         orientationPrepared = false
@@ -207,30 +312,41 @@ final class ContinuousPictureInPicture: NSObject {
         lastFramePositionSeconds = nil
         lastCopiedFramePositionSeconds = nil
         guard let item else { stopFrameTimer(); return nil }
-        originalComposition = item.videoComposition
-        let existingComposition = item.videoComposition
+        if let preparedVideo, preparedVideo.borrow(for: item), let output = preparedVideo.output {
+            guard !invalidated, presentationRevision == adoptionRevision, currentItem === item else {
+                preparedVideo.releaseBorrow(); return nil
+            }
+            currentResource = preparedVideo; currentResourceOwned = false; videoOutput = output
+            orientationPrepared = true
+            // No late preparation occurred. The existing ready/rewind/restore path
+            // owns first activation, including paused and nonzero selections.
+            return ticket
+        }
         preparationTask = Task { [weak self, weak item] in
             guard let item else { return }
             do {
-                let composition: AVVideoComposition
-                if let existingComposition { composition = existingComposition }
-                else { composition = try await Self.makeVideoComposition(for: item.asset) }
+                let plan = try await Self.prepareVideoResource(for: item)
                 try Task.checkCancellation()
                 guard let self, !self.invalidated, self.itemGeneration == generation,
                       self.currentItem === item else { return }
-                if existingComposition == nil {
-                    #if DEBUG
-                    self.debugTraceRender(.compositionAssigned) {
-                        item.videoComposition = composition
-                        self.installedComposition = composition
-                    }
-                    #else
-                    item.videoComposition = composition
-                    self.installedComposition = composition
-                    #endif
+                #if DEBUG
+                plan.debugTraceOwner = self
+                #endif
+                guard let resource = plan.install(ifEligible: {
+                    !Task.isCancelled && !self.invalidated && self.itemGeneration == generation && self.currentItem === item
+                }) else { return }
+                guard !Task.isCancelled, !self.invalidated, self.itemGeneration == generation,
+                      self.currentItem === item, resource.borrow(for: item) else {
+                    resource.retire(); return
                 }
+                guard !Task.isCancelled, !self.invalidated, self.itemGeneration == generation,
+                      self.currentItem === item, let output = resource.output else {
+                    resource.retire(); resource.releaseBorrow(); return
+                }
+                self.currentResource = resource; self.currentResourceOwned = true; self.videoOutput = output
                 self.orientationPrepared = true
-                self.attachOutput(to: item)
+                self.renderFrame()
+                if self.presentationActive && self.frameFeedEnabled && self.playbackState.read().isPlaying { self.startFrameTimer() }
                 self.onEvent?(.sourcePrepared, nil)
             } catch {
                 guard !Task.isCancelled, let self, !self.invalidated, self.itemGeneration == generation,
@@ -271,24 +387,11 @@ final class ContinuousPictureInPicture: NSObject {
             && currentItem.map { ObjectIdentifier($0) == ticket.item } == true
     }
 
-    private func attachOutput(to item: AVPlayerItem) {
-        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-        ])
-        // The AVPlayer can continue to render its ordinary inline layer underneath this layer.
-        output.suppressesPlayerRendering = false
-        #if DEBUG
-        debugTraceRender(.outputAttached) {
-            item.add(output)
-            videoOutput = output
-        }
-        #else
-        item.add(output)
-        videoOutput = output
-        #endif
-        renderFrame()
-        if frameFeedEnabled && playbackState.read().isPlaying { startFrameTimer() }
+    private func releaseCurrentResource() {
+        let resource = currentResource, owned = currentResourceOwned
+        currentResource = nil; currentResourceOwned = false; videoOutput = nil
+        if owned { resource?.retire() }
+        resource?.releaseBorrow()
     }
 
     /// Normalize the preferred source transform into actual output pixels. A layer-only transform
@@ -319,14 +422,6 @@ final class ContinuousPictureInPicture: NSObject {
         instruction.layerInstructions = [layer]
         composition.instructions = [instruction]
         return composition
-    }
-
-    private func restoreOriginalComposition() {
-        if let installedComposition, currentItem?.videoComposition === installedComposition {
-            currentItem?.videoComposition = originalComposition
-        }
-        installedComposition = nil
-        originalComposition = nil
     }
 
     /// Position must come from the audio renderer, not the independently muted video player.
@@ -418,8 +513,7 @@ final class ContinuousPictureInPicture: NSObject {
         controller?.stopPictureInPicture()
         controller?.delegate = nil
         controller = nil
-        if let videoOutput { currentItem?.remove(videoOutput) }
-        restoreOriginalComposition()
+        releaseCurrentResource()
         videoOutput = nil
         currentItem = nil
         displayLayer.flushAndRemoveImage()
