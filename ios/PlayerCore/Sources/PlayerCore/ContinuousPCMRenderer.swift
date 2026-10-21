@@ -231,6 +231,9 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     public let sampleRate: Double
     public let channels: Int
     public let retainedPCMMemoryBytes: Int
+    #if DEBUG
+    public let debugRenderAccounting: DebugRenderAccountingRecorder?
+    #endif
     private let first: ContinuousPCMSource
     private let second: ContinuousPCMSource
     private let third: ContinuousPCMSource
@@ -259,6 +262,21 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     private var consumedCommandVersion = 0
     private var nextStateVersion = 0
 
+    #if DEBUG
+    public init(sampleRate: Double = 48_000, channels: Int = 2,
+                prefixFrames: Int = 96_000, ringFrames: Int = 192_000,
+                debugRenderAccounting: DebugRenderAccountingRecorder? = nil) {
+        precondition(sampleRate.isFinite && sampleRate > 0 && (1...8).contains(channels))
+        precondition(prefixFrames > 0 && ringFrames > 0)
+        self.debugRenderAccounting = debugRenderAccounting
+        self.sampleRate = sampleRate; self.channels = channels
+        retainedPCMMemoryBytes = 3 * (prefixFrames + ringFrames) * channels * MemoryLayout<Float>.stride
+        first = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
+        second = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
+        third = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
+        speaker = SpeakerAudioProcessor(sampleRate: sampleRate, channels: channels, enabled: true)
+    }
+    #else
     public init(sampleRate: Double = 48_000, channels: Int = 2,
                 prefixFrames: Int = 96_000, ringFrames: Int = 192_000) {
         precondition(sampleRate.isFinite && sampleRate > 0 && (1...8).contains(channels))
@@ -270,6 +288,7 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         third = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
         speaker = SpeakerAudioProcessor(sampleRate: sampleRate, channels: channels, enabled: true)
     }
+    #endif
 
     public func source(at index: Int) -> ContinuousPCMSource {
         switch index { case 0: return first; case 1: return second; case 2: return third; default: preconditionFailure("Three PCM slots") }
@@ -330,15 +349,23 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
 
     public func render(interleaved output: UnsafeMutableBufferPointer<Float>, frameCount: Int) {
         guard frameCount > 0, frameCount <= output.count / channels, let base = output.baseAddress else { return }
+        #if DEBUG
+        debugRenderAccounting?.kernelEntered(frames: frameCount)
+        var debugCopied = 0, debugEOF = 0, debugUnderrun = 0
+        #endif
         // Initialize only the requested span. Silence here is pause/EOF/starvation,
         // never an implicit boundary fade or a fabricated source trim.
         for index in 0..<(frameCount * channels) { base[index] = 0 }
         consumeSelection()
-        if playing.load(ordering: .acquiring), activeToken > 0 {
+        let consumedPlaying = playing.load(ordering: .acquiring)
+        if consumedPlaying, activeToken > 0 {
             let shouldEnhance = enhance.load(ordering: .acquiring)
             var outputFrame = 0
             while outputFrame < frameCount {
                 guard let source = find(activeToken), source.acquire(token: activeToken) else {
+                    #if DEBUG
+                    if debugRenderAccounting != nil { debugUnderrun = frameCount - outputFrame }
+                    #endif
                     underrun += Int64(frameCount - outputFrame); break
                 }
                 let total = source.totalFrames
@@ -351,9 +378,15 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                         continue
                     }
                     guard next > 0, let nextSource = find(next), nextSource.acquire(token: next) else {
+                        #if DEBUG
+                        if debugRenderAccounting != nil { debugEOF = frameCount - outputFrame }
+                        #endif
                         source.release(); ended = true; break
                     }
                     guard nextSource.totalFrames > 0 else {
+                        #if DEBUG
+                        if debugRenderAccounting != nil { debugEOF = frameCount - outputFrame }
+                        #endif
                         nextSource.release(); source.release(); ended = true; break
                     }
                     source.prepareNextVisit(token: activeToken)
@@ -374,10 +407,24 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     cursor += 1; outputFrame += 1
                 }
                 source.release()
-                if starved { underrun += Int64(frameCount - outputFrame); break }
+                if starved {
+                    #if DEBUG
+                    if debugRenderAccounting != nil { debugUnderrun = frameCount - outputFrame }
+                    #endif
+                    underrun += Int64(frameCount - outputFrame); break
+                }
             }
+            #if DEBUG
+            if debugRenderAccounting != nil { debugCopied = outputFrame }
+            #endif
         }
         publishSnapshot()
+        #if DEBUG
+        debugRenderAccounting?.kernelCompleted(copied: debugCopied,
+            paused: !consumedPlaying && activeToken > 0 ? frameCount : 0,
+            inactive: activeToken <= 0 ? frameCount : 0, eof: debugEOF,
+            underrun: debugUnderrun, token: activeToken, visit: visit)
+        #endif
     }
 
     private func find(_ token: Int) -> ContinuousPCMSource? {
@@ -423,3 +470,190 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         }
     }
 }
+
+#if DEBUG
+extension ContinuousPCMRenderer {
+    /// A value copy of one record, not a joint snapshot with renderer/worker state.
+    public struct DebugRenderAccountingSnapshot: Sendable {
+        public var sequence: UInt64 = 0
+        public var sourceCallbacksEntered: UInt64 = 0
+        public var sourceCallbacksCompleted: UInt64 = 0
+        public var sourceFramesRequested: UInt64 = 0
+        public var sourceFramesCompleted: UInt64 = 0
+        public var invalidLayoutCallbacks: UInt64 = 0
+        public var invalidLayoutFrames: UInt64 = 0
+        public var kernelCallsEntered: UInt64 = 0
+        public var kernelCallsCompleted: UInt64 = 0
+        public var kernelFramesRequested: UInt64 = 0
+        public var kernelFramesClassified: UInt64 = 0
+        public var copiedPCMFrames: UInt64 = 0
+        public var pausedPositiveTokenFrames: UInt64 = 0
+        public var inactiveFrames: UInt64 = 0
+        public var eofRemainderFrames: UInt64 = 0
+        public var underrunFrames: UInt64 = 0
+        public var lastKernelToken: Int = 0
+        public var lastKernelVisit: Int64 = 0
+        public var lastSourceFrameCount: UInt64 = 0
+        public var lastSourceHostTimeValid = false
+        public var lastSourceHostTime: UInt64 = 0
+        public var overflowed = false
+    }
+
+    /// Optional immutable render configuration. One graph/kernel render writer only.
+    /// All storage is fixed before rendering; methods allocate, scan, clock and lock nothing.
+    /// Entry/completion are separate short publications, never odd across render/SDK work.
+    public final class DebugRenderAccountingRecorder: @unchecked Sendable {
+        private var state = DebugRenderAccountingSnapshot() // Render writer only.
+        private let sequence = Atomic<UInt64>(0)
+        private let publicationExhausted = Atomic<Bool>(false)
+        private let sourceCallbacksEntered = Atomic<UInt64>(0)
+        private let sourceCallbacksCompleted = Atomic<UInt64>(0)
+        private let sourceFramesRequested = Atomic<UInt64>(0)
+        private let sourceFramesCompleted = Atomic<UInt64>(0)
+        private let invalidLayoutCallbacks = Atomic<UInt64>(0)
+        private let invalidLayoutFrames = Atomic<UInt64>(0)
+        private let kernelCallsEntered = Atomic<UInt64>(0)
+        private let kernelCallsCompleted = Atomic<UInt64>(0)
+        private let kernelFramesRequested = Atomic<UInt64>(0)
+        private let kernelFramesClassified = Atomic<UInt64>(0)
+        private let copiedPCMFrames = Atomic<UInt64>(0)
+        private let pausedPositiveTokenFrames = Atomic<UInt64>(0)
+        private let inactiveFrames = Atomic<UInt64>(0)
+        private let eofRemainderFrames = Atomic<UInt64>(0)
+        private let underrunFrames = Atomic<UInt64>(0)
+        private let lastKernelToken = Atomic<Int>(0)
+        private let lastKernelVisit = Atomic<Int64>(0)
+        private let lastSourceFrameCount = Atomic<UInt64>(0)
+        private let lastSourceHostTimeValid = Atomic<Bool>(false)
+        private let lastSourceHostTime = Atomic<UInt64>(0)
+        private let overflowed = Atomic<Bool>(false)
+
+        public init() {}
+
+        /// Only supplied callback arguments are observed; no host-clock conversion occurs here.
+        public func sourceCallbackEntered(frames: Int, hostTimeValid: Bool, hostTime: UInt64) {
+            state.sourceCallbacksEntered = add(state.sourceCallbacksEntered, 1)
+            state.sourceFramesRequested = add(state.sourceFramesRequested, UInt64(max(0, frames)))
+            state.lastSourceFrameCount = UInt64(max(0, frames))
+            state.lastSourceHostTimeValid = hostTimeValid
+            state.lastSourceHostTime = hostTime
+            publish()
+        }
+
+        public func sourceCallbackCompleted(frames: Int, invalidLayout: Bool) {
+            state.sourceCallbacksCompleted = add(state.sourceCallbacksCompleted, 1)
+            state.sourceFramesCompleted = add(state.sourceFramesCompleted, UInt64(max(0, frames)))
+            if invalidLayout {
+                state.invalidLayoutCallbacks = add(state.invalidLayoutCallbacks, 1)
+                state.invalidLayoutFrames = add(state.invalidLayoutFrames, UInt64(max(0, frames)))
+            }
+            publish()
+        }
+
+        /// Accepted calls only: the original output-span guard has already succeeded.
+        fileprivate func kernelEntered(frames: Int) {
+            state.kernelCallsEntered = add(state.kernelCallsEntered, 1)
+            state.kernelFramesRequested = add(state.kernelFramesRequested, UInt64(frames))
+            publish()
+        }
+
+        fileprivate func kernelCompleted(copied: Int, paused: Int, inactive: Int, eof: Int,
+                                         underrun: Int, token: Int, visit: Int64) {
+            state.kernelCallsCompleted = add(state.kernelCallsCompleted, 1)
+            state.copiedPCMFrames = add(state.copiedPCMFrames, UInt64(copied))
+            state.pausedPositiveTokenFrames = add(state.pausedPositiveTokenFrames, UInt64(paused))
+            state.inactiveFrames = add(state.inactiveFrames, UInt64(inactive))
+            state.eofRemainderFrames = add(state.eofRemainderFrames, UInt64(eof))
+            state.underrunFrames = add(state.underrunFrames, UInt64(underrun))
+            state.kernelFramesClassified = add(state.kernelFramesClassified, UInt64(copied))
+            state.kernelFramesClassified = add(state.kernelFramesClassified, UInt64(paused))
+            state.kernelFramesClassified = add(state.kernelFramesClassified, UInt64(inactive))
+            state.kernelFramesClassified = add(state.kernelFramesClassified, UInt64(eof))
+            state.kernelFramesClassified = add(state.kernelFramesClassified, UInt64(underrun))
+            state.lastKernelToken = token
+            state.lastKernelVisit = visit
+            publish()
+        }
+
+        static func saturatingAdd(_ value: UInt64, _ amount: UInt64) -> (value: UInt64, overflowed: Bool) {
+            let result = value.addingReportingOverflow(amount)
+            return (result.overflow ? .max : result.partialValue, result.overflow)
+        }
+
+        private func add(_ value: UInt64, _ amount: UInt64) -> UInt64 {
+            let result = Self.saturatingAdd(value, amount)
+            if result.overflowed { state.overflowed = true }
+            return result.value
+        }
+
+        private func publish() {
+            // Sequence exhaustion fails closed without wrapping/reusing a version.
+            // Rendering continues; no writer waits for an observer.
+            guard !publicationExhausted.load(ordering: .relaxed) else { return }
+            guard state.sequence <= UInt64.max - 2 else {
+                publicationExhausted.store(true, ordering: .sequentiallyConsistent)
+                return
+            }
+            state.sequence += 2
+            sequence.store(state.sequence - 1, ordering: .sequentiallyConsistent)
+            sourceCallbacksEntered.store(state.sourceCallbacksEntered, ordering: .sequentiallyConsistent)
+            sourceCallbacksCompleted.store(state.sourceCallbacksCompleted, ordering: .sequentiallyConsistent)
+            sourceFramesRequested.store(state.sourceFramesRequested, ordering: .sequentiallyConsistent)
+            sourceFramesCompleted.store(state.sourceFramesCompleted, ordering: .sequentiallyConsistent)
+            invalidLayoutCallbacks.store(state.invalidLayoutCallbacks, ordering: .sequentiallyConsistent)
+            invalidLayoutFrames.store(state.invalidLayoutFrames, ordering: .sequentiallyConsistent)
+            kernelCallsEntered.store(state.kernelCallsEntered, ordering: .sequentiallyConsistent)
+            kernelCallsCompleted.store(state.kernelCallsCompleted, ordering: .sequentiallyConsistent)
+            kernelFramesRequested.store(state.kernelFramesRequested, ordering: .sequentiallyConsistent)
+            kernelFramesClassified.store(state.kernelFramesClassified, ordering: .sequentiallyConsistent)
+            copiedPCMFrames.store(state.copiedPCMFrames, ordering: .sequentiallyConsistent)
+            pausedPositiveTokenFrames.store(state.pausedPositiveTokenFrames, ordering: .sequentiallyConsistent)
+            inactiveFrames.store(state.inactiveFrames, ordering: .sequentiallyConsistent)
+            eofRemainderFrames.store(state.eofRemainderFrames, ordering: .sequentiallyConsistent)
+            underrunFrames.store(state.underrunFrames, ordering: .sequentiallyConsistent)
+            lastKernelToken.store(state.lastKernelToken, ordering: .sequentiallyConsistent)
+            lastKernelVisit.store(state.lastKernelVisit, ordering: .sequentiallyConsistent)
+            lastSourceFrameCount.store(state.lastSourceFrameCount, ordering: .sequentiallyConsistent)
+            lastSourceHostTimeValid.store(state.lastSourceHostTimeValid, ordering: .sequentiallyConsistent)
+            lastSourceHostTime.store(state.lastSourceHostTime, ordering: .sequentiallyConsistent)
+            overflowed.store(state.overflowed, ordering: .sequentiallyConsistent)
+            sequence.store(state.sequence, ordering: .sequentiallyConsistent)
+        }
+
+        /// Bounded off-render observation. Nil means unavailable, including exhausted publication.
+        public func snapshot() -> DebugRenderAccountingSnapshot? {
+            for _ in 0..<3 {
+                guard !publicationExhausted.load(ordering: .sequentiallyConsistent) else { return nil }
+                let before = sequence.load(ordering: .sequentiallyConsistent)
+                if before & 1 != 0 { continue }
+                var result = DebugRenderAccountingSnapshot()
+                result.sequence = before
+                result.sourceCallbacksEntered = sourceCallbacksEntered.load(ordering: .sequentiallyConsistent)
+                result.sourceCallbacksCompleted = sourceCallbacksCompleted.load(ordering: .sequentiallyConsistent)
+                result.sourceFramesRequested = sourceFramesRequested.load(ordering: .sequentiallyConsistent)
+                result.sourceFramesCompleted = sourceFramesCompleted.load(ordering: .sequentiallyConsistent)
+                result.invalidLayoutCallbacks = invalidLayoutCallbacks.load(ordering: .sequentiallyConsistent)
+                result.invalidLayoutFrames = invalidLayoutFrames.load(ordering: .sequentiallyConsistent)
+                result.kernelCallsEntered = kernelCallsEntered.load(ordering: .sequentiallyConsistent)
+                result.kernelCallsCompleted = kernelCallsCompleted.load(ordering: .sequentiallyConsistent)
+                result.kernelFramesRequested = kernelFramesRequested.load(ordering: .sequentiallyConsistent)
+                result.kernelFramesClassified = kernelFramesClassified.load(ordering: .sequentiallyConsistent)
+                result.copiedPCMFrames = copiedPCMFrames.load(ordering: .sequentiallyConsistent)
+                result.pausedPositiveTokenFrames = pausedPositiveTokenFrames.load(ordering: .sequentiallyConsistent)
+                result.inactiveFrames = inactiveFrames.load(ordering: .sequentiallyConsistent)
+                result.eofRemainderFrames = eofRemainderFrames.load(ordering: .sequentiallyConsistent)
+                result.underrunFrames = underrunFrames.load(ordering: .sequentiallyConsistent)
+                result.lastKernelToken = lastKernelToken.load(ordering: .sequentiallyConsistent)
+                result.lastKernelVisit = lastKernelVisit.load(ordering: .sequentiallyConsistent)
+                result.lastSourceFrameCount = lastSourceFrameCount.load(ordering: .sequentiallyConsistent)
+                result.lastSourceHostTimeValid = lastSourceHostTimeValid.load(ordering: .sequentiallyConsistent)
+                result.lastSourceHostTime = lastSourceHostTime.load(ordering: .sequentiallyConsistent)
+                result.overflowed = overflowed.load(ordering: .sequentiallyConsistent)
+                if before == sequence.load(ordering: .sequentiallyConsistent),
+                   !publicationExhausted.load(ordering: .sequentiallyConsistent) { return result }
+            }
+            return nil
+        }
+    }
+}
+#endif

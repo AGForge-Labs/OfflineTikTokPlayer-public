@@ -9,7 +9,13 @@ final class ContinuousAudioGraphTests: XCTestCase {
     // repeats or drops these independently specified samples.
     func testActualSourceNodeJoinsPreparedFramesInsideRenderBlocks() throws {
         for speaker in [false, true] {
+            #if DEBUG
+            let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+            let renderer = ContinuousPCMRenderer(sampleRate: 48_000, channels: 2, prefixFrames: 16, ringFrames: 16,
+                                                 debugRenderAccounting: accounting)
+            #else
             let renderer = ContinuousPCMRenderer(sampleRate: 48_000, channels: 2, prefixFrames: 16, ringFrames: 16)
+            #endif
             let first: [Float] = [0.1, -0.1, 0, 0, 0.2, -0.2]
             let second: [Float] = [0.3, -0.3, 0.4, -0.4]
             XCTAssertTrue(first.withUnsafeBufferPointer { renderer.source(at: 0).prepare(token: 1, totalFrames: 3, prefix: $0) })
@@ -40,6 +46,21 @@ final class ContinuousAudioGraphTests: XCTestCase {
             XCTAssertEqual(samples.count, expected.count)
             for (actual, wanted) in zip(samples, expected) { XCTAssertEqual(actual, wanted, accuracy: 0.000001) }
             XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+            #if DEBUG
+            let value = try XCTUnwrap(accounting.snapshot())
+            XCTAssertFalse(value.overflowed)
+            XCTAssertGreaterThan(value.sourceCallbacksEntered, 0)
+            XCTAssertEqual(value.sourceCallbacksEntered, value.sourceCallbacksCompleted)
+            XCTAssertEqual(value.sourceFramesRequested, value.sourceFramesCompleted)
+            XCTAssertEqual(value.sourceFramesCompleted, value.kernelFramesRequested)
+            XCTAssertEqual(value.kernelCallsEntered, value.kernelCallsCompleted)
+            XCTAssertEqual(value.kernelFramesRequested, value.kernelFramesClassified)
+            XCTAssertEqual(value.copiedPCMFrames, value.kernelFramesClassified)
+            XCTAssertGreaterThanOrEqual(value.copiedPCMFrames, 25)
+            XCTAssertEqual(value.invalidLayoutCallbacks, 0); XCTAssertEqual(value.invalidLayoutFrames, 0)
+            XCTAssertEqual(value.pausedPositiveTokenFrames, 0); XCTAssertEqual(value.inactiveFrames, 0)
+            XCTAssertEqual(value.eofRemainderFrames, 0); XCTAssertEqual(value.underrunFrames, 0)
+            #endif
         }
     }
 }

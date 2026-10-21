@@ -20,7 +20,7 @@ final class ContinuousAudioPlayer {
         let key: UUID
         let waiter: ContinuousAudioPreparationWaiter
     }
-    let renderer = ContinuousPCMRenderer()
+    let renderer: ContinuousPCMRenderer
     private(set) var graph: ContinuousAudioGraph
     private let decoder: ContinuousPCMDecoder
     #if DEBUG
@@ -41,13 +41,16 @@ final class ContinuousAudioPlayer {
     private var pendingPosition: (version: Int, position: Double)?
 
     #if DEBUG
-    init(debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil) {
+    init(debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil,
+         debugRenderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil) {
+        renderer = ContinuousPCMRenderer(debugRenderAccounting: debugRenderAccounting)
         self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
         graph = ContinuousAudioGraph(renderer: renderer)
         decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder)
     }
     #else
     init() {
+        renderer = ContinuousPCMRenderer()
         graph = ContinuousAudioGraph(renderer: renderer)
         decoder = ContinuousPCMDecoder(renderer: renderer)
     }

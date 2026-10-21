@@ -36,6 +36,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testDefaultProductionRenderAccountingBaseline() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: false, renderAccounting: false)
+    }
+
+    func testDefaultProductionRenderAccountingEnabled() async throws {
+        #if DEBUG
+        try await runProductionSelectionBenchmark(traceVideoSeeks: false, renderAccounting: true)
+        #else
+        XCTFail("Render accounting diagnostic requires DEBUG")
+        #endif
+    }
+
     func testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -283,7 +295,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     private func runProductionSelectionBenchmark(traceVideoSeeks: Bool, frameMonitorAlternative: Bool? = nil,
-                                                recordHost: Bool = true, traceNativeRefill: Bool = false) async throws {
+                                                recordHost: Bool = true, traceNativeRefill: Bool = false,
+                                                renderAccounting: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
@@ -298,7 +311,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #if DEBUG
         let nativeActivity = traceNativeRefill ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
-        let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity)
+        let accounting = renderAccounting == true ? ContinuousPCMRenderer.DebugRenderAccountingRecorder() : nil
+        let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity,
+                                          debugRenderAccounting: accounting)
+        if let enabled = renderAccounting {
+            print("ProductionRenderAccountingScope schema=1 enabled=\(enabled) immutableAtConstruction=true nativeRefillTrace=\(traceNativeRefill) videoSeekTrace=\(traceVideoSeeks) defaultVideoMonitor=\(frameMonitorAlternative == nil) samplesPerWindow=128 windows=3 intervalMs=100 snapshotAttempts=3 clocksOnRender=false pcmScan=false jointCoherence=false playbackAcceptance=unchanged")
+            XCTAssertFalse(traceNativeRefill); XCTAssertFalse(traceVideoSeeks)
+            XCTAssertNil(frameMonitorAlternative)
+        }
         let nativeTrace = nativeActivity.map { ProductionNativeRefillTrace(recorder: $0, audio: audio) }
         #else
         let audio = ContinuousAudioPlayer()
@@ -393,7 +413,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             #if DEBUG
             let probe = ProductionRendererProbe(renderer: audio.renderer, nativeTrace: nativeTrace,
                 nativePhase: phase, nativeExpectedToken: measurement.state.expectedToken,
-                nativeCommandUnderruns: measurement.before.underrunFrames)
+                nativeCommandUnderruns: measurement.before.underrunFrames, renderAccounting: accounting)
             #else
             let probe = ProductionRendererProbe(renderer: audio.renderer)
             #endif
@@ -463,6 +483,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertLessThanOrEqual(streams.reduce(0) { $0 + $1.result.samples.count }, 384)
         for measurement in measurements { assertProductionSelection(measurement, tap: tap) }
         for stream in streams { assertProductionStream(stream) }
+        #if DEBUG
+        if let enabled = renderAccounting {
+            for stream in streams { assertProductionRenderAccounting(stream, enabled: enabled) }
+        }
+        #endif
         if measurements.count == 3 {
             XCTAssertGreaterThan(measurements[0].state.expectedToken, 0)
             XCTAssertNotEqual(measurements[0].state.expectedToken, measurements[1].state.expectedToken)
@@ -681,6 +706,76 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertLessThanOrEqual(skew, tolerance)
         XCTAssertEqual(value.memoryBytes, 6_912_000); XCTAssertTrue(value.sameStorage)
     }
+
+
+    #if DEBUG
+    /// Cumulative record differences are diagnostic evidence, not a new timing allowance.
+    /// Samples retain unavailable/overflow states and stay inside the original acquisition bracket.
+    private func assertProductionRenderAccounting(_ value: ProductionSelectionStream, enabled: Bool) {
+        typealias Accounting = ContinuousPCMRenderer.DebugRenderAccountingSnapshot
+        let samples = value.result.samples.filter {
+            $0.end >= value.result.origin && $0.end - value.result.origin <= 8_000_000_000
+        }
+        let available = samples.compactMap { $0.renderAccounting }
+        let unavailable = enabled ? samples.count - available.count : 0
+        print("ProductionRenderAccountingWindow schema=1 phase=\(value.phase) enabled=\(enabled) samples=\(samples.count) available=\(available.count) unavailable=\(unavailable) snapshotAttempts=3 coherence=accounting-record-only rendererJointCoherence=false observerReadInsideAcquisition=true baselineToken=\(value.baseline.token) finalToken=\(value.final.token) baselineVisit=\(value.baseline.visit) finalVisit=\(value.final.visit)")
+        if !enabled {
+            XCTAssertTrue(available.isEmpty, "Nil observer must not synthesize zero counters")
+            return
+        }
+        XCTAssertEqual(unavailable, 0, "Unavailable accounting is retained and fails diagnostic quality")
+        for sample in samples {
+            let stored = sample.renderAccounting
+            func number(_ key: KeyPath<Accounting, UInt64>) -> String {
+                stored.map { String($0[keyPath: key]) } ?? "unknown"
+            }
+            let sourceInFlight = stored.map { String($0.sourceCallbacksEntered > $0.sourceCallbacksCompleted) } ?? "unknown"
+            let kernelInFlight = stored.map { String($0.kernelCallsEntered > $0.kernelCallsCompleted) } ?? "unknown"
+            print("ProductionRenderAccountingSample schema=1 phase=\(value.phase) beginNs=\(sample.begin) endNs=\(sample.end) available=\(stored != nil) sequence=\(number(\.sequence)) sourceEntered=\(number(\.sourceCallbacksEntered)) sourceCompleted=\(number(\.sourceCallbacksCompleted)) sourceRequestedFrames=\(number(\.sourceFramesRequested)) sourceCompletedFrames=\(number(\.sourceFramesCompleted)) kernelEntered=\(number(\.kernelCallsEntered)) kernelCompleted=\(number(\.kernelCallsCompleted)) kernelRequestedFrames=\(number(\.kernelFramesRequested)) kernelClassifiedFrames=\(number(\.kernelFramesClassified)) copiedPCMFrames=\(number(\.copiedPCMFrames)) pausedPositiveTokenFrames=\(number(\.pausedPositiveTokenFrames)) inactiveFrames=\(number(\.inactiveFrames)) eofRemainderFrames=\(number(\.eofRemainderFrames)) underrunFrames=\(number(\.underrunFrames)) sourceInFlight=\(sourceInFlight) kernelInFlight=\(kernelInFlight) overflowed=\(stored.map { String($0.overflowed) } ?? "unknown") coherence=accounting-record-only rendererJointCoherence=false")
+            guard let record = stored else { continue }
+            XCTAssertFalse(record.overflowed)
+            XCTAssertLessThanOrEqual(record.sourceCallbacksCompleted, record.sourceCallbacksEntered)
+            XCTAssertLessThanOrEqual(record.kernelCallsCompleted, record.kernelCallsEntered)
+            if record.sourceCallbacksEntered >= record.sourceCallbacksCompleted {
+                XCTAssertLessThanOrEqual(record.sourceCallbacksEntered - record.sourceCallbacksCompleted, 1)
+            }
+            if record.kernelCallsEntered >= record.kernelCallsCompleted {
+                XCTAssertLessThanOrEqual(record.kernelCallsEntered - record.kernelCallsCompleted, 1)
+            }
+            XCTAssertLessThanOrEqual(record.sourceFramesCompleted, record.sourceFramesRequested)
+            XCTAssertLessThanOrEqual(record.kernelFramesClassified, record.kernelFramesRequested)
+            var classified: UInt64 = 0, sumOverflow = false
+            for frames in [record.copiedPCMFrames, record.pausedPositiveTokenFrames,
+                           record.inactiveFrames, record.eofRemainderFrames, record.underrunFrames] {
+                let next = classified.addingReportingOverflow(frames)
+                classified = next.partialValue; sumOverflow = sumOverflow || next.overflow
+            }
+            XCTAssertFalse(sumOverflow)
+            XCTAssertEqual(classified, record.kernelFramesClassified)
+            if record.kernelCallsEntered == record.kernelCallsCompleted {
+                XCTAssertEqual(record.kernelFramesRequested, record.kernelFramesClassified)
+            }
+            if record.sourceCallbacksEntered == record.sourceCallbacksCompleted,
+               record.kernelCallsEntered == record.kernelCallsCompleted {
+                let total = record.kernelFramesRequested.addingReportingOverflow(record.invalidLayoutFrames)
+                XCTAssertFalse(total.overflow)
+                XCTAssertEqual(record.sourceFramesCompleted, total.partialValue)
+            }
+            XCTAssertEqual(record.invalidLayoutCallbacks, 0); XCTAssertEqual(record.invalidLayoutFrames, 0)
+        }
+        guard let firstSample = samples.first, let lastSample = samples.last,
+              let first = firstSample.renderAccounting, let last = lastSample.renderAccounting else { return }
+        func delta(_ key: KeyPath<Accounting, UInt64>) -> String {
+            let before = first[keyPath: key], after = last[keyPath: key]
+            XCTAssertGreaterThanOrEqual(after, before)
+            return after >= before ? String(after - before) : "invalid"
+        }
+        for (endpoint, sample, record) in [("first", firstSample, first), ("last", lastSample, last)] {
+            print("ProductionRenderAccountingEndpoint schema=1 phase=\(value.phase) endpoint=\(endpoint) beginNs=\(sample.begin) endNs=\(sample.end) sequence=\(record.sequence) sourceCallbacksEntered=\(record.sourceCallbacksEntered) sourceCallbacksCompleted=\(record.sourceCallbacksCompleted) sourceFramesRequested=\(record.sourceFramesRequested) sourceFramesCompleted=\(record.sourceFramesCompleted) invalidLayoutCallbacks=\(record.invalidLayoutCallbacks) invalidLayoutFrames=\(record.invalidLayoutFrames) kernelCallsEntered=\(record.kernelCallsEntered) kernelCallsCompleted=\(record.kernelCallsCompleted) kernelFramesRequested=\(record.kernelFramesRequested) kernelFramesClassified=\(record.kernelFramesClassified) copiedPCMFrames=\(record.copiedPCMFrames) pausedPositiveTokenFrames=\(record.pausedPositiveTokenFrames) inactiveFrames=\(record.inactiveFrames) eofRemainderFrames=\(record.eofRemainderFrames) underrunFrames=\(record.underrunFrames) lastKernelToken=\(record.lastKernelToken) lastKernelVisit=\(record.lastKernelVisit) lastSourceFrameCount=\(record.lastSourceFrameCount) lastSourceHostTimeValid=\(record.lastSourceHostTimeValid) lastSourceHostTime=\(record.lastSourceHostTime) sourceInFlight=\(record.sourceCallbacksEntered > record.sourceCallbacksCompleted) kernelInFlight=\(record.kernelCallsEntered > record.kernelCallsCompleted) uncompletedSourceFrames=\(record.sourceFramesRequested >= record.sourceFramesCompleted ? record.sourceFramesRequested - record.sourceFramesCompleted : 0) unclassifiedKernelFrames=\(record.kernelFramesRequested >= record.kernelFramesClassified ? record.kernelFramesRequested - record.kernelFramesClassified : 0) overflowed=\(record.overflowed) recordCoherent=true rendererJointCoherence=false")
+        }
+        print("ProductionRenderAccountingDelta schema=1 phase=\(value.phase) firstBeginNs=\(firstSample.begin) firstEndNs=\(firstSample.end) lastBeginNs=\(lastSample.begin) lastEndNs=\(lastSample.end) sourceCallbacksEntered=\(delta(\.sourceCallbacksEntered)) sourceCallbacksCompleted=\(delta(\.sourceCallbacksCompleted)) sourceFramesRequested=\(delta(\.sourceFramesRequested)) sourceFramesCompleted=\(delta(\.sourceFramesCompleted)) invalidLayoutCallbacks=\(delta(\.invalidLayoutCallbacks)) invalidLayoutFrames=\(delta(\.invalidLayoutFrames)) kernelCallsEntered=\(delta(\.kernelCallsEntered)) kernelCallsCompleted=\(delta(\.kernelCallsCompleted)) kernelFramesRequested=\(delta(\.kernelFramesRequested)) kernelFramesClassified=\(delta(\.kernelFramesClassified)) copiedPCMFrames=\(delta(\.copiedPCMFrames)) pausedPositiveTokenFrames=\(delta(\.pausedPositiveTokenFrames)) inactiveFrames=\(delta(\.inactiveFrames)) eofRemainderFrames=\(delta(\.eofRemainderFrames)) underrunFrames=\(delta(\.underrunFrames)) firstSourceInFlight=\(first.sourceCallbacksEntered > first.sourceCallbacksCompleted) firstKernelInFlight=\(first.kernelCallsEntered > first.kernelCallsCompleted) lastSourceInFlight=\(last.sourceCallbacksEntered > last.sourceCallbacksCompleted) lastKernelInFlight=\(last.kernelCallsEntered > last.kernelCallsCompleted) endpointScope=independent-record-reads priorInflightCompletionMayBeIncluded=true playbackAcceptance=unchanged")
+    }
+    #endif
 
     func testGeneratedSavedFixturesDecodeToExpectedDistinctTones() async throws {
         let fixture = try await SelectionVideoFixture()
@@ -2329,6 +2424,7 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         let lane0: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
         let lane1: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
         let lane2: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
+        let renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingSnapshot?
         #endif
     }
     struct Result: Sendable {
@@ -2351,12 +2447,15 @@ private final class ProductionRendererProbe: @unchecked Sendable {
     private let nativePhase: Int
     private let nativeExpectedToken: Int
     private let nativeCommandUnderruns: Int64
+    private let renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder?
     init(renderer: ContinuousPCMRenderer, nativeTrace: ProductionNativeRefillTrace? = nil,
-         nativePhase: Int = -1, nativeExpectedToken: Int = 0, nativeCommandUnderruns: Int64 = 0) {
+         nativePhase: Int = -1, nativeExpectedToken: Int = 0, nativeCommandUnderruns: Int64 = 0,
+         renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil) {
         self.renderer = renderer
         self.nativeTrace = nativeTrace
         self.nativePhase = nativePhase; self.nativeExpectedToken = nativeExpectedToken
         self.nativeCommandUnderruns = nativeCommandUnderruns
+        self.renderAccounting = renderAccounting
         samples.reserveCapacity(128)
         timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "test.production-render-sampler", qos: .userInitiated))
         timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(1))
@@ -2389,6 +2488,7 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         let lane0 = nativeTrace?.recorder.snapshot(at: 0)
         let lane1 = nativeTrace?.recorder.snapshot(at: 1)
         let lane2 = nativeTrace?.recorder.snapshot(at: 2)
+        let accounting = renderAccounting?.snapshot()
         #endif
         let end = DispatchTime.now().uptimeNanoseconds
         #if DEBUG
@@ -2400,7 +2500,8 @@ private final class ProductionRendererProbe: @unchecked Sendable {
             if samples.count < 128 {
                 #if DEBUG
                 samples.append(Sample(begin: begin, end: end, audio: audio,
-                    nativeTraceEnabled: nativeTrace != nil, lane0: lane0, lane1: lane1, lane2: lane2))
+                    nativeTraceEnabled: nativeTrace != nil, lane0: lane0, lane1: lane1, lane2: lane2,
+                    renderAccounting: accounting))
                 requestFromStoredWindowSample = end >= origin && end - origin < 8_000_000_000
                 #else
                 samples.append(Sample(begin: begin, end: end, audio: audio))

@@ -47,10 +47,16 @@ final class ContinuousAudioGraph {
 
     private final class RenderStorage: @unchecked Sendable {
         let renderer: ContinuousPCMRenderer
+        #if DEBUG
+        let debugRenderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder?
+        #endif
         let scratch = UnsafeMutablePointer<Float>.allocate(capacity: 512 * 2)
         let maximumFrameCount = Atomic<Int>(0)
         init(_ renderer: ContinuousPCMRenderer) {
             self.renderer = renderer
+            #if DEBUG
+            debugRenderAccounting = renderer.debugRenderAccounting
+            #endif
             scratch.initialize(repeating: 0, count: 512 * 2)
         }
         deinit { scratch.deinitialize(count: 512 * 2); scratch.deallocate() }
@@ -62,6 +68,11 @@ final class ContinuousAudioGraph {
         let anchor = RenderAnchor()
         self.anchor = anchor
         source = AVAudioSourceNode(format: format) { isSilence, timestamp, count, audioBufferList in
+            #if DEBUG
+            storage.debugRenderAccounting?.sourceCallbackEntered(frames: Int(count),
+                hostTimeValid: timestamp.pointee.mFlags.contains(.hostTimeValid),
+                hostTime: timestamp.pointee.mHostTime)
+            #endif
             // One render writer; expose the actual callback quantum rather than
             // assuming that the fixed scratch chunk is the hardware buffer size.
             if Int(count) > storage.maximumFrameCount.load(ordering: .relaxed) {
@@ -71,7 +82,12 @@ final class ContinuousAudioGraph {
             let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
             guard buffers.count == 2,
                   let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
-                  let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else { return kAudio_ParamError }
+                  let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else {
+                #if DEBUG
+                storage.debugRenderAccounting?.sourceCallbackCompleted(frames: Int(count), invalidLayout: true)
+                #endif
+                return kAudio_ParamError
+            }
             var offset = 0
             while offset < Int(count) {
                 let frames = min(512, Int(count) - offset)
@@ -86,6 +102,9 @@ final class ContinuousAudioGraph {
                 anchor.publish(storage.renderer.snapshot,
                     hostEnd: AVAudioTime.seconds(forHostTime: timestamp.pointee.mHostTime) + Double(count) / 48_000)
             }
+            #if DEBUG
+            storage.debugRenderAccounting?.sourceCallbackCompleted(frames: Int(count), invalidLayout: false)
+            #endif
             return noErr
         }
         engine.attach(source)
