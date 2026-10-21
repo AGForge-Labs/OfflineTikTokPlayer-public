@@ -37,10 +37,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame() async throws {
+        try recordRuntimeHost()
         #if DEBUG
         for (ordinal, alternative) in [false, true].enumerated() {
-            print("FrameMonitorBenchmarkArm schema=1 order=default-then-custom ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true playbackAcceptance=unchanged physicalPixels=unmeasured")
-            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative)
+            print("FrameMonitorBenchmarkArm schema=1 order=default-then-custom ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true nativeRefillTrace=false playbackAcceptance=unchanged physicalPixels=unmeasured")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative,
+                                                       recordHost: false)
         }
         #else
         XCTFail("Frame-monitor diagnostic requires DEBUG controls")
@@ -48,13 +50,41 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault() async throws {
+        try recordRuntimeHost()
         #if DEBUG
         for (ordinal, alternative) in [true, false].enumerated() {
-            print("FrameMonitorBenchmarkArm schema=1 order=custom-then-default ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true playbackAcceptance=unchanged physicalPixels=unmeasured")
-            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative)
+            print("FrameMonitorBenchmarkArm schema=1 order=custom-then-default ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true nativeRefillTrace=false playbackAcceptance=unchanged physicalPixels=unmeasured")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative,
+                                                       recordHost: false)
         }
         #else
         XCTFail("Frame-monitor diagnostic requires DEBUG controls")
+        #endif
+    }
+
+    func testNativeRefillTraceCurrentCustomFrameThenDefault() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, alternative) in [true, false].enumerated() {
+            print("FrameMonitorBenchmarkArm schema=1 order=custom-then-default ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true nativeRefillTrace=true playbackAcceptance=unchanged physicalPixels=unmeasured")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative,
+                                                       recordHost: false, traceNativeRefill: true)
+        }
+        #else
+        XCTFail("Native-refill diagnostic requires DEBUG controls")
+        #endif
+    }
+
+    func testNativeRefillTraceDefaultThenCurrentCustomFrame() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, alternative) in [false, true].enumerated() {
+            print("FrameMonitorBenchmarkArm schema=1 order=default-then-custom ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true nativeRefillTrace=true playbackAcceptance=unchanged physicalPixels=unmeasured")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative,
+                                                       recordHost: false, traceNativeRefill: true)
+        }
+        #else
+        XCTFail("Native-refill diagnostic requires DEBUG controls")
         #endif
     }
 
@@ -66,23 +96,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             try await withOwnedNaturalFixture(buffer: buffer, recordHost: false) { fixture, audio, service, screen in
                 service.isInteractingWithFeed = true
                 service.debugUsesCurrentCustomFrameForReadiness = alternative
+                service.debugInitialLoadPhaseEnabled = true
                 var starts = 0, overflow = false
-                var observedCount = -1, observedPreparedIdentity = false
-                var observedItem: ObjectIdentifier?, observedResource: ObjectIdentifier?, observedOutput: ObjectIdentifier?
-                service.debugAfterFirstFrameMonitorStart = { item in
-                    guard starts < 8 else { overflow = true; return }
-                    starts += 1
-                    let outputs = item.outputs
-                    observedCount = outputs.count
-                    let resource = buffer.resource(for: item)
-                    observedItem = ObjectIdentifier(item)
-                    observedResource = resource.map { ObjectIdentifier($0) }
-                    observedOutput = resource?.output.map { ObjectIdentifier($0) }
-                    observedPreparedIdentity = resource?.output.map { expected in
-                        outputs.contains { $0 === expected }
-                    } ?? false
+                defer {
+                    service.debugAfterFirstFrameMonitorStart = nil; service.onDebugInitialVideoReady = nil
+                    service.debugInitialLoadPhaseEnabled = false
                 }
-                defer { service.debugAfterFirstFrameMonitorStart = nil; service.onDebugInitialVideoReady = nil }
                 for phase in 0..<3 {
                     if phase > 0 {
                         try await require({ service.preparedAudioCount == 2
@@ -90,19 +109,76 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                 : buffer.previousMediaID == fixture.aID && buffer.debugPreviousNeedsRewind == false) },
                             "Both actual audio and the selected prepared video must exist before the control action")
                     }
-                    let request = service.debugInitialVideoReadyState.generation + 1
-                    let gate = SelectionInitialReadyOrderingProbe(generation: request)
-                    service.onDebugInitialVideoReady = { generation in await gate.hold(request: generation) }
-                    defer { gate.release() }
+                    let expectedID = phase == 1 ? fixture.bID : fixture.aID
+                    let previousGeneration = service.debugInitialVideoReadyState.generation
+                    let requestedGeneration = previousGeneration + 1 // Diagnostic expectation, not the owner.
                     let beforeStarts = starts
+                    var gate: SelectionInitialReadyOrderingProbe?
+                    var ownerConflict = false
+                    var ownerCaptures = 0, sameOwnerRestarts = 0
+                    var rejectedStarts = 0, readyDeliveries = 0, staleReadyDeliveries = 0
+                    var observedCount = -1, observedPreparedIdentity = false
+                    var observedItem: ObjectIdentifier?, observedResource: ObjectIdentifier?, observedOutput: ObjectIdentifier?
+                    service.debugAfterFirstFrameMonitorStart = { [weak service] item in
+                        guard let service else { return }
+                        guard starts < 8 else { overflow = true; return }
+                        starts += 1
+                        let outputs = item.outputs
+                        let resource = buffer.resource(for: item)
+                        let state = service.debugInitialVideoReadyState
+                        guard state.generation > previousGeneration,
+                              service.queue.currentID == expectedID, audio.selectedID == expectedID,
+                              let resource, resource.item === item, let output = resource.output,
+                              resource.isAttached, resource.isBorrowed, !resource.isRetired,
+                              outputs.contains(where: { $0 === output }) else {
+                            rejectedStarts += 1; return
+                        }
+                        // The hook runs after this exact monitor starts and before
+                        // its KVO is registered. Cold retries may have a later generation.
+                        if let gate {
+                            if state.generation == gate.generation,
+                               observedItem == ObjectIdentifier(item),
+                               observedResource == ObjectIdentifier(resource),
+                               observedOutput == ObjectIdentifier(output) { sameOwnerRestarts += 1 }
+                            else { ownerConflict = true }
+                            return // Never rearm or rehold a captured owner.
+                        }
+                        observedCount = outputs.count; observedPreparedIdentity = true
+                        observedItem = ObjectIdentifier(item); observedResource = ObjectIdentifier(resource)
+                        observedOutput = ObjectIdentifier(output)
+                        gate = SelectionInitialReadyOrderingProbe(generation: state.generation)
+                        ownerCaptures += 1
+                    }
+                    service.onDebugInitialVideoReady = { [weak service] request in
+                        guard readyDeliveries < 8 else { overflow = true; return }
+                        readyDeliveries += 1
+                        guard let service, let gate, request == gate.generation,
+                              service.debugInitialVideoReadyState.generation == gate.generation,
+                              service.queue.currentID == expectedID, audio.selectedID == expectedID else {
+                            staleReadyDeliveries += 1; return
+                        }
+                        await gate.hold(request: request)
+                    }
+                    defer { gate?.release() }
                     switch phase {
                     case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
                     case 1: service.next()
                     default: service.previous()
                     }
-                    let held = await waitUntil(timeout: 3) { gate.isHolding && starts == beforeStarts + 1 }
+                    let held = await waitUntil(timeout: 3) {
+                        guard let gate else { return false }
+                        return gate.isHolding && ownerCaptures == 1 && rejectedStarts == 0 && !ownerConflict
+                            && starts == beforeStarts + 1 + sameOwnerRestarts
+                            && service.debugInitialVideoReadyState.generation == gate.generation
+                            && service.queue.currentID == expectedID && audio.selectedID == expectedID
+                    }
+                    if !held {
+                        let state = service.debugInitialVideoReadyState, load = service.debugInitialLoadPhaseState
+                        print("FrameMonitorHeldGateFailure schema=1 alternative=\(alternative) phase=\(phase) requestedGeneration=\(requestedGeneration) ownerGeneration=\(gate.map { String($0.generation) } ?? "unknown") currentGeneration=\(state.generation) readyGeneration=\(state.readyGeneration.map { String($0) } ?? "unknown") beforeStarts=\(beforeStarts) starts=\(starts) ownerCaptures=\(ownerCaptures) sameOwnerRestarts=\(sameOwnerRestarts) rejectedStarts=\(rejectedStarts) ownerConflict=\(ownerConflict) readyDeliveries=\(readyDeliveries) staleReadyDeliveries=\(staleReadyDeliveries) gateEntered=\(gate?.entered ?? 0) gateActive=\(gate?.active ?? 0) gateTimedOut=\(gate?.timedOut ?? false) gateCancelled=\(gate?.cancelled ?? false) gateOverflow=\(gate?.overflow ?? false) gateDropped=\(gate?.dropped ?? 0) overflow=\(overflow) loadEnabled=\(load.enabled) loadRequest=\(load.request) loadGeneration=\(load.generation) loadPhase=\(load.phase.rawValue)")
+                    }
                     XCTAssertTrue(held)
-                    guard held else { throw SelectionVideoTestFailure.timeout }
+                    guard held, let gate else { throw SelectionVideoTestFailure.timeout }
+                    let request = gate.generation
                     let current = try XCTUnwrap(service.player.currentItem)
                     let resource = try XCTUnwrap(buffer.resource(for: current))
                     let preparedOutput = try XCTUnwrap(resource.output)
@@ -125,11 +201,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     XCTAssertNotEqual(service.debugInitialVideoReadyState.readyGeneration, request)
                     XCTAssertFalse(gate.timedOut); XCTAssertFalse(gate.cancelled); XCTAssertFalse(gate.overflow)
                     XCTAssertEqual(gate.dropped, 0); XCTAssertFalse(overflow)
+                    XCTAssertFalse(ownerConflict); XCTAssertEqual(rejectedStarts, 0); XCTAssertEqual(ownerCaptures, 1)
                     print("FrameMonitorHeldReady schema=1 alternative=\(alternative) phase=\(phase) startOutputs=\(observedCount) heldOutputs=\(outputs.count) expectedStartOutputs=\(alternative ? 1 : 2) preparedIdentity=\(observedPreparedIdentity) currentEpochImage=false request=\(request) held=true startBeforeStatusObservation=true")
                     gate.release()
                     try await require({ self.explicitInitialReadySourceSettled(service, screen: screen) },
                                       "Actual selected custom/native readiness must settle after releasing the real callback")
                     XCTAssertFalse(gate.isHolding, "This source's gate must be released before the next source action")
+                    XCTAssertFalse(ownerConflict); XCTAssertEqual(ownerCaptures, 1)
+                    XCTAssertEqual(service.debugInitialVideoReadyState.generation, request)
                     assertSelection(service, fixture: fixture, id: phase == 1 ? fixture.bID : fixture.aID)
                     XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
                 }
@@ -203,8 +282,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertNil(overflow.run(at: 4))
     }
 
-    private func runProductionSelectionBenchmark(traceVideoSeeks: Bool, frameMonitorAlternative: Bool? = nil) async throws {
-        try recordRuntimeHost()
+    private func runProductionSelectionBenchmark(traceVideoSeeks: Bool, frameMonitorAlternative: Bool? = nil,
+                                                recordHost: Bool = true, traceNativeRefill: Bool = false) async throws {
+        if recordHost { try recordRuntimeHost() }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             return
@@ -216,7 +296,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         for (id, frequency) in [(fixture.aID, 440.0), (fixture.bID, 880.0)] {
             references.append((try await fixture.decodedTone(id: id), frequency))
         }
+        #if DEBUG
+        let nativeActivity = traceNativeRefill ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+        let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity)
+        let nativeTrace = nativeActivity.map { ProductionNativeRefillTrace(recorder: $0, audio: audio) }
+        #else
         let audio = ContinuousAudioPlayer()
+        #endif
         let tap = ProductionSelectionOutputTap()
         let seeks = ProductionSelectionSeekRecorder()
         let startup = ProductionVideoStartupTrace(serviceTracing: traceVideoSeeks)
@@ -304,7 +390,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             let baseline = audio.renderer.snapshot
             let before = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+            #if DEBUG
+            let probe = ProductionRendererProbe(renderer: audio.renderer, nativeTrace: nativeTrace,
+                nativePhase: phase, nativeExpectedToken: measurement.state.expectedToken,
+                nativeCommandUnderruns: measurement.before.underrunFrames)
+            #else
             let probe = ProductionRendererProbe(renderer: audio.renderer)
+            #endif
             try? await Task.sleep(for: .seconds(8))
             let result = probe.stop()
             let final = audio.renderer.snapshot
@@ -327,7 +419,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         audio.debugShutdown { shutdown.complete($0) }
         #endif
         let cleanupReturned = await waitUntil(timeout: 3) { shutdown.result != nil && preparation.result != nil }
-        mayRemoveFixture = cleanupReturned && shutdown.result == true && preparation.result == true
+        let preparationAck = preparation.result, decoderAck = shutdown.result
+        mayRemoveFixture = cleanupReturned && decoderAck == true && preparationAck == true
+        print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
+        #if DEBUG
+        nativeTrace?.dumpAfterCleanup()
+        #endif
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
         XCTAssertTrue(mayRemoveFixture, "Queued decoder cleanup must return before removing only this synthetic fixture")
         if !mayRemoveFixture { Self.targetedFixtureOwnershipLost = true; fixture.restorePreferences() }
@@ -558,6 +655,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         print("ProductionSelectionStream phase=\(value.phase) seconds=8 samples=\(samples.count) rendererCoherentSamples=\(samples.count) firstMs=\((elapsed.first ?? .infinity) * 1_000) lastMs=\((elapsed.last ?? -1) * 1_000) maximumGapMs=\((gaps.max() ?? .infinity) * 1_000) maximumAcquisitionMs=\(acquisition * 1_000) wallSeconds=\(wall) pcmSeconds=\(pcm) maximumSkewMs=\(skew * 1_000) toleranceMs=\(tolerance * 1_000) quantum=\(value.quantum) dropped=\(result.dropped) acquisitionOutstanding=\(result.acquisitionOutstanding) baselineToken=\(value.baseline.token) finalToken=\(value.final.token) baselineVisit=\(value.baseline.visit) finalVisit=\(value.final.visit) baselineFrame=\(value.baseline.frame) finalFrame=\(value.final.frame) baselineUnderruns=\(value.baseline.underrunFrames) finalUnderruns=\(value.final.underrunFrames) retainedPCMBytes=\(value.memoryBytes) sameStorage=\(value.sameStorage) producerTracing=absent")
         for sample in samples {
             print("ProductionSelectionRenderSample phase=\(value.phase) originNs=\(result.origin) beginNs=\(sample.begin) endNs=\(sample.end) elapsedMs=\(Double(sample.end - result.origin) / 1_000_000) acquisitionMs=\(Double(sample.end - sample.begin) / 1_000_000) rendererCoherent=true token=\(sample.audio.token) visit=\(sample.audio.visit) frame=\(sample.audio.frame) ended=\(sample.audio.ended) underrunFrames=\(sample.audio.underrunFrames)")
+            #if DEBUG
+            if sample.nativeTraceEnabled {
+                print("ProductionSelectionNativeLanes schema=1 phase=\(value.phase) beginNs=\(sample.begin) endNs=\(sample.end) token=\(sample.audio.token) visit=\(sample.audio.visit) frame=\(sample.audio.frame) underrunFrames=\(sample.audio.underrunFrames) lane0Available=\(sample.lane0 != nil) lane0Packed=\(sample.lane0?.packedState ?? 0) lane0Sequence=\(sample.lane0?.copySequence ?? 0) lane0Stage=\(sample.lane0?.stageCode ?? 0) lane0Overflow=\(sample.lane0?.sequenceOverflowed ?? false) lane1Available=\(sample.lane1 != nil) lane1Packed=\(sample.lane1?.packedState ?? 0) lane1Sequence=\(sample.lane1?.copySequence ?? 0) lane1Stage=\(sample.lane1?.stageCode ?? 0) lane1Overflow=\(sample.lane1?.sequenceOverflowed ?? false) lane2Available=\(sample.lane2 != nil) lane2Packed=\(sample.lane2?.packedState ?? 0) lane2Sequence=\(sample.lane2?.copySequence ?? 0) lane2Stage=\(sample.lane2?.stageCode ?? 0) lane2Overflow=\(sample.lane2?.sequenceOverflowed ?? false) coherence=individual-packed-words-only")
+            }
+            #endif
         }
         XCTAssertGreaterThanOrEqual(samples.count, 40); XCTAssertLessThanOrEqual(samples.count, 128)
         XCTAssertGreaterThanOrEqual(samples.count, 20, "Every returned renderer snapshot is coherent; no producer-coherence claim is made")
@@ -1243,10 +1345,40 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let buffer = PlaybackBuffer()
         try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
             service.isInteractingWithFeed = true
+            service.debugInitialLoadPhaseEnabled = true
+            defer { service.debugInitialLoadPhaseEnabled = false }
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
-            try await require({ self.explicitInitialReadySourceSettled(service, screen: screen)
-                && service.preparedAudioCount == 2 && buffer.hasPrepared(fixture.bID) },
-                "Initial A and prepared B must settle before the ready-before-visit control")
+            var initialState: PlaybackService.DebugInitialVideoReadyState?
+            var initialAudio: ContinuousPCMRenderer.Snapshot?
+            var initialVideoReady = false, initialLoading = true
+            var initialCustomReady: Bool?, initialBPrepared: Bool?
+            var initialPreparedCount: Int?
+            do {
+                try await require({
+                    let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                    initialState = state; initialAudio = sample
+                    initialVideoReady = service.isVideoReady; initialLoading = service.isLoading
+                    initialCustomReady = nil; initialPreparedCount = nil; initialBPrepared = nil
+                    // Preserve the original short circuit: the native layer and
+                    // buffer predicates are read only when their earlier guards pass.
+                    guard sample.token > 0 && sample.frame > 2_400 && !sample.ended
+                        && state.readyGeneration == state.generation && state.audioVisit == sample.visit
+                        && state.syncingVideoGeneration == nil && initialVideoReady && !initialLoading else { return false }
+                    let customReady = screen.customVideoLayer?.isReadyForDisplay == true
+                    initialCustomReady = customReady
+                    guard customReady else { return false }
+                    let preparedCount = service.preparedAudioCount
+                    initialPreparedCount = preparedCount
+                    guard preparedCount == 2 else { return false }
+                    let prepared = buffer.hasPrepared(fixture.bID)
+                    initialBPrepared = prepared
+                    return prepared
+                }, "Initial A and prepared B must settle before the ready-before-visit control")
+            } catch {
+                let load = service.debugInitialLoadPhaseState
+                print("InitialReadySetupFailure schema=1 currentGeneration=\(initialState.map { String($0.generation) } ?? "unknown") readyGeneration=\(initialState?.readyGeneration.map { String($0) } ?? "unknown") cachedVisit=\(initialState.map { String($0.audioVisit) } ?? "unknown") syncingGeneration=\(initialState?.syncingVideoGeneration.map { String($0) } ?? "unknown") token=\(initialAudio.map { String($0.token) } ?? "unknown") frame=\(initialAudio.map { String($0.frame) } ?? "unknown") visit=\(initialAudio.map { String($0.visit) } ?? "unknown") ended=\(initialAudio.map { String($0.ended) } ?? "unknown") videoReady=\(initialVideoReady) loading=\(initialLoading) customReady=\(initialCustomReady.map { String($0) } ?? "unread") preparedCount=\(initialPreparedCount.map { String($0) } ?? "unread") preparedB=\(initialBPrepared.map { String($0) } ?? "unread") loadEnabled=\(load.enabled) loadRequest=\(load.request) loadGeneration=\(load.generation) loadPhase=\(load.phase.rawValue)")
+                throw error
+            }
             let aToken = service.audioSnapshot.token
             assertSelection(service, fixture: fixture, id: fixture.aID)
             service.next()
@@ -2192,6 +2324,12 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         let begin: UInt64
         let end: UInt64
         let audio: ContinuousPCMRenderer.Snapshot
+        #if DEBUG
+        let nativeTraceEnabled: Bool
+        let lane0: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
+        let lane1: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
+        let lane2: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
+        #endif
     }
     struct Result: Sendable {
         let origin: UInt64
@@ -2208,6 +2346,24 @@ private final class ProductionRendererProbe: @unchecked Sendable {
     private var acquiring = false
     private var dropped = 0
 
+    #if DEBUG
+    private let nativeTrace: ProductionNativeRefillTrace?
+    private let nativePhase: Int
+    private let nativeExpectedToken: Int
+    private let nativeCommandUnderruns: Int64
+    init(renderer: ContinuousPCMRenderer, nativeTrace: ProductionNativeRefillTrace? = nil,
+         nativePhase: Int = -1, nativeExpectedToken: Int = 0, nativeCommandUnderruns: Int64 = 0) {
+        self.renderer = renderer
+        self.nativeTrace = nativeTrace
+        self.nativePhase = nativePhase; self.nativeExpectedToken = nativeExpectedToken
+        self.nativeCommandUnderruns = nativeCommandUnderruns
+        samples.reserveCapacity(128)
+        timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "test.production-render-sampler", qos: .userInitiated))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.sample() }
+        timer.resume()
+    }
+    #else
     init(renderer: ContinuousPCMRenderer) {
         self.renderer = renderer
         samples.reserveCapacity(128)
@@ -2216,6 +2372,7 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.sample() }
         timer.resume()
     }
+    #endif
 
     private func sample() {
         let begin = DispatchTime.now().uptimeNanoseconds
@@ -2223,16 +2380,45 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         lock.lock()
         guard !stopped else { lock.unlock(); return }
         acquiring = true
+        #if DEBUG
+        let firstWindowSample = samples.isEmpty
+        #endif
         lock.unlock()
         let audio = renderer.snapshot
+        #if DEBUG
+        let lane0 = nativeTrace?.recorder.snapshot(at: 0)
+        let lane1 = nativeTrace?.recorder.snapshot(at: 1)
+        let lane2 = nativeTrace?.recorder.snapshot(at: 2)
+        #endif
         let end = DispatchTime.now().uptimeNanoseconds
+        #if DEBUG
+        var requestFromStoredWindowSample = false
+        #endif
         lock.lock()
         acquiring = false
         if !stopped {
-            if samples.count < 128 { samples.append(Sample(begin: begin, end: end, audio: audio)) }
+            if samples.count < 128 {
+                #if DEBUG
+                samples.append(Sample(begin: begin, end: end, audio: audio,
+                    nativeTraceEnabled: nativeTrace != nil, lane0: lane0, lane1: lane1, lane2: lane2))
+                requestFromStoredWindowSample = end >= origin && end - origin < 8_000_000_000
+                #else
+                samples.append(Sample(begin: begin, end: end, audio: audio))
+                #endif
+            }
             else { dropped += 1 }
         }
         lock.unlock()
+        #if DEBUG
+        // Stop/drop/late acquisitions cannot trigger a request. A retained
+        // pre-stop observation may still deliver its async response after stop;
+        // request/reply times and nonjoint coherence qualify that later state.
+        if requestFromStoredWindowSample {
+            nativeTrace?.observeFirstUnderrun(audio, renderer: renderer, phase: nativePhase, expectedToken: nativeExpectedToken,
+                commandUnderruns: nativeCommandUnderruns, firstWindowSample: firstWindowSample,
+                observationBegin: begin, observationEnd: end)
+        }
+        #endif
     }
 
     func stop() -> Result {
@@ -2242,6 +2428,113 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         return Result(origin: origin, samples: samples, dropped: dropped, acquisitionOutstanding: acquiring)
     }
 }
+
+#if DEBUG
+/// One arm-owned failure request/response, shared by its three existing probes.
+/// No producer sampling task, native getter, media reference or per-call history.
+private final class ProductionNativeRefillTrace: @unchecked Sendable {
+    private struct SourceEndpoint: Sendable {
+        let slot: Int, token: Int, tokenAfter: Int
+        let prefixFrames: Int, availableRaw: Int, writableRaw: Int
+        let totalFrames: Int64
+    }
+    let recorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder
+    @MainActor private weak var audio: ContinuousAudioPlayer?
+    private let lock = NSLock()
+    private var requested = false, issued = false
+    private var observationBegin: UInt64 = 0, observationEnd: UInt64 = 0
+    private var enqueueNs: UInt64 = 0, issueNs: UInt64 = 0, replyNs: UInt64 = 0
+    private var phase = -1
+    private var token = 0
+    private var visit: Int64 = 0, frame: Int64 = 0, underruns: Int64 = 0, commandUnderruns: Int64 = 0
+    private var firstWindowSample = false
+    private var sourceBeginNs: UInt64 = 0, sourceEndNs: UInt64 = 0
+    private var sources: [SourceEndpoint] = [] // One fixed three-source endpoint, not a history.
+    private var response: ContinuousPCMDecoder.DebugFailureState?
+
+    @MainActor init(recorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder, audio: ContinuousAudioPlayer) {
+        self.recorder = recorder
+        self.audio = audio
+    }
+
+    func observeFirstUnderrun(_ value: ContinuousPCMRenderer.Snapshot, renderer: ContinuousPCMRenderer,
+                             phase: Int, expectedToken: Int,
+                             commandUnderruns: Int64, firstWindowSample: Bool,
+                             observationBegin: UInt64, observationEnd: UInt64) {
+        guard phase == 1 || phase == 2, expectedToken > 0, value.token == expectedToken,
+              !value.ended, value.underrunFrames > commandUnderruns else { return }
+        lock.lock()
+        guard !requested else { lock.unlock(); return }
+        requested = true
+        self.observationBegin = observationBegin; self.observationEnd = observationEnd
+        self.phase = phase; self.firstWindowSample = firstWindowSample
+        token = value.token; visit = value.visit; frame = value.frame; underruns = value.underrunFrames
+        self.commandUnderruns = commandUnderruns
+        sourceBeginNs = DispatchTime.now().uptimeNanoseconds
+        sources.reserveCapacity(3)
+        for index in 0..<3 {
+            let source = renderer.source(at: index)
+            let before = source.token
+            let total = source.totalFrames, prefix = source.prefixFrameCount
+            let available = source.availableStreamFrames, writable = source.writableStreamFrames
+            let after = source.token
+            sources.append(SourceEndpoint(slot: index, token: before, tokenAfter: after,
+                prefixFrames: prefix, availableRaw: available, writableRaw: writable, totalFrames: total))
+        }
+        sourceEndNs = DispatchTime.now().uptimeNanoseconds
+        enqueueNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+        // One task per arm, only after a real positive underrun. No wait in the
+        // observation window; failure of main/worker delivery stays explicit.
+        Task { @MainActor [weak self] in
+            guard let self, let audio = self.audio else { return }
+            self.markIssued()
+            audio.debugDecoderFailureState { [weak self] state in
+                guard let self else { return }
+                self.storeResponse(state)
+            }
+        }
+    }
+
+    private func markIssued() {
+        lock.lock(); issued = true; issueNs = DispatchTime.now().uptimeNanoseconds; lock.unlock()
+    }
+
+    private func storeResponse(_ state: ContinuousPCMDecoder.DebugFailureState) {
+        lock.lock(); response = state; replyNs = DispatchTime.now().uptimeNanoseconds; lock.unlock()
+    }
+
+    func dumpAfterCleanup() {
+        lock.lock()
+        let requestObserved = requested, requestIssued = issued, state = response
+        let begin = observationBegin, end = observationEnd
+        let requestEnqueueNs = enqueueNs, requestIssueNs = issueNs, workerReplyNs = replyNs
+        let triggerPhase = phase, triggerToken = token, triggerVisit = visit, triggerFrame = frame
+        let triggerUnderruns = underruns, commandBaseline = commandUnderruns, positiveAtFirstSample = firstWindowSample
+        let sourceRecords = sources, sourcesBegin = sourceBeginNs, sourcesEnd = sourceEndNs
+        lock.unlock()
+        print("ProductionNativeRefillScope schema=1 enabled=true lanes=3 windows=3 maximumSamplesPerWindow=128 intervalMs=100 windowSeconds=8 failureRequestsPerArm=1 failurePriority=B-then-A-fallback coldSubstitution=false snapshotWaitInsideWindow=false realtimeQueries=false")
+        print("ProductionNativeRefillFailure schema=1 enabled=true requested=\(requestObserved) requestIssued=\(requestIssued) workerResponseAvailable=\(state != nil) phase=\(triggerPhase) target=\(triggerPhase == 1 ? "B-priority" : triggerPhase == 2 ? "A-fallback" : "none") token=\(triggerToken) visit=\(triggerVisit) frame=\(triggerFrame) underrunFrames=\(triggerUnderruns) commandBaselineUnderruns=\(commandBaseline) positiveAtFirstWindowSample=\(positiveAtFirstSample) onsetBeforeFirstObservation=\(positiveAtFirstSample) observationBeginNs=\(begin) observationEndNs=\(end) requestEnqueueNs=\(requestEnqueueNs) requestIssueNs=\(requestIssueNs) workerReplyNs=\(workerReplyNs) requestCapacity=1 requestDeliveryOutsideAcquisition=true snapshotScope=worker-cached-state jointLaneRendererCoherence=false onsetExact=false coldSubstitution=false")
+        print("ProductionNativeRefillSourceScope schema=1 available=\(sourceRecords.count == 3) count=\(sourceRecords.count) capacity=3 beginNs=\(sourcesBegin) endNs=\(sourcesEnd) epochQualified=false streamRequestReads=0 scope=first-observed-failure-after-renderer-acquisition")
+        for source in sourceRecords.prefix(3) {
+            print("ProductionNativeRefillSource schema=1 slot=\(source.slot) token=\(source.token) tokenAfter=\(source.tokenAfter) tokenStable=\(source.token == source.tokenAfter) prefixFrames=\(source.prefixFrames) totalFrames=\(source.totalFrames) rawAvailableFrames=\(source.availableRaw) rawWritableFrames=\(source.writableRaw) epochQualified=false coherence=individual-atomic-accessors")
+        }
+        for index in 0..<3 {
+            let lane = recorder.snapshot(at: index)
+            print("ProductionNativeRefillCleanupLane schema=1 lane=\(index) available=\(lane != nil) packedState=\(lane?.packedState ?? 0) copySequence=\(lane?.copySequence ?? 0) stage=\(lane?.stageCode ?? 0) overflowed=\(lane?.sequenceOverflowed ?? false) scope=after-cleanup-wait")
+        }
+        guard let state else { return }
+        let s = state.stats
+        print("ProductionNativeRefillWorker schema=1 leasedReaders=\(s.leasedReaders) peakLeasedReaders=\(s.peakLeasedReaders) retiredLeasesAwaitingClose=\(s.retiredLeasesAwaitingClose) startingLeases=\(s.startingLeases) pendingPreparations=\(s.pendingPreparations) pendingReads=\(s.readJobsAwaitingAcceptanceOrClose) mailboxPackets=\(s.mailboxPackets) pendingOrMailboxPacketSlots=\(s.pendingOrMailboxPacketSlots) shutdownRequested=\(s.shutdownRequested) readerLeasesClosed=\(s.readerLeasesClosed) overflowed=\(s.counterOverflowed)")
+        for slot in state.slots.prefix(3) {
+            print("ProductionNativeRefillSlot schema=1 slot=\(slot.index) token=\(slot.token) epoch=\(slot.epoch) finished=\(slot.finished) cancelled=\(slot.cancelled) lease=\(slot.leaseIndex) streamAvailable=\(slot.stream != nil) cursor=\(slot.stream?.cursor ?? 0) generatedFrames=\(slot.stream?.generatedFrames ?? 0) outputStart=\(slot.stream?.outputStart ?? 0) outputCount=\(slot.stream?.outputCount ?? 0) converterFinished=\(slot.stream?.converterFinished ?? false) reachedEnd=\(slot.stream?.reachedEnd ?? false)")
+        }
+        for lease in state.leases.prefix(3) {
+            print("ProductionNativeRefillLease schema=1 lane=\(lease.index) present=\(lease.present) starting=\(lease.starting) readPending=\(lease.readPending) retired=\(lease.retired) requestedFrames=\(lease.requestedFrames) packetFrames=\(lease.packetFrames) packetOffset=\(lease.packetOffset) reachedEnd=\(lease.reachedEnd) hasFailure=\(lease.hasFailure)")
+        }
+    }
+}
+#endif
 
 /// Fixed 12-second storage for actual mixer PCM and its AVAudioTime host timeline.
 /// The tap is disabled during the first two 8-second renderer-only windows.
