@@ -540,7 +540,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         defer { fixture.remove() }
         let audio = ContinuousAudioPlayer()
         let service = fixture.service(continuousAudio: audio)
-        let context = SelectionProducerContext(renderer: audio.renderer, producer: audio.producerProgressRecorder)
+        let context = SelectionProducerContext(renderer: audio.renderer, producer: audio.producerProgressRecorder,
+            nativeSamplePurpose: 1)
         let screen = try SelectionVideoScreen(service: service, producerContext: context,
             producerWindowSeconds: 45, producerSampleCapacity: 512)
         defer { service.pause(); audio.graph.engine.stop(); screen.close() }
@@ -585,7 +586,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
         XCTAssertEqual(audio.producerProgressRecorder.snapshot().tracingEnabled, trace)
         let probe = SelectionProducerProbe(context: SelectionProducerContext(renderer: audio.renderer,
-            producer: audio.producerProgressRecorder), durationSeconds: 45, capacity: 512)
+            producer: audio.producerProgressRecorder, nativeSamplePurpose: 1), durationSeconds: 45, capacity: 512)
         let start = ProcessInfo.processInfo.systemUptime
         if capture {
             // Preserve the original compositor identity, moving marker, source,
@@ -658,10 +659,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let sample = service.audioSnapshot
         print("SelectionBoundary phase=runway reached=\(reachedRunway) sourceA=\(sample.token == aToken) frame=\(sample.frame) visit=\(sample.visit) underrunFrames=\(sample.underrunFrames) engineRunning=\(service.audioEngineRunning) wantsToPlay=\(service.wantsToPlay) position=\(service.clock.position) duration=\(service.clock.duration)")
         guard reachedRunway else {
-            // Keep this an assertion failure, with the original numeric evidence,
-            // instead of throwing a setup error through deferred fixture cleanup.
+            // Preserve the original assertion and numeric evidence, then abort
+            // this failed setup instead of continuing with the wrong source.
             XCTFail("The real renderer must reach the seek runway or naturally enter B")
-            return
+            // Sampling happens only after this existing setup guard has failed.
+            // Abort this arm: A's failed seek cannot stand in for natural B.
+            let identifier = UUID().uuidString.lowercased()
+            let written = SelectionNativeWorkerSample.request(purpose: 0, identifier: identifier)
+            print("SelectionNativeWorkerRequest purposeCode=0 requestID=\(identifier) written=\(written)")
+            throw SelectionVideoTestFailure.timeout
         }
         // The audio thread continues through the boundary while the main actor is briefly busy.
         // This deterministically exercises an arriving frame offset greater than zero.
@@ -1353,10 +1359,56 @@ private struct SelectionVideoCaptureState {
 private struct SelectionProducerContext: Sendable {
     let renderer: ContinuousPCMRenderer
     let producer: ContinuousPCMDecoder.ProgressRecorder
+    let nativeSamplePurpose: Int?
+
+    init(renderer: ContinuousPCMRenderer, producer: ContinuousPCMDecoder.ProgressRecorder,
+         nativeSamplePurpose: Int? = nil) {
+        self.renderer = renderer; self.producer = producer
+        self.nativeSamplePurpose = nativeSamplePurpose
+    }
+}
+
+/// Synthetic native tests request one bounded CI worker stack only after an
+/// existing setup failure or an observed new underrun. The host verifies PID,
+/// exact Simulator/app ownership and a two-sample run cap before profiling.
+private enum SelectionNativeWorkerSample {
+    private struct Request: Encodable {
+        let schemaVersion: Int
+        let requestID: String
+        let processID: Int
+        let purposeCode: Int
+    }
+
+    @discardableResult
+    static func request(purpose: Int, identifier: String = UUID().uuidString.lowercased()) -> Bool {
+        guard (0...1).contains(purpose), UUID(uuidString: identifier)?.uuidString.lowercased() == identifier else { return false }
+        let manager = FileManager.default
+        let temporary = manager.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = "OfflinePlayer-TestWorkerTrace-" + identifier
+        let partial = temporary.appendingPathComponent(prefix + ".partial")
+        let request = temporary.appendingPathComponent(prefix + ".request.json")
+        guard [partial, request].allSatisfy({
+            $0.deletingLastPathComponent() == temporary
+                && $0.resolvingSymlinksInPath().deletingLastPathComponent() == temporary
+                && !manager.fileExists(atPath: $0.path)
+        }) else { return false }
+        var created = false
+        defer { if created { try? manager.removeItem(at: partial) } }
+        do {
+            let data = try JSONEncoder().encode(Request(schemaVersion: 1, requestID: identifier,
+                processID: Int(ProcessInfo.processInfo.processIdentifier), purposeCode: purpose))
+            guard data.count <= 1_024 else { return false }
+            try data.write(to: partial, options: .withoutOverwriting)
+            created = true
+            try manager.moveItem(at: partial, to: request)
+            return true
+        } catch { return false }
+    }
 }
 
 /// A test-only sampler independent of both the UI and decode queues, with fixed
 /// numeric records, no media, no console I/O and no unbounded seqlock read.
+/// After a proven underrun, an enabled probe may write one bounded stack request.
 /// Ordinary probes keep 128 records/eight seconds; full captures cap at 512/45s.
 private final class SelectionProducerProbe: @unchecked Sendable {
     struct Sample: Sendable {
@@ -1376,13 +1428,15 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         let maximumGap: UInt64
         let durationSeconds: Double
         let capacity: Int
+        let nativeSampleRequestID: String?
+        let nativeSampleWriteCode: Int
 
         func dump(label: String) {
             let delta: String
             if let initial, let last = samples.last { delta = String(last.audio.underrunFrames - initial.underrunFrames) }
             else { delta = "missing" }
             let observedMs = samples.last.map { String(Double($0.uptime - origin) / 1_000_000) } ?? "missing"
-            print("SelectionProducerWindow label=\(label) requestedSeconds=\(durationSeconds) capacity=\(capacity) observedUntilMs=\(observedMs) samples=\(samples.count) skipped=\(skipped) dropped=\(dropped) maxSamplerGapMs=\(Double(maximumGap) / 1_000_000) underrunDelta=\(delta)")
+            print("SelectionProducerWindow label=\(label) requestedSeconds=\(durationSeconds) capacity=\(capacity) observedUntilMs=\(observedMs) samples=\(samples.count) skipped=\(skipped) dropped=\(dropped) maxSamplerGapMs=\(Double(maximumGap) / 1_000_000) underrunDelta=\(delta) nativeSampleRequestID=\(nativeSampleRequestID ?? "none") nativeSampleWriteCode=\(nativeSampleWriteCode)")
             for sample in samples {
                 let progress = sample.producer
                 let age = progress.phaseEnteredUptimeNanoseconds > 0 && sample.producerAcquisitionEnd >= progress.phaseEnteredUptimeNanoseconds
@@ -1399,6 +1453,7 @@ private final class SelectionProducerProbe: @unchecked Sendable {
     private let durationSeconds: Double
     private let durationNanoseconds: UInt64
     private let capacity: Int
+    private let nativeSampleIdentifier: String?
     private let lock = NSLock()
     private var samples: [Sample] = []
     private var stopped = false
@@ -1406,6 +1461,10 @@ private final class SelectionProducerProbe: @unchecked Sendable {
     private var dropped = 0
     private var previousSample: UInt64?
     private var maximumGap: UInt64 = 0
+    private var baselineUnderruns: Int64?
+    private var nativeSampleRequested = false
+    // 0 no request, 1 attempted/pending, 2 written, 3 failed to write.
+    private var nativeSampleWriteCode = 0
 
     init(context: SelectionProducerContext, durationSeconds: Double = 8, capacity: Int = 128) {
         precondition(durationSeconds > 0 && durationSeconds <= 45
@@ -1414,7 +1473,10 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         self.durationSeconds = durationSeconds
         durationNanoseconds = UInt64(durationSeconds * 1_000_000_000)
         self.capacity = capacity
-        initial = context.renderer.diagnosticSnapshot
+        nativeSampleIdentifier = context.nativeSamplePurpose.map { _ in UUID().uuidString.lowercased() }
+        let baseline = context.renderer.diagnosticSnapshot
+        initial = baseline
+        baselineUnderruns = baseline?.underrunFrames
         timer = DispatchSource.makeTimerSource(flags: .strict,
             queue: DispatchQueue(label: "OfflinePlayer.TestProducerProbe", qos: .utility))
         samples.reserveCapacity(capacity)
@@ -1430,6 +1492,12 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         let audioEnd = DispatchTime.now().uptimeNanoseconds
         let producer = context.producer.snapshot()
         let producerEnd = DispatchTime.now().uptimeNanoseconds
+        record(audio: audio, producer: producer, begin: begin,
+            audioEnd: audioEnd, producerEnd: producerEnd)
+    }
+
+    private func record(audio: ContinuousPCMRenderer.Snapshot?, producer: ContinuousPCMDecoder.ProgressSnapshot,
+        begin: UInt64, audioEnd: UInt64, producerEnd: UInt64) {
         lock.lock(); defer { lock.unlock() }
         guard !stopped else { return }
         guard let audio else { skipped += 1; return }
@@ -1438,6 +1506,15 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         previousSample = audioEnd
         samples.append(Sample(uptime: audioEnd, acquisitionBegin: begin, audioAcquisitionEnd: audioEnd,
             producerAcquisitionEnd: producerEnd, audio: audio, producer: producer))
+        if baselineUnderruns == nil { baselineUnderruns = audio.underrunFrames }
+        guard let purpose = context.nativeSamplePurpose, let identifier = nativeSampleIdentifier,
+              !nativeSampleRequested,
+              audio.underrunFrames > (baselineUnderruns ?? audio.underrunFrames) else { return }
+        nativeSampleRequested = true; nativeSampleWriteCode = 1
+        // Serialize this small, failure-triggered file write with stop(). A
+        // request must not appear after teardown and sample a later fixture.
+        let written = SelectionNativeWorkerSample.request(purpose: purpose, identifier: identifier)
+        nativeSampleWriteCode = written ? 2 : 3
     }
 
     func stop() -> Result {
@@ -1445,7 +1522,9 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         stopped = true
         return Result(origin: origin, initial: initial, samples: samples, skipped: skipped,
-                      dropped: dropped, maximumGap: maximumGap, durationSeconds: durationSeconds, capacity: capacity)
+                      dropped: dropped, maximumGap: maximumGap, durationSeconds: durationSeconds, capacity: capacity,
+                      nativeSampleRequestID: nativeSampleRequested ? nativeSampleIdentifier : nil,
+                      nativeSampleWriteCode: nativeSampleWriteCode)
     }
 
     deinit { timer.cancel() }
