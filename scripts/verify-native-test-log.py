@@ -261,8 +261,6 @@ def verify_log(text, expected):
                         problems.append(f"Malformed native/UI case at line {number}: {header.group(1)}")
                 elif RESULT_SUFFIX.fullmatch(clean):
                     problems.append(f"Orphan case result suffix at line {number}")
-                elif AQ_WORD_TAIL.fullmatch(clean):
-                    problems.append(f"Orphan AQ word interleave tail at line {number}")
                 continue
         raw, status = event
         parsed = CASE_ID.fullmatch(raw)

@@ -205,6 +205,13 @@ class NativeTestEvidenceTests(unittest.TestCase):
                                         + aq_word_case(target, timestamp=timestamp) + ["** TEST SUCCEEDED **"])
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("PASS " + target + "\n", result.stdout)
+        # The same diagnostic word can be split by unrelated SDK output. Its
+        # tail alone is noise, never another XCTest event or proof of a result.
+        sdk_only = ["2026-10-21 13:04:23.882411+0000 OfflineTikTokPlayer[20057:66683] [AQ]        LoudnessMan"
+                    "2026-10-21 13:04:23.904062+0000 OfflineTikTokPlayer[20057:64049] [] (Fig) signalled err=-12710 at <>:987",
+                    "ager.mm:1215  IsHardwareSupported: no plist loaded, returning false"]
+        result = self.check_log(self.full_log()[:-1] + sdk_only + ["** TEST SUCCEEDED **"])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_aq_word_interleave_preserves_failed_skipped_and_failed_summary(self):
         target = self.expected[0]
@@ -243,7 +250,7 @@ class NativeTestEvidenceTests(unittest.TestCase):
                      [header.replace("2026-10-21 13:06:38.051696+0000", "unknown-time"), tail],
                      [header.replace("OfflineTikTokPlayer[", "OtherProcess["), tail],
                      [header.replace("0.104 seconds", "unknown seconds"), tail],
-                     [header, tail.replace("1215", "1216")], [tail],
+                     [header, tail.replace("1215", "1216")],
                      [header + " ** TEST FAILED **", tail])
         # Every expected identity already passes, so malformed extra records must
         # be rejected directly rather than merely by a missing-target side effect.
