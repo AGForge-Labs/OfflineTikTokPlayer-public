@@ -13,6 +13,7 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -83,9 +84,18 @@ class NativeControlHarnessTests(unittest.TestCase):
         self.receipt.write_text(json.dumps(value), encoding="utf-8")
         return value
 
-    def log(self, name, status="passed"):
+    def runtime_host(self, name):
+        owner = "PlaybackSelectionVideoRegressionTests"
+        return dict(schema=1, simulatorUDID=SIMULATOR, pid=31, bundleIdentifier=self.ns["BUNDLE"],
+                    moduleNonce=str(uuid.uuid5(uuid.NAMESPACE_URL, "native-control/" + name)),
+                    testName="-[%s %s]" % (owner, name))
+
+    def log(self, name, status="passed", runtime=True):
         owner = "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests"
+        receipt = self.runtime_host(name) if runtime is True else runtime
+        host = "NativeRuntimeHost " + json.dumps(receipt) + "\n" if receipt is not False else ""
         return ("Test Case '-[%s %s]' started.\n" % (owner, name)
+                + host
                 + "Test Case '-[%s %s]' %s (0.001 seconds).\n" % (owner, name, status)
                 + "** TEST SUCCEEDED **\n")
 
@@ -261,6 +271,7 @@ class NativeControlHarnessTests(unittest.TestCase):
                 alias.unlink(missing_ok=True)
 
     def test_singleton_logs_reject_wrong_duplicate_and_failed_cases(self):
+        self.make_receipt()
         name = self.cases[0]
         path = self.ns["raw_log"](1, name)
         good = self.log(name)
@@ -268,8 +279,79 @@ class NativeControlHarnessTests(unittest.TestCase):
                                       ("duplicate", good + good, False), ("failed", self.log(name, "failed"), False)):
             with self.subTest(label=label):
                 path.write_text(text)
-                status, _output = self.mode("verify-one", 1, name)
+                status, _output = self.mode("verify-one", 1, name, SOURCE, TREE, SIMULATOR)
                 self.assertEqual(status == 0, accepted)
+
+    def test_runtime_host_receipt_binds_exact_case_device_bundle_and_process(self):
+        self.make_receipt()
+        name = self.cases[0]
+        path = self.ns["raw_log"](1, name)
+        good = self.runtime_host(name)
+        invalid = [("missing", self.log(name, runtime=False)),
+                   ("duplicate", self.log(name).replace("** TEST SUCCEEDED **",
+                    "NativeRuntimeHost " + json.dumps(good) + "\n** TEST SUCCEEDED **")),
+                   ("malformed", self.log(name, runtime=False).replace("** TEST SUCCEEDED **",
+                    "NativeRuntimeHost {broken}\n** TEST SUCCEEDED **"))]
+        for field, value in (("simulatorUDID", "unknown"), ("simulatorUDID", CONTAINER),
+                             ("simulatorUDID", SIMULATOR.replace("-", "")),
+                             ("bundleIdentifier", "dev.wrong.App"), ("testName", self.cases[-1]),
+                             ("pid", 0), ("pid", -1), ("pid", True), ("pid", 2147483648),
+                             ("pid", "31"), ("moduleNonce", "unknown"), ("schema", True)):
+            changed = dict(good); changed[field] = value
+            invalid.append((field + "=" + str(value), self.log(name, runtime=changed)))
+        changed = dict(good); del changed["testName"]
+        invalid.append(("missing-field", self.log(name, runtime=changed)))
+        changed = dict(good); changed["extra"] = "not permitted"
+        invalid.append(("extra-field", self.log(name, runtime=changed)))
+        duplicate_key = json.dumps(good)[:-1] + ', "pid": 31}'
+        invalid.append(("duplicate-json-key", self.log(name, runtime=False).replace("** TEST SUCCEEDED **",
+                        "NativeRuntimeHost " + duplicate_key + "\n** TEST SUCCEEDED **")))
+        for label, text in [("valid", self.log(name))] + invalid:
+            with self.subTest(label=label):
+                path.write_text(text)
+                status, output = self.mode("verify-one", 1, name, SOURCE, TREE, SIMULATOR)
+                self.assertEqual(status, 0 if label == "valid" else 2, output)
+
+    def test_qualified_runtime_host_does_not_replace_native_case_evidence(self):
+        self.make_receipt()
+        name = self.cases[0]
+        path = self.ns["raw_log"](1, name)
+        for label, text in (("failed", self.log(name, "failed")), ("skipped", self.log(name, "skipped")),
+                            ("missing-terminal", self.log(name).replace(" passed (0.001 seconds).", " unfinished.")),
+                            ("missing-success", self.log(name).replace("** TEST SUCCEEDED **", "")),
+                            ("wrong-native-module", self.log(name).replace(
+                                "Test Case '-[OfflineTikTokPlayerTests.", "Test Case '-[WrongModule."))):
+            with self.subTest(label=label):
+                path.write_text(text)
+                status, _output = self.mode("verify-one", 1, name, SOURCE, TREE, SIMULATOR)
+                self.assertEqual(status, 1)
+
+    def test_observed_runtime_basename_receipt_and_exact_name_guards(self):
+        # Retained F run39632207053 line2671: self.name omits the module,
+        # while the independent XCTest terminal identity retains its module.
+        name = "testProductionSelectionLatencyAndStreamingContinuityWithoutCapture"
+        identity = self.ns["PREFIX"] + name
+        observed = dict(schema=1, simulatorUDID="6EEDD2B9-6E06-4333-91B6-8661FDCCBA47", pid=6749,
+                        bundleIdentifier="dev.galaxybigbird.OfflineTikTokPlayer",
+                        moduleNonce="0f8a21a3-02e6-4e7e-b86c-c12f75a52462",
+                        testName="-[PlaybackSelectionVideoRegressionTests " + name + "]")
+        for prefix in ("", "2026-10-21T16:13:50.2195340Z "):
+            with self.subTest(prefix=bool(prefix)):
+                parsed = self.ns["runtime_host"](prefix + "NativeRuntimeHost " + json.dumps(observed),
+                                                  identity, observed["simulatorUDID"])
+                self.assertEqual(parsed["pid"], observed["pid"])
+                self.assertEqual(parsed["moduleNonce"], observed["moduleNonce"])
+        for wrong in ("-[OtherClass " + name + "]",
+                      "-[PlaybackSelectionVideoRegressionTests testDifferentMethod]",
+                      "-[OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests " + name + "]",
+                      "-[PlaybackSelectionVideoRegressionTests " + name + "] trailing",
+                      "[PlaybackSelectionVideoRegressionTests " + name + "]",
+                      "-[PlaybackSelectionVideoRegressionTests " + name + " extra]"):
+            with self.subTest(testName=wrong):
+                changed = dict(observed, testName=wrong)
+                with self.assertRaises(ValueError):
+                    self.ns["runtime_host"]("NativeRuntimeHost " + json.dumps(changed),
+                                            identity, observed["simulatorUDID"])
 
     @unittest.skipUnless(os.name == "posix", "The launcher contract uses Bash")
     def test_benchmark_builds_one_immutable_plan_before_testing_and_fails_closed(self):
@@ -279,7 +361,11 @@ class NativeControlHarnessTests(unittest.TestCase):
         end = shell.index('\nfi\n\ntest_plan=', start) + len('\nfi')
         benchmark = shell[start:end]
         names = shlex.split(re.search(r"benchmark\) cases=\((.*?)\) ;;", shell).group(1))
-        self.assertEqual(len(names), 2)
+        self.assertEqual(names, [
+            'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+            'testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+            'testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
+            'testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation'])
         fake_xcode = '''import json, os, sys
 from pathlib import Path
 root = Path(os.environ['HARNESS_UNIT_ROOT'])
@@ -386,6 +472,58 @@ raise SystemExit(17 if os.environ['HARNESS_UNIT_SCENARIO'] == 'tee-failure' and 
                 self.assertNotEqual(verify(changed), 0)
         self.assertNotEqual(verify(rows[:-1]), 0)
         self.assertNotEqual(verify(rows[:-1] + [rows[0]]), 0)
+
+    def test_aggregate_rejects_reused_runtime_process_nonce(self):
+        self.make_receipt()
+        rows = []
+        for ordinal, name in enumerate(self.cases, 1):
+            self.ns["raw_log"](ordinal, name).write_text(self.log(name))
+            rows.append([str(ordinal), name, "0", "0", "0", "0"])
+        self.statuses.write_text("".join("\t".join(row) + "\n" for row in rows))
+        self.assertEqual(self.mode("verify-controls", SOURCE, TREE)[0], 0)
+        changed = self.runtime_host(self.cases[1])
+        changed["moduleNonce"] = self.runtime_host(self.cases[0])["moduleNonce"]
+        self.ns["raw_log"](2, self.cases[1]).write_text(self.log(self.cases[1], runtime=changed))
+        self.assertNotEqual(self.mode("verify-controls", SOURCE, TREE)[0], 0)
+
+    @unittest.skipUnless(os.name == "posix", "The launcher contract uses Bash")
+    def test_unknown_runtime_identity_stops_later_controls_after_boundary_and_status(self):
+        shell = HARNESS.read_text(encoding="utf-8").replace("\r\n", "\n")
+        start = shell.index('for name in "${cases[@]}"; do\n')
+        end = shell.index('\ndone\n', start) + len('\ndone')
+        loop = shell[start:end]
+        for verify_status in (1, 2):
+            with self.subTest(verify_status=verify_status), tempfile.TemporaryDirectory(dir=self.root) as directory:
+                root = Path(directory)
+                controls = root / "artifacts/native/native-playback-controls"
+                controls.mkdir(parents=True)
+                preamble = '\n'.join((
+                    'set -euo pipefail', 'cd "$HARNESS_UNIT_ROOT"',
+                    'expected_code_source=' + SOURCE, 'expected_ios_tree=' + TREE,
+                    'simulator_id=' + SIMULATOR, 'test_plan=unused', 'overall_status=0', 'ordinal=0',
+                    'cases=(' + ' '.join(shlex.quote(name) for name in self.cases) + ')',
+                    'xcodebuild() { printf "launch %s\\n" "$ordinal" >> events; return 65; }',
+                    'tee() { while IFS= read -r line; do :; done; }',
+                    'evidence_tool() {', '  case "$1" in',
+                    '    read-plan) return 0 ;;',
+                    '    verify-one) printf "verify %s\\n" "$ordinal" >> events; return "$HARNESS_UNIT_VERIFY_STATUS" ;;',
+                    '    boundary) printf "boundary %s\\n" "$ordinal" >> events; return 0 ;;',
+                    '    *) return 91 ;;', '  esac', '}', ''))
+                script = root / "control-loop.sh"
+                script.write_text(preamble + loop + '\n')
+                environment = dict(os.environ, HARNESS_UNIT_ROOT=str(root),
+                                   HARNESS_UNIT_VERIFY_STATUS=str(verify_status))
+                result = REAL_SUBPROCESS_RUN(['/bin/bash', str(script)], env=environment,
+                                             text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                expected = 1 if verify_status == 2 else len(self.cases)
+                events = (root / "events").read_text().splitlines()
+                self.assertEqual(events, [event + " " + str(ordinal)
+                    for ordinal in range(1, expected + 1) for event in ("launch", "verify", "boundary")])
+                rows = (controls / "statuses.tsv").read_text().splitlines()
+                self.assertEqual(len(rows), expected)
+                for row in rows:
+                    self.assertEqual(row.split('\t')[2:], ["65", "0", str(verify_status), "0"])
 
 
 if __name__ == "__main__":

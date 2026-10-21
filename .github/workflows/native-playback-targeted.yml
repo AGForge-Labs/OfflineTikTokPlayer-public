@@ -9,7 +9,7 @@ jobs:
   native-playback-targeted:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -30,7 +30,7 @@ jobs:
       - name: Default SDK and traced production benchmarks before causal controls
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require both benchmark exact native identities
+      - name: Require both benchmarks and both diagnostic unit identities
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -42,15 +42,17 @@ jobs:
           prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
           expected = {prefix + name for name in (
               'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-              'testProductionSelectionLatencyAndStreamingContinuityWithoutCapture')}
-          if len(expected) != 2 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              'testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+              'testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
+              'testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation')}
+          if len(expected) != 4 or not expected.issubset(evidence.source_manifest(Path('.'))):
               raise SystemExit('Default or original benchmark missing from pinned source')
           evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected)
-          print('Targeted benchmarks native=2 ui=0; original guards retained; no physical-output/full acceptance claim')
+          print('Targeted benchmarks and diagnostic units native=4 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
-      - name: Seven ordered controls in separate app hosts using benchmark-built products
+      - name: Eight ordered controls using benchmark-built products
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh controls
-      - name: Require all seven singleton identities and native exit and host-boundary receipts
+      - name: Require all eight singleton identities and native exit and host-boundary receipts
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh --verify-controls
