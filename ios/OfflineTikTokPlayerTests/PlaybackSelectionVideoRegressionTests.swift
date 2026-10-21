@@ -636,10 +636,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let setupStart = ProcessInfo.processInfo.systemUptime
         var result: SelectionProducerProbe.Result?
         var summaries: [String] = []
+        var copyBoundaries: [(String, SelectionNativeCopyBoundary)] = []
+        copyBoundaries.reserveCapacity(2)
         defer {
             service.pause(); audio.graph.engine.stop(); screen.close()
             result?.dump(label: label)
             for summary in summaries { print(summary) }
+            for (boundary, observation) in copyBoundaries {
+                observation.dump(label: label, boundary: boundary)
+            }
         }
         try await preparePositiveOffsetNaturalB(service, fixture: fixture, audio: audio)
         let ready = await waitUntil {
@@ -648,9 +653,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         XCTAssertTrue(ready, "The same natural B visibility gate must precede either condition")
         let baseline = service.audioSnapshot
+        let copyBaseline = SelectionNativeCopyBoundary(producer: audio.producerProgressRecorder,
+            expectedAudioToken: baseline.token)
+        copyBoundaries.append(("baseline", copyBaseline))
         let setupMs = (ProcessInfo.processInfo.systemUptime - setupStart) * 1_000
         XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
-        XCTAssertEqual(audio.producerProgressRecorder.snapshot().tracingEnabled, trace)
+        XCTAssertEqual(copyBaseline.snapshot.tracingEnabled, trace)
         let probe = SelectionProducerProbe(context: SelectionProducerContext(renderer: audio.renderer,
             producer: audio.producerProgressRecorder, nativeSamplePurpose: 1), durationSeconds: 45, capacity: 512)
         let start = ProcessInfo.processInfo.systemUptime
@@ -663,6 +671,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let remaining = max(0, 24 - captureSeconds)
         if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
         let observed = probe.stop()
+        // Preserve the complete-call history before assertions, native getters
+        // or cleanup can delay this exact observation boundary.
+        let copyFinal = SelectionNativeCopyBoundary(producer: audio.producerProgressRecorder,
+            expectedAudioToken: baseline.token)
+        copyBoundaries.append(("final", copyFinal))
         result = observed
         // The unchanged first-eight-second contract is checked separately from
         // the longer matched window. A slow capture's later tail stays visible.
@@ -751,6 +764,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     private func traceFailedNaturalSetup(_ service: PlaybackService, audio: ContinuousAudioPlayer,
                                          expectedA: String, stage: String) async {
+        // This guard has already failed. These scopes include diagnostic
+        // request/log/grace work and must never stand in for a valid B arm.
+        let failedAudioToken = audio.renderer.diagnosticSnapshot?.token ?? -1
+        let copyBefore = SelectionNativeCopyBoundary(producer: audio.producerProgressRecorder,
+            expectedAudioToken: failedAudioToken, contextCode: 1)
         func log(_ observation: String) {
             let progress = audio.producerProgressRecorder.snapshot()
             let sample = audio.renderer.diagnosticSnapshot
@@ -770,7 +788,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             // This grace cannot turn the original failed guard into a pass.
             try? await Task.sleep(for: .seconds(7))
         }
+        let copyAfter = SelectionNativeCopyBoundary(producer: audio.producerProgressRecorder,
+            expectedAudioToken: failedAudioToken, contextCode: 1)
         log("after")
+        let copyLabel = "failed-natural-setup-\(stage)-\(audio.producerProgressRecorder.workerIdentifier)"
+        copyBefore.dump(label: copyLabel, boundary: "baseline")
+        copyAfter.dump(label: copyLabel, boundary: "final")
     }
 
     func testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause() async throws {
@@ -1528,6 +1551,40 @@ private struct SelectionProducerContext: Sendable {
          nativeSamplePurpose: Int? = nil) {
         self.renderer = renderer; self.producer = producer
         self.nativeSamplePurpose = nativeSamplePurpose
+    }
+}
+
+/// Six fixed numeric rows per matched arm, buffered until playback has stopped.
+/// Sum differences require equal keys, coherent endpoints and no overflow. They
+/// include whole calls completing between endpoints, not only their overlap with
+/// that interval; a scope's wall time cannot identify an SDK wait or its cause.
+private struct SelectionNativeCopyBoundary {
+    // 0 matched observation (which may trigger profiling); 1 already-failed
+    // setup including request/log/grace perturbation, never a valid B arm.
+    let contextCode: Int
+    let workerIdentifier: String
+    let expectedAudioToken: Int
+    let beginNanoseconds: UInt64
+    let endNanoseconds: UInt64
+    let snapshot: ContinuousPCMDecoder.NativeCopyCompletionSnapshot
+
+    init(producer: ContinuousPCMDecoder.ProgressRecorder, expectedAudioToken: Int, contextCode: Int = 0) {
+        precondition(contextCode == 0 || contextCode == 1)
+        self.contextCode = contextCode
+        workerIdentifier = producer.workerIdentifier
+        self.expectedAudioToken = expectedAudioToken
+        beginNanoseconds = DispatchTime.now().uptimeNanoseconds
+        snapshot = producer.nativeCopyCompletionSnapshot()
+        endNanoseconds = DispatchTime.now().uptimeNanoseconds
+    }
+
+    func dump(label: String, boundary: String) {
+        func row(_ value: ContinuousPCMDecoder.NativeCopySlotSnapshot, slot: Int) {
+            print("SelectionNativeCopyCompletion schemaVersion=1 contextCode=\(contextCode) label=\(label) boundary=\(boundary) workerID=\(workerIdentifier) beginNs=\(beginNanoseconds) endNs=\(endNanoseconds) expectedAudioToken=\(expectedAudioToken) nativeTrace=\(snapshot.tracingEnabled) coherent=\(snapshot.coherent) phase=\(snapshot.phase.rawValue) phaseToken=\(snapshot.token) phaseSlot=\(snapshot.slot) phaseEpoch=\(snapshot.epoch) phaseSequence=\(snapshot.phaseSequence) phaseEnteredNs=\(snapshot.phaseEnteredUptimeNanoseconds) slot=\(slot) token=\(value.token) epoch=\(value.epoch) completedCount=\(value.completedCount) completedWallNs=\(value.completedWallNanoseconds) wallTimeOverflowed=\(value.wallTimeOverflowed) maximumWallNs=\(value.maximumWallNanoseconds) maximumEntrySequence=\(value.maximumEntrySequence) maximumStartNs=\(value.maximumStartNanoseconds) maximumEndNs=\(value.maximumEndNanoseconds)")
+        }
+        row(snapshot.slot0, slot: 0)
+        row(snapshot.slot1, slot: 1)
+        row(snapshot.slot2, slot: 2)
     }
 }
 

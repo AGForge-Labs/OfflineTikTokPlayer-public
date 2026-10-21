@@ -125,6 +125,45 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let coherent: Bool
     }
 
+    /// Completed copy scopes for one physical slot's latest token/epoch. A key
+    /// change invalidates count/sum differences; retirement does not clear history.
+    struct NativeCopySlotSnapshot: Sendable, Equatable {
+        let token: Int
+        let epoch: Int
+        let completedCount: UInt64
+        let completedWallNanoseconds: UInt64
+        let wallTimeOverflowed: Bool
+        let maximumWallNanoseconds: UInt64
+        let maximumEntrySequence: Int64
+        let maximumStartNanoseconds: UInt64
+        let maximumEndNanoseconds: UInt64
+
+        static let empty = NativeCopySlotSnapshot(token: 0, epoch: 0, completedCount: 0,
+            completedWallNanoseconds: 0, wallTimeOverflowed: false, maximumWallNanoseconds: 0,
+            maximumEntrySequence: 0, maximumStartNanoseconds: 0, maximumEndNanoseconds: 0)
+    }
+
+    /// Read only at observation boundaries, independently of periodic sampling.
+    /// Wall time includes descheduling; it neither identifies a wait owner nor
+    /// measures an unfinished copy, which remains in the current phase tuple.
+    struct NativeCopyCompletionSnapshot: Sendable, Equatable {
+        let tracingEnabled: Bool
+        let phase: ProgressPhase
+        let token: Int
+        let slot: Int
+        let epoch: Int
+        let phaseSequence: Int64
+        let phaseEnteredUptimeNanoseconds: UInt64
+        let slot0: NativeCopySlotSnapshot
+        let slot1: NativeCopySlotSnapshot
+        let slot2: NativeCopySlotSnapshot
+        let coherent: Bool
+
+        static let disabled = NativeCopyCompletionSnapshot(tracingEnabled: false, phase: .idle,
+            token: 0, slot: -1, epoch: 0, phaseSequence: 0, phaseEnteredUptimeNanoseconds: 0,
+            slot0: .empty, slot1: .empty, slot2: .empty, coherent: true)
+    }
+
     struct WorkerThreadState: Sendable {
         // 0 valid, 1 disabled, 2 incoherent, 3 idle, 4 missing port,
         // 5 phase changed, 6 kernel error, 7 unexpected returned info count.
@@ -139,13 +178,26 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let acquisitionEndNs: UInt64
     }
 
-    fileprivate struct ProgressMark {
+    fileprivate struct NativeCopyEntry: Sendable {
+        let token: Int
+        let slot: Int
+        let epoch: Int
+        let sequence: Int64
+        let startNanoseconds: UInt64
+    }
+
+    fileprivate struct ProgressMark: Sendable {
         let enabled: Bool
         let phase: ProgressPhase
         let token: Int
         let slot: Int
         let epoch: Int
         let threadPort: UInt32
+        var nativeCopyEntry: NativeCopyEntry? = nil
+    }
+
+    struct NativeCopyCalibrationMark: Sendable {
+        fileprivate let mark: ProgressMark
     }
 
     fileprivate struct ProgressContext {
@@ -185,6 +237,61 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             }
         }
 
+        private final class NativeCopyCounters {
+            let token = Atomic<Int>(0)
+            let epoch = Atomic<Int>(0)
+            let completed = Atomic<UInt64>(0)
+            let wall = Atomic<UInt64>(0)
+            let overflowed = Atomic<Bool>(false)
+            let maximum = Atomic<UInt64>(0)
+            let maximumSequence = Atomic<Int64>(0)
+            let maximumStart = Atomic<UInt64>(0)
+            let maximumEnd = Atomic<UInt64>(0)
+
+            func snapshot() -> NativeCopySlotSnapshot {
+                NativeCopySlotSnapshot(token: token.load(ordering: .sequentiallyConsistent),
+                    epoch: epoch.load(ordering: .sequentiallyConsistent),
+                    completedCount: completed.load(ordering: .sequentiallyConsistent),
+                    completedWallNanoseconds: wall.load(ordering: .sequentiallyConsistent),
+                    wallTimeOverflowed: overflowed.load(ordering: .sequentiallyConsistent),
+                    maximumWallNanoseconds: maximum.load(ordering: .sequentiallyConsistent),
+                    maximumEntrySequence: maximumSequence.load(ordering: .sequentiallyConsistent),
+                    maximumStartNanoseconds: maximumStart.load(ordering: .sequentiallyConsistent),
+                    maximumEndNanoseconds: maximumEnd.load(ordering: .sequentiallyConsistent))
+            }
+
+            func begin(token nextToken: Int, epoch nextEpoch: Int) {
+                guard token.load(ordering: .relaxed) != nextToken
+                    || epoch.load(ordering: .relaxed) != nextEpoch else { return }
+                token.store(nextToken, ordering: .sequentiallyConsistent)
+                epoch.store(nextEpoch, ordering: .sequentiallyConsistent)
+                completed.store(0, ordering: .sequentiallyConsistent)
+                wall.store(0, ordering: .sequentiallyConsistent)
+                overflowed.store(false, ordering: .sequentiallyConsistent)
+                maximum.store(0, ordering: .sequentiallyConsistent)
+                maximumSequence.store(0, ordering: .sequentiallyConsistent)
+                maximumStart.store(0, ordering: .sequentiallyConsistent)
+                maximumEnd.store(0, ordering: .sequentiallyConsistent)
+            }
+
+            func complete(_ entry: NativeCopyEntry, end: UInt64) {
+                guard token.load(ordering: .relaxed) == entry.token,
+                      epoch.load(ordering: .relaxed) == entry.epoch else { return }
+                let duration = end - entry.startNanoseconds
+                let count = completed.load(ordering: .relaxed)
+                completed.store(count == UInt64.max ? count : count + 1, ordering: .sequentiallyConsistent)
+                let sum = wall.load(ordering: .relaxed).addingReportingOverflow(duration)
+                wall.store(sum.overflow ? UInt64.max : sum.partialValue, ordering: .sequentiallyConsistent)
+                if sum.overflow { overflowed.store(true, ordering: .sequentiallyConsistent) }
+                if count == 0 || duration > maximum.load(ordering: .relaxed) {
+                    maximum.store(duration, ordering: .sequentiallyConsistent)
+                    maximumSequence.store(entry.sequence, ordering: .sequentiallyConsistent)
+                    maximumStart.store(entry.startNanoseconds, ordering: .sequentiallyConsistent)
+                    maximumEnd.store(end, ordering: .sequentiallyConsistent)
+                }
+            }
+        }
+
         private let tracing = Atomic<Bool>(true)
         private let version = Atomic<Int64>(0)
         private let workerPort = Atomic<UInt32>(0)
@@ -205,6 +312,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private let firstSlot = SlotCounters()
         private let secondSlot = SlotCounters()
         private let thirdSlot = SlotCounters()
+        private let firstNativeCopy = NativeCopyCounters()
+        private let secondNativeCopy = NativeCopyCounters()
+        private let thirdNativeCopy = NativeCopyCounters()
         // These flags have multiple possible callers and remain independent of
         // the decode worker's single-writer phase seqlock and tracing switch.
         private let lifecycleRequested = Atomic<Bool>(false)
@@ -249,6 +359,33 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 result = readSnapshot()
             }
             return result
+        }
+
+        func nativeCopyCompletionSnapshot() -> NativeCopyCompletionSnapshot {
+            var result = readNativeCopyCompletionSnapshot()
+            for _ in 0..<2 {
+                if result.coherent { return result }
+                result = readNativeCopyCompletionSnapshot()
+            }
+            return result
+        }
+
+        private func readNativeCopyCompletionSnapshot() -> NativeCopyCompletionSnapshot {
+            // Disabled observers do not read any of the new per-slot atomics.
+            guard tracing.load(ordering: .sequentiallyConsistent) else { return .disabled }
+            let before = version.load(ordering: .sequentiallyConsistent)
+            let phase = ProgressPhase(rawValue: phaseValue.load(ordering: .sequentiallyConsistent)) ?? .idle
+            let token = tokenValue.load(ordering: .sequentiallyConsistent)
+            let slot = slotValue.load(ordering: .sequentiallyConsistent)
+            let epoch = epochValue.load(ordering: .sequentiallyConsistent)
+            let sequence = phaseCount.load(ordering: .sequentiallyConsistent)
+            let entered = enteredTime.load(ordering: .sequentiallyConsistent)
+            let first = firstNativeCopy.snapshot(), second = secondNativeCopy.snapshot(), third = thirdNativeCopy.snapshot()
+            let coherent = before & 1 == 0 && before == version.load(ordering: .sequentiallyConsistent)
+                && tracing.load(ordering: .sequentiallyConsistent)
+            return NativeCopyCompletionSnapshot(tracingEnabled: true, phase: phase, token: token, slot: slot,
+                epoch: epoch, phaseSequence: sequence, phaseEnteredUptimeNanoseconds: entered,
+                slot0: first, slot1: second, slot2: third, coherent: coherent)
         }
 
         /// Observes only this worker's cached, borrowed pthread Mach port. The
@@ -304,6 +441,17 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             operation()
         }
 
+        /// Synthetic calibration of the same entry/return path as nextSample;
+        /// this does not create an asset reader or claim a native SDK wait.
+        func beginNativeCopyCalibration(token: Int, slot: Int, epoch: Int) -> NativeCopyCalibrationMark {
+            precondition(token > 0 && (0..<3).contains(slot))
+            return NativeCopyCalibrationMark(mark: enter(.nativeCopy, token: token, slot: slot, epoch: epoch))
+        }
+
+        func endNativeCopyCalibration(_ calibration: NativeCopyCalibrationMark) {
+            restore(calibration.mark)
+        }
+
         private func readSnapshot() -> ProgressSnapshot {
             let enabled = tracing.load(ordering: .sequentiallyConsistent)
             let before = version.load(ordering: .sequentiallyConsistent)
@@ -338,15 +486,33 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             guard tracing.load(ordering: .acquiring) else {
                 return ProgressMark(enabled: false, phase: .idle, token: 0, slot: -1, epoch: 0, threadPort: 0)
             }
-            let previous = ProgressMark(enabled: true, phase: ProgressPhase(rawValue: phaseValue.load(ordering: .relaxed)) ?? .idle,
+            var previous = ProgressMark(enabled: true, phase: ProgressPhase(rawValue: phaseValue.load(ordering: .relaxed)) ?? .idle,
                 token: tokenValue.load(ordering: .relaxed), slot: slotValue.load(ordering: .relaxed),
                 epoch: epochValue.load(ordering: .relaxed), threadPort: workerPort.load(ordering: .relaxed))
-            publish(phase, token: token, slot: slot, epoch: epoch)
+            previous.nativeCopyEntry = publish(phase, token: token, slot: slot, epoch: epoch,
+                recordsNativeCopy: phase == .nativeCopy)
             return previous
         }
 
         fileprivate func restore(_ previous: ProgressMark) {
             guard previous.enabled, tracing.load(ordering: .acquiring) else { return }
+            if let entry = previous.nativeCopyEntry {
+                // A duplicate or obsolete return cannot overwrite a later
+                // call's phase or another generation's physical-slot summary.
+                guard phaseValue.load(ordering: .relaxed) == ProgressPhase.nativeCopy.rawValue,
+                      phaseCount.load(ordering: .relaxed) == entry.sequence,
+                      tokenValue.load(ordering: .relaxed) == entry.token,
+                      slotValue.load(ordering: .relaxed) == entry.slot,
+                      epochValue.load(ordering: .relaxed) == entry.epoch else { return }
+                let end = DispatchTime.now().uptimeNanoseconds
+                guard end >= entry.startNanoseconds else { return }
+                beginUpdate()
+                nativeCopyCounters(slot: entry.slot)?.complete(entry, end: end)
+                _ = writePhase(previous.phase, token: previous.token, slot: previous.slot, epoch: previous.epoch,
+                    port: previous.threadPort, now: end)
+                endUpdate()
+                return
+            }
             publish(previous.phase, token: previous.token, slot: previous.slot, epoch: previous.epoch,
                 publisherPort: previous.threadPort)
         }
@@ -388,8 +554,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             return source.streamRequest
         }
 
+        @discardableResult
         private func publish(_ phase: ProgressPhase, token: Int, slot: Int, epoch: Int,
-                             publisherPort: UInt32? = nil) {
+                             publisherPort: UInt32? = nil, recordsNativeCopy: Bool = false) -> NativeCopyEntry? {
             // Hide the previous phase before querying the actual publisher's
             // borrowed port. A serialized native callback may use another
             // thread; an in-progress lookup must never look like an SDK wait.
@@ -398,15 +565,35 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             if phase == .idle { port = 0 }
             else if let publisherPort { port = publisherPort }
             else { port = pthread_mach_thread_np(pthread_self()) }
+            if recordsNativeCopy { nativeCopyCounters(slot: slot)?.begin(token: token, epoch: epoch) }
             let now = DispatchTime.now().uptimeNanoseconds
+            let sequence = writePhase(phase, token: token, slot: slot, epoch: epoch, port: port, now: now)
+            endUpdate()
+            return recordsNativeCopy
+                ? NativeCopyEntry(token: token, slot: slot, epoch: epoch, sequence: sequence, startNanoseconds: now) : nil
+        }
+
+        private func writePhase(_ phase: ProgressPhase, token: Int, slot: Int, epoch: Int,
+                                port: UInt32, now: UInt64) -> Int64 {
+            // Caller owns the one writer transaction; never nest beginUpdate.
             workerPort.store(port, ordering: .sequentiallyConsistent)
             phaseValue.store(phase.rawValue, ordering: .sequentiallyConsistent)
             tokenValue.store(token, ordering: .sequentiallyConsistent)
             slotValue.store(slot, ordering: .sequentiallyConsistent)
             epochValue.store(epoch, ordering: .sequentiallyConsistent)
             enteredTime.store(now, ordering: .sequentiallyConsistent)
-            phaseCount.store(phaseCount.load(ordering: .relaxed) &+ 1, ordering: .sequentiallyConsistent)
-            endUpdate()
+            let sequence = phaseCount.load(ordering: .relaxed) &+ 1
+            phaseCount.store(sequence, ordering: .sequentiallyConsistent)
+            return sequence
+        }
+
+        private func nativeCopyCounters(slot: Int) -> NativeCopyCounters? {
+            switch slot {
+            case 0: return firstNativeCopy
+            case 1: return secondNativeCopy
+            case 2: return thirdNativeCopy
+            default: return nil
+            }
         }
 
         private func beginUpdate() {

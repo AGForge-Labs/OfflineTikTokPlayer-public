@@ -88,8 +88,141 @@ final class ZZZWorkerTraceCalibrationTests: XCTestCase {
         XCTAssertEqual(recorder.workerThreadState(matching: recorder.snapshot()).statusCode, 3)
         recorder.setTracingEnabled(false)
         XCTAssertEqual(recorder.workerThreadState(matching: recorder.snapshot()).statusCode, 1)
+        try await verifyNativeCopyCompletions()
         try await verifyIdleDecoderLifecycle()
         try await verifyHeldDecoderLifecycle()
+    }
+
+    private func verifyNativeCopyCompletions() async throws {
+        // A fresh synthetic recorder exercises publication only, after the host
+        // calibration. No reader, converter, audio graph or SDK wait is involved.
+        let recorder = ContinuousPCMDecoder.ProgressRecorder()
+        let empty = recorder.nativeCopyCompletionSnapshot()
+        XCTAssertTrue(empty.coherent)
+        XCTAssertEqual(empty.slot0, .empty)
+        XCTAssertEqual(empty.slot1, .empty)
+        XCTAssertEqual(empty.slot2, .empty)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let queue = DispatchQueue(label: "OfflinePlayer.TestCopyCompletionCalibration")
+        queue.async {
+            let mark = recorder.beginNativeCopyCalibration(token: 101, slot: 0, epoch: 0)
+            entered.signal()
+            _ = release.wait(timeout: .now() + .seconds(12))
+            recorder.endNativeCopyCalibration(mark)
+            finished.signal()
+        }
+        guard try await untilLifecycle({ entered.wait(timeout: .now()) == .success }) else {
+            XCTFail("The synthetic copy scope must enter"); return
+        }
+        let held = recorder.nativeCopyCompletionSnapshot()
+        XCTAssertTrue(held.coherent)
+        XCTAssertEqual(held.phase, .nativeCopy)
+        XCTAssertEqual(held.token, 101)
+        XCTAssertEqual(held.slot, 0)
+        XCTAssertEqual(held.epoch, 0)
+        XCTAssertGreaterThan(held.phaseSequence, 0)
+        XCTAssertGreaterThan(held.phaseEnteredUptimeNanoseconds, 0)
+        assertEmptyCopyKey(held.slot0, token: 101, epoch: 0)
+        release.signal()
+        guard try await untilLifecycle({ finished.wait(timeout: .now()) == .success }) else {
+            XCTFail("The released synthetic copy scope must complete"); return
+        }
+        let completed = recorder.nativeCopyCompletionSnapshot()
+        XCTAssertTrue(completed.coherent)
+        XCTAssertEqual(completed.phase, .idle)
+        XCTAssertEqual(completed.slot0.completedCount, 1)
+        XCTAssertEqual(completed.slot0.maximumEntrySequence, held.phaseSequence)
+        XCTAssertEqual(completed.slot0.maximumStartNanoseconds, held.phaseEnteredUptimeNanoseconds)
+        XCTAssertGreaterThanOrEqual(completed.slot0.maximumEndNanoseconds, completed.slot0.maximumStartNanoseconds)
+        let initialDuration = completed.slot0.maximumEndNanoseconds.subtractingReportingOverflow(
+            completed.slot0.maximumStartNanoseconds)
+        XCTAssertFalse(initialDuration.overflow)
+        XCTAssertEqual(completed.slot0.maximumWallNanoseconds, initialDuration.partialValue)
+        XCTAssertEqual(completed.slot0.completedWallNanoseconds, completed.slot0.maximumWallNanoseconds)
+        XCTAssertFalse(completed.slot0.wallTimeOverflowed)
+
+        let prior = recorder.beginNativeCopyCalibration(token: 101, slot: 0, epoch: 0)
+        let priorEntry = recorder.nativeCopyCompletionSnapshot()
+        recorder.endNativeCopyCalibration(prior)
+        let second = recorder.nativeCopyCompletionSnapshot()
+        XCTAssertEqual(second.slot0.completedCount, 2)
+        XCTAssertGreaterThanOrEqual(second.slot0.completedWallNanoseconds, completed.slot0.completedWallNanoseconds)
+        XCTAssertGreaterThanOrEqual(second.slot0.maximumWallNanoseconds, completed.slot0.maximumWallNanoseconds)
+        if second.slot0.maximumEntrySequence == priorEntry.phaseSequence {
+            XCTAssertEqual(second.slot0.maximumStartNanoseconds, priorEntry.phaseEnteredUptimeNanoseconds)
+            let nextDuration = second.slot0.maximumEndNanoseconds.subtractingReportingOverflow(
+                second.slot0.maximumStartNanoseconds)
+            XCTAssertFalse(nextDuration.overflow)
+            XCTAssertEqual(second.slot0.maximumWallNanoseconds, nextDuration.partialValue)
+        } else {
+            XCTAssertEqual(second.slot0.maximumWallNanoseconds, completed.slot0.maximumWallNanoseconds)
+            XCTAssertEqual(second.slot0.maximumEntrySequence, completed.slot0.maximumEntrySequence)
+            XCTAssertEqual(second.slot0.maximumStartNanoseconds, completed.slot0.maximumStartNanoseconds)
+            XCTAssertEqual(second.slot0.maximumEndNanoseconds, completed.slot0.maximumEndNanoseconds)
+        }
+        let current = recorder.beginNativeCopyCalibration(token: 101, slot: 0, epoch: 0)
+        let active = recorder.nativeCopyCompletionSnapshot()
+        recorder.endNativeCopyCalibration(prior)
+        XCTAssertEqual(recorder.nativeCopyCompletionSnapshot(), active,
+            "An old same-key return cannot restore or count over a later entry")
+        recorder.endNativeCopyCalibration(current)
+        let third = recorder.nativeCopyCompletionSnapshot()
+        XCTAssertEqual(third.slot0.completedCount, 3)
+        recorder.endNativeCopyCalibration(current)
+        XCTAssertEqual(recorder.nativeCopyCompletionSnapshot(), third, "A duplicate return cannot count twice")
+
+        let other = recorder.beginNativeCopyCalibration(token: 202, slot: 1, epoch: 2)
+        XCTAssertEqual(recorder.nativeCopyCompletionSnapshot().slot0, third.slot0,
+            "A's maximum cannot overwrite B's separate physical-slot summary")
+        recorder.endNativeCopyCalibration(other)
+        let otherCompleted = recorder.nativeCopyCompletionSnapshot().slot1
+        XCTAssertEqual(otherCompleted.completedCount, 1)
+        let replacement = recorder.beginNativeCopyCalibration(token: 202, slot: 0, epoch: 0)
+        let replaced = recorder.nativeCopyCompletionSnapshot()
+        assertEmptyCopyKey(replaced.slot0, token: 202, epoch: 0)
+        XCTAssertEqual(replaced.slot1, otherCompleted)
+        recorder.endNativeCopyCalibration(current)
+        XCTAssertEqual(recorder.nativeCopyCompletionSnapshot(), replaced,
+            "An obsolete token's return cannot alter the replacement generation")
+        recorder.endNativeCopyCalibration(replacement)
+        let newEpoch = recorder.beginNativeCopyCalibration(token: 202, slot: 0, epoch: 2)
+        let reset = recorder.nativeCopyCompletionSnapshot()
+        assertEmptyCopyKey(reset.slot0, token: 202, epoch: 2)
+        XCTAssertEqual(reset.slot1, otherCompleted)
+        recorder.endNativeCopyCalibration(newEpoch)
+        let epochCompleted = recorder.nativeCopyCompletionSnapshot()
+        XCTAssertEqual(epochCompleted.slot0.completedCount, 1)
+        XCTAssertEqual(epochCompleted.slot0.maximumEntrySequence, reset.phaseSequence)
+        recorder.withKnownWorkerWait {}
+        XCTAssertEqual(recorder.nativeCopyCompletionSnapshot().slot0, epochCompleted.slot0,
+            "Generic phase changes must preserve a completed token/epoch history")
+        let last = recorder.beginNativeCopyCalibration(token: 303, slot: 2, epoch: 2)
+        recorder.endNativeCopyCalibration(last)
+        let allSlots = recorder.nativeCopyCompletionSnapshot()
+        XCTAssertEqual(allSlots.slot0, epochCompleted.slot0)
+        XCTAssertEqual(allSlots.slot1, otherCompleted)
+        XCTAssertEqual(allSlots.slot2.completedCount, 1)
+
+        recorder.setTracingEnabled(false)
+        let disabledPhase = recorder.snapshot()
+        XCTAssertEqual(recorder.nativeCopyCompletionSnapshot(), .disabled)
+        let disabled = recorder.beginNativeCopyCalibration(token: 404, slot: 0, epoch: 3)
+        recorder.endNativeCopyCalibration(disabled)
+        XCTAssertEqual(recorder.nativeCopyCompletionSnapshot(), .disabled,
+            "Disabled completion snapshots expose constant empty counters")
+        XCTAssertEqual(recorder.snapshot().phaseSequence, disabledPhase.phaseSequence)
+        XCTAssertEqual(recorder.snapshot().phaseEnteredUptimeNanoseconds, disabledPhase.phaseEnteredUptimeNanoseconds)
+    }
+
+    private func assertEmptyCopyKey(_ value: ContinuousPCMDecoder.NativeCopySlotSnapshot, token: Int, epoch: Int,
+                                   file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(value, ContinuousPCMDecoder.NativeCopySlotSnapshot(token: token, epoch: epoch,
+            completedCount: 0, completedWallNanoseconds: 0, wallTimeOverflowed: false,
+            maximumWallNanoseconds: 0, maximumEntrySequence: 0, maximumStartNanoseconds: 0,
+            maximumEndNanoseconds: 0), file: file, line: line)
     }
 
     private func verifyIdleDecoderLifecycle() async throws {
