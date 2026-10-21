@@ -1,0 +1,67 @@
+name: Native reader production and full validation
+on:
+  push:
+    branches: [diagnostic/native-reader-isolation]
+    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh']
+permissions:
+  contents: read
+jobs:
+  native-reader-full-validation:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Require exact committed app and test source before native work
+        id: source_pin
+        run: bash scripts/check-native-reader-full-validation.sh --verify-source
+      - name: Unsigned initial production benchmark with one build job
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: bash scripts/check-native-reader-full-validation.sh
+      - name: Preserve raw benchmark log and require its one exact native identity
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          cp artifacts/native/xcodebuild-test.log artifacts/native/native-reader-production-benchmark.log
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
+          evidence = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(evidence)
+          expected = {'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
+          if not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('Production benchmark identity missing from pinned source')
+          evidence.verify_log(Path('artifacts/native/native-reader-production-benchmark.log').read_text(), expected)
+          print('INITIAL production benchmark native=1 ui=0; readiness/streaming guards unchanged; compositor/full acceptance NOT ESTABLISHED by this step')
+          PY
+      - name: Verify existing native launcher shell regressions
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: python3 tests/validation-shell/test_check_ios_shell.py
+      - name: Verify existing strict native evidence regressions
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: python3 tests/validation-shell/test_native_test_evidence.py
+      - name: Run unchanged full unsigned playback validation
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          bash scripts/check-native-reader-full-validation.sh --verify-source
+          bash scripts/check-ios.sh
+      - name: Require all ninety-seven native and one UI identities
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
+          evidence = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(evidence)
+          expected = evidence.source_manifest(Path('.'))
+          native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
+          ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
+          if len(native) != 97 or len(ui) != 1 or native | ui != expected:
+              raise SystemExit(f'Pinned full manifest must equal native=97 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
+          evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
+          print('FULL source-manifest evidence native=97 ui=1; original guards retained; physical-device acceptance remains separate')
+          PY
