@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=ed300b654f3bf94c17fdeb24012ae49f4ae0650b
-expected_ios_tree=0e278307d6b3d0bffd8414ab129d8c72185fb2fe
+expected_code_source=1ac3de09a02b5463f383483c2c63e6c58eb5d52d
+expected_ios_tree=b3128730940eb36df8fa05959b946e7fd838d842
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,6 +44,7 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
+    'testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek',
     'testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek',
     'testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
     'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
@@ -57,8 +58,42 @@ def require(condition, message):
     if not condition:
         raise ValueError(message)
 
+class RuntimeHostIdentityError(ValueError):
+    pass
+
+def runtime_host(log, identity, simulator):
+    def canonical_uuid(value):
+        require(isinstance(value, str) and re.fullmatch(
+            r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', value) is not None,
+            'Runtime UUID is unavailable or noncanonical')
+        return str(uuid.UUID(value))
+
+    def unique_object(pairs):
+        require(len(dict(pairs)) == len(pairs), 'Duplicate runtime JSON field')
+        return dict(pairs)
+
+    try:
+        lines = [line for line in log.splitlines() if 'NativeRuntimeHost' in line]
+        require(len(lines) == 1 and len(lines[0]) <= 2048, 'Expected one bounded runtime host receipt')
+        line = re.sub(r'^\d{4}-\d\d-\d\dT\S+Z ', '', lines[0])
+        require(line.startswith('NativeRuntimeHost '), 'Malformed runtime host receipt prefix')
+        value = json.loads(line[len('NativeRuntimeHost '):], object_pairs_hook=unique_object)
+        require(isinstance(value, dict) and set(value) == {
+            'schema', 'simulatorUDID', 'pid', 'bundleIdentifier', 'moduleNonce', 'testName'},
+            'Unexpected runtime host receipt fields')
+        require(type(value['schema']) is int and value['schema'] == 1, 'Wrong runtime host receipt schema')
+        require(canonical_uuid(value['simulatorUDID']) == canonical_uuid(simulator), 'Runtime simulator mismatch')
+        require(value['bundleIdentifier'] == BUNDLE, 'Runtime app bundle mismatch')
+        require(type(value['pid']) is int and 0 < value['pid'] <= 2147483647, 'Runtime process identity unavailable')
+        owner, method = identity.split('/', 1)
+        require(value['testName'] == '-[%s %s]' % (owner, method), 'Runtime XCTest identity mismatch')
+        value['moduleNonce'] = canonical_uuid(value['moduleNonce'])
+        return value
+    except (ValueError, TypeError, KeyError):
+        raise RuntimeHostIdentityError('Runtime host identity unavailable or mismatched') from None
+
 def verifier():
-    require(len(CASES) == 7 and len(set(CASES)) == 7, 'Expected seven distinct isolated controls')
+    require(len(CASES) == 8 and len(set(CASES)) == 8, 'Expected eight distinct isolated controls')
     spec = importlib.util.spec_from_file_location('evidence', ROOT / 'scripts/verify-native-test-log.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -233,17 +268,22 @@ try:
     elif mode == 'boundary':
         boundary(*args)
     elif mode == 'verify-one':
-        ordinal, name = int(args[0]), args[1]
-        verifier().verify_log(raw_log(ordinal, name).read_text(), {PREFIX + name})
+        require(len(args) == 5, 'Singleton verification requires exact source/tree/device inputs')
+        ordinal = int(args[0])
+        name, source, tree, simulator = args[1:]
+        read_receipt(source, tree, simulator)
+        text = raw_log(ordinal, name).read_text()
+        runtime_host(text, PREFIX + name, simulator)
+        verifier().verify_log(text, {PREFIX + name})
         print('NativeIsolatedControl ordinal=%d identity=%s native=1 ui=0' % (ordinal, PREFIX + name))
     elif mode == 'verify-controls':
         require(len(args) == 2, 'Final aggregate requires the exact source pins')
         receipt = json.loads(RECEIPT.read_text())
         read_receipt(args[0], args[1], receipt['simulator'])
-        module, errors, seen = verifier(), [], set()
+        module, errors, seen, runtime_nonces = verifier(), [], set(), set()
         rows = STATUSES.read_text().splitlines() if STATUSES.is_file() else []
         if len(rows) != len(CASES):
-            errors.append('Expected seven isolated command receipts; found %d' % len(rows))
+            errors.append('Expected eight isolated command receipts; found %d' % len(rows))
         for ordinal, name in enumerate(CASES, 1):
             identity = PREFIX + name
             try:
@@ -251,15 +291,22 @@ try:
                 fields = rows[ordinal - 1].split('\t')
                 require(len(fields) == 6 and fields[:2] == [str(ordinal), name], 'Wrong, duplicate, or reordered command receipt')
                 require(all(value == '0' for value in fields[2:]), 'Native/tee/evidence/host-boundary exit is nonzero: ' + ','.join(fields[2:]))
-                module.verify_log(raw_log(ordinal, name).read_text(), {identity})
+                text = raw_log(ordinal, name).read_text()
+                host = runtime_host(text, identity, receipt['simulator'])
+                require(host['moduleNonce'] not in runtime_nonces, 'Runtime process nonce reused across controls')
+                runtime_nonces.add(host['moduleNonce'])
+                module.verify_log(text, {identity})
                 seen.add(identity)
                 print('NativeIsolatedControlVerified ordinal=%d identity=%s native=1 ui=0' % (ordinal, identity))
             except (OSError, ValueError) as error:
                 errors.append('%s: %s' % (identity, error))
-        require(len(seen) == 7 and not errors, '\n'.join(errors) or 'Missing unique control identity')
-        print('Targeted isolated controls native=7 ui=0; seven raw singleton logs; original guards retained; no full/device acceptance claim')
+        require(len(seen) == 8 and not errors, '\n'.join(errors) or 'Missing unique control identity')
+        print('Targeted isolated controls native=8 ui=0; eight raw singleton logs; original guards retained; no full/device acceptance claim')
     else:
         raise ValueError('Unknown local evidence operation')
+except RuntimeHostIdentityError:
+    print('Native isolated harness: runtime host identity unavailable or mismatched', file=sys.stderr)
+    raise SystemExit(2)
 except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
     print('Native isolated harness: ' + str(error), file=sys.stderr)
     raise SystemExit(1)
@@ -273,7 +320,7 @@ if [ "$1" = --verify-controls ]; then evidence_tool verify-controls "$expected_c
 mode="$1"
 case "$mode" in
   benchmark) cases=(testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture testProductionSelectionLatencyAndStreamingContinuityWithoutCapture) ;;
-  controls) cases=(testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce) ;;
+  controls) cases=(testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
@@ -368,7 +415,7 @@ for name in "${cases[@]}"; do
   pipeline_status=("${PIPESTATUS[@]}")
   set -e
   verify_status=0
-  evidence_tool verify-one "$ordinal" "$name" || verify_status=$?
+  evidence_tool verify-one "$ordinal" "$name" "$expected_code_source" "$expected_ios_tree" "$simulator_id" || verify_status=$?
   boundary_status=0
   evidence_tool boundary "$simulator_id" "$(printf 'after-%02d' "$ordinal")" || boundary_status=$?
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ordinal" "$name" "${pipeline_status[0]}" "${pipeline_status[1]}" "$verify_status" "$boundary_status" >> artifacts/native/native-playback-controls/statuses.tsv
@@ -376,6 +423,7 @@ for name in "${cases[@]}"; do
     if [ "$overall_status" -eq 0 ] && [ "$status" -ne 0 ]; then overall_status="$status"; fi
   done
   if [ "$boundary_status" -ne 0 ]; then break; fi
+  if [ "$verify_status" -eq 2 ]; then break; fi
 done
 aggregate_status=0
 evidence_tool verify-controls "$expected_code_source" "$expected_ios_tree" || aggregate_status=$?
