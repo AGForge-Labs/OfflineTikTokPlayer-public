@@ -6,6 +6,111 @@ import PlayerCore
 @testable import OfflineTikTokPlayer
 
 final class ContinuousPCMDecoderTests: XCTestCase {
+    func testHeldNeighbourNativeReadDoesNotPreventPreparedCurrentSourceRefill() async throws {
+        #if DEBUG
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let aURL = directory.appendingPathComponent("independence-a.caf")
+        let bURL = directory.appendingPathComponent("independence-b.caf")
+        let expected = (0..<8_193).flatMap { frame -> [Float] in
+            let value = Float(frame % 127 + 1) / 256
+            return [value, -value]
+        }
+        do {
+            try writePCM(expected, to: aURL)
+            try writePCM(expected.map { -$0 }, to: bURL)
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        let gate = ContinuousPCMDecoder.DebugNativeReadGate()
+        decoder.debugSetNativeReadGate(gate)
+        defer {
+            gate.release()
+            decoder.shutdown()
+            // Delete only this owned directory, after queued reader retirement.
+            // A native cleanup stall retains its files rather than deleting an
+            // asset beneath an outstanding reader.
+            decoder.debugAfterShutdown { stopped in
+                if stopped { try? FileManager.default.removeItem(at: directory) }
+            }
+        }
+        let a = try await decoder.prepare(url: aURL, token: 1, slot: 0)
+        _ = try await decoder.prepare(url: bURL, token: 2, slot: 1)
+        let source = renderer.source(at: 0), preparedRequest = source.streamRequest
+        let memory = renderer.retainedPCMMemoryBytes
+        XCTAssertEqual(a.totalFrames, 8_193)
+        XCTAssertEqual(source.availableStreamFrames(for: preparedRequest.epoch), 1_024)
+
+        renderer.select(token: 2, frame: 0); renderer.setPlaying(true)
+        var acknowledged = [Float](repeating: .nan, count: 2)
+        acknowledged.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+        XCTAssertEqual(renderer.snapshot.token, 2)
+        XCTAssertTrue(gate.arm(token: 2))
+        // A same-token restart requests a fresh B reader. Its pinned first
+        // sample is already available, so reaching the gate causes no underrun.
+        let oldBRequest = renderer.source(at: 1).streamRequest
+        renderer.select(token: 2, frame: 0)
+        acknowledged.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+        XCTAssertGreaterThan(renderer.source(at: 1).streamRequest.epoch, oldBRequest.epoch)
+        let enteredDeadline = Date().addingTimeInterval(2)
+        while !gate.didEnter, Date() < enteredDeadline { try await Task.sleep(for: .milliseconds(2)) }
+        guard gate.didEnter, gate.isHolding, !gate.didTimeOut else {
+            XCTFail("Setup must hold B immediately before its actual native read")
+            throw ContinuousPCMDecoder.Failure.cannotDecode
+        }
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+
+        // A has never been selected: restart(frame: 0) must preserve its prepared
+        // request/ring. These are positive controls, not readiness workarounds.
+        renderer.select(token: 1, frame: 0)
+        var head = [Float](repeating: .nan, count: 1_536 * 2)
+        head.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1_536) }
+        let afterHead = renderer.snapshot
+        XCTAssertEqual(afterHead.token, 1)
+        XCTAssertEqual(afterHead.frame, 1_536)
+        XCTAssertEqual(afterHead.underrunFrames, 0)
+        XCTAssertEqual(source.streamRequest.epoch, preparedRequest.epoch)
+        assertSamples(head, equal: Array(expected.prefix(head.count)))
+        guard afterHead.token == 1, afterHead.frame == 1_536, afterHead.underrunFrames == 0,
+              source.streamRequest.epoch == preparedRequest.epoch else {
+            throw ContinuousPCMDecoder.Failure.cannotDecode
+        }
+
+        let refillDeadline = Date().addingTimeInterval(1)
+        while source.availableStreamFrames(for: preparedRequest.epoch) < 128,
+              gate.isHolding, Date() < refillDeadline { try await Task.sleep(for: .milliseconds(2)) }
+        let ready = source.availableStreamFrames(for: preparedRequest.epoch)
+        let heldAtRefill = gate.isHolding && !gate.didTimeOut
+        var following: [Float] = []
+        if ready >= 128, heldAtRefill {
+            following = [Float](repeating: .nan, count: 128 * 2)
+            following.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 128) }
+        }
+        let final = renderer.snapshot, heldAfterRender = gate.isHolding && !gate.didTimeOut
+        gate.release()
+        decoder.shutdown()
+        let closed = expectation(description: "Released B and both readers finish queued shutdown")
+        decoder.debugAfterShutdown { stopped in if stopped { closed.fulfill() } }
+        await fulfillment(of: [closed], timeout: 2)
+
+        XCTAssertTrue(heldAtRefill && heldAfterRender, "The controlled B call must remain held through the observation")
+        XCTAssertGreaterThanOrEqual(ready, 128,
+            "A must refill after its prepared head while B's native read remains outstanding")
+        if ready >= 128, heldAtRefill {
+            assertSamples(following, equal: Array(expected[(1_536 * 2)..<(1_664 * 2)]))
+            XCTAssertEqual(final.frame, 1_664)
+        }
+        XCTAssertEqual(final.token, 1)
+        XCTAssertEqual(final.underrunFrames, 0)
+        XCTAssertEqual(renderer.retainedPCMMemoryBytes, memory)
+        XCTAssertFalse(gate.didTimeOut)
+        print("PCM_NATIVE_READ_INDEPENDENCE gateToken=2 controlledBoundary=before-copy currentToken=1 readyFrames=\(ready) heldAtRefill=\(heldAtRefill) heldAfterRender=\(heldAfterRender) frame=\(final.frame) underruns=\(final.underrunFrames) retainedBytes=\(memory) gateMaximumSeconds=5 refillMaximumSeconds=1 interpretation=producer-independence-not-SDK-wait-cause")
+        #endif
+    }
+
     func testDecoderPreservesLeadingAndTrailingSourceSilenceAndTheLastFrame() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

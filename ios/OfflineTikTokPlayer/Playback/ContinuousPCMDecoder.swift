@@ -33,6 +33,45 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     private enum ReadControl: Error { case deferred }
 
+    #if DEBUG
+    /// One-shot test gate immediately before native acquisition. This models an
+    /// outstanding call boundary; it makes no claim about an SDK-internal wait.
+    final class DebugNativeReadGate: @unchecked Sendable {
+        private let target = Atomic<Int>(0)
+        private let entered = Atomic<Bool>(false)
+        private let returned = Atomic<Bool>(false)
+        private let released = Atomic<Bool>(false)
+        private let timedOut = Atomic<Bool>(false)
+        private let semaphore = DispatchSemaphore(value: 0)
+
+        func arm(token: Int) -> Bool {
+            guard token > 0, !entered.load(ordering: .acquiring),
+                  !released.load(ordering: .acquiring) else { return false }
+            return target.compareExchange(expected: 0, desired: token,
+                ordering: .acquiringAndReleasing).exchanged
+        }
+        var didEnter: Bool { entered.load(ordering: .acquiring) }
+        var isHolding: Bool { didEnter && !returned.load(ordering: .acquiring) }
+        var didTimeOut: Bool { timedOut.load(ordering: .acquiring) }
+
+        func release() {
+            if !released.exchange(true, ordering: .acquiringAndReleasing) { semaphore.signal() }
+        }
+        fileprivate func beforeCopy(token: Int) {
+            guard token > 0, target.compareExchange(expected: token, desired: 0,
+                ordering: .acquiringAndReleasing).exchanged else { return }
+            entered.store(true, ordering: .releasing)
+            timedOut.store(semaphore.wait(timeout: .now() + .seconds(5)) == .timedOut,
+                ordering: .releasing)
+            returned.store(true, ordering: .releasing)
+        }
+    }
+    private var debugNativeReadGate: DebugNativeReadGate?
+    func debugSetNativeReadGate(_ gate: DebugNativeReadGate) {
+        worker.async { [self] in debugNativeReadGate = gate }
+    }
+    #endif
+
     private final class Description: @unchecked Sendable {
         let asset: AVURLAsset
         let track: AVAssetTrack?
@@ -40,6 +79,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let endTime: CMTime
         let nativeRate: Double
         let nativeChannels: UInt32
+        #if DEBUG
+        var debugReadToken = 0
+        var debugReadGate: DebugNativeReadGate?
+        #endif
         init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32) {
             self.asset = asset; self.track = track; self.totalFrames = totalFrames
             self.endTime = endTime
@@ -127,6 +170,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         do {
                             guard !stopped, !cancellation.value.load(ordering: .acquiring) else { throw Failure.cancelled }
                             let source = renderer.source(at: index)
+                            #if DEBUG
+                            description.debugReadToken = token
+                            description.debugReadGate = debugNativeReadGate
+                            #endif
                             let stream = try Stream(description: description, startFrame: 0,
                                 shouldCancel: { cancellation.value.load(ordering: .acquiring) })
                             var prefix = [Float](repeating: 0, count: source.prefixCapacityFrames * 2)
@@ -460,6 +507,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private final class NativeReader {
         private let reader: AVAssetReader
         private let output: AVAssetReaderTrackOutput
+        #if DEBUG
+        private let debugReadToken: Int
+        private let debugReadGate: DebugNativeReadGate?
+        #endif
         private let rate: Double
         private let channels: Int
         private var samples: [Float] = []
@@ -473,6 +524,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
         init(description: Description) throws {
             guard let track = description.track else { throw Failure.cannotDecode }
+            #if DEBUG
+            debugReadToken = description.debugReadToken
+            debugReadGate = description.debugReadGate
+            #endif
             rate = description.nativeRate; channels = Int(description.nativeChannels)
             totalFrames = try ContinuousPCMDecoder.frame(description.endTime, rate: rate)
             reader = try AVAssetReader(asset: description.asset)
@@ -524,6 +579,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
 
         private func nextSample() throws {
+            #if DEBUG
+            debugReadGate?.beforeCopy(token: debugReadToken)
+            #endif
             guard let buffer = output.copyNextSampleBuffer() else {
                 guard reader.status == .completed else { throw Failure.cannotDecode }
                 eof = true; return
