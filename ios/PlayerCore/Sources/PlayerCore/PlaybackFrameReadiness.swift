@@ -1,5 +1,21 @@
 import Foundation
 
+/// Whether the muted native clock requires an exact seek. The submitted
+/// presentation is evidence only after its owner validates item/epoch/readiness.
+public enum PlaybackVideoSynchronization {
+    public static func requiresExactSeek(force: Bool, canPlay: Bool, nativeRate: Float,
+                                         nativePosition: Double, audioPosition: Double,
+                                         framePosition: Double?, timebasePosition: Double?) -> Bool {
+        guard force || abs(nativePosition - audioPosition) > 0.080 else { return false }
+        guard !force, canPlay, nativeRate.isFinite, nativeRate > 0,
+              audioPosition.isFinite, let framePosition, framePosition.isFinite,
+              let timebasePosition, timebasePosition.isFinite,
+              abs(framePosition - audioPosition) <= 0.080,
+              abs(timebasePosition - audioPosition) <= 0.080 else { return true }
+        return false
+    }
+}
+
 /// A persistent AVPlayerLayer can still be displaying the departing item's frame.
 /// Only the arriving item's output can arm this gate; allow a display commit, then latch.
 public struct PlaybackFrameReadiness {

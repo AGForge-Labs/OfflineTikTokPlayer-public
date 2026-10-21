@@ -1,6 +1,7 @@
 import XCTest
 import AVFoundation
 import CoreVideo
+import UIKit
 @testable import OfflineTikTokPlayer
 
 @MainActor
@@ -17,6 +18,8 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         let bridge = ContinuousPictureInPicture()
         defer { bridge.invalidate() }
         bridge.setCurrentItem(a); bridge.setCurrentItem(b); bridge.setCurrentItem(a)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Output ownership alone is not a submitted frame")
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: b), "A different item's evidence cannot preserve presentation")
         XCTAssertTrue(bridge.orientationPrepared)
         XCTAssertTrue(a.outputs.contains { $0 === aOutput })
         XCTAssertTrue(b.outputs.contains { $0 === bOutput })
@@ -37,9 +40,54 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertTrue(bridge.orientationPrepared)
         XCTAssertEqual(fallback.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
         bridge.setCurrentItem(a)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 160, height: 160)
+        window.windowLevel = .alert + 1
+        window.rootViewController = UIViewController()
+        window.rootViewController?.view.layer.addSublayer(bridge.displayLayer)
+        bridge.displayLayer.frame = window.bounds
+        window.makeKeyAndVisible()
+        window.rootViewController?.view.layoutIfNeeded()
+        defer {
+            bridge.displayLayer.removeFromSuperlayer()
+            window.isHidden = true; window.rootViewController = nil
+            previousKeyWindow?.makeKey()
+        }
+        let player = AVPlayer(playerItem: a)
+        player.isMuted = true
+        defer { player.pause() }
+        let duration = try await a.asset.load(.duration).seconds
+        let playbackStart = ProcessInfo.processInfo.systemUptime
+        player.play()
+        while bridge.currentSubmittedPresentation(for: a) == nil,
+              ProcessInfo.processInfo.systemUptime - playbackStart < 3 {
+            bridge.updatePlayback(positionSeconds: ProcessInfo.processInfo.systemUptime - playbackStart,
+                                  durationSeconds: duration, isPlaying: true)
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        _ = try XCTUnwrap(bridge.currentSubmittedPresentation(for: a),
+                          "A live ready frame must supply positive presentation evidence before testing its invalidation")
+        XCTAssertGreaterThan(bridge.submittedFrameCount, 0)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: b), "A different item cannot borrow A's ready frame")
+        bridge.suspendFrameFeed()
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Suspending the feed withdraws otherwise ready evidence")
+        bridge.resumeFrameFeed()
+        XCTAssertNotNil(bridge.currentSubmittedPresentation(for: a))
+        let pausePosition = bridge.requestedPositionSeconds
+        bridge.updatePlayback(positionSeconds: pausePosition, durationSeconds: duration, isPlaying: false)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Paused presentation cannot bypass native recovery")
+        bridge.updatePlayback(positionSeconds: pausePosition, durationSeconds: duration, isPlaying: true)
+        XCTAssertNotNil(bridge.currentSubmittedPresentation(for: a), "Resume retains this same current frame before testing seek invalidation")
+        let seek = bridge.beginSeek()
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "An active seek withdraws epoch evidence")
+        bridge.completeSeek(seek)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Completing a seek cannot restore the preceding epoch's frame")
         XCTAssertTrue(fallback.outputs.isEmpty, "Unprepared fallback outputs retain their existing detach lifecycle")
         XCTAssertTrue(a.outputs.contains { $0 === aOutput })
         bridge.invalidate()
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a))
         XCTAssertTrue(a.outputs.isEmpty, "Invalidation detaches the active prepared output")
     }
 

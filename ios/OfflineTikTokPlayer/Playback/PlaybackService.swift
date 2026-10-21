@@ -34,6 +34,7 @@ final class PlaybackService: NSObject {
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
     @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
     @ObservationIgnored private var firstProgressGeneration: Int?
+    @ObservationIgnored private var firstPreservedPresentationGeneration: Int?
     var player: AVQueuePlayer { buffer.player }
     let clock = PlaybackClock()
     private(set) var queue = PlaybackQueue(ids: [])
@@ -761,7 +762,28 @@ final class PlaybackService: NSObject {
               let item = player.currentItem, item.status == .readyToPlay else { return }
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         let position = continuousAudio.presentationPosition(at: hostTime)
-        guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
+        if !force {
+            let nativePosition = item.currentTime().seconds
+            guard abs(nativePosition - position) > 0.080 else { return }
+            // The inline overlay follows PCM independently of the muted native
+            // clock. Do not withdraw its aligned current epoch merely because that
+            // clock still reports the departing/start position. Recheck ownership
+            // now; a prior copied frame or latched readiness is insufficient.
+            let presentation: (frame: Double, timebase: Double)?
+            if readyGeneration == generation, let id = queue.currentID,
+               continuousAudio.selectedID == id, continuousAudio.entry(forToken: audioToken)?.id == id {
+                presentation = continuousPiP.currentSubmittedPresentation(for: item)
+            } else { presentation = nil }
+            guard PlaybackVideoSynchronization.requiresExactSeek(force: false, canPlay: intent.canPlay,
+                nativeRate: player.rate, nativePosition: nativePosition, audioPosition: position,
+                framePosition: presentation?.frame, timebasePosition: presentation?.timebase) else {
+                if firstPreservedPresentationGeneration != generation {
+                    firstPreservedPresentationGeneration = generation
+                    recordPlaybackEvent("videoAlignedPresentationKept")
+                }
+                return
+            }
+        }
         recordPlaybackEvent(force ? "videoForcedSeek" : "videoDriftSeek")
         let request = generation
         syncingVideoGeneration = request

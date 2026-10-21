@@ -75,6 +75,16 @@ final class ContinuousPictureInPicture: NSObject {
         return seconds.isFinite ? seconds : nil
     }
 
+    /// Only a submitted, display-ready frame owned by this item and epoch can
+    /// justify preserving presentation. Copy attempts and lifetime counts cannot.
+    func currentSubmittedPresentation(for item: AVPlayerItem) -> (frame: Double, timebase: Double)? {
+        guard !invalidated, currentItem === item, frameFeedEnabled,
+              playbackState.read().isPlaying, activeSeekTicket == nil,
+              displayLayer.status != .failed, displayLayer.isReadyForDisplay,
+              let frame = lastFramePositionSeconds, let timebase = timebasePositionSeconds else { return nil }
+        return (frame, timebase)
+    }
+
     override init() {
         super.init()
         displayLayer.videoGravity = .resizeAspect
