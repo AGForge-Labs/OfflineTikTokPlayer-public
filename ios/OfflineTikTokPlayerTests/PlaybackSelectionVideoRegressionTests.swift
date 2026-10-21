@@ -13,26 +13,29 @@ import PlayerCore
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testCommandToEngineToneAndSelectedCustomFrameLatency() async throws {
         var witnesses: [SelectionDecoderLifetimeWitness] = []
-        witnesses.reserveCapacity(2)
-        for condition in [(nativeGetters: false, phaseBase: 0), (nativeGetters: true, phaseBase: 10)] {
+        witnesses.reserveCapacity(3)
+        for condition in [(nativeGetters: false, phaseBase: 0, reanchor: false),
+                          (nativeGetters: true, phaseBase: 10, reanchor: false),
+                          (nativeGetters: false, phaseBase: 20, reanchor: true)] {
             defer {
                 logDecoderLifetimes(boundary: "getter-arm-after-phase-\(condition.phaseBase)", witnesses: witnesses)
             }
             try await measureSelectionLatencySequence(nativeVideoGetterControl: condition.nativeGetters,
-                phaseBase: condition.phaseBase, witnesses: &witnesses)
+                phaseBase: condition.phaseBase, pausedVideoReanchorControl: condition.reanchor, witnesses: &witnesses)
         }
     }
 
     private func measureSelectionLatencySequence(nativeVideoGetterControl: Bool, phaseBase: Int,
-        witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
+        pausedVideoReanchorControl: Bool, witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
         let audio = ContinuousAudioPlayer()
         let tap = SelectionOutputTap()
-        let seeks = SelectionLatencySeekProbe(nativeVideoGetterControl: nativeVideoGetterControl)
+        let seeks = SelectionLatencySeekProbe(nativeVideoGetterControl: nativeVideoGetterControl,
+            pausedVideoReanchorControl: pausedVideoReanchorControl)
         let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
         seeks.service = service
-        precondition(witnesses.count < 2)
+        precondition(witnesses.count < 3)
         witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
             label: "getter-arm-phase-\(phaseBase)"))
         let screen = try SelectionVideoScreen(service: service)
@@ -46,9 +49,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             seeks.dump()
         }
         service.isInteractingWithFeed = true
-        let arm = nativeVideoGetterControl ? "native-getter-control" : "primary"
-        let labelSuffix = nativeVideoGetterControl ? "-native-getter-control" : ""
+        let arm = pausedVideoReanchorControl ? "paused-video-reanchor-control" : (nativeVideoGetterControl ? "native-getter-control" : "primary")
+        let labelSuffix = pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : "")
         print("SelectionLatency scope=engineMixerTap-not-physical-speaker arm=\(arm) phaseBase=\(phaseBase) videoNativeGetters=\(nativeVideoGetterControl) outputLimitMs=100 customReadyLimitMs=250 silenceWindowMs=10 importHashVerification=already-verified")
+        if pausedVideoReanchorControl {
+            print("SelectionReanchorScope phaseBase=\(phaseBase) eligiblePhase=22 maximumAttempts=1 acceptedZero=inconclusive design=fresh-ordered-cohort-not-causal-proof publicationCost=includes-intentional-reanchor-and-reentrancy")
+        }
         let aReference = try await fixture.decodedTone(id: fixture.aID, startSeconds: 0)
         let bReference = try await fixture.decodedTone(id: fixture.bID, startSeconds: 0)
         let sourceQuiet = max(SelectionOutputTap.quietRun(aReference, rate: 48_000),
@@ -75,6 +81,45 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let validity = tap.validity()
         XCTAssertEqual(validity.invalidTimestamps, 0, "Engine-output timing requires valid host timestamps; no callback-wall-time fallback")
         XCTAssertEqual(validity.droppedFrames, 0, "The bounded tap must retain all measured PCM")
+    }
+
+    func testDebugPausedVideoReanchorRejectsUserActionsBeforeFirstFrame() async throws {
+        #if DEBUG
+        // Real item-ready/host-start callbacks establish the ordinary startup
+        // marker. Each action is synchronous before any first-frame callback;
+        // no readiness, intent or native player state is fabricated.
+        for action in 0..<4 {
+            let fixture = try await SelectionVideoFixture()
+            defer { fixture.remove() }
+            let service = fixture.service()
+            defer { service.pause(); service.onPlaybackEvent = nil }
+            var result: PlaybackService.DebugVideoReanchorResult?
+            var observedStartup = false
+            service.onPlaybackEvent = { [weak service] event in
+                guard let service, event.name == "videoHostClockStarted", !observedStartup,
+                      let item = service.player.currentItem else { return }
+                observedStartup = true
+                XCTAssertFalse(service.isVideoReady)
+                switch action {
+                case 0: service.pause()
+                case 1: service.handleInterruption(began: true)
+                case 2: service.audioOnly = true
+                default: service.seek(0.4)
+                }
+                result = service.debugReanchorUnexpectedPausedVideo(item: item, generation: event.generation,
+                    observedStatus: service.player.timeControlStatus.rawValue)
+            }
+            service.isInteractingWithFeed = true
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await require({ result != nil }, "The real ordinary startup must reach the negative control hook")
+            let expected: PlaybackService.DebugVideoReanchorResult = action < 2 ? .audioNotPermitted
+                : (action == 2 ? .videoNotAllowed : .pendingAudioSeek)
+            XCTAssertEqual(result, expected, "The active user-action guard must reject the explicit Debug operation")
+            XCTAssertEqual(service.debugVideoReanchorAppliedCount, 0)
+        }
+        #else
+        XCTFail("The explicit reanchor control requires the Debug test configuration")
+        #endif
     }
 
     private func measureSelectionLatency(_ service: PlaybackService, fixture: SelectionVideoFixture,
@@ -1200,6 +1245,30 @@ private final class SelectionLatencySeekProbe {
                     self.diagnostics.append(.playbackDetail(commandMs: commandMs, eventUptime: event.uptime,
                         generation: event.generation, detail: detail), phase: self.phase)
                 }
+                #if DEBUG
+                guard self.pausedVideoReanchorControl, self.phase == 22 else { return }
+                if event.name == "videoHostClockStarted" {
+                    // Both owner and selected item remain weak. A later event
+                    // cannot apply this control to a replaced source/generation.
+                    self.reanchorItem = self.service?.player.currentItem
+                    self.reanchorGeneration = event.generation
+                } else if !self.reanchorAttempted,
+                          case let .timeControl(_, _, _, _, finalStatus, finalUptime)? = event.detail,
+                          finalStatus == AVPlayer.TimeControlStatus.paused.rawValue,
+                          let service = self.service, let item = self.reanchorItem,
+                          self.reanchorGeneration == event.generation {
+                    self.reanchorAttempted = true // Before SDK/event reentrancy.
+                    let begin = SelectionOutputTap.hostSeconds()
+                    let result = service.debugReanchorUnexpectedPausedVideo(item: item,
+                        generation: event.generation, observedStatus: finalStatus)
+                    let end = SelectionOutputTap.hostSeconds()
+                    self.reanchorResultCode = result.rawValue
+                    if result == .applied { self.reanchorAcceptedCount += 1 }
+                    self.diagnostics.append(.pausedVideoReanchor(commandMs: (begin - self.origin) * 1_000,
+                        finalStatus: finalStatus, finalUptime: finalUptime, resultCode: result.rawValue,
+                        acceptedCount: self.reanchorAcceptedCount, durationMs: (end - begin) * 1_000), phase: self.phase)
+                }
+                #endif
             }
         }
     }
@@ -1213,6 +1282,14 @@ private final class SelectionLatencySeekProbe {
     var origin = 0.0
     var isPreparedMeasurement = false
     private let nativeVideoGetterControl: Bool
+    private let pausedVideoReanchorControl: Bool
+    #if DEBUG
+    private weak var reanchorItem: AVPlayerItem?
+    private var reanchorGeneration: Int?
+    private var reanchorAttempted = false
+    private var reanchorResultCode = 0
+    private var reanchorAcceptedCount = 0
+    #endif
     private var videoBatchID = 0
     private var videoMilestones = Set<String>()
     private let diagnostics = SelectionLatencyDiagnostics()
@@ -1220,8 +1297,9 @@ private final class SelectionLatencySeekProbe {
     private(set) var nativeSeekCount: [Int: Int] = [:]
     var droppedCount: Int { diagnostics.droppedCount }
 
-    init(nativeVideoGetterControl: Bool = false) {
+    init(nativeVideoGetterControl: Bool = false, pausedVideoReanchorControl: Bool = false) {
         self.nativeVideoGetterControl = nativeVideoGetterControl
+        self.pausedVideoReanchorControl = pausedVideoReanchorControl
         videoMilestones.reserveCapacity(2); diagnostics.prepare(phase: phase)
     }
 
@@ -1299,8 +1377,16 @@ private final class SelectionLatencySeekProbe {
         }
         if let service {
             let cost = service.playbackEventPublicationCost
-            print("SelectionPlaybackEventPublicationCost phase=\(phase) nativeVideoGetters=\(nativeVideoGetterControl) count=\(cost.count) totalNanoseconds=\(cost.totalNanoseconds) maximumNanoseconds=\(cost.maximumNanoseconds) saturated=\(cost.saturated) scope=inclusive-observer-delivery")
+            let scope = pausedVideoReanchorControl ? "inclusive-observer-delivery-including-test-control-sdk-and-reentrancy" : "inclusive-observer-delivery"
+            print("SelectionPlaybackEventPublicationCost phase=\(phase) nativeVideoGetters=\(nativeVideoGetterControl) count=\(cost.count) totalNanoseconds=\(cost.totalNanoseconds) maximumNanoseconds=\(cost.maximumNanoseconds) saturated=\(cost.saturated) scope=\(scope)")
         }
+        #if DEBUG
+        if pausedVideoReanchorControl {
+            print("SelectionPausedVideoReanchorSummary phase=22 attempted=\(reanchorAttempted) resultCode=\(reanchorResultCode) acceptedCount=\(reanchorAcceptedCount) acceptedZero=inconclusive")
+            XCTAssertLessThanOrEqual(reanchorAcceptedCount, 1)
+            if let service { XCTAssertEqual(service.debugVideoReanchorAppliedCount, UInt64(reanchorAcceptedCount)) }
+        }
+        #endif
         XCTAssertEqual(snapshot.droppedCount, 0, "Bounded latency diagnostics must not silently discard evidence")
     }
 }
@@ -1318,6 +1404,8 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
         case seekStart(commandMs: Double, requested: Double, playerPosition: Double, playerRate: Double)
         case nativeComplete(commandMs: Double, seekMs: Double, finished: Bool)
         case completionObserved(commandMs: Double, requested: Double, playerPosition: Double, playerRate: Double)
+        case pausedVideoReanchor(commandMs: Double, finalStatus: Int, finalUptime: Double,
+                                 resultCode: Int, acceptedCount: Int, durationMs: Double)
 
         func line(phase: Int) -> String {
             switch self {
@@ -1325,8 +1413,8 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
                 return "SelectionLatencyEvent phase=\(phase) name=\(name) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) clockPosition=\(clockPosition)"
             case let .playbackDetail(commandMs, eventUptime, generation, detail):
                 switch detail {
-                case let .timeControl(publishedStatus, notificationUptime, observedStatus, observedUptime):
-                    return "SelectionLatencyTimeControl phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) publishedStatus=\(publishedStatus.map { String($0) } ?? "unavailable") notificationUptime=\(notificationUptime) observedStatus=\(observedStatus) observedUptime=\(observedUptime)"
+                case let .timeControl(publishedStatus, notificationUptime, observedStatus, observedUptime, finalStatus, finalUptime):
+                    return "SelectionLatencyTimeControl phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) publishedStatus=\(publishedStatus.map { String($0) } ?? "unavailable") notificationUptime=\(notificationUptime) observedStatus=\(observedStatus) observedUptime=\(observedUptime) finalStatus=\(finalStatus) finalUptime=\(finalUptime)"
                 case let .buffer(event):
                     return "SelectionLatencyBufferAction phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) actionCode=\(event.action.rawValue) reasonCode=\(event.reason.rawValue) operationID=\(event.operationID) actionUptime=\(event.actionUptime) targetIsCurrent=\(event.targetIsCurrent.map { String($0) } ?? "unavailable") finished=\(event.finished.map { String($0) } ?? "unavailable")"
                 }
@@ -1342,6 +1430,8 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
                 return "SelectionLatencySeek phase=\(phase) event=nativeComplete commandMs=\(commandMs) seekMs=\(seekMs) finished=\(finished)"
             case let .completionObserved(commandMs, requested, playerPosition, playerRate):
                 return "SelectionLatencySeek phase=\(phase) event=completionObserved commandMs=\(commandMs) playerPosition=\(playerPosition) requested=\(requested) drift=\(playerPosition - requested) playerRate=\(playerRate)"
+            case let .pausedVideoReanchor(commandMs, finalStatus, finalUptime, resultCode, acceptedCount, durationMs):
+                return "SelectionPausedVideoReanchor phase=\(phase) commandMs=\(commandMs) finalStatus=\(finalStatus) finalUptime=\(finalUptime) resultCode=\(resultCode) acceptedCount=\(acceptedCount) durationMs=\(durationMs)"
             }
         }
     }

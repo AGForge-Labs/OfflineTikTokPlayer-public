@@ -24,9 +24,11 @@ final class PlaybackClock {
 @MainActor @Observable
 final class PlaybackService: NSObject {
     enum PlaybackEventDetail: Sendable {
-        // First actor-side policy read; later existing SDK reads can change
-        // before the event name is chosen. This is not an atomic status pair.
-        case timeControl(publishedStatus: Int?, notificationUptime: Double, observedStatus: Int, observedUptime: Double)
+        // First policy and final event-name reads retain their original SDK
+        // call sites/count. These and publishedStatus are non-atomic snapshots;
+        // the native KVO publication can supply no newValue at all.
+        case timeControl(publishedStatus: Int?, notificationUptime: Double, observedStatus: Int, observedUptime: Double,
+                         finalStatus: Int, finalUptime: Double)
         case buffer(PlaybackBuffer.DiagnosticEvent)
     }
     struct PlaybackEvent {
@@ -59,6 +61,19 @@ final class PlaybackService: NSObject {
         count: 0, totalNanoseconds: 0, maximumNanoseconds: 0, saturated: false)
     @ObservationIgnored private var firstProgressGeneration: Int?
     @ObservationIgnored private var firstPreservedPresentationGeneration: Int?
+    #if DEBUG
+    // Explicit test control only. Nothing in normal playback calls the helper.
+    enum DebugVideoReanchorResult: Int {
+        case applied = 1, notPaused, generationChanged, currentItemChanged, notReady
+        case pendingAudioSeek, videoSeekInFlight, audioNotPermitted, videoNotAllowed, alreadyVideoReady
+        case notOrdinaryStartup, audioIdentityChanged, alreadyApplied, invalidClock
+    }
+    @ObservationIgnored private weak var debugOrdinaryStartupItem: AVPlayerItem?
+    @ObservationIgnored private var debugOrdinaryStartupGeneration: Int?
+    @ObservationIgnored private var debugStartupChangedSource = false
+    @ObservationIgnored private var debugReanchoredGeneration: Int?
+    @ObservationIgnored private(set) var debugVideoReanchorAppliedCount: UInt64 = 0
+    #endif
     var player: AVQueuePlayer { buffer.player }
     let clock = PlaybackClock()
     private(set) var queue = PlaybackQueue(ids: [])
@@ -335,6 +350,10 @@ final class PlaybackService: NSObject {
     func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
+        #if DEBUG
+        // An explicit request cannot inherit this ordinary-startup experiment.
+        debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        #endif
         if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
            let version = continuousAudio.seek(seek.target) {
             pendingAudioSeek = (seek, version)
@@ -386,6 +405,12 @@ final class PlaybackService: NSObject {
         endedDuringScroll = false
         let resume = MediaResumePosition(mediaID: queue.currentID, seconds: position)
         generation += 1; let request = generation
+        #if DEBUG
+        debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        // Capture before selection. A same-ID repeat/reload is not an ordinary
+        // source handoff even when its prepared native item happens to be zero.
+        debugStartupChangedSource = continuousAudio.selectedID != queue.currentID
+        #endif
         recordPlaybackEvent("loadRequested")
         cancelStallRecovery()
         loadTask?.cancel(); itemObservation = nil; frameMonitor.cancel(); observedItem = nil; readyGeneration = nil
@@ -549,6 +574,13 @@ final class PlaybackService: NSObject {
                             durationSeconds: self.clock.duration, isPlaying: true)
                         self.monitorFirstFrame(playerItem, request: request)
                         self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
+                        #if DEBUG
+                        if !naturalHandoff, position == 0, self.pendingAudioSeek == nil,
+                           self.debugStartupChangedSource {
+                            self.debugOrdinaryStartupItem = playerItem
+                            self.debugOrdinaryStartupGeneration = request
+                        }
+                        #endif
                         self.recordPlaybackEvent("videoHostClockStarted")
                     } else if position > 0 || rewind {
                         self.recordPlaybackEvent(rewind ? "videoRewindRequested" : "videoRestoreRequested")
@@ -784,6 +816,37 @@ final class PlaybackService: NSObject {
         if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
     }
 
+    #if DEBUG
+    /// One opt-in, once-per-generation startup experiment. The caller supplies
+    /// the final status from the existing KVO handler; this performs no extra
+    /// native status/item-clock query, exact seek, epoch flush, wait, or drift suppression.
+    /// A rejection is diagnostic evidence only, never a successful recovery.
+    func debugReanchorUnexpectedPausedVideo(item: AVPlayerItem, generation request: Int,
+                                           observedStatus: Int) -> DebugVideoReanchorResult {
+        guard generation == request else { return .generationChanged }
+        guard player.currentItem === item, observedItem === item else { return .currentItemChanged }
+        guard readyGeneration == request else { return .notReady }
+        guard pendingAudioSeek == nil else { return .pendingAudioSeek }
+        guard syncingVideoGeneration != request else { return .videoSeekInFlight }
+        guard intent.canPlay else { return .audioNotPermitted }
+        guard videoAllowed else { return .videoNotAllowed }
+        guard !isVideoReady else { return .alreadyVideoReady }
+        guard debugOrdinaryStartupGeneration == request, debugOrdinaryStartupItem === item else { return .notOrdinaryStartup }
+        guard audioLoadingID == nil, let id = queue.currentID, continuousAudio.selectedID == id,
+              continuousAudio.entry(forToken: audioToken)?.id == id else { return .audioIdentityChanged }
+        guard debugReanchoredGeneration != request else { return .alreadyApplied }
+        guard observedStatus == AVPlayer.TimeControlStatus.paused.rawValue else { return .notPaused }
+        let host = CMClockGetTime(CMClockGetHostTimeClock())
+        let desired = continuousAudio.presentationPosition(at: host)
+        guard host.isNumeric, desired.isFinite, desired >= 0 else { return .invalidClock }
+        // Set once state before the SDK can publish a synchronous status event.
+        debugReanchoredGeneration = request
+        debugVideoReanchorAppliedCount += 1
+        player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
+        return .applied
+    }
+    #endif
+
     private func synchronizeVideoToAudio(force: Bool = false) {
         // KVO's ready handler owns the initial host-clock anchor. The poll can
         // see native readiness before that queued MainActor handler has run.
@@ -814,6 +877,11 @@ final class PlaybackService: NSObject {
                 return
             }
         }
+        #if DEBUG
+        // Any real correction ends ordinary startup eligibility. Its exact
+        // seek/callback/flush policy below is unchanged in all configurations.
+        debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        #endif
         recordPlaybackEvent(force ? "videoForcedSeek" : "videoDriftSeek")
         let request = generation
         syncingVideoGeneration = request
@@ -1087,11 +1155,14 @@ final class PlaybackService: NSObject {
                 if observedStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
                 else if self.player.timeControlStatus == .playing { self.cancelStallRecovery() }
                 // Preserve the original native reads and recovery decisions.
-                // The detail describes the first policy read, which can differ
-                // from the later event-name read during a concurrent transition.
-                self.recordPlaybackEvent(self.player.timeControlStatus == .playing ? "playing" : "waitingOrPaused",
+                // Bind the original final read, rather than add another native
+                // query to decide whether the explicit test control may run.
+                let finalStatus = self.player.timeControlStatus
+                let finalUptime = ProcessInfo.processInfo.systemUptime
+                self.recordPlaybackEvent(finalStatus == .playing ? "playing" : "waitingOrPaused",
                     detail: .timeControl(publishedStatus: publishedStatus, notificationUptime: notificationUptime,
-                        observedStatus: observedStatus.rawValue, observedUptime: observedUptime))
+                        observedStatus: observedStatus.rawValue, observedUptime: observedUptime,
+                        finalStatus: finalStatus.rawValue, finalUptime: finalUptime))
             }
         }
         let center = NotificationCenter.default
