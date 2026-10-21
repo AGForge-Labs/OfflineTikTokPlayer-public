@@ -538,9 +538,108 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testNaturalBoundaryAtPositiveIncomingOffsetRevealsB() async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
-        let service = fixture.service()
+        let audio = ContinuousAudioPlayer()
+        let service = fixture.service(continuousAudio: audio)
+        let context = SelectionProducerContext(renderer: audio.renderer, producer: audio.producerProgressRecorder)
+        let screen = try SelectionVideoScreen(service: service, producerContext: context,
+            producerWindowSeconds: 45, producerSampleCapacity: 512)
+        defer { service.pause(); audio.graph.engine.stop(); screen.close() }
+        try await preparePositiveOffsetNaturalB(service, fixture: fixture)
+        await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "natural-B-positive-offset")
+    }
+
+    func testMatchedNaturalBoundaryProducerTraceAndCaptureControls() async throws {
+        // Fresh identical histories isolate capture and native-trace overhead.
+        // Every arm keeps the same independent snapshot sampler and bounds.
+        for condition in [(trace: false, capture: false), (trace: true, capture: false),
+                          (trace: false, capture: true), (trace: true, capture: true)] {
+            do { try await measureNaturalProducer(trace: condition.trace, capture: condition.capture) }
+            catch { XCTFail("Matched natural setup failed: \(error)") }
+        }
+    }
+
+    private func measureNaturalProducer(trace: Bool, capture: Bool) async throws {
+        let fixture = try await SelectionVideoFixture()
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        audio.producerProgressRecorder.setTracingEnabled(trace)
+        let service = fixture.service(continuousAudio: audio)
         let screen = try SelectionVideoScreen(service: service)
-        defer { service.pause(); screen.close() }
+        let label = "matched-natural-trace-\(trace)-capture-\(capture)"
+        let setupStart = ProcessInfo.processInfo.systemUptime
+        var result: SelectionProducerProbe.Result?
+        var summaries: [String] = []
+        defer {
+            service.pause(); audio.graph.engine.stop(); screen.close()
+            result?.dump(label: label)
+            for summary in summaries { print(summary) }
+        }
+        try await preparePositiveOffsetNaturalB(service, fixture: fixture)
+        let ready = await waitUntil {
+            service.isVideoReady && (service.surface.playerLayer.isReadyForDisplay
+                || screen.customVideoLayer?.isReadyForDisplay == true)
+        }
+        XCTAssertTrue(ready, "The same natural B visibility gate must precede either condition")
+        let baseline = service.audioSnapshot
+        let setupMs = (ProcessInfo.processInfo.systemUptime - setupStart) * 1_000
+        XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
+        XCTAssertEqual(audio.producerProgressRecorder.snapshot().tracingEnabled, trace)
+        let probe = SelectionProducerProbe(context: SelectionProducerContext(renderer: audio.renderer,
+            producer: audio.producerProgressRecorder), durationSeconds: 45, capacity: 512)
+        let start = ProcessInfo.processInfo.systemUptime
+        if capture {
+            // Preserve the original compositor identity, moving marker, source,
+            // no-new-underrun and 29-second complete-source assertions.
+            await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: label)
+        }
+        let captureSeconds = ProcessInfo.processInfo.systemUptime - start
+        let remaining = max(0, 24 - captureSeconds)
+        if remaining > 0 { try await Task.sleep(for: .seconds(remaining)) }
+        let observed = probe.stop()
+        result = observed
+        // The unchanged first-eight-second contract is checked separately from
+        // the longer matched window. A slow capture's later tail stays visible.
+        summaries.append(assertNaturalProducerWindow(observed, baseline: baseline,
+            quantum: service.audioRenderQuantumFrames, seconds: 8, label: label))
+        summaries.append(assertNaturalProducerWindow(observed, baseline: baseline,
+            quantum: service.audioRenderQuantumFrames, seconds: 24, label: label))
+        XCTAssertEqual(observed.dropped, 0)
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, baseline.underrunFrames,
+                       "Starvation after the matched prefix must not disappear from a long capture")
+        XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
+        assertSelection(service, fixture: fixture, id: fixture.bID)
+        summaries.append("SelectionNaturalCondition label=\(label) nativeTrace=\(trace) capture=\(capture) setupMs=\(setupMs) captureSeconds=\(captureSeconds) baselineFrame=\(baseline.frame) baselineUnderruns=\(baseline.underrunFrames) finalUnderruns=\(service.audioSnapshot.underrunFrames)")
+    }
+
+    private func assertNaturalProducerWindow(_ result: SelectionProducerProbe.Result,
+        baseline: ContinuousPCMRenderer.Snapshot, quantum: Int, seconds: Double, label: String) -> String {
+        let samples = result.samples.filter { Double($0.uptime - result.origin) / 1_000_000_000 <= seconds }
+        XCTAssertGreaterThanOrEqual(samples.count, Int(seconds * 5), "The independent sampler must provide useful coverage")
+        XCTAssertLessThanOrEqual(samples.first.map { Double($0.uptime - result.origin) / 1_000_000_000 } ?? .infinity, 0.25)
+        XCTAssertGreaterThanOrEqual(samples.last.map { Double($0.uptime - result.origin) / 1_000_000_000 } ?? -1, seconds - 0.5)
+        XCTAssertGreaterThanOrEqual(samples.filter { $0.producer.coherent }.count, Int(seconds * 2.5))
+        let gaps = zip(samples, samples.dropFirst()).map { before, after in
+            Double(after.uptime - before.uptime) / 1_000_000_000
+        }
+        XCTAssertLessThanOrEqual(gaps.max() ?? .infinity, 0.25, "Missing observations cannot establish continuity")
+        let acquisition = samples.map { Double($0.audioAcquisitionEnd - $0.acquisitionBegin) / 1_000_000_000 }.max() ?? .infinity
+        XCTAssertLessThanOrEqual(acquisition, 0.005, "A preempted snapshot read cannot masquerade as a precise sample time")
+        XCTAssertEqual(samples.map { $0.audio.underrunFrames }.max() ?? -1, baseline.underrunFrames)
+        XCTAssertTrue(samples.allSatisfy { $0.audio.token == baseline.token && $0.audio.visit == baseline.visit && !$0.audio.ended })
+        let tolerance = 2 * Double(max(1, quantum)) / 48_000 + 0.005
+        let wall = samples.first.flatMap { first in samples.last.map { Double($0.uptime - first.uptime) / 1_000_000_000 } } ?? -1
+        let pcm = samples.first.flatMap { first in samples.last.map { Double($0.audio.frame - first.audio.frame) / 48_000 } } ?? -1
+        let skew = zip(samples, samples.dropFirst()).map { before, after in
+            abs(Double(after.audio.frame - before.audio.frame) / 48_000
+                - Double(after.uptime - before.uptime) / 1_000_000_000)
+        }.max() ?? .infinity
+        XCTAssertGreaterThan(pcm, 0)
+        XCTAssertEqual(pcm, wall, accuracy: tolerance)
+        XCTAssertLessThanOrEqual(skew, tolerance, "A paused/stalled render clock cannot hide between samples")
+        return "SelectionNaturalProducerProgress label=\(label) windowSeconds=\(seconds) samples=\(samples.count) wallSeconds=\(wall) pcmSeconds=\(pcm) maximumProgressSkewMs=\(skew * 1_000) maximumAcquisitionMs=\(acquisition * 1_000)"
+    }
+
+    private func preparePositiveOffsetNaturalB(_ service: PlaybackService, fixture: SelectionVideoFixture) async throws {
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 },
                           "Both complete Saved sources must be ready")
@@ -574,7 +673,6 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             && service.audioSnapshot.token != aToken
             && service.clock.position > 0 }, "The service must adopt naturally rendered B at a positive offset")
         assertSelection(service, fixture: fixture, id: fixture.bID)
-        await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "natural-B-positive-offset")
     }
 
     func testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause() async throws {
@@ -1257,11 +1355,15 @@ private struct SelectionProducerContext: Sendable {
     let producer: ContinuousPCMDecoder.ProgressRecorder
 }
 
-/// A test-only sampler independent of both the UI and decode queues. At most
-/// 128 numeric samples, no media, no console I/O and no unbounded seqlock read.
+/// A test-only sampler independent of both the UI and decode queues, with fixed
+/// numeric records, no media, no console I/O and no unbounded seqlock read.
+/// Ordinary probes keep 128 records/eight seconds; full captures cap at 512/45s.
 private final class SelectionProducerProbe: @unchecked Sendable {
     struct Sample: Sendable {
         let uptime: UInt64
+        let acquisitionBegin: UInt64
+        let audioAcquisitionEnd: UInt64
+        let producerAcquisitionEnd: UInt64
         let audio: ContinuousPCMRenderer.Snapshot
         let producer: ContinuousPCMDecoder.ProgressSnapshot
     }
@@ -1272,18 +1374,20 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         let skipped: Int
         let dropped: Int
         let maximumGap: UInt64
+        let durationSeconds: Double
+        let capacity: Int
 
         func dump(label: String) {
             let delta: String
             if let initial, let last = samples.last { delta = String(last.audio.underrunFrames - initial.underrunFrames) }
             else { delta = "missing" }
             let observedMs = samples.last.map { String(Double($0.uptime - origin) / 1_000_000) } ?? "missing"
-            print("SelectionProducerWindow label=\(label) requestedSeconds=8 observedUntilMs=\(observedMs) samples=\(samples.count) skipped=\(skipped) dropped=\(dropped) maxSamplerGapMs=\(Double(maximumGap) / 1_000_000) underrunDelta=\(delta)")
+            print("SelectionProducerWindow label=\(label) requestedSeconds=\(durationSeconds) capacity=\(capacity) observedUntilMs=\(observedMs) samples=\(samples.count) skipped=\(skipped) dropped=\(dropped) maxSamplerGapMs=\(Double(maximumGap) / 1_000_000) underrunDelta=\(delta)")
             for sample in samples {
                 let progress = sample.producer
-                let age = progress.phaseEnteredUptimeNanoseconds > 0 && sample.uptime >= progress.phaseEnteredUptimeNanoseconds
-                    ? Double(sample.uptime - progress.phaseEnteredUptimeNanoseconds) / 1_000_000 : -1
-                print("SelectionProducerSample label=\(label) elapsedMs=\(Double(sample.uptime - origin) / 1_000_000) audioToken=\(sample.audio.token) audioVisit=\(sample.audio.visit) audioFrame=\(sample.audio.frame) ended=\(sample.audio.ended) underrunFrames=\(sample.audio.underrunFrames) phase=\(progress.phase.rawValue) phaseToken=\(progress.token) slot=\(progress.slot) epoch=\(progress.epoch) phaseAgeMs=\(age) phaseSequence=\(progress.phaseSequence) pumpCount=\(progress.pumpCount) currentTokenAtLastPump=\(progress.currentTokenAtLastPump) acceptedFrames=\(progress.acceptedFrames) appendCount=\(progress.appendCount) lastAcceptedNs=\(progress.lastAcceptedUptimeNanoseconds) lastAcceptedToken=\(progress.lastAcceptedToken) lastAcceptedSlot=\(progress.lastAcceptedSlot) lastAcceptedEpoch=\(progress.lastAcceptedEpoch) coherent=\(progress.coherent)")
+                let age = progress.phaseEnteredUptimeNanoseconds > 0 && sample.producerAcquisitionEnd >= progress.phaseEnteredUptimeNanoseconds
+                    ? Double(sample.producerAcquisitionEnd - progress.phaseEnteredUptimeNanoseconds) / 1_000_000 : -1
+                print("SelectionProducerSample label=\(label) elapsedMs=\(Double(sample.uptime - origin) / 1_000_000) audioAcquisitionMs=\(Double(sample.audioAcquisitionEnd - sample.acquisitionBegin) / 1_000_000) producerAcquisitionMs=\(Double(sample.producerAcquisitionEnd - sample.audioAcquisitionEnd) / 1_000_000) nativeTrace=\(progress.tracingEnabled) audioToken=\(sample.audio.token) audioVisit=\(sample.audio.visit) audioFrame=\(sample.audio.frame) ended=\(sample.audio.ended) underrunFrames=\(sample.audio.underrunFrames) phase=\(progress.phase.rawValue) phaseToken=\(progress.token) slot=\(progress.slot) epoch=\(progress.epoch) phaseAgeMs=\(age) phaseSequence=\(progress.phaseSequence) pumpCount=\(progress.pumpCount) currentTokenAtLastPump=\(progress.currentTokenAtLastPump) acceptedFrames=\(progress.acceptedFrames) appendCount=\(progress.appendCount) lastAcceptedNs=\(progress.lastAcceptedUptimeNanoseconds) lastAcceptedToken=\(progress.lastAcceptedToken) lastAcceptedSlot=\(progress.lastAcceptedSlot) lastAcceptedEpoch=\(progress.lastAcceptedEpoch) slot0Token=\(progress.slot0.token) slot0Epoch=\(progress.slot0.epoch) slot0Accepted=\(progress.slot0.acceptedFrames) slot0Appends=\(progress.slot0.appendCount) slot0LastAcceptedNs=\(progress.slot0.lastAcceptedUptimeNanoseconds) slot1Token=\(progress.slot1.token) slot1Epoch=\(progress.slot1.epoch) slot1Accepted=\(progress.slot1.acceptedFrames) slot1Appends=\(progress.slot1.appendCount) slot1LastAcceptedNs=\(progress.slot1.lastAcceptedUptimeNanoseconds) slot2Token=\(progress.slot2.token) slot2Epoch=\(progress.slot2.epoch) slot2Accepted=\(progress.slot2.acceptedFrames) slot2Appends=\(progress.slot2.appendCount) slot2LastAcceptedNs=\(progress.slot2.lastAcceptedUptimeNanoseconds) coherent=\(progress.coherent)")
             }
         }
     }
@@ -1292,6 +1396,9 @@ private final class SelectionProducerProbe: @unchecked Sendable {
     private let timer: DispatchSourceTimer
     private let origin = DispatchTime.now().uptimeNanoseconds
     private let initial: ContinuousPCMRenderer.Snapshot?
+    private let durationSeconds: Double
+    private let durationNanoseconds: UInt64
+    private let capacity: Int
     private let lock = NSLock()
     private var samples: [Sample] = []
     private var stopped = false
@@ -1300,29 +1407,37 @@ private final class SelectionProducerProbe: @unchecked Sendable {
     private var previousSample: UInt64?
     private var maximumGap: UInt64 = 0
 
-    init(context: SelectionProducerContext) {
+    init(context: SelectionProducerContext, durationSeconds: Double = 8, capacity: Int = 128) {
+        precondition(durationSeconds > 0 && durationSeconds <= 45
+            && capacity >= Int(ceil(durationSeconds * 10)) && capacity <= 512)
         self.context = context
+        self.durationSeconds = durationSeconds
+        durationNanoseconds = UInt64(durationSeconds * 1_000_000_000)
+        self.capacity = capacity
         initial = context.renderer.diagnosticSnapshot
         timer = DispatchSource.makeTimerSource(flags: .strict,
             queue: DispatchQueue(label: "OfflinePlayer.TestProducerProbe", qos: .utility))
-        samples.reserveCapacity(128)
+        samples.reserveCapacity(capacity)
         timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(10))
         timer.setEventHandler { [weak self] in self?.sample() }
         timer.resume()
     }
 
     private func sample() {
-        let now = DispatchTime.now().uptimeNanoseconds
-        if now - origin >= 8_000_000_000 { timer.cancel(); return }
+        let begin = DispatchTime.now().uptimeNanoseconds
+        if begin - origin >= durationNanoseconds { timer.cancel(); return }
         let audio = context.renderer.diagnosticSnapshot
+        let audioEnd = DispatchTime.now().uptimeNanoseconds
         let producer = context.producer.snapshot()
+        let producerEnd = DispatchTime.now().uptimeNanoseconds
         lock.lock(); defer { lock.unlock() }
         guard !stopped else { return }
         guard let audio else { skipped += 1; return }
-        guard samples.count < 128 else { dropped += 1; return }
-        if let previousSample { maximumGap = max(maximumGap, now - previousSample) }
-        previousSample = now
-        samples.append(Sample(uptime: now, audio: audio, producer: producer))
+        guard samples.count < capacity else { dropped += 1; return }
+        if let previousSample { maximumGap = max(maximumGap, audioEnd - previousSample) }
+        previousSample = audioEnd
+        samples.append(Sample(uptime: audioEnd, acquisitionBegin: begin, audioAcquisitionEnd: audioEnd,
+            producerAcquisitionEnd: producerEnd, audio: audio, producer: producer))
     }
 
     func stop() -> Result {
@@ -1330,7 +1445,7 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         stopped = true
         return Result(origin: origin, initial: initial, samples: samples, skipped: skipped,
-                      dropped: dropped, maximumGap: maximumGap)
+                      dropped: dropped, maximumGap: maximumGap, durationSeconds: durationSeconds, capacity: capacity)
     }
 
     deinit { timer.cancel() }
@@ -1342,6 +1457,8 @@ private final class SelectionVideoScreen {
     let service: PlaybackService
     private weak var previousKeyWindow: UIWindow?
     private let producerContext: SelectionProducerContext?
+    private let producerWindowSeconds: Double
+    private let producerSampleCapacity: Int
     private var producerResults: [(String, SelectionProducerProbe.Result)] = []
     private var captureLogs: [String] = []
     private var droppedDiagnostics = 0
@@ -1349,9 +1466,12 @@ private final class SelectionVideoScreen {
         service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.last
     }
 
-    init(service: PlaybackService, producerContext: SelectionProducerContext? = nil) throws {
+    init(service: PlaybackService, producerContext: SelectionProducerContext? = nil,
+         producerWindowSeconds: Double = 8, producerSampleCapacity: Int = 128) throws {
         self.service = service
         self.producerContext = producerContext
+        self.producerWindowSeconds = producerWindowSeconds
+        self.producerSampleCapacity = producerSampleCapacity
         producerResults.reserveCapacity(40); captureLogs.reserveCapacity(128)
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
@@ -1373,7 +1493,9 @@ private final class SelectionVideoScreen {
     }
 
     func capture(label: String, test: XCTestCase) async throws -> SelectionVideoPixels {
-        let producerProbe = producerContext.map { SelectionProducerProbe(context: $0) }
+        let producerProbe = producerContext.map {
+            SelectionProducerProbe(context: $0, durationSeconds: producerWindowSeconds, capacity: producerSampleCapacity)
+        }
         defer {
             if let producerProbe {
                 let result = producerProbe.stop()

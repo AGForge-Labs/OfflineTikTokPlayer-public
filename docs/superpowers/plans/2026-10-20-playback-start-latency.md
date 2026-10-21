@@ -8,7 +8,8 @@
 - [x] Read current instructions, prior acceptance evidence and relevant current/shipped paths.
 - [x] Run the portable baseline: 83 tests pass with one Swift job.
 - [x] Add native request-to-output/first-frame measurements and reproduce a failure before changing production behavior.
-- [x] Isolate a supported causal path and implement only the demonstrated correction.
+- [x] Isolate the redundant aligned-seek path and implement that demonstrated correction.
+- [ ] Isolate recurrent producer starvation in the exact positive-offset natural-transition capture before another production fix.
 - [ ] Verify regression identity, pixels, output continuity, intent, queue endings and resource bounds without relaxing thresholds.
 - [ ] Obtain independent review and publish exact before/after evidence and remaining physical-device limits.
 
@@ -17,3 +18,5 @@ Initial supported paths: current cold selection does not attach the video item u
 Measured baseline `ed11c712684aeb175d2d2b21eb22cc8257c48a7c`, run `39503751284`: prepared Next/Previous readiness 379.12/305.49 ms failed unchanged 250 ms targets; independent engine tone windows ended 42.33/42.20 ms after commands, with no detected 10 ms silence or host-timeline holes. Previous performed a 280.93 ms exact seek despite only 0.208 ms drift. The focused correction prepares the existing local composition before staging and avoids that redundant aligned selection seek. Cold/relaunch file verification and actual phone output remain outside these fixture measurements.
 
 First corrected source `68ee696`, run `39507305343`, still failed the unchanged limits (Next306.67ms, Previous623.12ms, natural286.18ms); no silence/timestamp holes appeared in the captured output. It is not accepted. Next experiment: avoid an unnecessary compositor only for verified ordinary identity geometry; preserve transformed/aperture/pixel-aspect normalization, and require current-epoch PTS in timing checks. A separate simulator screenshot timeout also remains a hard failure.
+
+The authorized 2026-10-21 follow-up targets `natural-B-positive-offset-motion-start`: explicit audio injection and a bounded full-capture producer trace on the original failing case, plus fresh matched natural-handoff arms with/without capture and with/without native tracing. All arms retain the original far seek, conditional main-actor stall and natural-advance policy. The independent sampler is common to the four arms; native tracing controls its write overhead. Keep the existing first-eight-second coverage/progress contract, add a 24-second shared observation, and retain up to 45 seconds/512 numeric records for a long capture's later tail. Record snapshot acquisition times and per-slot accepted frames. No production playback decision changes precede a supported cause; use one unsigned standard Mac validation worker.

@@ -19,10 +19,25 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     enum ProgressPhase: Int, Sendable {
-        case idle, preparing, pumping, openingStream, readerStart, nativeCopy, converting, readerCancel, appending
+        case idle = 0, preparing = 1, pumping = 2, openingStream = 3
+        case readerStart = 4, nativeCopy = 5, converting = 6, readerCancel = 7, appending = 8
+        case rendererSnapshot = 9, streamRequest = 10, readerConfiguration = 11
+        case converterConstruction = 12, streamReplacement = 13, poolDrain = 14, retiringSlots = 15
+        case readerConstruction = 16
+    }
+
+    struct SlotProgressSnapshot: Sendable {
+        let token: Int
+        // Latest accepted epoch; counts span this token's epochs and reset only
+        // when a different token positively appends into this fixed slot.
+        let epoch: Int
+        let acceptedFrames: Int64
+        let appendCount: Int64
+        let lastAcceptedUptimeNanoseconds: UInt64
     }
 
     struct ProgressSnapshot: Sendable {
+        let tracingEnabled: Bool
         let phase: ProgressPhase
         let token: Int
         let slot: Int
@@ -39,10 +54,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let lastAcceptedToken: Int
         let lastAcceptedSlot: Int
         let lastAcceptedEpoch: Int
+        let slot0: SlotProgressSnapshot
+        let slot1: SlotProgressSnapshot
+        let slot2: SlotProgressSnapshot
         let coherent: Bool
     }
 
     fileprivate struct ProgressMark {
+        let enabled: Bool
         let phase: ProgressPhase
         let token: Int
         let slot: Int
@@ -59,6 +78,32 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// observers make at most three attempts to read the fixed-size atomic record.
     /// A preempted writer produces coherent=false rather than blocking a probe.
     final class ProgressRecorder: @unchecked Sendable {
+        private final class SlotCounters {
+            let token = Atomic<Int>(0)
+            let epoch = Atomic<Int>(0)
+            let frames = Atomic<Int64>(0)
+            let appends = Atomic<Int64>(0)
+            let time = Atomic<UInt64>(0)
+
+            func snapshot() -> SlotProgressSnapshot {
+                SlotProgressSnapshot(token: token.load(ordering: .sequentiallyConsistent),
+                    epoch: epoch.load(ordering: .sequentiallyConsistent),
+                    acceptedFrames: frames.load(ordering: .sequentiallyConsistent),
+                    appendCount: appends.load(ordering: .sequentiallyConsistent),
+                    lastAcceptedUptimeNanoseconds: time.load(ordering: .sequentiallyConsistent))
+            }
+
+            func noteAccepted(frames count: Int, token nextToken: Int, epoch nextEpoch: Int, now: UInt64) {
+                let changed = token.load(ordering: .relaxed) != nextToken
+                token.store(nextToken, ordering: .sequentiallyConsistent)
+                epoch.store(nextEpoch, ordering: .sequentiallyConsistent)
+                frames.store((changed ? 0 : frames.load(ordering: .relaxed)) &+ Int64(count), ordering: .sequentiallyConsistent)
+                appends.store((changed ? 0 : appends.load(ordering: .relaxed)) &+ 1, ordering: .sequentiallyConsistent)
+                time.store(now, ordering: .sequentiallyConsistent)
+            }
+        }
+
+        private let tracing = Atomic<Bool>(true)
         private let version = Atomic<Int64>(0)
         private let phaseValue = Atomic<Int>(ProgressPhase.idle.rawValue)
         private let tokenValue = Atomic<Int>(0)
@@ -74,6 +119,15 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private let acceptedToken = Atomic<Int>(0)
         private let acceptedSlot = Atomic<Int>(-1)
         private let acceptedEpoch = Atomic<Int>(0)
+        private let firstSlot = SlotCounters()
+        private let secondSlot = SlotCounters()
+        private let thirdSlot = SlotCounters()
+
+        /// Controls diagnostic publication only. Set once before preparing a
+        /// fresh fixture; disabled snapshots retain the last published record.
+        func setTracingEnabled(_ enabled: Bool) {
+            tracing.store(enabled, ordering: .sequentiallyConsistent)
+        }
 
         func snapshot() -> ProgressSnapshot {
             var result = readSnapshot()
@@ -85,6 +139,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
 
         private func readSnapshot() -> ProgressSnapshot {
+            let enabled = tracing.load(ordering: .sequentiallyConsistent)
             let before = version.load(ordering: .sequentiallyConsistent)
             let phase = ProgressPhase(rawValue: phaseValue.load(ordering: .sequentiallyConsistent)) ?? .idle
             let token = tokenValue.load(ordering: .sequentiallyConsistent)
@@ -100,17 +155,23 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let lastToken = acceptedToken.load(ordering: .sequentiallyConsistent)
             let lastSlot = acceptedSlot.load(ordering: .sequentiallyConsistent)
             let lastEpoch = acceptedEpoch.load(ordering: .sequentiallyConsistent)
+            let slot0 = firstSlot.snapshot(), slot1 = secondSlot.snapshot(), slot2 = thirdSlot.snapshot()
             let coherent = before & 1 == 0 && before == version.load(ordering: .sequentiallyConsistent)
-            return ProgressSnapshot(phase: phase, token: token, slot: slot, epoch: epoch,
+                && enabled == tracing.load(ordering: .sequentiallyConsistent)
+            return ProgressSnapshot(tracingEnabled: enabled, phase: phase, token: token, slot: slot, epoch: epoch,
                 currentTokenAtLastPump: active, phaseEnteredUptimeNanoseconds: entered,
                 phaseSequence: transitions, pumpCount: pumpCount, acceptedFrames: frames,
                 appendCount: appendCount, lastAcceptedUptimeNanoseconds: lastAccepted,
                 lastAcceptedToken: lastToken, lastAcceptedSlot: lastSlot, lastAcceptedEpoch: lastEpoch,
+                slot0: slot0, slot1: slot1, slot2: slot2,
                 coherent: coherent)
         }
 
         fileprivate func enter(_ phase: ProgressPhase, token: Int, slot: Int, epoch: Int) -> ProgressMark {
-            let previous = ProgressMark(phase: ProgressPhase(rawValue: phaseValue.load(ordering: .relaxed)) ?? .idle,
+            guard tracing.load(ordering: .acquiring) else {
+                return ProgressMark(enabled: false, phase: .idle, token: 0, slot: -1, epoch: 0)
+            }
+            let previous = ProgressMark(enabled: true, phase: ProgressPhase(rawValue: phaseValue.load(ordering: .relaxed)) ?? .idle,
                 token: tokenValue.load(ordering: .relaxed), slot: slotValue.load(ordering: .relaxed),
                 epoch: epochValue.load(ordering: .relaxed))
             publish(phase, token: token, slot: slot, epoch: epoch)
@@ -118,6 +179,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
 
         fileprivate func restore(_ previous: ProgressMark) {
+            guard previous.enabled, tracing.load(ordering: .acquiring) else { return }
             publish(previous.phase, token: previous.token, slot: previous.slot, epoch: previous.epoch)
         }
 
@@ -126,6 +188,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
 
         fileprivate func notePump(currentToken token: Int) {
+            guard tracing.load(ordering: .acquiring) else { return }
             beginUpdate()
             currentToken.store(token, ordering: .sequentiallyConsistent)
             pumps.store(pumps.load(ordering: .relaxed) &+ 1, ordering: .sequentiallyConsistent)
@@ -133,7 +196,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
 
         fileprivate func noteAccepted(frames: Int, token: Int, slot: Int, epoch: Int) {
-            guard frames > 0 else { return }
+            guard tracing.load(ordering: .acquiring), frames > 0 else { return }
             let now = DispatchTime.now().uptimeNanoseconds
             beginUpdate()
             accepted.store(accepted.load(ordering: .relaxed) &+ Int64(frames), ordering: .sequentiallyConsistent)
@@ -142,7 +205,19 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             acceptedToken.store(token, ordering: .sequentiallyConsistent)
             acceptedSlot.store(slot, ordering: .sequentiallyConsistent)
             acceptedEpoch.store(epoch, ordering: .sequentiallyConsistent)
+            switch slot {
+            case 0: firstSlot.noteAccepted(frames: frames, token: token, epoch: epoch, now: now)
+            case 1: secondSlot.noteAccepted(frames: frames, token: token, epoch: epoch, now: now)
+            case 2: thirdSlot.noteAccepted(frames: frames, token: token, epoch: epoch, now: now)
+            default: break
+            }
             endUpdate()
+        }
+
+        fileprivate func streamRequest(from source: ContinuousPCMSource, context: ProgressContext) -> ContinuousPCMStreamRequest {
+            let previous = enter(.streamRequest, context: context)
+            defer { restore(previous) }
+            return source.streamRequest
         }
 
         private func publish(_ phase: ProgressPhase, token: Int, slot: Int, epoch: Int) {
@@ -275,6 +350,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                     let previous = progressRecorder.enter(.preparing, token: token, slot: index, epoch: 0)
                     defer { progressRecorder.restore(previous) }
                     autoreleasepool {
+                        defer { _ = progressRecorder.enter(.poolDrain, token: token, slot: index, epoch: 0) }
                         do {
                             guard !stopped, !cancellation.value.load(ordering: .acquiring) else { throw Failure.cancelled }
                             let source = renderer.source(at: index)
@@ -292,9 +368,13 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                             }
                             guard published else { throw Failure.slotInUse }
                             let state = Slot(index: index, token: token, source: source, description: description, cancellation: cancellation, stream: stream)
+                            let beforeReplacement = progressRecorder.enter(.retiringSlots,
+                                token: slots[index]?.token ?? 0, slot: index, epoch: slots[index]?.epoch ?? 0)
                             slots[index] = state
-                            guard source.beginStream(epoch: source.streamRequest.epoch) else { throw Failure.cancelled }
-                            state.epoch = source.streamRequest.epoch
+                            progressRecorder.restore(beforeReplacement)
+                            let context = ProgressContext(token: token, slot: index, epoch: 0)
+                            guard source.beginStream(epoch: progressRecorder.streamRequest(from: source, context: context).epoch) else { throw Failure.cancelled }
+                            state.epoch = progressRecorder.streamRequest(from: source, context: context).epoch
                             stream.setProgressEpoch(state.epoch)
                             try fill(state, chunks: 8)
                             continuation.resume(returning: Prepared(token: token, totalFrames: stream.totalFrames, hasAudio: hasAudio))
@@ -307,7 +387,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         } onCancel: {
             cancellation.value.store(true, ordering: .releasing)
             self.worker.async { [self] in
-                for index in slots.indices where slots[index]?.token == token { slots[index] = nil }
+                let previous = progressRecorder.enter(.retiringSlots, token: token, slot: -1, epoch: 0)
+                defer { progressRecorder.restore(previous) }
+                for index in slots.indices where slots[index]?.token == token { retireSlot(at: index) }
             }
         }
     }
@@ -316,10 +398,19 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// Storage retirement itself remains the renderer/source owner's decision.
     func retain(tokens: Set<Int>) {
         worker.async { [self] in
+            let previous = progressRecorder.enter(.retiringSlots, token: 0, slot: -1, epoch: 0)
+            defer { progressRecorder.restore(previous) }
             for index in slots.indices {
-                if let slot = slots[index], !tokens.contains(slot.token) { slots[index] = nil }
+                if let slot = slots[index], !tokens.contains(slot.token) { retireSlot(at: index) }
             }
         }
+    }
+
+    private func retireSlot(at index: Int) {
+        let previous = progressRecorder.enter(.retiringSlots,
+            token: slots[index]?.token ?? 0, slot: index, epoch: slots[index]?.epoch ?? 0)
+        slots[index] = nil
+        progressRecorder.restore(previous)
     }
 
     /// The callback runs on the decode worker. Only an ephemeral numeric token
@@ -337,6 +428,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     func shutdown() {
         worker.async { [self] in
+            let previous = progressRecorder.enter(.retiringSlots, token: 0, slot: -1, epoch: 0)
+            defer { progressRecorder.restore(previous) }
             stopped = true
             timer?.setEventHandler {}; timer?.cancel(); timer = nil
             slots = [nil, nil, nil]
@@ -345,23 +438,29 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     private func pump() {
         guard !stopped else { return }
+        let previous = progressRecorder.enter(.pumping, token: 0, slot: -1, epoch: 0)
+        // Restore outside the closure: a deferred marker remains observable
+        // throughout Objective-C autorelease-pool pop, including native releases.
+        defer { progressRecorder.restore(previous) }
         autoreleasepool {
+            let beforeSnapshot = progressRecorder.enter(.rendererSnapshot, token: 0, slot: -1, epoch: 0)
             let active = renderer.snapshot.token
+            progressRecorder.restore(beforeSnapshot)
             progressRecorder.notePump(currentToken: active)
-            let previous = progressRecorder.enter(.pumping, token: active, slot: -1, epoch: 0)
-            defer { progressRecorder.restore(previous) }
+            _ = progressRecorder.enter(.pumping, token: active, slot: -1, epoch: 0)
+            defer { _ = progressRecorder.enter(.poolDrain, token: active, slot: -1, epoch: 0) }
             // Current replenishment takes precedence over speculative neighbours.
             for isCurrent in [true, false] {
                 for index in slots.indices {
                     guard let slot = slots[index], (slot.token == active) == isCurrent else { continue }
                     if slot.cancellation.value.load(ordering: .acquiring) || slot.source.token != slot.token {
-                        slots[index] = nil; continue
+                        retireSlot(at: index); continue
                     }
                     do { try fill(slot, chunks: isCurrent ? 8 : 2) }
                     catch {
                         if (error as? Failure) == .cancelled {
                             if slot.source.token != slot.token || slot.cancellation.value.load(ordering: .acquiring) {
-                                slots[index] = nil
+                                retireSlot(at: index)
                             }
                             // Retirement/task cancellation is normal cleanup.
                             // An epoch change retains this slot for the next pump.
@@ -369,7 +468,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         }
                         // A failed reader must not publish fabricated success/EOF.
                         // Its source will report an underrun if it is selected.
-                        slots[index] = nil
+                        retireSlot(at: index)
                         failureHandler?(slot.token, (error as? Failure) ?? .cannotDecode)
                     }
                 }
@@ -378,7 +477,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     private func fill(_ slot: Slot, chunks: Int) throws {
-        let request = slot.source.streamRequest
+        let request = progressRecorder.streamRequest(from: slot.source,
+            context: ProgressContext(token: slot.token, slot: slot.index, epoch: slot.epoch))
         let context = ProgressContext(token: slot.token, slot: slot.index, epoch: request.epoch)
         let previous = progressRecorder.enter(.pumping, context: context)
         defer { progressRecorder.restore(previous) }
@@ -392,18 +492,22 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 slot.source.finishStream(totalFrames: slot.source.totalFrames, epoch: slot.epoch)
                 return
             }
-            let source = slot.source, token = slot.token, cancellation = slot.cancellation
+            let source = slot.source, token = slot.token, cancellation = slot.cancellation, progress = progressRecorder
             let stream = try Stream(description: slot.description, startFrame: request.startFrame,
                 progress: progressRecorder, context: context,
                 shouldCancel: {
-                    cancellation.value.load(ordering: .acquiring) || source.token != token || source.streamRequest.epoch != request.epoch
+                    cancellation.value.load(ordering: .acquiring) || source.token != token
+                        || progress.streamRequest(from: source, context: context).epoch != request.epoch
                 })
             guard slot.source.beginStream(epoch: request.epoch) else { return }
+            let beforeReplacement = progressRecorder.enter(.streamReplacement, context: context)
             slot.stream = stream; slot.epoch = request.epoch; slot.finished = false
+            progressRecorder.restore(beforeReplacement)
         }
         guard !slot.finished else { return }
         for _ in 0..<chunks {
-            guard slot.source.token == slot.token, slot.source.streamRequest.epoch == slot.epoch else { return }
+            guard slot.source.token == slot.token,
+                  progressRecorder.streamRequest(from: slot.source, context: context).epoch == slot.epoch else { return }
             let capacity = min(8_192, slot.source.writableStreamFrames)
             guard capacity > 0 else { return }
             let count: Int
@@ -484,8 +588,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let native = try NativeReader(description: description, progress: progress, context: context)
             guard let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: description.nativeRate,
                     channels: description.nativeChannels, interleaved: true),
-                  let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true),
-                  let converter = AVAudioConverter(from: inputFormat, to: outputFormat),
+                  let outputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true) else { throw Failure.unsupportedPCM }
+            let beforeConverter = progress.enter(.converterConstruction, context: context)
+            let createdConverter = AVAudioConverter(from: inputFormat, to: outputFormat)
+            progress.restore(beforeConverter)
+            guard let converter = createdConverter,
                   let input = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 4_096),
                   let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4_096) else { throw Failure.unsupportedPCM }
             if description.nativeChannels == 1 { converter.channelMap = [0, 0] }
@@ -643,10 +750,16 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
         init(description: Description, progress: ProgressRecorder, context: ProgressContext) throws {
             self.progress = progress; progressContext = context
+            let previous = progress.enter(.readerConfiguration, context: context)
+            defer { progress.restore(previous) }
             guard let track = description.track else { throw Failure.cannotDecode }
             rate = description.nativeRate; channels = Int(description.nativeChannels)
             totalFrames = try ContinuousPCMDecoder.frame(description.endTime, rate: rate)
-            reader = try AVAssetReader(asset: description.asset)
+            do {
+                let beforeConstruction = progress.enter(.readerConstruction, context: context)
+                defer { progress.restore(beforeConstruction) }
+                reader = try AVAssetReader(asset: description.asset)
+            }
             output = AVAssetReaderTrackOutput(track: track, outputSettings: [
                 AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true,
                 AVLinearPCMBitDepthKey: 32, AVLinearPCMIsNonInterleaved: false
@@ -658,9 +771,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             // decoder postroll outside a compressed asset's presentation.
             // Request the complete declared asset/track interval explicitly.
             reader.timeRange = CMTimeRange(start: .zero, duration: description.endTime)
-            let previous = progress.enter(.readerStart, context: context)
+            let beforeStart = progress.enter(.readerStart, context: context)
             let started = reader.startReading()
-            progress.restore(previous)
+            progress.restore(beforeStart)
             guard started else { throw Failure.cannotDecode }
         }
 
