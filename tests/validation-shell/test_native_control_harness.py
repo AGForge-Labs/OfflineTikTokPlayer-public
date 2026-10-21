@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import textwrap
 import types
 import unittest
 import uuid
@@ -21,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HARNESS = Path(os.environ.get("NATIVE_CONTROL_HARNESS_SOURCE", ROOT / "scripts/check-native-playback-targeted.sh"))
 VERIFIER = ROOT / "scripts/verify-native-test-log.py"
 CAPTURE_HELPER = Path(os.environ.get("SIMULATOR_CAPTURE_HELPER_SOURCE", ROOT / "scripts/capture-simulator-test-frames.py"))
+TARGETED_WORKFLOW = Path(os.environ.get("NATIVE_TARGETED_WORKFLOW_SOURCE", ROOT / ".github/workflows/native-playback-targeted.yml"))
 REAL_SUBPROCESS_RUN = subprocess.run
 SIMULATOR = "11111111-2222-4333-8444-555555555555"
 CONTAINER = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -151,6 +153,19 @@ class NativeControlHarnessTests(unittest.TestCase):
             yield calls
 
     def test_live_control_inventory_and_source_manifest_are_required(self):
+        self.assertEqual(self.cases, (
+            'testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek',
+            'testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek',
+            'testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
+            'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
+            'testNaturalBoundaryWithNativeLaneActivityRevealsB',
+            'testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner',
+            'testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
+            'testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
+            'testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld'))
+        shell = HARNESS.read_text(encoding="utf-8")
+        control_names = shlex.split(re.search(r"controls\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
+        self.assertEqual(tuple(control_names), self.cases)
         spec = importlib.util.spec_from_file_location("real_native_evidence_unit", VERIFIER)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -165,7 +180,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         capture = importlib.util.module_from_spec(capture_spec)
         capture_spec.loader.exec_module(capture)
         for requested, effective in ((None, 1200), ("60", 60), ("1800", 1800),
-                                     ("1801", 1800), ("99999", 1800)):
+                                     ("1801", 1801), ("2400", 2400), ("2401", 2400), ("99999", 2400)):
             with self.subTest(requested=requested):
                 argv = ["capture-helper", "--udid", SIMULATOR]
                 if requested is not None:
@@ -401,8 +416,29 @@ class NativeControlHarnessTests(unittest.TestCase):
             'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedInstallEligibilityConsumesPlanWithoutMutatingItem',
             'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased',
             'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRetirementPreservesExternallyReplacedComposition',
-            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRepeatedBufferTransitionsBoundActualAttachedOutputs']
+            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRepeatedBufferTransitionsBoundActualAttachedOutputs',
+            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame',
+            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault',
+            'OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource',
+            'OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks']
         self.assertEqual(names, expected_selectors)
+        workflow = TARGETED_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r'^\s*timeout-minutes:\s*(\d+)\s*$', workflow, re.MULTILINE), ['40'])
+        # Execute only the workflow's expected-set/source-membership guard.
+        # No imports, log reads, SDK invocation, or arbitrary workflow run body.
+        scope = re.search(r'^          prefix = .*?(?=^          evidence\.verify_log\()',
+                          workflow, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(scope)
+        scope = textwrap.dedent(scope.group(0))
+        expected_identities = {selector.replace('/', '.', 1) for selector in expected_selectors}
+        evidence = types.SimpleNamespace(source_manifest=lambda _root: expected_identities)
+        namespace = dict(evidence=evidence, Path=Path)
+        exec(compile(scope, str(TARGETED_WORKFLOW), 'exec'), namespace)
+        self.assertEqual(namespace['expected'], expected_identities)
+        for missing in expected_identities:
+            with self.subTest(workflow_missing_identity=missing), self.assertRaises(SystemExit):
+                evidence = types.SimpleNamespace(source_manifest=lambda _root: expected_identities - {missing})
+                exec(compile(scope, str(TARGETED_WORKFLOW), 'exec'), dict(evidence=evidence, Path=Path))
         fake_xcode = '''import json, os, sys
 from pathlib import Path
 root = Path(os.environ['HARNESS_UNIT_ROOT'])
@@ -565,7 +601,7 @@ raise SystemExit(17 if os.environ['HARNESS_UNIT_SCENARIO'] == 'tee-failure' and 
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 expected = 1 if verify_status == 2 else len(self.cases)
                 self.assertEqual((root / "capture-args").read_text().splitlines(),
-                                 ["scripts/capture-simulator-test-frames.py", "--udid", SIMULATOR, "--lifetime", "1800"])
+                                 ["scripts/capture-simulator-test-frames.py", "--udid", SIMULATOR, "--lifetime", "2400"])
                 events = (root / "events").read_text().splitlines()
                 self.assertEqual(events, [event + " " + str(ordinal)
                     for ordinal in range(1, expected + 1) for event in ("launch", "verify", "boundary")])

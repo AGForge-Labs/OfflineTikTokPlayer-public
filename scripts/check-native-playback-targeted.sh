@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=37decd420486354bef315eb5c27394f03682a679
-expected_ios_tree=7a49566358722644118a2d908f630a62c5c42d48
+expected_code_source=441002cf4dfdf2ecda3fc1e37fd777f3d63065ec
+expected_ios_tree=2608730f78323a6c836f7473a6202203f7dd93f5
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -52,6 +52,7 @@ CASES = (
     'testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner',
     'testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
     'testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
+    'testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld',
 )
 
 def require(condition, message):
@@ -95,7 +96,7 @@ def runtime_host(log, identity, simulator):
         raise RuntimeHostIdentityError('Runtime host identity unavailable or mismatched') from None
 
 def verifier():
-    require(len(CASES) == 8 and len(set(CASES)) == 8, 'Expected eight distinct isolated controls')
+    require(len(CASES) == 9 and len(set(CASES)) == 9, 'Expected nine distinct isolated controls')
     spec = importlib.util.spec_from_file_location('evidence', ROOT / 'scripts/verify-native-test-log.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -285,7 +286,7 @@ try:
         module, errors, seen, runtime_nonces = verifier(), [], set(), set()
         rows = STATUSES.read_text().splitlines() if STATUSES.is_file() else []
         if len(rows) != len(CASES):
-            errors.append('Expected eight isolated command receipts; found %d' % len(rows))
+            errors.append('Expected nine isolated command receipts; found %d' % len(rows))
         for ordinal, name in enumerate(CASES, 1):
             identity = PREFIX + name
             try:
@@ -302,8 +303,8 @@ try:
                 print('NativeIsolatedControlVerified ordinal=%d identity=%s native=1 ui=0' % (ordinal, identity))
             except (OSError, ValueError) as error:
                 errors.append('%s: %s' % (identity, error))
-        require(len(seen) == 8 and not errors, '\n'.join(errors) or 'Missing unique control identity')
-        print('Targeted isolated controls native=8 ui=0; eight raw singleton logs; original guards retained; no full/device acceptance claim')
+        require(len(seen) == 9 and not errors, '\n'.join(errors) or 'Missing unique control identity')
+        print('Targeted isolated controls native=9 ui=0; nine raw singleton logs; original guards retained; no full/device acceptance claim')
     else:
         raise ValueError('Unknown local evidence operation')
 except RuntimeHostIdentityError:
@@ -332,8 +333,12 @@ case "$mode" in
     OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased
     OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRetirementPreservesExternallyReplacedComposition
     OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRepeatedBufferTransitionsBoundActualAttachedOutputs
+    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame
+    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault
+    OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource
+    OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks
   ) ;;
-  controls) cases=(testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce) ;;
+  controls) cases=(testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
@@ -403,7 +408,7 @@ evidence_tool initialize-controls
 # This is the same bounded helper used by the existing natural pixel tests.
 # It is absent during both benchmarks and never launches an app.
 evidence_tool boundary "$simulator_id" before-01
-python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1800 &
+python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 2400 &
 capture_pid=$!
 overall_status=0
 ordinal=0

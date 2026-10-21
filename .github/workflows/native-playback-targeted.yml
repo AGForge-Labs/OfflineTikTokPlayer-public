@@ -9,7 +9,7 @@ jobs:
   native-playback-targeted:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -27,10 +27,10 @@ jobs:
           python3 tests/validation-shell/test_check_ios_shell.py
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_native_control_harness.py
-      - name: Default SDK and traced production benchmarks and PiP resource regressions before causal controls
+      - name: Production benchmarks and PiP resource and readiness diagnostic regressions before causal controls
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require both benchmarks and both diagnostic units and six PiP resource identities
+      - name: Require all fourteen benchmark and resource and readiness identities
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -53,14 +53,21 @@ jobs:
               'testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased',
               'testRetirementPreservesExternallyReplacedComposition',
               'testRepeatedBufferTransitionsBoundActualAttachedOutputs'))
-          if len(expected) != 10 or not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('A benchmark or diagnostic unit or PiP resource test is missing from pinned source')
+          expected.update(prefix + name for name in (
+              'testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame',
+              'testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault'))
+          monitor_prefix = 'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/'
+          expected.update(monitor_prefix + name for name in (
+              'testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource',
+              'testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks'))
+          if len(expected) != 14 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('A benchmark or resource or readiness test is missing from pinned source')
           evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected, invocation='test-without-building')
-          print('Targeted benchmarks and diagnostic units and PiP resources native=10 ui=0; original guards retained; no physical-output/full acceptance claim')
+          print('Targeted benchmark and resource and readiness identities native=14 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
-      - name: Eight ordered controls using benchmark-built products
+      - name: Nine ordered controls using benchmark-built products
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh controls
-      - name: Require all eight singleton identities and native exit and host-boundary receipts
+      - name: Require all nine singleton identities and native exit and host-boundary receipts
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh --verify-controls
