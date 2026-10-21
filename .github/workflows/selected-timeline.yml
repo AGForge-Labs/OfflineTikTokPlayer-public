@@ -1,0 +1,33 @@
+name: Selected timeline native validation
+on:
+  push:
+    branches: [fix/selected-video-timeline]
+    paths: ['.github/workflows/selected-timeline.yml', 'scripts/check-selected-timeline.sh']
+permissions:
+  contents: read
+jobs:
+  selected-timeline:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Unsigned focused native adoption regression with one build job
+        run: bash scripts/check-selected-timeline.sh
+      - name: Verify the focused identity without claiming full playback acceptance
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
+          evidence = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(evidence)
+          expected = {'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testAdoptionCannotAcquireTheDepartingTimelineBeforeActivation'}
+          if not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('Focused native identity missing from this source')
+          evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
+          print('SCOPED selected-timeline native=1 ui=0; full playback acceptance NOT RUN')
+          PY
