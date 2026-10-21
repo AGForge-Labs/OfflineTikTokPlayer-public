@@ -1170,8 +1170,13 @@ private final class SelectionLatencySeekProbe {
             service?.onPlaybackEvent = { [weak self] event in
                 guard let self, self.phase >= 0 else { return }
                 let observed = SelectionOutputTap.hostSeconds()
-                self.diagnostics.append(.playback(name: event.name, commandMs: (observed - self.origin) * 1_000,
+                let commandMs = (observed - self.origin) * 1_000
+                self.diagnostics.append(.playback(name: event.name, commandMs: commandMs,
                     eventUptime: event.uptime, generation: event.generation, clockPosition: event.clockPosition), phase: self.phase)
+                if let detail = event.detail {
+                    self.diagnostics.append(.playbackDetail(commandMs: commandMs, eventUptime: event.uptime,
+                        generation: event.generation, detail: detail), phase: self.phase)
+                }
             }
         }
     }
@@ -1269,6 +1274,10 @@ private final class SelectionLatencySeekProbe {
             for event in phase.events { print(event.line(phase: phase.id)) }
             print("SelectionLatencyDiagnostics phase=\(phase.id) events=\(phase.totalCount) emitted=\(phase.events.count) droppedCount=\(phase.droppedCount)")
         }
+        if let service {
+            let cost = service.playbackEventPublicationCost
+            print("SelectionPlaybackEventPublicationCost phase=\(phase) nativeVideoGetters=\(nativeVideoGetterControl) count=\(cost.count) totalNanoseconds=\(cost.totalNanoseconds) maximumNanoseconds=\(cost.maximumNanoseconds) saturated=\(cost.saturated) scope=inclusive-observer-delivery")
+        }
         XCTAssertEqual(snapshot.droppedCount, 0, "Bounded latency diagnostics must not silently discard evidence")
     }
 }
@@ -1278,6 +1287,7 @@ private final class SelectionLatencySeekProbe {
 private final class SelectionLatencyDiagnostics: @unchecked Sendable {
     enum Event: Sendable {
         case playback(name: String, commandMs: Double, eventUptime: Double, generation: Int, clockPosition: Double)
+        case playbackDetail(commandMs: Double, eventUptime: Double, generation: Int, detail: PlaybackService.PlaybackEventDetail)
         case videoBatch(batchID: Int, commandMs: Double, copiedPosition: Double?, submittedPosition: Double?, requested: Double)
         case video(name: String, batchID: Int, commandMs: Double, framePosition: Double, requested: Double)
         case videoNativeGetter(batchID: Int, name: String, beginMs: Double, endMs: Double, acquisitionMs: Double,
@@ -1290,6 +1300,13 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
             switch self {
             case let .playback(name, commandMs, eventUptime, generation, clockPosition):
                 return "SelectionLatencyEvent phase=\(phase) name=\(name) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) clockPosition=\(clockPosition)"
+            case let .playbackDetail(commandMs, eventUptime, generation, detail):
+                switch detail {
+                case let .timeControl(publishedStatus, notificationUptime, observedStatus, observedUptime):
+                    return "SelectionLatencyTimeControl phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) publishedStatus=\(publishedStatus.map { String($0) } ?? "unavailable") notificationUptime=\(notificationUptime) observedStatus=\(observedStatus) observedUptime=\(observedUptime)"
+                case let .buffer(event):
+                    return "SelectionLatencyBufferAction phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) actionCode=\(event.action.rawValue) reasonCode=\(event.reason.rawValue) operationID=\(event.operationID) actionUptime=\(event.actionUptime) targetIsCurrent=\(event.targetIsCurrent.map { String($0) } ?? "unavailable") finished=\(event.finished.map { String($0) } ?? "unavailable")"
+                }
             case let .videoBatch(batchID, commandMs, copiedPosition, submittedPosition, requested):
                 return "SelectionLatencyVideoBatch phase=\(phase) batchID=\(batchID) commandMs=\(commandMs) copiedPresent=\(copiedPosition != nil) submittedPresent=\(submittedPosition != nil) copiedPosition=\(copiedPosition.map { String($0) } ?? "missing") submittedPosition=\(submittedPosition.map { String($0) } ?? "missing") requested=\(requested)"
             case let .video(name, batchID, commandMs, framePosition, requested):

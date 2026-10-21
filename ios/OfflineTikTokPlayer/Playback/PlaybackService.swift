@@ -23,16 +23,40 @@ final class PlaybackClock {
 
 @MainActor @Observable
 final class PlaybackService: NSObject {
+    enum PlaybackEventDetail: Sendable {
+        // First actor-side policy read; later existing SDK reads can change
+        // before the event name is chosen. This is not an atomic status pair.
+        case timeControl(publishedStatus: Int?, notificationUptime: Double, observedStatus: Int, observedUptime: Double)
+        case buffer(PlaybackBuffer.DiagnosticEvent)
+    }
     struct PlaybackEvent {
         let name: String
         let uptime: Double
         let generation: Int
         let clockPosition: Double
+        let detail: PlaybackEventDetail?
+    }
+    struct PlaybackEventPublicationCost {
+        let count: UInt64
+        let totalNanoseconds: UInt64
+        let maximumNanoseconds: UInt64
+        let saturated: Bool
     }
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
-    @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
+    @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)? {
+        didSet {
+            if onPlaybackEvent == nil { buffer.onDiagnosticEvent = nil }
+            else {
+                buffer.onDiagnosticEvent = { [weak self] event in
+                    self?.recordPlaybackEvent("bufferAction", detail: .buffer(event))
+                }
+            }
+        }
+    }
+    @ObservationIgnored private(set) var playbackEventPublicationCost = PlaybackEventPublicationCost(
+        count: 0, totalNanoseconds: 0, maximumNanoseconds: 0, saturated: false)
     @ObservationIgnored private var firstProgressGeneration: Int?
     @ObservationIgnored private var firstPreservedPresentationGeneration: Int?
     var player: AVQueuePlayer { buffer.player }
@@ -1025,21 +1049,49 @@ final class PlaybackService: NSObject {
         } catch { return nil }
     }
 
-    private func recordPlaybackEvent(_ name: StaticString) {
+    private func recordPlaybackEvent(_ name: StaticString, detail: PlaybackEventDetail? = nil) {
         // Phase recording must not query native player state or allocate an item
         // inventory on the playback path. Resource checks remain separate.
         os_signpost(.event, log: Self.playbackLog, name: name, "generation=%d", generation)
-        onPlaybackEvent?(PlaybackEvent(name: String(describing: name), uptime: ProcessInfo.processInfo.systemUptime,
-            generation: generation, clockPosition: clock.position))
+        guard let observer = onPlaybackEvent else { return }
+        let begin = DispatchTime.now().uptimeNanoseconds
+        observer(PlaybackEvent(name: String(describing: name), uptime: ProcessInfo.processInfo.systemUptime,
+            generation: generation, clockPosition: clock.position, detail: detail))
+        let end = DispatchTime.now().uptimeNanoseconds
+        let elapsed = end >= begin ? end - begin : 0
+        let previous = playbackEventPublicationCost
+        let count = previous.count.addingReportingOverflow(1)
+        let total = previous.totalNanoseconds.addingReportingOverflow(elapsed)
+        // Fixed saturating counters include payload construction and inclusive
+        // observer delivery (including reentrant observer work). They exclude
+        // status/currentItem SDK reads, KVO/task delivery delay, upstream buffer
+        // diagnostic work and the signpost. This is neither total tracing cost
+        // nor CPU time or evidence of the cause of a playback delay.
+        playbackEventPublicationCost = PlaybackEventPublicationCost(
+            count: count.overflow ? .max : count.partialValue,
+            totalNanoseconds: total.overflow ? .max : total.partialValue,
+            maximumNanoseconds: max(previous.maximumNanoseconds, elapsed),
+            saturated: previous.saturated || count.overflow || total.overflow)
     }
 
     private func installObservers() {
-        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
-            Task { @MainActor in
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, change in
+            // The publication may precede actor delivery. Pass only numeric
+            // values across that boundary; never capture a native change object.
+            let publishedStatus = change.newValue?.rawValue
+            let notificationUptime = ProcessInfo.processInfo.systemUptime
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                if self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
+                let observedStatus = self.player.timeControlStatus
+                let observedUptime = ProcessInfo.processInfo.systemUptime
+                if observedStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
                 else if self.player.timeControlStatus == .playing { self.cancelStallRecovery() }
-                self.recordPlaybackEvent(self.player.timeControlStatus == .playing ? "playing" : "waitingOrPaused")
+                // Preserve the original native reads and recovery decisions.
+                // The detail describes the first policy read, which can differ
+                // from the later event-name read during a concurrent transition.
+                self.recordPlaybackEvent(self.player.timeControlStatus == .playing ? "playing" : "waitingOrPaused",
+                    detail: .timeControl(publishedStatus: publishedStatus, notificationUptime: notificationUptime,
+                        observedStatus: observedStatus.rawValue, observedUptime: observedUptime))
             }
         }
         let center = NotificationCenter.default
