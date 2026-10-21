@@ -52,6 +52,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let audio = ContinuousAudioPlayer()
         let tap = ProductionSelectionOutputTap()
         let seeks = ProductionSelectionSeekRecorder()
+        let startup = ProductionVideoStartupTrace(serviceTracing: traceVideoSeeks)
         let service: PlaybackService
         if traceVideoSeeks {
             service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
@@ -60,9 +61,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #if DEBUG
         if traceVideoSeeks {
-            service.onDebugVideoSeekStamp = { [weak seeks] stamp in seeks?.record(stamp) }
+            service.onDebugVideoSeekStamp = { [weak seeks, weak startup] stamp in
+                seeks?.record(stamp); startup?.recordSeek(stamp)
+            }
+            service.onDebugVideoStartupStamp = { [weak startup] stamp in startup?.record(stamp) }
         }
-        defer { if traceVideoSeeks { service.onDebugVideoSeekStamp = nil } }
+        defer {
+            if traceVideoSeeks { service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil }
+        }
         #endif
         let screen = try SelectionVideoScreen(service: service)
         // From here, deletion requires the decoder's queued cleanup acknowledgement.
@@ -89,7 +95,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
             } else { preparedBefore = true }
             let measurement = await measureProductionSelection(service, screen: screen, fixture: fixture,
-                audio: audio, tap: tap, seeks: seeks, phase: phase, id: id,
+                audio: audio, tap: tap, seeks: seeks, startup: startup, phase: phase, id: id,
                 frequency: frequency, prepared: prepared, preparedBefore: preparedBefore) {
                 switch phase {
                 case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -185,9 +191,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         } else {
             #if DEBUG
             XCTAssertNil(service.onDebugVideoSeekStamp, "The default production benchmark must leave the seek observer unset")
+            XCTAssertNil(service.onDebugVideoStartupStamp)
             #endif
             seeks.assertUnused()
         }
+        startup.dumpAndAssert()
     }
 
     private func productionSelectionState(_ service: PlaybackService, fixture: SelectionVideoFixture,
@@ -207,7 +215,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     private func measureProductionSelection(_ service: PlaybackService, screen: SelectionVideoScreen,
         fixture: SelectionVideoFixture, audio: ContinuousAudioPlayer, tap: ProductionSelectionOutputTap,
-        seeks: ProductionSelectionSeekRecorder, phase: Int, id: String, frequency: Double,
+        seeks: ProductionSelectionSeekRecorder, startup: ProductionVideoStartupTrace, phase: Int, id: String, frequency: Double,
         prepared: Bool, preparedBefore: Bool, command: () -> Void) async -> ProductionSelectionMeasurement {
         let first = tap.begin()
         if prepared { try? await Task.sleep(for: .milliseconds(120)) }
@@ -215,6 +223,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let expectedTokenBefore = audio.entry(for: id)?.token ?? 0
         let submitted = service.submittedVideoFrameCount
         seeks.phase = phase
+        startup.phase = phase
         let origin = ProductionSelectionOutputTap.hostSeconds()
         command()
         let commandReturned = ProductionSelectionOutputTap.hostSeconds()
@@ -224,7 +233,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var displayReady: Double?
         var ready: Double?
         let deadline = ProcessInfo.processInfo.systemUptime + (prepared ? 1 : 5)
-        while ProcessInfo.processInfo.systemUptime < deadline {
+        var pollUptime = ProcessInfo.processInfo.systemUptime
+        while pollUptime < deadline {
             while tone == nil, let window = tap.window(at: cursor) {
                 cursor += max(1, Int(window.rate * 0.01))
                 if prepared, outgoing == nil, window.end <= origin,
@@ -237,8 +247,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
             }
             let state = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+            startup.beginPoll()
             if ready == nil, state.selected, state.audio.visit > before.visit,
-               state.submitted > submitted, screen.customVideoLayer?.isReadyForDisplay == true,
+               state.submitted > submitted, startup.observeLayerReady(screen.customVideoLayer?.isReadyForDisplay == true),
                let frame = state.frame, let copied = state.copied,
                frame.isFinite, copied.isFinite, state.requested.isFinite, frame >= 0, copied >= 0,
                abs(frame - state.requested) <= 0.080, abs(copied - frame) <= 0.080 {
@@ -247,16 +258,21 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     ready = ProductionSelectionOutputTap.hostSeconds()
                 }
             }
+            startup.recordPoll(uptime: pollUptime, readyLatched: ready != nil,
+                state: state, beforeVisit: before.visit, beforeSubmitted: submitted)
             if tone != nil && ready != nil { break }
             try? await Task.sleep(for: .milliseconds(5))
+            pollUptime = ProcessInfo.processInfo.systemUptime
         }
         let last = tap.stop()
+        let finalState = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+        startup.finishPhase(state: finalState, beforeVisit: before.visit, beforeSubmitted: submitted)
         return ProductionSelectionMeasurement(phase: phase, prepared: prepared, preparedBefore: preparedBefore,
             frequency: frequency, first: first, last: last, origin: origin,
             commandReturnHostSeconds: commandReturned, outgoing: outgoing, tone: tone,
             displayReady: displayReady, ready: ready, before: before,
             expectedTokenBefore: expectedTokenBefore, beforeSubmitted: submitted,
-            state: productionSelectionState(service, fixture: fixture, audio: audio, id: id))
+            state: finalState)
     }
 
     private func assertProductionSelection(_ value: ProductionSelectionMeasurement, tap: ProductionSelectionOutputTap) {
@@ -1710,6 +1726,97 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             do { try await Task.sleep(for: .milliseconds(10)) } catch { return false }
         }
         return condition()
+    }
+}
+
+/// Both benchmarks retain three predicate summaries; only the existing traced
+/// benchmark receives up to 32 default-off DEBUG service stamps. Main actor only.
+@MainActor
+private final class ProductionVideoStartupTrace {
+    struct Poll { let uptime: Double; let readyLatched: Bool; let mask: UInt16; let evaluated: UInt16 }
+    let serviceTracing: Bool
+    var phase = 0
+    private var layerReady: Bool?
+    private var lastPolls = [Poll?](repeating: nil, count: 3)
+    private var finalMasks = [UInt16?](repeating: nil, count: 3)
+    private var badPhase = false
+    #if DEBUG
+    private enum Event {
+        case startup(Int, PlaybackService.DebugVideoStartupStamp)
+        case seek(Int, UInt64, PlaybackService.DebugVideoSeekStamp)
+    }
+    private var events: [Event] = []
+    private var dropped = 0, overflow = false
+    #endif
+    init(serviceTracing: Bool) {
+        self.serviceTracing = serviceTracing
+        #if DEBUG
+        if serviceTracing { events.reserveCapacity(32) }
+        #endif
+    }
+    func beginPoll() { layerReady = nil }
+    func observeLayerReady(_ value: Bool) -> Bool { layerReady = value; return value }
+    private func predicates(_ state: ProductionSelectionState, beforeVisit: Int64, beforeSubmitted: UInt64) -> UInt16 {
+        var result: UInt16 = 0
+        if state.selected { result |= 1 << 0 }
+        if state.audio.visit > beforeVisit { result |= 1 << 1 }
+        if state.submitted > beforeSubmitted { result |= 1 << 2 }
+        if layerReady == true { result |= 1 << 3 }
+        if let frame = state.frame, let copied = state.copied,
+           frame.isFinite, copied.isFinite, state.requested.isFinite, frame >= 0, copied >= 0 {
+            result |= 1 << 4
+            if abs(frame - state.requested) <= 0.080 { result |= 1 << 5 }
+            if abs(copied - frame) <= 0.080 { result |= 1 << 6 }
+        }
+        if state.videoReady { result |= 1 << 7 }
+        if !state.loading { result |= 1 << 8 }
+        return result
+    }
+    func recordPoll(uptime: Double, readyLatched: Bool, state: ProductionSelectionState,
+                    beforeVisit: Int64, beforeSubmitted: UInt64) {
+        guard (0..<3).contains(phase) else { badPhase = true; return }
+        lastPolls[phase] = Poll(uptime: uptime, readyLatched: readyLatched,
+            mask: predicates(state, beforeVisit: beforeVisit, beforeSubmitted: beforeSubmitted),
+            evaluated: layerReady == nil ? 503 : 511)
+    }
+    func finishPhase(state: ProductionSelectionState, beforeVisit: Int64, beforeSubmitted: UInt64) {
+        guard (0..<3).contains(phase) else { badPhase = true; return }
+        layerReady = nil // No second custom-layer query at the terminal snapshot.
+        finalMasks[phase] = predicates(state, beforeVisit: beforeVisit, beforeSubmitted: beforeSubmitted)
+    }
+    #if DEBUG
+    private func append(_ event: Event) {
+        guard serviceTracing, events.count < 32 else {
+            if dropped < Int.max { dropped += 1 } else { overflow = true }
+            return
+        }
+        events.append(event)
+    }
+    func record(_ stamp: PlaybackService.DebugVideoStartupStamp) { append(.startup(phase, stamp)) }
+    func recordSeek(_ stamp: PlaybackService.DebugVideoSeekStamp) {
+        guard serviceTracing else { return }
+        append(.seek(phase, DispatchTime.now().uptimeNanoseconds, stamp))
+    }
+    #endif
+    func dumpAndAssert() {
+        for phase in 0..<3 {
+            if let poll = lastPolls[phase] {
+                print("ProductionSelectionReadyPredicates schema=1 phase=\(phase) lastPollEntryUptime=\(poll.uptime) readyLatched=\(poll.readyLatched) lastPollMask=\(poll.mask) lastPollEvaluatedMask=\(poll.evaluated) terminalMask=\(finalMasks[phase].map { String($0) } ?? "unknown") terminalEvaluatedMask=503 allTrueMask=511 serviceTracing=\(serviceTracing)")
+            }
+        }
+        XCTAssertFalse(badPhase)
+        #if DEBUG
+        print("ProductionSelectionStartupSummary schema=1 enabled=\(serviceTracing) events=\(events.count) capacity=32 dropped=\(dropped) overflow=\(overflow)")
+        for (ordinal, event) in events.enumerated() {
+            switch event {
+            case .startup(let phase, let s):
+                print("ProductionSelectionStartup schema=1 ordinal=\(ordinal) phase=\(phase) kind=\(s.kind.rawValue) request=\(s.request) entryGeneration=\(s.entryGeneration) returnGeneration=\(s.returnGeneration) entryNs=\(s.entryNs) returnNs=\(s.returnNs) presentationRequest=\(s.presentationRequest.map { String($0) } ?? "unknown") presentationUnchanged=\(s.presentationUnchanged) token=\(s.audioToken) visit=\(s.audioVisit) readyGeneration=\(s.readyGeneration.map { String($0) } ?? "unknown") entryVideoReady=\(s.entryVideoReady) returnVideoReady=\(s.returnVideoReady) entryLoading=\(s.entryLoading) returnLoading=\(s.returnLoading) timelineInstalled=\(s.timelineInstalled) anchorHostSeconds=\(s.anchorHostSeconds.map { String($0) } ?? "unknown") anchorPosition=\(s.anchorPosition.map { String($0) } ?? "unknown")")
+            case .seek(let phase, let seenNs, let s):
+                print("ProductionSelectionStartupSeekOrder schema=1 ordinal=\(ordinal) phase=\(phase) observedNs=\(seenNs) reason=\(s.reason.rawValue) request=\(s.request) generation=\(s.generation) nativeSeekTicket=\(s.nativeSeekTicket) force=\(s.force)")
+            }
+        }
+        XCTAssertEqual(dropped, 0); XCTAssertFalse(overflow)
+        #endif
     }
 }
 

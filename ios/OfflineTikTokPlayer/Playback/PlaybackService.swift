@@ -86,6 +86,39 @@ final class PlaybackService: NSObject {
     }
     @ObservationIgnored var onDebugVideoSeekStamp: ((DebugVideoSeekStamp) -> Void)?
     @ObservationIgnored private var debugVideoSeekReason: DebugVideoSeekReason = .unattributed
+    enum DebugVideoStartupKind: Int, Sendable {
+        case itemReadyEvent = 0, setRate = 1, playImmediately = 2, startSkipped = 3, firstFrameEvent = 4, readyAccepted = 5
+    }
+    struct DebugVideoStartupStamp: Sendable {
+        let kind: DebugVideoStartupKind
+        let request: Int, entryGeneration: Int, returnGeneration: Int
+        let entryNs: UInt64, returnNs: UInt64
+        let presentationRequest: Int?, presentationUnchanged: Bool
+        let audioToken: Int, audioVisit: Int64, readyGeneration: Int?
+        let entryVideoReady: Bool, returnVideoReady: Bool, entryLoading: Bool, returnLoading: Bool
+        let timelineInstalled: Bool, anchorHostSeconds: Double?, anchorPosition: Double?
+    }
+    @ObservationIgnored var onDebugVideoStartupStamp: ((DebugVideoStartupStamp) -> Void)?
+    private func debugTraceVideoStartup(_ kind: DebugVideoStartupKind, request: Int,
+        installed: Bool = false, anchorHostSeconds: Double? = nil, anchorPosition: Double? = nil,
+        _ operation: () -> Void) {
+        guard let observer = onDebugVideoStartupStamp else { operation(); return }
+        let entryGeneration = generation, presentation = videoPresentation
+        let token = audioToken, visit = audioVisit, ready = readyGeneration
+        let videoReady = isVideoReady, loading = isLoading
+        let entered = DispatchTime.now().uptimeNanoseconds
+        operation()
+        let returned = DispatchTime.now().uptimeNanoseconds
+        observer(DebugVideoStartupStamp(kind: kind, request: request,
+            entryGeneration: entryGeneration, returnGeneration: generation, entryNs: entered, returnNs: returned,
+            presentationRequest: presentation?.request,
+            presentationUnchanged: presentation != nil && presentation?.request == videoPresentation?.request
+                && presentation?.ticket == videoPresentation?.ticket,
+            audioToken: token, audioVisit: visit, readyGeneration: ready,
+            entryVideoReady: videoReady, returnVideoReady: isVideoReady,
+            entryLoading: loading, returnLoading: isLoading, timelineInstalled: installed,
+            anchorHostSeconds: anchorHostSeconds, anchorPosition: anchorPosition))
+    }
     struct DebugInitialVideoReadyState: Sendable {
         let audioVisit: Int64
         let readyGeneration: Int?
@@ -647,6 +680,9 @@ final class PlaybackService: NSObject {
                               self.readyGeneration != request else { return }
                     }
                     #endif
+                    #if DEBUG
+                    self.debugTraceVideoStartup(.readyAccepted, request: request) {}
+                    #endif
                     if let owner = self.pendingInitialZeroStart, owner.request == request,
                        self.currentVideoPresentation(for: playerItem, request: request) == owner.ticket {
                         self.pendingInitialZeroStart = nil
@@ -655,7 +691,11 @@ final class PlaybackService: NSObject {
                     self.refreshAudioProcessing()
                     self.clock.updateDuration(playerItem.duration.seconds)
                     self.isLoading = false
+                    #if DEBUG
+                    self.debugTraceVideoStartup(.itemReadyEvent, request: request) { self.recordPlaybackEvent("itemReady") }
+                    #else
                     self.recordPlaybackEvent("itemReady")
+                    #endif
                     // A new or prebuffered item is already at zero; an exact zero seek discards that benefit.
                     if position > 0 || rewind {
                         // Audio already owns its position. Readiness of a reused
@@ -680,11 +720,29 @@ final class PlaybackService: NSObject {
                         if self.intent.canPlay, self.videoAllowed {
                             if installed, let ticket, let anchor = playbackAnchor,
                                self.currentVideoPresentation(for: playerItem, request: request) == ticket {
+                                #if DEBUG
+                                self.debugTraceVideoStartup(.setRate, request: request, installed: installed,
+                                    anchorHostSeconds: anchor.host.seconds, anchorPosition: anchor.position) {
+                                    self.player.setRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
+                                                        atHostTime: anchor.host)
+                                }
+                                #else
                                 self.player.setRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
                                                     atHostTime: anchor.host)
+                                #endif
                             } else {
+                                #if DEBUG
+                                self.debugTraceVideoStartup(.playImmediately, request: request, installed: installed) {
+                                    self.player.playImmediately(atRate: 1)
+                                }
+                                #else
                                 self.player.playImmediately(atRate: 1)
+                                #endif
                             }
+                        } else {
+                            #if DEBUG
+                            self.debugTraceVideoStartup(.startSkipped, request: request, installed: installed) {}
+                            #endif
                         }
                         if installed, let ticket,
                            self.currentVideoPresentation(for: playerItem, request: request) == ticket {
@@ -703,8 +761,15 @@ final class PlaybackService: NSObject {
     private func monitorFirstFrame(_ playerItem: AVPlayerItem, request: Int) {
         frameMonitor.start(item: playerItem, layer: surface.playerLayer) { [weak self, weak playerItem] in
             guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
+            #if DEBUG
+            self.debugTraceVideoStartup(.firstFrameEvent, request: request) {
+                self.isVideoReady = true
+                self.recordPlaybackEvent("firstFrame")
+            }
+            #else
             self.isVideoReady = true
             self.recordPlaybackEvent("firstFrame")
+            #endif
         }
     }
 
