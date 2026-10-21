@@ -65,3 +65,19 @@ public struct PlaybackScrub: Sendable {
         return self.mediaID == mediaID ? position : nil
     }
 }
+
+public extension PlaybackTimeline {
+    /// A native position query can block while audio continues. Compare against
+    /// the audio goal sampled after it returns, within the same owned visit.
+    /// Forced paused/restored corrections never invoke the native query.
+    static func videoCorrectionTarget(force: Bool, readVideoPosition: () -> Double,
+                                      readAudioPosition: () -> Double,
+                                      isCurrent: () -> Bool) -> Double? {
+        guard isCurrent() else { return nil }
+        let nativePosition = force ? nil : readVideoPosition()
+        guard isCurrent() else { return nil }
+        let position = readAudioPosition()
+        guard isCurrent(), force || abs(nativePosition! - position) > 0.080 else { return nil }
+        return position
+    }
+}

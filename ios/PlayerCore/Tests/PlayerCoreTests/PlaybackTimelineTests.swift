@@ -66,4 +66,86 @@ final class PlaybackTimelineTests: XCTestCase {
         scrub.begin(mediaID: "second", position: 0)
         XCTAssertEqual(scrub.finish(mediaID: "second"), 0)
     }
+
+    func testVideoCorrectionTargetsAudioAfterTheNativeReadReturns() throws {
+        var audio = 0.8939155833357972
+        var nativeReads = 0
+        let target = PlaybackTimeline.videoCorrectionTarget(force: false, readVideoPosition: {
+            nativeReads += 1
+            audio = 1.344 // Audio progressed while the opaque native read was in flight.
+            return 1.0
+        }, readAudioPosition: { audio }, isCurrent: { true })
+        XCTAssertEqual(try XCTUnwrap(target), 1.344, accuracy: 0.5 / 48_000)
+        XCTAssertEqual(nativeReads, 1)
+    }
+
+    func testVideoCorrectionDoesNotSeekFromAnAgedFalsePositive() {
+        var audio = 0.9
+        var nativeReads = 0
+        let target = PlaybackTimeline.videoCorrectionTarget(force: false, readVideoPosition: {
+            nativeReads += 1
+            audio = 1.0
+            return 1.0
+        }, readAudioPosition: { audio }, isCurrent: { true })
+        XCTAssertNil(target)
+        XCTAssertEqual(nativeReads, 1)
+    }
+
+    func testForcedPausedVideoCorrectionUsesTheLatestTargetWithoutANativeRead() throws {
+        var pendingAudioTarget = 0.75
+        var nativeReads = 0
+        let target = PlaybackTimeline.videoCorrectionTarget(force: true, readVideoPosition: {
+            nativeReads += 1
+            XCTFail("A forced paused/restored correction must not query native position")
+            return 0
+        }, readAudioPosition: {
+            pendingAudioTarget = 2.25
+            return pendingAudioTarget
+        }, isCurrent: { true })
+        XCTAssertEqual(try XCTUnwrap(target), 2.25)
+        XCTAssertEqual(nativeReads, 0)
+    }
+
+    func testVideoCorrectionRejectsOwnersChangedDuringEitherPositionRead() {
+        var owner = 1
+        var audioReads = 0
+        var nativeReads = 0
+        let alreadyChanged = PlaybackTimeline.videoCorrectionTarget(force: false,
+            readVideoPosition: {
+                nativeReads += 1
+                return 1.0
+            }, readAudioPosition: {
+                audioReads += 1
+                return 0.9
+            }, isCurrent: { false })
+        XCTAssertNil(alreadyChanged)
+        XCTAssertEqual(nativeReads, 0)
+        XCTAssertEqual(audioReads, 0)
+
+        let afterVideo = PlaybackTimeline.videoCorrectionTarget(force: false, readVideoPosition: {
+            owner = 2
+            return 1.0
+        }, readAudioPosition: {
+            audioReads += 1
+            return 0.9
+        }, isCurrent: { owner == 1 })
+        XCTAssertNil(afterVideo)
+        XCTAssertEqual(audioReads, 0)
+
+        owner = 1
+        let afterAudio = PlaybackTimeline.videoCorrectionTarget(force: false,
+            readVideoPosition: { 1.0 }, readAudioPosition: {
+                owner = 2
+                return 1.5
+            }, isCurrent: { owner == 1 })
+        XCTAssertNil(afterAudio)
+    }
+
+    func testVideoCorrectionRetainsTheExistingDriftThresholdAndFallback() throws {
+        XCTAssertNil(PlaybackTimeline.videoCorrectionTarget(force: false,
+            readVideoPosition: { 1.04 }, readAudioPosition: { 1.0 }, isCurrent: { true }))
+        let drift = PlaybackTimeline.videoCorrectionTarget(force: false,
+            readVideoPosition: { 1.16 }, readAudioPosition: { 1.0 }, isCurrent: { true })
+        XCTAssertEqual(try XCTUnwrap(drift), 1.0)
+    }
 }

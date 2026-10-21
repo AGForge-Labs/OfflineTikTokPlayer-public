@@ -1104,17 +1104,23 @@ final class PlaybackService: NSObject {
         #endif
         guard videoAllowed, continuousAudio.isSelected, audioLoadingID == nil, syncingVideoGeneration != generation,
               let item = player.currentItem, item.status == .readyToPlay else { return }
-        let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
-        let position = continuousAudio.presentationPosition(at: hostTime)
+        let request = generation
+        let selectedID = continuousAudio.selectedID
+        let presentation = videoPresentation
+        let visit = continuousAudio.snapshot
+        let expectedToken = selectedID.flatMap { continuousAudio.entry(for: $0)?.token }
+        let initialSelectionPending = continuousAudio.isSelectionPending(in: visit)
+        let canPlay = intent.canPlay
+        var currentItemAfterRead = true
         #if DEBUG
-        let ordinaryDriftVideoPositionSeconds: Double?
+        var ordinaryDriftVideoPositionSeconds: Double? = nil
         var ordinaryDriftReadEntryNs: UInt64? = nil
         var ordinaryDriftReadReturnNs: UInt64? = nil
-        if force {
-            ordinaryDriftVideoPositionSeconds = nil
-        } else {
+        #endif
+        guard let position = PlaybackTimeline.videoCorrectionTarget(force: force, readVideoPosition: {
             let sampledPosition: Double
-            if onDebugVideoSeekStamp != nil {
+            #if DEBUG
+            if self.onDebugVideoSeekStamp != nil {
                 ordinaryDriftReadEntryNs = DispatchTime.now().uptimeNanoseconds
                 sampledPosition = item.currentTime().seconds
                 ordinaryDriftReadReturnNs = DispatchTime.now().uptimeNanoseconds
@@ -1122,12 +1128,38 @@ final class PlaybackService: NSObject {
                 sampledPosition = item.currentTime().seconds
             }
             ordinaryDriftVideoPositionSeconds = sampledPosition
-            guard abs(sampledPosition - position) > 0.080 else { return }
-        }
-        #else
-        guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
-        #endif
-        let request = generation
+            #else
+            sampledPosition = item.currentTime().seconds
+            #endif
+            // Revalidate the SDK-owned queue before taking the fresh audio goal.
+            // No SDK item/position query follows that goal in this decision.
+            currentItemAfterRead = self.player.currentItem === item
+            return sampledPosition
+        }, readAudioPosition: {
+            let host = CMClockGetTime(CMClockGetHostTimeClock())
+            return self.continuousAudio.presentationPosition(at: host)
+        }, isCurrent: {
+            guard currentItemAfterRead, self.generation == request,
+                  self.observedItem === item, self.videoAllowed,
+                  self.audioLoadingID == nil, self.syncingVideoGeneration != request,
+                  self.continuousAudio.isSelected, selectedID != nil,
+                  self.continuousAudio.selectedID == selectedID, self.queue.currentID == selectedID,
+                  self.videoPresentation?.request == presentation?.request,
+                  self.videoPresentation?.ticket == presentation?.ticket,
+                  self.intent.canPlay == canPlay else { return false }
+            // A forced pending seek may legitimately be acknowledged by audio
+            // here. It uses the latest pending target and still skips native read.
+            if force { return true }
+            // A natural boundary can already have changed the render visit
+            // before this decision begins, ahead of the service's queued poll.
+            // An unacknowledged explicit selection still owns its pending goal.
+            if !initialSelectionPending {
+                guard let expectedToken, expectedToken > 0, visit.token == expectedToken else { return false }
+            }
+            let current = self.continuousAudio.snapshot
+            return current.token == visit.token && current.visit == visit.visit
+                && current.selectionVersion == visit.selectionVersion
+        }) else { return }
         syncingVideoGeneration = request
         let videoSeek = continuousPiP.beginSeek()
         #if DEBUG
