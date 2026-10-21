@@ -7,6 +7,194 @@ import Synchronization
 final class ContinuousAudioPlayerTests: XCTestCase {
     func testCancelledCoalescedPreparationCallersReleaseWhileLegitimateNativeReadIsHeld() async throws {
         #if DEBUG
+        try await assertSharedPreparationCancellation(creatorIsCancelled: false)
+        #else
+        XCTFail("This native cancellation control requires DEBUG gate seams")
+        #endif
+    }
+
+    func testCancelledPreparationCreatorReleasesWhileLegitimateCoalescedNativeReadIsHeld() async throws {
+        #if DEBUG
+        try await assertSharedPreparationCancellation(creatorIsCancelled: true)
+        #else
+        XCTFail("This native cancellation control requires DEBUG gate seams")
+        #endif
+    }
+
+    func testSameIDSlotWaitersCoalesceAfterTwoNeighbourSlotsAreReleased() async throws {
+        #if DEBUG
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var nativePreparationStarted = false
+        defer { if !nativePreparationStarted { try? FileManager.default.removeItem(at: directory) } }
+        let ids = ["a", "b", "c", "d"]
+        let urls = ids.map { directory.appendingPathComponent("slot-\($0).caf") }
+        let expected = (0..<257).flatMap { frame -> [Float] in
+            let value = Float((frame % 127) - 63) / 128
+            return [value, -value]
+        }
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2))
+        for index in 0..<4 {
+            let file = try AVAudioFile(forWriting: urls[index], settings: format.settings)
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 257))
+            buffer.frameLength = 257
+            let scale: Float = index == 3 ? 1 : Float(index + 1) / 8
+            for frame in 0..<257 {
+                buffer.floatChannelData![0][frame] = expected[frame * 2] * scale
+                buffer.floatChannelData![1][frame] = expected[frame * 2 + 1] * scale
+            }
+            try file.write(from: buffer)
+        }
+        let audio = ContinuousAudioPlayer()
+        let gate = ContinuousPCMDecoder.DebugNativeReadGate()
+        let run = CAPBusySlotRun()
+        let closed = Mutex<Bool?>(nil)
+        let memory = audio.renderer.retainedPCMMemoryBytes
+        var jobs = [Task<Void, Never>]()
+        var cleanupRequested = false
+        func makeCaller(_ index: Int, id: String, url: URL) -> Task<Void, Never> {
+            Task { @MainActor in
+                do { run.entries[index] = try await audio.prepare(id: id, url: url, currentPriority: false) }
+                catch { run.failed[index] = true }
+                run.finished[index] = true
+            }
+        }
+        defer {
+            gate.release(); jobs.forEach { $0.cancel() }
+            audio.suspend(); audio.graph.engine.stop()
+            if !cleanupRequested { audio.debugShutdown { _ in } }
+        }
+        var setupError: Error?
+        var slotWaitVerified = false, trimVerified = false, exactSamplesVerified = false
+        var expectedDToken = 0, heldActive = -1, heldShared = -1, heldReserved = -1, heldNextToken = -1
+        var bothPendingWhileHeld = false
+        do {
+            audio.setWindow(Set(ids))
+            for index in 0..<3 {
+                nativePreparationStarted = true
+                jobs.append(makeCaller(index, id: ids[index], url: urls[index]))
+                let ready = await Self.capCancellationWait(.seconds(2)) { run.finished[index] }
+                guard ready, !run.failed[index], let entry = run.entries[index],
+                      entry.id == ids[index], entry.frames == 257 else {
+                    XCTFail("Initial three real preparations must complete before the slot-wait control")
+                    throw CAPCancellationSetupError.invalidSetup
+                }
+            }
+            let a = try XCTUnwrap(run.entries[0])
+            guard Set(run.entries.prefix(3).compactMap { $0?.slot }).count == 3,
+                  audio.preparedCount == 3, audio.select(id: "a") else {
+                XCTFail("Three distinct cached slots and a selected A are required")
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            // Consume A's selection while paused: no engine, head consumption,
+            // source samples, or real-time pacing is needed to pin its slot.
+            audio.renderer.setPlaying(false)
+            var paused = [Float](repeating: .nan, count: 2)
+            paused.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 1) }
+            let active = audio.snapshot, idle = audio.debugPreparationState
+            guard active.token == a.token, active.frame == 0, !active.ended,
+                  active.underrunFrames == 0, !audio.isSelectionPending(in: active),
+                  paused.allSatisfy({ $0 == 0 }), idle.activeCalls == 0,
+                  idle.sharedTasks == 0, idle.reservedSlots == 0, !idle.counterOverflowed else {
+                XCTFail("Paused A must actually own the renderer before releasing neighbours")
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            expectedDToken = idle.nextToken
+            guard expectedDToken > 0, expectedDToken < Int.max, gate.arm(token: expectedDToken) else {
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            audio.debugSetNativeReadGate(gate)
+            jobs.append(makeCaller(3, id: "d", url: urls[3]))
+            jobs.append(makeCaller(4, id: "d", url: urls[3]))
+            slotWaitVerified = await Self.capCancellationWait(.seconds(1)) {
+                let state = audio.debugPreparationState
+                return state.activeCalls == 2 && state.sharedTasks == 0 && state.reservedSlots == 0
+                    && state.nextToken == expectedDToken && !state.counterOverflowed
+                    && audio.preparedCount == 3 && audio.entry(for: "d") == nil
+                    && !run.finished[3] && !run.finished[4] && !gate.didEnter
+            }
+            guard slotWaitVerified else {
+                XCTFail("Both actual D calls must wait with three cached slots, zero shared jobs and zero reservations")
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            // The test only resumes after both calls have suspended. Neither
+            // can reserve a slot while the main actor synchronously trims B/C.
+            audio.setWindow(["a", "d"])
+            let trimmed = audio.debugPreparationState
+            trimVerified = audio.preparedCount == 1 && audio.entry(for: "a")?.token == a.token
+                && audio.entry(for: "b") == nil && audio.entry(for: "c") == nil
+                && audio.snapshot.token == a.token && trimmed.activeCalls == 2
+                && trimmed.sharedTasks == 0 && trimmed.reservedSlots == 0
+                && trimmed.nextToken == expectedDToken && !trimmed.counterOverflowed
+            guard trimVerified else {
+                XCTFail("Only B/C must retire, freeing two logical slots while A remains active")
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            let entered = await Self.capCancellationWait(.seconds(2)) { gate.isHolding }
+            guard entered, !gate.didTimeOut else {
+                XCTFail("The first D job must reach its real controlled native-read boundary")
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            let held = audio.debugPreparationState
+            heldActive = held.activeCalls; heldShared = held.sharedTasks
+            heldReserved = held.reservedSlots; heldNextToken = held.nextToken
+            bothPendingWhileHeld = !run.finished[3] && !run.finished[4]
+            XCTAssertTrue(gate.isHolding && !gate.didTimeOut)
+            XCTAssertTrue(heldActive == 2 && heldShared == 1 && heldReserved == 1
+                && heldNextToken == expectedDToken + 1 && bothPendingWhileHeld && !held.counterOverflowed,
+                "Slot waiters must recheck/coalesce into exactly one held D job and reservation")
+            gate.release()
+            let returned = await Self.capCancellationWait(.seconds(2)) { run.finished[3] && run.finished[4] }
+            guard returned, !run.failed[3], !run.failed[4],
+                  let first = run.entries[3], let second = run.entries[4] else {
+                XCTFail("Both D callers must receive the actual prepared source after release")
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            XCTAssertEqual(first.id, "d"); XCTAssertEqual(second.id, "d")
+            XCTAssertEqual(first.token, expectedDToken); XCTAssertEqual(second.token, expectedDToken)
+            XCTAssertEqual(first.slot, second.slot); XCTAssertEqual(first.frames, 257); XCTAssertEqual(second.frames, 257)
+            let final = audio.debugPreparationState
+            XCTAssertEqual(final.nextToken, expectedDToken + 1, "A later slot waiter must not allocate a second job")
+            XCTAssertEqual(final.activeCalls, 0); XCTAssertEqual(final.sharedTasks, 0); XCTAssertEqual(final.reservedSlots, 0)
+            XCTAssertEqual(audio.entry(for: "d")?.token, expectedDToken, "Both finalizers must leave the one D cache entry intact")
+            XCTAssertEqual(audio.preparedCount, 2)
+            XCTAssertTrue(audio.select(id: "d"))
+            audio.renderer.setPlaying(true)
+            var rendered = [Float](repeating: .nan, count: expected.count)
+            rendered.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 257) }
+            XCTAssertEqual(rendered, expected); XCTAssertTrue(rendered.contains { abs($0) > 0.01 })
+            XCTAssertEqual(audio.snapshot.token, expectedDToken); XCTAssertEqual(audio.snapshot.underrunFrames, 0)
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, memory); XCTAssertFalse(gate.didTimeOut)
+            exactSamplesVerified = rendered == expected && audio.snapshot.token == expectedDToken
+                && audio.snapshot.underrunFrames == 0
+        } catch { setupError = error }
+
+        gate.release(); jobs.forEach { $0.cancel() }
+        audio.suspend(); audio.graph.engine.stop(); cleanupRequested = true
+        audio.debugShutdown { acknowledged in closed.withLock { $0 = acknowledged } }
+        let acknowledged = await Self.capCancellationWait(.seconds(3)) { closed.withLock { $0 } != nil }
+        XCTAssertTrue(acknowledged && closed.withLock { $0 } == true, "Native lane close must precede fixture deletion")
+        let settled = await Self.capCancellationWait(.seconds(1)) {
+            let state = audio.debugPreparationState
+            return run.finished.prefix(jobs.count).allSatisfy({ $0 }) && state.activeCalls == 0
+                && state.sharedTasks == 0 && state.reservedSlots == 0 && !state.counterOverflowed
+        }
+        XCTAssertTrue(settled, "All launched caller/metadata/shared work must settle before fixture deletion")
+        if closed.withLock({ $0 }) == true, settled { try FileManager.default.removeItem(at: directory) }
+        print("CAP_BUSY_SLOT_COALESCING slotWaitVerified=\(slotWaitVerified) trimVerified=\(trimVerified) expectedDToken=\(expectedDToken) heldActive=\(heldActive) heldShared=\(heldShared) heldReserved=\(heldReserved) heldNextToken=\(heldNextToken) bothPendingWhileHeld=\(bothPendingWhileHeld) returnedToken0=\(run.entries[3]?.token ?? 0) returnedToken1=\(run.entries[4]?.token ?? 0) finalCachedToken=\(audio.entry(for: "d")?.token ?? 0) finalNextToken=\(audio.debugPreparationState.nextToken) exactSamplesVerified=\(exactSamplesVerified) nativeCloseAcknowledged=\(closed.withLock { $0 } == true) callersSettled=\(settled) gateTimedOut=\(gate.didTimeOut) maximumCallerTasks=5 gateMaximumSeconds=5 retainedPCMBytes=\(memory) sdkRSS=unmeasured latencyFix=false")
+        if let setupError { throw setupError }
+        #else
+        XCTFail("This native slot-wait control requires DEBUG gate seams")
+        #endif
+    }
+
+    #if DEBUG
+    @MainActor private final class CAPBusySlotRun {
+        var entries = [ContinuousAudioPlayer.Entry?](repeating: nil, count: 5)
+        var finished = [Bool](repeating: false, count: 5)
+        var failed = [Bool](repeating: false, count: 5)
+    }
+    private func assertSharedPreparationCancellation(creatorIsCancelled: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var nativePreparationStarted = false
@@ -33,6 +221,34 @@ final class ContinuousAudioPlayerTests: XCTestCase {
         let closed = Mutex<Bool?>(nil)
         var legitimate: Task<Void, Never>?
         var callers = [Task<Void, Never>]()
+        func makeLegitimateCaller() -> Task<Void, Never> {
+            Task { @MainActor in
+                do { run.legitimateEntry = try await audio.prepare(id: "b", url: url) }
+                catch { run.legitimateFailed = true }
+                run.legitimateFinished = true
+            }
+        }
+        func makeCancelledCaller(_ index: Int) -> Task<Void, Never> {
+            Task { @MainActor in
+                let witness = CAPPreparationWitness()
+                run.witnesses[index].value = witness
+                run.entered += 1
+                defer {
+                    // This task-local reference is deliberately live across
+                    // the real prepare await, and is never owned by run.
+                    withExtendedLifetime(witness) {}
+                    run.finished += 1
+                }
+                do {
+                    _ = try await audio.prepare(id: "b", url: url)
+                    run.returnedEntry += 1
+                } catch {
+                    if error is CancellationError || (error as? ContinuousPCMDecoder.Failure) == .cancelled {
+                        run.cancelled += 1
+                    } else { run.otherErrors += 1 }
+                }
+            }
+        }
         var cleanupRequested = false
         defer {
             gate.release(); legitimate?.cancel(); callers.forEach { $0.cancel() }
@@ -45,6 +261,7 @@ final class ContinuousAudioPlayerTests: XCTestCase {
         }
         var setupError: Error?
         var coalescedSetupVerified = false, exactSamplesVerified = false
+        var firstCallerRoleVerified = false, legitimateJoinedSecond = false
         var heldFinished = -1, heldCancelled = -1, heldLiveWitnesses = -1, heldActiveCalls = -1
         let token = audio.debugPreparationState.nextToken
         do {
@@ -54,11 +271,8 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             guard gate.arm(token: token) else { throw CAPCancellationSetupError.invalidSetup }
             audio.debugSetNativeReadGate(gate)
             nativePreparationStarted = true
-            legitimate = Task {
-                do { run.legitimateEntry = try await audio.prepare(id: "b", url: url) }
-                catch { run.legitimateFailed = true }
-                run.legitimateFinished = true
-            }
+            if creatorIsCancelled { callers.append(makeCancelledCaller(0)) }
+            else { legitimate = makeLegitimateCaller() }
             let entered = await Self.capCancellationWait(.seconds(2)) { gate.isHolding }
             let initial = audio.debugPreparationState
             guard entered, !gate.didTimeOut, initial.activeCalls == 1,
@@ -68,26 +282,33 @@ final class ContinuousAudioPlayerTests: XCTestCase {
                 XCTFail("Setup must hold B's first real native read before any prefix publication")
                 throw CAPCancellationSetupError.invalidSetup
             }
-            for index in 0..<8 {
-                callers.append(Task {
-                    let witness = CAPPreparationWitness()
-                    run.witnesses[index].value = witness
-                    run.entered += 1
-                    defer {
-                        // This task-local reference is deliberately live across
-                        // the real prepare await, and is never owned by run.
-                        withExtendedLifetime(witness) {}
-                        run.finished += 1
-                    }
-                    do {
-                        _ = try await audio.prepare(id: "b", url: url)
-                        run.returnedEntry += 1
-                    } catch {
-                        if error is CancellationError || (error as? ContinuousPCMDecoder.Failure) == .cancelled {
-                            run.cancelled += 1
-                        } else { run.otherErrors += 1 }
-                    }
-                })
+            // No second task exists before this real native hold/one-call
+            // checkpoint, so the first task's creator role is established.
+            firstCallerRoleVerified = creatorIsCancelled
+                ? callers.count == 1 && legitimate == nil && run.entered == 1 && run.liveWitnesses == 1
+                : callers.isEmpty && legitimate != nil && run.entered == 0 && run.liveWitnesses == 0
+            guard firstCallerRoleVerified else {
+                XCTFail("The first held CAP caller must have the scenario's actual creator role")
+                throw CAPCancellationSetupError.invalidSetup
+            }
+            if creatorIsCancelled {
+                legitimate = makeLegitimateCaller()
+                let joined = await Self.capCancellationWait(.seconds(1)) {
+                    audio.debugPreparationState.activeCalls == 2
+                }
+                let joinedState = audio.debugPreparationState
+                guard joined, gate.isHolding, !gate.didTimeOut,
+                      joinedState.sharedTasks == 1, joinedState.reservedSlots == 1,
+                      !joinedState.counterOverflowed, !run.legitimateFinished,
+                      run.entered == 1, run.liveWitnesses == 1, run.finished == 0 else {
+                    XCTFail("Legitimate caller must join the held creator before the remaining seven callers exist")
+                    throw CAPCancellationSetupError.invalidSetup
+                }
+                legitimateJoinedSecond = true
+            }
+            let firstCoalescedIndex = creatorIsCancelled ? 1 : 0
+            for index in firstCoalescedIndex..<8 {
+                callers.append(makeCancelledCaller(index))
             }
             let registered = await Self.capCancellationWait(.seconds(1)) {
                 run.entered == 8 && run.liveWitnesses == 8 && audio.debugPreparationState.activeCalls == 9
@@ -96,7 +317,7 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             guard registered, gate.isHolding, !gate.didTimeOut,
                   registeredState.sharedTasks == 1, registeredState.reservedSlots == 1,
                   !registeredState.counterOverflowed else {
-                XCTFail("All eight additional callers must actually enter the same held preparation")
+                XCTFail("All eight cancellation-target callers must actually enter the same held preparation")
                 throw CAPCancellationSetupError.invalidSetup
             }
             coalescedSetupVerified = true
@@ -112,7 +333,7 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             heldLiveWitnesses = run.liveWitnesses; heldActiveCalls = audio.debugPreparationState.activeCalls
             XCTAssertTrue(gate.isHolding && !gate.didTimeOut, "The cancellation observation must finish before gate release/timeout")
             XCTAssertTrue(cancelledWhileHeld,
-                "Cancelled coalesced callers must finish and release task-local owners while legitimate B remains held")
+                "All eight canceled callers must finish and release task-local owners while legitimate B remains held")
 
             // Do not throw at the expected RED: still validate real completion,
             // complete PCM and native close, and safely clean up the owned file.
@@ -159,14 +380,11 @@ final class ContinuousAudioPlayerTests: XCTestCase {
         // A missing/false ACK intentionally retains the UUID-owned fixture;
         // even a failed test never deletes media beneath outstanding SDK work.
         if closed.withLock({ $0 }) == true, callersSettled { try FileManager.default.removeItem(at: directory) }
-        print("CAP_SHARED_PREPARATION_CANCELLATION expectedCallers=8 enteredCallers=\(run.entered) coalescedSetupVerified=\(coalescedSetupVerified) heldFinished=\(heldFinished) heldCancelled=\(heldCancelled) heldLiveWitnesses=\(heldLiveWitnesses) heldActiveCalls=\(heldActiveCalls) finalFinished=\(run.finished) finalReturnedEntry=\(run.returnedEntry) finalOtherErrors=\(run.otherErrors) nativeCloseAcknowledged=\(closed.withLock { $0 } == true) callersSettled=\(callersSettled) gateTimedOut=\(gate.didTimeOut) cancellationMaximumMilliseconds=250 gateMaximumSeconds=5 expectedFrames=257 exactSamplesVerified=\(exactSamplesVerified) resourceScope=caller-lifetimes-not-RSS latencyFix=false")
+        let prefix = creatorIsCancelled ? "CAP_SHARED_PREPARATION_CREATOR_CANCELLATION" : "CAP_SHARED_PREPARATION_CANCELLATION"
+        print("\(prefix) creatorIsCancelled=\(creatorIsCancelled) firstCallerRoleVerified=\(firstCallerRoleVerified) legitimateJoinedSecond=\(legitimateJoinedSecond) expectedCallers=8 enteredCallers=\(run.entered) coalescedSetupVerified=\(coalescedSetupVerified) heldFinished=\(heldFinished) heldCancelled=\(heldCancelled) heldLiveWitnesses=\(heldLiveWitnesses) heldActiveCalls=\(heldActiveCalls) finalFinished=\(run.finished) finalReturnedEntry=\(run.returnedEntry) finalOtherErrors=\(run.otherErrors) nativeCloseAcknowledged=\(closed.withLock { $0 } == true) callersSettled=\(callersSettled) gateTimedOut=\(gate.didTimeOut) cancellationMaximumMilliseconds=250 gateMaximumSeconds=5 expectedFrames=257 exactSamplesVerified=\(exactSamplesVerified) resourceScope=caller-lifetimes-not-RSS latencyFix=false")
         if let setupError { throw setupError }
-        #else
-        XCTFail("This native cancellation control requires DEBUG gate seams")
-        #endif
     }
 
-    #if DEBUG
     private enum CAPCancellationSetupError: Error { case invalidSetup }
     private final class CAPPreparationWitness {}
     @MainActor private final class CAPWeakPreparationWitness {

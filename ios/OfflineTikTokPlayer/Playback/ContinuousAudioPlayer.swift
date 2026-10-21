@@ -1,11 +1,25 @@
 import AVFoundation
 import PlayerCore
+import Synchronization
 
 /// Main-actor policy around a single audio graph. IDs and URLs stay here/the
 /// decoder; the render thread sees only small visit tokens and PCM.
 @MainActor
 final class ContinuousAudioPlayer {
-    struct Entry { let id: String; let token: Int; let slot: Int; let frames: Int64 }
+    struct Entry: Sendable { let id: String; let token: Int; let slot: Int; let frames: Int64 }
+    private struct PreparationJob: Sendable {
+        let token: Int
+        let slot: Int
+        var runner: Task<Void, Never>?
+        var invalidated = false
+        var waiters: [UUID: ContinuousAudioPreparationWaiter] = [:]
+    }
+    private struct PreparationSubscription: Sendable {
+        let id: String
+        let token: Int
+        let key: UUID
+        let waiter: ContinuousAudioPreparationWaiter
+    }
     let renderer = ContinuousPCMRenderer()
     private(set) var graph: ContinuousAudioGraph
     private let decoder: ContinuousPCMDecoder
@@ -15,7 +29,7 @@ final class ContinuousAudioPlayer {
     private var debugPreparationCounterOverflowed = false
     #endif
     private var entries: [String: Entry] = [:]
-    private var preparing: [String: Task<Entry, Error>] = [:]
+    private var preparing: [String: PreparationJob] = [:]
     private var reservedSlots = Set<Int>()
     private var reservedTokens = Set<Int>()
     private var nextToken = 1
@@ -38,7 +52,13 @@ final class ContinuousAudioPlayer {
         decoder = ContinuousPCMDecoder(renderer: renderer)
     }
     #endif
-    deinit { decoder.shutdown(); graph.engine.stop() }
+    deinit {
+        for job in preparing.values {
+            job.runner?.cancel()
+            for waiter in job.waiters.values { waiter.resolve(.failure(CancellationError())) }
+        }
+        decoder.shutdown(); graph.engine.stop()
+    }
     var isSelected: Bool { selectedID != nil }
 
     #if DEBUG
@@ -68,6 +88,7 @@ final class ContinuousAudioPlayer {
         decoder.debugFailureState(completion)
     }
     func debugShutdown(_ completion: @escaping @Sendable (Bool) -> Void) {
+        cancelPreparations(outside: [])
         decoder.shutdown()
         decoder.debugAfterShutdown(completion)
     }
@@ -82,7 +103,7 @@ final class ContinuousAudioPlayer {
 
     func setWindow(_ ids: Set<String>) {
         window = ids
-        for (id, task) in preparing where !ids.contains(id) { task.cancel() }
+        cancelPreparations(outside: ids)
         // Clear stale links before retiring an offscreen slot. The current
         // natural successor is installed explicitly after preparation.
         let retained = Set(entries.values.filter { ids.contains($0.id) }.map(\.token))
@@ -91,6 +112,15 @@ final class ContinuousAudioPlayer {
             successors[token] = nil
         }
         evictUnused()
+    }
+
+    private func cancelPreparations(outside ids: Set<String>) {
+        for id in Array(preparing.keys) where !ids.contains(id) {
+            // Keep the job and its reservation until its runner settles. New
+            // callers can await that cancellation without creating another job.
+            preparing[id]?.invalidated = true
+            preparing[id]?.runner?.cancel()
+        }
     }
 
     private func evictUnused() {
@@ -111,12 +141,18 @@ final class ContinuousAudioPlayer {
         defer { if debugCallCounted { debugActivePreparationCalls -= 1 } }
         #endif
         if let entry = entries[id], !failedTokens.contains(entry.token) { return entry }
-        if let task = preparing[id] { return try await task.value }
         var available: Int?
         // Rapid direction changes may briefly pin all slots. Yield to the one
         // decoder and render acknowledgement instead of skipping valid media.
         for _ in 0..<200 {
             try Task.checkCancellation()
+            // Another caller can publish a cache entry/job while this caller
+            // sleeps for a slot. Coalesce again before any new reservation.
+            if let entry = entries[id], !failedTokens.contains(entry.token) { return entry }
+            if let token = preparing[id]?.token {
+                let subscription = subscribeToPreparation(id: id, token: token)
+                return try await waitForPreparation(subscription)
+            }
             evictUnused()
             let used = Set(entries.values.map(\.slot)).union(reservedSlots)
             available = (0..<3).first(where: { !used.contains($0) })
@@ -140,30 +176,88 @@ final class ContinuousAudioPlayer {
             if available != nil { break }
             try await Task.sleep(for: .milliseconds(10))
         }
+        try Task.checkCancellation()
+        if let entry = entries[id], !failedTokens.contains(entry.token) { return entry }
+        if let token = preparing[id]?.token {
+            let subscription = subscribeToPreparation(id: id, token: token)
+            return try await waitForPreparation(subscription)
+        }
         guard let slot = available else { throw PreparationError.windowBusy }
         let token = nextToken; nextToken += 1
         reservedSlots.insert(slot); reservedTokens.insert(token)
-        let task = Task { [decoder] in
-            let prepared = try await decoder.prepare(url: url, token: token, slot: slot)
-            return Entry(id: id, token: token, slot: slot, frames: prepared.totalFrames)
+        preparing[id] = PreparationJob(token: token, slot: slot)
+        let subscription = subscribeToPreparation(id: id, token: token)
+        // Exactly one runner observes the real decoder result. Neither the job
+        // nor CAP is captured strongly across the native/metadata await.
+        let runner = Task { @MainActor [weak self, decoder] in
+            let result: Result<ContinuousPCMDecoder.Prepared, Error>
+            do { result = .success(try await decoder.prepare(url: url, token: token, slot: slot)) }
+            catch { result = .failure(error) }
+            self?.finishPreparation(id: id, token: token, slot: slot, result: result)
         }
-        preparing[id] = task
-        do {
-            let entry = try await task.value
-            // The worker can report a stream failure after publishing the
-            // prefix but before this actor receives the prepared Entry.
-            guard !failedTokens.contains(token) else { throw ContinuousPCMDecoder.Failure.cannotDecode }
-            preparing[id] = nil; reservedSlots.remove(slot); reservedTokens.remove(token)
+        preparing[id]?.runner = runner
+        return try await waitForPreparation(subscription)
+    }
+
+    private func subscribeToPreparation(id: String, token: Int) -> PreparationSubscription {
+        let subscription = PreparationSubscription(id: id, token: token,
+            key: UUID(), waiter: ContinuousAudioPreparationWaiter())
+        // Called synchronously after the matching job lookup/creation. There is
+        // no suspension between choosing the job and registering this waiter.
+        guard preparing[id]?.token == token else {
+            subscription.waiter.resolve(.failure(ContinuousPCMDecoder.Failure.cancelled))
+            return subscription
+        }
+        preparing[id]?.waiters[subscription.key] = subscription.waiter
+        return subscription
+    }
+
+    private func waitForPreparation(_ subscription: PreparationSubscription) async throws -> Entry {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                subscription.waiter.install(continuation)
+            }
+        } onCancel: {
+            // Completing the caller is independent of native completion and of
+            // this short actor cleanup. No per-caller task awaits the shared job.
+            subscription.waiter.resolve(.failure(CancellationError()))
+            Task { @MainActor [weak self] in
+                guard let self, self.preparing[subscription.id]?.token == subscription.token else { return }
+                self.preparing[subscription.id]?.waiters[subscription.key] = nil
+            }
+        }
+    }
+
+    private func finishPreparation(id: String, token: Int, slot: Int,
+                                   result: Result<ContinuousPCMDecoder.Prepared, Error>) {
+        guard let job = preparing[id], job.token == token, job.slot == slot else { return }
+        preparing[id] = nil; reservedSlots.remove(slot); reservedTokens.remove(token)
+        let outcome: Result<Entry, Error>
+        if job.invalidated { outcome = .failure(ContinuousPCMDecoder.Failure.cancelled) }
+        else {
+            switch result {
+            case .success(let prepared):
+                // Failure may arrive after prefix publication but before this
+                // actor receives the prepared result, as in the original path.
+                outcome = failedTokens.contains(token)
+                    ? .failure(ContinuousPCMDecoder.Failure.cannotDecode)
+                    : .success(Entry(id: id, token: token, slot: slot, frames: prepared.totalFrames))
+            case .failure(let error): outcome = .failure(error)
+            }
+        }
+        switch outcome {
+        case .success(let entry):
             entries[id] = entry
             evictUnused()
-            return entry
-        } catch {
-            preparing[id] = nil; reservedSlots.remove(slot); reservedTokens.remove(token)
+        case .failure:
             failedTokens.remove(token)
-            _ = renderer.retireSource(at: slot)
+            if renderer.source(at: slot).token == token { _ = renderer.retireSource(at: slot) }
             decoder.retain(tokens: Set(entries.values.map(\.token)).union(reservedTokens))
-            throw error
         }
+        // The shared job owns finalization even when its creating caller left.
+        // Canceled cells are already terminal; resolving them again is a no-op.
+        for waiter in job.waiters.values { waiter.resolve(outcome) }
     }
 
     @discardableResult
@@ -265,4 +359,41 @@ final class ContinuousAudioPlayer {
         setWindow(Set([currentEntry?.id, selectedID, requestedID].compactMap { $0 }))
     }
     enum PreparationError: Error { case windowBusy }
+}
+
+/// A one-shot caller result. Only this cell crosses cancellation-handler
+/// threads; job membership and all playback policy stay on the main actor.
+private final class ContinuousAudioPreparationWaiter: Sendable {
+    private typealias Outcome = Result<ContinuousAudioPlayer.Entry, Error>
+    private struct State {
+        var completed = false
+        var continuation: CheckedContinuation<ContinuousAudioPlayer.Entry, Error>?
+        var result: Outcome?
+    }
+    private let state = Mutex(State())
+
+    // Exactly one installation per registered subscription. Completion can win
+    // before it: keep that one result only until installation consumes it.
+    func install(_ continuation: CheckedContinuation<ContinuousAudioPlayer.Entry, Error>) {
+        let ready: Outcome? = state.withLock { value in
+            if value.completed {
+                let result = value.result; value.result = nil
+                return result
+            }
+            value.continuation = continuation
+            return nil
+        }
+        if let ready { continuation.resume(with: ready) }
+    }
+
+    func resolve(_ result: Result<ContinuousAudioPlayer.Entry, Error>) {
+        let continuation: CheckedContinuation<ContinuousAudioPlayer.Entry, Error>? = state.withLock { value in
+            guard !value.completed else { return nil }
+            value.completed = true
+            let continuation = value.continuation; value.continuation = nil
+            if continuation == nil { value.result = result }
+            return continuation
+        }
+        continuation?.resume(with: result)
+    }
 }
