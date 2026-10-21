@@ -1720,12 +1720,45 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
     }
 
+    func testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation() async {
+        var successCalls = 0
+        let succeeded = await waitUntil(timeout: 0.25) {
+            successCalls += 1
+            return successCalls == 2 // Script: false, true, false.
+        }
+        XCTAssertTrue(succeeded, "A valid sample must latch without another predicate/SDK evaluation")
+        XCTAssertEqual(successCalls, 2)
+
+        for wouldBecomeTrue in [false, true] {
+            var deadlineCalls = 0
+            let expired = await waitUntil(timeout: 0) {
+                deadlineCalls += 1
+                return wouldBecomeTrue && deadlineCalls > 1
+            }
+            XCTAssertFalse(expired, "A false sample at the deadline is final, even if a second call would pass")
+            XCTAssertEqual(deadlineCalls, 1)
+        }
+
+        let cancelled = await Task { @MainActor in
+            var calls = 0
+            let result = await self.waitUntil(timeout: 1) {
+                calls += 1
+                withUnsafeCurrentTask { $0?.cancel() }
+                return false
+            }
+            return (result, calls)
+        }.value
+        XCTAssertFalse(cancelled.0, "Cancellation of the poll sleep must return false")
+        XCTAssertEqual(cancelled.1, 1, "Cancellation must not cause a second predicate/SDK evaluation")
+    }
+
     private func waitUntil(timeout: Double = 3, _ condition: () -> Bool) async -> Bool {
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        while !condition(), ProcessInfo.processInfo.systemUptime < deadline {
+        while true {
+            if condition() { return true }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { return false }
             do { try await Task.sleep(for: .milliseconds(10)) } catch { return false }
         }
-        return condition()
     }
 }
 
