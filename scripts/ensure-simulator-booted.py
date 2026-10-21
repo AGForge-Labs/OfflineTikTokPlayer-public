@@ -55,7 +55,7 @@ def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotoni
         # A temporary stream avoids unbounded Python PIPE accumulation. It is
         # closed on every path; only a bounded query read is parsed or retained.
         with tempfile.TemporaryFile() as stream:
-            code = command(["list", "devices", "--json"], stdout=stream, maximum=15)
+            code = command(["list", "devices", "--json"], stdout=stream, maximum=60)
             result["lastQueryReturnCode"] = code
             if code:
                 raise PreflightError(2)

@@ -41,6 +41,10 @@ class SimulatorBootPreflightTests(unittest.TestCase):
             if isinstance(outcome, BaseException):
                 raise outcome
             code, output, elapsed = outcome
+            if elapsed > kwargs["timeout"]:
+                if clock is not None:
+                    clock.value += kwargs["timeout"]
+                raise subprocess.TimeoutExpired(arguments, kwargs["timeout"])
             if clock is not None:
                 clock.value += elapsed
             if output:
@@ -175,7 +179,7 @@ class SimulatorBootPreflightTests(unittest.TestCase):
                                    (0, b"", 200), (0, inventory(), 1)], clock=clock)
         self.assertEqual(result["statusCode"], 0)
         self.assertEqual(result["elapsedMs"], 222000)
-        self.assertEqual([call.kwargs["timeout"] for call in runner.call_args_list], [15, 30, 219, 15])
+        self.assertEqual([call.kwargs["timeout"] for call in runner.call_args_list], [60, 30, 219, 19])
         result, runner = self.call([(0, inventory(), 241)], clock=Clock())
         self.assertEqual(result["statusCode"], 10)
         self.assertEqual(runner.call_count, 1)
@@ -196,6 +200,15 @@ class SimulatorBootPreflightTests(unittest.TestCase):
                 prepare.assert_called_once_with(None)
             self.assertEqual(json.loads(output.getvalue()), result)
             self.assertNotIn("PRIVATE", output.getvalue())
+
+    def test_slow_final_identity_query_can_use_remaining_shared_budget(self):
+        result, runner = self.call([(0, inventory("Shutdown"), 1), (0, b"", 1),
+                                   (0, b"", 100), (0, inventory(), 30)])
+        self.assertEqual(result["statusCode"], 0)
+        self.assertEqual(result["finalStateCode"], 1)
+        self.assertEqual(result["identityChecksPassed"], 2)
+        self.assertEqual(result["elapsedMs"], 132000)
+        self.assertEqual(runner.call_count, 4)
 
 
 if __name__ == "__main__":
