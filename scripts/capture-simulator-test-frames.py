@@ -74,7 +74,7 @@ def resolve_destination(destination):
         if not re.fullmatch(r"\d+(?:\.\d+)*", wanted_os):
             raise ValueError("Simulator OS must be a numeric version or latest")
         wanted_version = tuple(int(part) for part in wanted_os.split("."))
-    listing = run("list", "devices", "available", "--json")
+    listing = run("list", "devices", "available", "--json", timeout=60)
     if listing.returncode:
         raise ValueError("Could not list available iOS Simulators")
     candidates = []

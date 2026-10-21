@@ -2,7 +2,7 @@ name: Native reader full validation
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh', 'scripts/ensure-simulator-booted.py', 'tests/validation-shell/test_simulator_boot_preflight.py', 'scripts/test-apple-buffer.sh', 'scripts/generate-apple-buffer-resources.py', 'tests/validation-shell/test_apple_buffer_projection.py']
+    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh', 'scripts/ensure-simulator-booted.py', 'tests/validation-shell/test_simulator_boot_preflight.py', 'scripts/test-apple-buffer.sh', 'scripts/generate-apple-buffer-resources.py', 'tests/validation-shell/test_apple_buffer_projection.py', 'scripts/capture-simulator-test-frames.py', 'tests/validation-shell/test_simulator_destination_resolution.py']
 permissions:
   contents: read
 jobs:
@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-          fetch-depth: 4
+          fetch-depth: 5
       - name: Require exact committed app and test source before native work
         id: source_pin
         run: |
@@ -28,6 +28,7 @@ jobs:
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_simulator_boot_preflight.py
           python3 tests/validation-shell/test_apple_buffer_projection.py
+          python3 tests/validation-shell/test_simulator_destination_resolution.py
       - name: Resolve the Simulator then verify boot within a four minute budget
         id: simulator_boot
         if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
