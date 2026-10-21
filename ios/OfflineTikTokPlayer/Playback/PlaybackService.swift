@@ -73,7 +73,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let downloads: OfflineDownloads
     @ObservationIgnored private let cloud: OneDriveClient
     @ObservationIgnored private let buffer: PlaybackBuffer
-    @ObservationIgnored private let continuousAudio = ContinuousAudioPlayer()
+    @ObservationIgnored private let continuousAudio: ContinuousAudioPlayer
     @ObservationIgnored private var audioPollTask: Task<Void, Never>?
     @ObservationIgnored private var audioVisit: Int64 = -1
     @ObservationIgnored private var audioToken = 0
@@ -125,7 +125,8 @@ final class PlaybackService: NSObject {
     init(library: LibraryRepository, downloads: OfflineDownloads, cloud: OneDriveClient,
          bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
          activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) },
-         buffer: PlaybackBuffer? = nil, speakerAudio: SpeakerAudioController? = nil,
+         buffer: PlaybackBuffer? = nil, continuousAudio: ContinuousAudioPlayer? = nil,
+         speakerAudio: SpeakerAudioController? = nil,
          audioRoutes: @escaping () -> [AVAudioSession.Port] = { AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType) },
          seekPlayer: @escaping SeekPlayer = { player, time, completion in
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
@@ -134,6 +135,7 @@ final class PlaybackService: NSObject {
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
          }) {
         self.library = library; self.downloads = downloads; self.cloud = cloud
+        self.continuousAudio = continuousAudio ?? ContinuousAudioPlayer()
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
         self.buffer = buffer ?? PlaybackBuffer()
         self.speakerAudio = speakerAudio ?? SpeakerAudioController()
@@ -268,6 +270,22 @@ final class PlaybackService: NSObject {
         cancelStallRecovery()
         player.pause(); persist(); updateNowPlaying()
     }
+
+    #if DEBUG
+    /// Test teardown only. Join the currently owned tasks as well as the decoder's
+    /// queued cleanup; neither acknowledgement proves SDK-internal quiescence.
+    func debugStopPreparation(_ completion: @escaping @Sendable () -> Void) {
+        generation += 1; warmRevision += 1
+        observedItem = nil; itemObservation = nil; readyGeneration = nil
+        let tasks = [loadTask, warmTask, audioCheckTask, audioPollTask, stallTask].compactMap { $0 }
+        loadTask = nil; warmTask = nil; audioCheckTask = nil; audioPollTask = nil; stallTask = nil
+        for task in tasks { task.cancel() }
+        Task {
+            for task in tasks { await task.value }
+            completion()
+        }
+    }
+    #endif
 
     func next(explicit: Bool = true) {
         let previousVisit = audioVisit
