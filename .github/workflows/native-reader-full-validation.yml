@@ -1,8 +1,8 @@
-name: Native reader production and full validation
+name: Native reader full validation
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh']
+    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh', 'scripts/ensure-simulator-booted.py', 'tests/validation-shell/test_simulator_boot_preflight.py']
 permissions:
   contents: read
 jobs:
@@ -17,39 +17,31 @@ jobs:
           fetch-depth: 2
       - name: Require exact committed app and test source before native work
         id: source_pin
-        run: bash scripts/check-native-reader-full-validation.sh --verify-source
-      - name: Unsigned initial production benchmark with one build job
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
-        run: bash scripts/check-native-reader-full-validation.sh
-      - name: Preserve raw benchmark log and require its one exact native identity
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
-          cp artifacts/native/xcodebuild-test.log artifacts/native/native-reader-production-benchmark.log
-          python3 - <<'PY'
-          import importlib.util
-          from pathlib import Path
-          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
-          evidence = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(evidence)
-          expected = {'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
-          if not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('Production benchmark identity missing from pinned source')
-          evidence.verify_log(Path('artifacts/native/native-reader-production-benchmark.log').read_text(), expected)
-          print('INITIAL production benchmark native=1 ui=0; readiness/streaming guards unchanged; compositor/full acceptance NOT ESTABLISHED by this step')
-          PY
-      - name: Verify existing native launcher shell regressions
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
-        run: python3 tests/validation-shell/test_check_ios_shell.py
-      - name: Verify existing strict native evidence regressions
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
-        run: python3 tests/validation-shell/test_native_test_evidence.py
-      - name: Run all unsigned playback regressions with bounded XCTest watchdog
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
-        run: |
+          mkdir -p artifacts/native
           bash scripts/check-native-reader-full-validation.sh --verify-source
-          bash scripts/check-ios.sh
-      - name: Require all 108 native and one UI identities
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+      - name: Preserve native launcher, strict evidence and exact boot regressions
+        id: harness
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+          python3 tests/validation-shell/test_simulator_boot_preflight.py
+      - name: Resolve the Simulator then verify boot within a four minute budget
+        id: simulator_boot
+        if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
+        run: |
+          simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
+          printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
+      - name: Run every unsigned native and UI regression with one build job
+        id: native
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
+        env:
+          SIMULATOR_DESTINATION: platform=iOS Simulator,id=${{ steps.simulator_boot.outputs.simulator_id }}
+        run: bash scripts/check-native-reader-full-validation.sh
+      - name: Independently require all 128 native and one UI identities after the attempt
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import importlib.util
@@ -60,8 +52,8 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          if len(native) != 108 or len(ui) != 1 or native | ui != expected:
-              raise SystemExit(f'Pinned full manifest must equal native=108 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
+          if len(native) != 128 or len(ui) != 1 or native | ui != expected:
+              raise SystemExit(f'Pinned full manifest must equal native=128 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('FULL source-manifest evidence native=108 ui=1; original guards retained; physical-device acceptance remains separate')
+          print('FULL source-manifest evidence native=128 ui=1; original guards retained; physical-device acceptance remains separate')
           PY
