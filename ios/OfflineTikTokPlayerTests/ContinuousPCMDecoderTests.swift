@@ -6,6 +6,439 @@ import PlayerCore
 @testable import OfflineTikTokPlayer
 
 final class ContinuousPCMDecoderTests: XCTestCase {
+    // Bounded native-reader lifecycle and complete-presentation regressions.
+    // These tests use worker-coherent DEBUG counters; they do not
+    // characterize SDK-internal cancellation, memory, thread count or wait causes.
+    func testShutdownAcknowledgementWaitsForHeldNativeReadAndEveryLeaseClose() async throws {
+        #if DEBUG
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("held-shutdown.caf")
+        do { try writePCM(Self.mailboxPattern(frames: 8_193, identity: 1), to: url) }
+        catch { try? FileManager.default.removeItem(at: directory); throw error }
+        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        let gate = ContinuousPCMDecoder.DebugNativeReadGate()
+        decoder.debugSetNativeReadGate(gate)
+        defer {
+            gate.release(); renderer.setPlaying(false); decoder.shutdown()
+            decoder.debugAfterShutdown { closed in
+                if closed { try? FileManager.default.removeItem(at: directory) }
+            }
+        }
+        _ = try await Self.mailboxPrepare(decoder, url: url, token: 1, slot: 0)
+        XCTAssertTrue(gate.arm(token: 1))
+        // Paused selection publishes a real nonprefix request without spending
+        // samples or making the deliberate blocked call an audio underrun.
+        Self.mailboxAcknowledge(renderer, token: 1, frame: 2_049)
+        try await Self.mailboxWait(timeout: 1, "The controlled native read must enter") { gate.didEnter }
+        guard gate.isHolding, !gate.didTimeOut else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+
+        let acknowledgement = Mutex<Bool?>(nil)
+        decoder.shutdown()
+        decoder.debugAfterShutdown { value in acknowledgement.withLock { $0 = value } }
+        let held = try await Self.mailboxStatsUntil(decoder, timeout: 0.5) {
+            $0.shutdownRequested && $0.retiredLeasesAwaitingClose > 0
+        }
+        Self.assertMailboxBounds(held)
+        XCTAssertFalse(held.readerLeasesClosed)
+        XCTAssertGreaterThan(held.leasedReaders, 0)
+        XCTAssertNil(acknowledgement.withLock { $0 }, "Stopped=true alone cannot acknowledge a still-held lease")
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(gate.isHolding); XCTAssertFalse(gate.didTimeOut)
+        XCTAssertNil(acknowledgement.withLock { $0 }, "Shutdown acknowledgement must stay pending until native return/close")
+
+        gate.release()
+        try await Self.mailboxWait(timeout: 2, "Released native read must finish actual queued shutdown") {
+            acknowledgement.withLock { $0 } != nil
+        }
+        XCTAssertEqual(acknowledgement.withLock { $0 }, true)
+        let closed = try await Self.mailboxStats(decoder)
+        Self.assertMailboxBounds(closed)
+        XCTAssertTrue(closed.shutdownRequested); XCTAssertTrue(closed.readerLeasesClosed)
+        XCTAssertEqual(closed.leasedReaders, 0); XCTAssertEqual(closed.retiredLeasesAwaitingClose, 0)
+        XCTAssertEqual(closed.startingLeases, 0); XCTAssertEqual(closed.pendingPreparations, 0)
+        XCTAssertEqual(closed.readJobsAwaitingAcceptanceOrClose, 0); XCTAssertEqual(closed.mailboxPackets, 0)
+        XCTAssertEqual(closed.pendingOrMailboxPacketSlots, 0); XCTAssertEqual(closed.packetAllocationUpperBound, 0)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0); XCTAssertFalse(gate.didTimeOut)
+        print("PCM_MAILBOX_SHUTDOWN heldLeases=\(held.leasedReaders) heldRetired=\(held.retiredLeasesAwaitingClose) finalLeases=\(closed.leasedReaders) acknowledged=\(acknowledgement.withLock { $0 } == true) gateMaximumSeconds=5 sdkInternalQuiescence=unverified")
+        #endif
+    }
+
+    func testRetiredHeldReadersKeepTheirPermitsAcrossEpochsAndPendingPreparations() async throws {
+        #if DEBUG
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let oldURLs = (0..<3).map { directory.appendingPathComponent("retired-old-\($0).caf") }
+        let newURLs = (0..<3).map { directory.appendingPathComponent("retired-new-\($0).caf") }
+        let newPCM = (0..<3).map { Self.mailboxPattern(frames: 8_193, identity: $0 + 4) }
+        do {
+            for slot in 0..<3 {
+                try writePCM(Self.mailboxPattern(frames: 8_193, identity: slot + 1), to: oldURLs[slot])
+                try writePCM(newPCM[slot], to: newURLs[slot])
+            }
+        } catch { try? FileManager.default.removeItem(at: directory); throw error }
+        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        let gates = (0..<3).map { _ in ContinuousPCMDecoder.DebugNativeReadGate() }
+        var jobs: [Task<Void, Never>] = []
+        defer {
+            gates.forEach { $0.release() }; jobs.forEach { $0.cancel() }
+            renderer.setPlaying(false); decoder.shutdown()
+            decoder.debugAfterShutdown { closed in
+                if closed { try? FileManager.default.removeItem(at: directory) }
+            }
+        }
+        for slot in 0..<3 {
+            decoder.debugSetNativeReadGate(gates[slot])
+            _ = try await Self.mailboxPrepare(decoder, url: oldURLs[slot], token: slot + 1, slot: slot)
+        }
+        var observedStats: [ContinuousPCMDecoder.DebugWorkerStats] = []
+        observedStats.reserveCapacity(12)
+        observedStats.append(try await Self.mailboxStats(decoder))
+        let memory = renderer.retainedPCMMemoryBytes
+        for slot in 0..<3 {
+            let token = slot + 1, source = renderer.source(at: slot), gate = gates[slot]
+            XCTAssertTrue(gate.arm(token: token))
+            Self.mailboxAcknowledge(renderer, token: token, frame: 2_049)
+            try await Self.mailboxWait(timeout: 0.75, "Each source must enter its actual controlled native read") { gate.didEnter }
+            guard gate.isHolding, !gate.didTimeOut else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+            let firstEpoch = source.streamRequest.epoch
+            // Every command is consumed while paused. Obsolete requests cannot
+            // acquire uncounted leases or publish a later request's ring data.
+            for frame in [Int64(2_303), 2_701, 3_201, 2_111] {
+                Self.mailboxAcknowledge(renderer, token: token, frame: frame)
+            }
+            let last = source.streamRequest
+            XCTAssertGreaterThan(last.epoch, firstEpoch); XCTAssertEqual(last.startFrame, 2_111)
+            XCTAssertEqual(source.availableStreamFrames(for: last.epoch), 0)
+            Self.mailboxAcknowledge(renderer, token: 0, frame: 0)
+            XCTAssertTrue(renderer.retireSource(at: slot))
+            XCTAssertEqual(source.token, 0)
+            decoder.retain(tokens: Set(((slot + 1)..<3).map { $0 + 1 }))
+            let stats = try await Self.mailboxStatsUntil(decoder, timeout: 0.5) {
+                $0.retiredLeasesAwaitingClose >= slot + 1
+            }
+            observedStats.append(stats)
+        }
+        let held = try await Self.mailboxStats(decoder)
+        observedStats.append(held)
+        XCTAssertEqual(held.leasedReaders, 3); XCTAssertEqual(held.retiredLeasesAwaitingClose, 3)
+        XCTAssertFalse(held.readerLeasesClosed)
+        XCTAssertTrue(gates.allSatisfy { $0.isHolding && !$0.didTimeOut })
+
+        let results = Mutex<[Int: Result<ContinuousPCMDecoder.Prepared, ContinuousPCMDecoder.Failure>]>([:])
+        for slot in 0..<3 {
+            let url = newURLs[slot], token = slot + 4
+            jobs.append(Task {
+                do {
+                    let prepared = try await decoder.prepare(url: url, token: token, slot: slot)
+                    results.withLock { $0[token] = .success(prepared) }
+                } catch { results.withLock { $0[token] = .failure((error as? ContinuousPCMDecoder.Failure) ?? .cannotDecode) } }
+            })
+        }
+        // Registration is observed on the real worker, not inferred from a delay.
+        let pending = try await Self.mailboxStatsUntil(decoder, timeout: 0.75) { $0.pendingPreparations == 3 }
+        observedStats.append(pending)
+        XCTAssertTrue(results.withLock { $0.isEmpty })
+        XCTAssertEqual(pending.leasedReaders, 3); XCTAssertEqual(pending.retiredLeasesAwaitingClose, 3)
+        XCTAssertTrue((0..<3).allSatisfy { renderer.source(at: $0).token == 0 })
+        let duplicate = Mutex<ContinuousPCMDecoder.Failure?>(nil)
+        jobs.append(Task {
+            do {
+                _ = try await decoder.prepare(url: newURLs[0], token: 7, slot: 0)
+                duplicate.withLock { $0 = .cannotDecode }
+            } catch { duplicate.withLock { $0 = (error as? ContinuousPCMDecoder.Failure) ?? .cannotDecode } }
+        })
+        try await Self.mailboxWait(timeout: 0.5, "A fourth preparation must be rejected without another descriptor") {
+            duplicate.withLock { $0 } != nil
+        }
+        XCTAssertEqual(duplicate.withLock { $0 }, .slotInUse)
+        let stillHeld = try await Self.mailboxStats(decoder)
+        observedStats.append(stillHeld)
+        XCTAssertEqual(stillHeld.pendingPreparations, 3); XCTAssertEqual(stillHeld.leasedReaders, 3)
+        XCTAssertTrue(results.withLock { $0.isEmpty })
+        XCTAssertTrue(gates.allSatisfy { $0.isHolding && !$0.didTimeOut })
+        gates.forEach { $0.release() }
+        try await Self.mailboxWait(timeout: 3, "Releasing retired reads must permit all three queued replacements") {
+            results.withLock { $0.count == 3 }
+        }
+        for token in 4...6 {
+            let result = try XCTUnwrap(results.withLock { $0[token] })
+            switch result {
+            case .success(let prepared): XCTAssertEqual(prepared.token, token); XCTAssertEqual(prepared.totalFrames, 8_193)
+            case .failure(let failure): XCTFail("Replacement preparation failed: \(failure)"); throw failure
+            }
+        }
+        // All three replacements have different PCM from their retired source.
+        // Their full prepared prefix+ring detects stale completion acceptance.
+        for slot in 0..<3 {
+            Self.mailboxAcknowledge(renderer, token: slot + 4, frame: 0)
+            renderer.setPlaying(true)
+            var actual = [Float](repeating: .nan, count: 1_536 * 2)
+            actual.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1_536) }
+            renderer.setPlaying(false)
+            assertSamples(actual, equal: Array(newPCM[slot].prefix(actual.count)))
+        }
+        Self.mailboxAcknowledge(renderer, token: 4, frame: 3_201)
+        let current = renderer.source(at: 0), epoch = current.streamRequest.epoch
+        try await Self.mailboxWait(timeout: 2, "The latest current epoch must eventually receive its exact nonprefix span") {
+            current.availableStreamFrames(for: epoch) >= 193
+        }
+        renderer.setPlaying(true)
+        var actual = [Float](repeating: .nan, count: 193 * 2)
+        actual.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 193) }
+        renderer.setPlaying(false)
+        assertSamples(actual, equal: Array(newPCM[0][(3_201 * 2)..<(3_394 * 2)]))
+        XCTAssertEqual(renderer.snapshot.token, 4); XCTAssertEqual(renderer.snapshot.frame, 3_394)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0); XCTAssertEqual(renderer.retainedPCMMemoryBytes, memory)
+        observedStats.append(try await Self.mailboxStats(decoder))
+        for stats in observedStats { Self.assertMailboxBounds(stats) }
+        XCTAssertTrue(gates.allSatisfy { !$0.didTimeOut })
+        let closed = try await Self.mailboxShutdown(decoder)
+        Self.assertMailboxBounds(closed)
+        XCTAssertTrue(closed.readerLeasesClosed); XCTAssertEqual(closed.leasedReaders, 0)
+        XCTAssertEqual(closed.pendingPreparations, 0); XCTAssertEqual(closed.peakLeasedReaders, 3)
+        print("PCM_MAILBOX_RETIREMENT heldRetired=\(held.retiredLeasesAwaitingClose) pendingPreparations=\(pending.pendingPreparations) peakLeases=\(closed.peakLeasedReaders) maximumLeases=3 maximumPacketAllocationCapacity=6 exactCurrentFrames=193 underruns=\(renderer.snapshot.underrunFrames) retainedPCMBytes=\(memory) gateMaximumSeconds=5 sdkRSS=unmeasured")
+        #endif
+    }
+
+    func testPositiveInputRanDryOutputSurvivesReal44100ConversionThroughItsExactTail() async throws {
+        #if DEBUG
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("positive-input-ran-dry-44100.caf")
+        let native = (0..<9_801).flatMap { frame -> [Float] in
+            let value = Float(sin(Double(frame) * 0.071)) * 0.2
+            return [value, -value]
+        }
+        do { try writePCM(native, to: url, sampleRate: 44_100) }
+        catch { try? FileManager.default.removeItem(at: directory); throw error }
+        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        defer {
+            renderer.setPlaying(false); decoder.shutdown()
+            decoder.debugAfterShutdown { closed in
+                if closed { try? FileManager.default.removeItem(at: directory) }
+            }
+        }
+        let expected = try await independentlyDecode(AVURLAsset(url: url), diagnosticName: "mailbox-44100-tail")
+        XCTAssertEqual(expected.count, 10_668 * 2)
+        XCTAssertGreaterThan(abs(try XCTUnwrap(expected.suffix(2).first)), 0.01,
+                             "The final fractional frame must contain calculated source content")
+        let failures = Mutex<[ContinuousPCMDecoder.Failure]>([])
+        let reports = Mutex<[(Int, ContinuousPCMDecoder.SourceSilence)]>([])
+        decoder.setFailureHandler { _, failure in failures.withLock { $0.append(failure) } }
+        decoder.setSourceSilenceHandler { token, value in reports.withLock { $0.append((token, value)) } }
+        let initial = try await Self.mailboxStats(decoder)
+        XCTAssertEqual(initial.positiveInputRanDryBuffersRetained, 0)
+        XCTAssertEqual(initial.positiveInputRanDryFramesRetained, 0)
+        let prepared = try await Self.mailboxPrepare(decoder, url: url, token: 1, slot: 0)
+        XCTAssertEqual(prepared.totalFrames, 10_668)
+        renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+        let graph = ContinuousAudioGraph(renderer: renderer)
+        try graph.engine.enableManualRenderingMode(.offline, format: graph.format, maximumFrameCount: 257)
+        try graph.engine.start()
+        defer { graph.engine.stop() }
+        var actual: [Float] = []
+        actual.reserveCapacity(expected.count)
+        while actual.count < expected.count {
+            let count = min(127, (expected.count - actual.count) / 2)
+            try await Self.waitForPreparedFrames(renderer, count: count, totalFrames: prepared.totalFrames, timeout: 2)
+            actual.append(contentsOf: try render(graph, frames: count))
+        }
+        graph.engine.stop(); renderer.setPlaying(false)
+        // A terminal observation is required. Pending native input is not EOF,
+        // and no progress/counter may replace the full reference comparison.
+        try await Self.mailboxWait(timeout: 2, "The complete native presentation must actually reach EOF") {
+            reports.withLock { !$0.isEmpty }
+        }
+        let final = try await Self.mailboxStats(decoder)
+        Self.assertMailboxBounds(final)
+        XCTAssertGreaterThan(final.positiveInputRanDryBuffersRetained, 0,
+                             "This real AVAudioConverter run must exercise positive-output inputRanDry, not silently miss that branch")
+        XCTAssertGreaterThan(final.positiveInputRanDryFramesRetained, 0)
+        XCTAssertGreaterThanOrEqual(final.positiveInputRanDryFramesRetained, final.positiveInputRanDryBuffersRetained)
+        assertSamples(actual, equal: expected)
+        assertSamples(Array(actual.suffix(64)), equal: Array(expected.suffix(64)))
+        XCTAssertEqual(renderer.snapshot.frame, prepared.totalFrames)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        XCTAssertTrue(failures.withLock { $0.isEmpty })
+        let analyses = reports.withLock { $0 }
+        XCTAssertEqual(analyses.count, 1); XCTAssertEqual(analyses.first?.0, 1)
+        XCTAssertEqual(analyses.first?.1.totalFrames, prepared.totalFrames)
+        let closed = try await Self.mailboxShutdown(decoder)
+        XCTAssertTrue(closed.readerLeasesClosed); XCTAssertEqual(closed.leasedReaders, 0)
+        print("PCM_MAILBOX_CONVERTER nativeRate=44100 outputRate=48000 referenceFrames=10668 actualFrames=\(actual.count / 2) positiveInputRanDryBuffersRetained=\(final.positiveInputRanDryBuffersRetained) positiveInputRanDryFramesRetained=\(final.positiveInputRanDryFramesRetained) sourceReports=\(analyses.count) underruns=\(renderer.snapshot.underrunFrames) retainedCounterMeaning=stream-output-before-cursor-discard")
+        #endif
+    }
+
+    func testExactlyPinnedSourceDrainsTrueEOFAndReportsItsRealLeadingAndTrailingZerosOnce() async throws {
+        #if DEBUG
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("exact-prefix-with-zeros.caf")
+        let expected = (0..<512).flatMap { frame -> [Float] in
+            let value: Float = frame < 3 || frame >= 507 ? 0 : Float(frame % 31 + 1) / 64
+            return [value, -value]
+        }
+        do { try writePCM(expected, to: url) }
+        catch { try? FileManager.default.removeItem(at: directory); throw error }
+        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        defer {
+            renderer.setPlaying(false); decoder.shutdown()
+            decoder.debugAfterShutdown { closed in
+                if closed { try? FileManager.default.removeItem(at: directory) }
+            }
+        }
+        let reports = Mutex<[(Int, ContinuousPCMDecoder.SourceSilence)]>([])
+        let failures = Mutex<[ContinuousPCMDecoder.Failure]>([])
+        decoder.setSourceSilenceHandler { token, value in reports.withLock { $0.append((token, value)) } }
+        decoder.setFailureHandler { _, failure in failures.withLock { $0.append(failure) } }
+        let prepared = try await Self.mailboxPrepare(decoder, url: url, token: 1, slot: 0)
+        // Preparation's original EOF probe is required even when no sample is
+        // left for the ring. Later playback cannot repair a premature return.
+        let beforePlayback = reports.withLock { $0 }
+        XCTAssertEqual(beforePlayback.count, 1, "Exactly filling the pinned prefix must still drain actual EOF during preparation")
+        let analysis = try XCTUnwrap(beforePlayback.first)
+        XCTAssertEqual(analysis.0, 1); XCTAssertEqual(analysis.1.totalFrames, 512)
+        XCTAssertEqual(analysis.1.leadingFrames, 3); XCTAssertEqual(analysis.1.trailingFrames, 5)
+        XCTAssertEqual(analysis.1.peak, 31.0 / 64.0)
+        XCTAssertEqual(prepared.totalFrames, 512)
+        XCTAssertEqual(renderer.source(at: 0).prefixFrameCount, 512)
+        XCTAssertEqual(renderer.source(at: 0).availableStreamFrames, 0)
+        renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+        var actual = [Float](repeating: .nan, count: expected.count)
+        var offset = 0
+        while offset < 512 {
+            let count = min(127, 512 - offset)
+            actual.withUnsafeMutableBufferPointer {
+                renderer.render(interleaved: UnsafeMutableBufferPointer(rebasing: $0[(offset * 2)..<((offset + count) * 2)]), frameCount: count)
+            }
+            offset += count
+        }
+        assertSamples(actual, equal: expected)
+        assertSamples(Array(actual.suffix(24)), equal: Array(expected.suffix(24)))
+        XCTAssertEqual(renderer.snapshot.frame, 512); XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        var eof = [Float](repeating: .nan, count: 2)
+        eof.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+        XCTAssertEqual(eof, [0, 0]); XCTAssertTrue(renderer.snapshot.ended)
+        XCTAssertEqual(renderer.snapshot.frame, 512); XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        let final = try await Self.mailboxStats(decoder)
+        Self.assertMailboxBounds(final)
+        XCTAssertEqual(reports.withLock { $0.count }, 1)
+        XCTAssertTrue(failures.withLock { $0.isEmpty })
+        let closed = try await Self.mailboxShutdown(decoder)
+        XCTAssertTrue(closed.readerLeasesClosed); XCTAssertEqual(closed.leasedReaders, 0)
+        print("PCM_MAILBOX_EXACT_PREFIX totalFrames=512 prefixFrames=512 leadingFrames=3 trailingFrames=5 sourceReports=\(reports.withLock { $0.count }) exactTailSamples=24 ended=\(renderer.snapshot.ended) underruns=\(renderer.snapshot.underrunFrames)")
+        #endif
+    }
+
+    #if DEBUG
+    private static func mailboxPattern(frames: Int, identity: Int) -> [Float] {
+        (0..<frames).flatMap { frame -> [Float] in
+            let value = Float(identity) / 32 + Float(frame % 97 + 1) / 512
+            let sign: Float = identity < 4 ? 1 : -1
+            return [sign * value, -sign * value * 0.5]
+        }
+    }
+
+    private static func mailboxAcknowledge(_ renderer: ContinuousPCMRenderer, token: Int, frame: Int64) {
+        renderer.setPlaying(false)
+        let version = renderer.select(token: token, frame: frame)
+        var ignored = [Float](repeating: .nan, count: 2)
+        ignored.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+        XCTAssertEqual(renderer.snapshot.selectionVersion, version)
+        XCTAssertEqual(renderer.snapshot.token, token)
+    }
+
+    private static func mailboxWait(timeout: Double, _ message: String,
+                                    _ condition: () -> Bool) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while !condition(), ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        guard condition() else { XCTFail(message); throw ContinuousPCMDecoder.Failure.cannotDecode }
+    }
+
+    private static func mailboxPrepare(_ decoder: ContinuousPCMDecoder, url: URL, token: Int, slot: Int,
+                                       timeout: Double = 3) async throws -> ContinuousPCMDecoder.Prepared {
+        let value = Mutex<Result<ContinuousPCMDecoder.Prepared, ContinuousPCMDecoder.Failure>?>(nil)
+        let job = Task {
+            do {
+                let prepared = try await decoder.prepare(url: url, token: token, slot: slot)
+                value.withLock { $0 = .success(prepared) }
+            } catch { value.withLock { $0 = .failure((error as? ContinuousPCMDecoder.Failure) ?? .cannotDecode) } }
+        }
+        defer { job.cancel() }
+        try await mailboxWait(timeout: timeout, "The owned synthetic preparation must finish within its bounded setup window") {
+            value.withLock { $0 } != nil
+        }
+        return try XCTUnwrap(value.withLock { $0 }).get()
+    }
+
+    private static func mailboxStats(_ decoder: ContinuousPCMDecoder, timeout: Double = 0.25) async throws -> ContinuousPCMDecoder.DebugWorkerStats {
+        let value = Mutex<ContinuousPCMDecoder.DebugWorkerStats?>(nil)
+        decoder.debugWorkerStats { stats in value.withLock { $0 = stats } }
+        try await mailboxWait(timeout: timeout, "The real serial worker must answer a bounded stats query") {
+            value.withLock { $0 } != nil
+        }
+        return try XCTUnwrap(value.withLock { $0 })
+    }
+
+    private static func mailboxStatsUntil(_ decoder: ContinuousPCMDecoder, timeout: Double,
+        _ condition: (ContinuousPCMDecoder.DebugWorkerStats) -> Bool) async throws -> ContinuousPCMDecoder.DebugWorkerStats {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        repeat {
+            let value = try await mailboxStats(decoder, timeout: min(0.25, max(0.001, deadline - ProcessInfo.processInfo.systemUptime)))
+            if condition(value) { return value }
+            try await Task.sleep(for: .milliseconds(2))
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        XCTFail("The worker did not reach the required bounded mailbox lifecycle state")
+        throw ContinuousPCMDecoder.Failure.cannotDecode
+    }
+
+    private static func mailboxShutdown(_ decoder: ContinuousPCMDecoder) async throws -> ContinuousPCMDecoder.DebugWorkerStats {
+        let value = Mutex<Bool?>(nil)
+        decoder.shutdown()
+        decoder.debugAfterShutdown { closed in value.withLock { $0 = closed } }
+        try await mailboxWait(timeout: 2, "Actual reader-lane close acknowledgement must finish before owned-file cleanup") {
+            value.withLock { $0 } != nil
+        }
+        XCTAssertEqual(value.withLock { $0 }, true)
+        let stats = try await mailboxStats(decoder)
+        XCTAssertTrue(stats.shutdownRequested); XCTAssertTrue(stats.readerLeasesClosed)
+        XCTAssertEqual(stats.leasedReaders, 0); XCTAssertEqual(stats.pendingPreparations, 0)
+        return stats
+    }
+
+    private static func assertMailboxBounds(_ stats: ContinuousPCMDecoder.DebugWorkerStats,
+                                           file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(stats.maximumLeases, 3, file: file, line: line)
+        XCTAssertEqual(stats.maximumNativeFramesPerPacket, 4_096, file: file, line: line)
+        XCTAssertEqual(stats.maximumChannels, 8, file: file, line: line)
+        XCTAssertEqual(stats.maximumLaneBufferBytes, 131_072, file: file, line: line)
+        XCTAssertEqual(stats.maximumOwnedPacketBytes, 131_072, file: file, line: line)
+        XCTAssertEqual(stats.maximumOwnedPacketsPerLease, 2, file: file, line: line)
+        XCTAssertEqual(stats.maximumOwnedPayloadBytesPerLease, 262_144, file: file, line: line)
+        XCTAssertTrue((0...3).contains(stats.leasedReaders), file: file, line: line)
+        XCTAssertTrue((0...3).contains(stats.peakLeasedReaders), file: file, line: line)
+        XCTAssertGreaterThanOrEqual(stats.peakLeasedReaders, stats.leasedReaders, file: file, line: line)
+        XCTAssertTrue((0...3).contains(stats.pendingPreparations), file: file, line: line)
+        XCTAssertTrue((0...max(0, stats.leasedReaders)).contains(stats.retiredLeasesAwaitingClose), file: file, line: line)
+        XCTAssertTrue((0...max(0, stats.leasedReaders)).contains(stats.startingLeases), file: file, line: line)
+        XCTAssertTrue((0...max(0, stats.leasedReaders)).contains(stats.readJobsAwaitingAcceptanceOrClose), file: file, line: line)
+        XCTAssertTrue((0...max(0, stats.leasedReaders)).contains(stats.mailboxPackets), file: file, line: line)
+        XCTAssertEqual(stats.pendingOrMailboxPacketSlots,
+                       stats.mailboxPackets + stats.readJobsAwaitingAcceptanceOrClose, file: file, line: line)
+        XCTAssertTrue((0...3).contains(stats.pendingOrMailboxPacketSlots), file: file, line: line)
+        XCTAssertEqual(stats.packetAllocationUpperBound, 2 * stats.leasedReaders, file: file, line: line)
+        XCTAssertTrue((0...6).contains(stats.packetAllocationUpperBound), file: file, line: line)
+        XCTAssertFalse(stats.counterOverflowed, file: file, line: line)
+    }
+    #endif
+
     func testHeldNeighbourNativeReadDoesNotPreventPreparedCurrentSourceRefill() async throws {
         #if DEBUG
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
