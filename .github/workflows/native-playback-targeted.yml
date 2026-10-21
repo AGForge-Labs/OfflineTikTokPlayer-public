@@ -1,0 +1,69 @@
+name: Native playback targeted causal controls
+on:
+  push:
+    branches: [diagnostic/native-reader-isolation]
+    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh']
+permissions:
+  contents: read
+jobs:
+  native-playback-targeted:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Require exact committed source before native work
+        id: source_pin
+        run: bash scripts/check-native-playback-targeted.sh --verify-source
+      - name: Portable Core regressions
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: bash scripts/test-core.sh
+      - name: Preserve launcher and strict evidence regression gates
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+      - name: Original production benchmark before causal controls
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: bash scripts/check-native-playback-targeted.sh benchmark
+      - name: Require original benchmark exact native identity
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
+          evidence = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(evidence)
+          expected = {'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
+          if not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('Original benchmark missing from pinned source')
+          evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected)
+          print('Targeted benchmark native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
+          PY
+      - name: Matched natural tracing and initial-readiness/composition controls
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: bash scripts/check-native-playback-targeted.sh controls
+      - name: Require all four exact causal-control identities
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
+          evidence = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(evidence)
+          prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
+          expected = {prefix + name for name in (
+              'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
+              'testNaturalBoundaryWithNativeLaneActivityRevealsB',
+              'testPrecomposedOffscreenItemsUseOriginalSelectionBenchmarkWithoutCapture',
+              'testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek')}
+          if len(expected) != 4 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('Four causal-control identities missing from pinned source')
+          evidence.verify_log(Path('artifacts/native/native-playback-controls.log').read_text(), expected)
+          print('Targeted controls native=4 ui=0; no threshold or original compositor/progress assertion removed')
+          PY
