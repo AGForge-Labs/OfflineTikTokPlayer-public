@@ -9,6 +9,14 @@ import Foundation
 /// The caller must add displayLayer to its visible inline surface and keep its bounds current.
 @MainActor
 final class ContinuousPictureInPicture: NSObject {
+    struct PresentationTicket: Equatable {
+        fileprivate let generation: Int
+        fileprivate let item: ObjectIdentifier
+    }
+    #if DEBUG
+    /// Observes the actual SDK request without replacing its result.
+    var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
+    #endif
     enum Event: Int {
         case willStart = 0
         case didStart = 1
@@ -109,8 +117,10 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     /// Exactly one item output is attached at a time; this never prepares additional video items.
-    func setCurrentItem(_ item: AVPlayerItem?) {
-        guard !invalidated, currentItem !== item else { return }
+    @discardableResult
+    func setCurrentItem(_ item: AVPlayerItem?) -> PresentationTicket? {
+        guard !invalidated else { return nil }
+        if currentItem === item { return item.map { PresentationTicket(generation: itemGeneration, item: ObjectIdentifier($0)) } }
         preparationTask?.cancel()
         preparationTask = nil
         stopFrameTimer()
@@ -128,7 +138,7 @@ final class ContinuousPictureInPicture: NSObject {
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
         lastCopiedFramePositionSeconds = nil
-        guard let item else { stopFrameTimer(); return }
+        guard let item else { stopFrameTimer(); return nil }
         originalComposition = item.videoComposition
         let existingComposition = item.videoComposition
         preparationTask = Task { [weak self, weak item] in
@@ -153,6 +163,25 @@ final class ContinuousPictureInPicture: NSObject {
                 self.onEvent?(.sourcePreparationFailed, (error as NSError).code)
             }
         }
+        return PresentationTicket(generation: generation, item: ObjectIdentifier(item))
+    }
+
+    /// API scaffold for the native regression: retains the original eager pulls
+    /// until the failing acquisition-order test has run on the Apple SDK.
+    @discardableResult
+    func installTimeline(_ ticket: PresentationTicket, positionSeconds: Double,
+                         durationSeconds: Double, isPlaying: Bool) -> Bool {
+        guard owns(ticket) else { return false }
+        updatePlayback(positionSeconds: positionSeconds, durationSeconds: durationSeconds, isPlaying: isPlaying)
+        return true
+    }
+
+    @discardableResult
+    func activate(_ ticket: PresentationTicket) -> Bool { owns(ticket) }
+
+    private func owns(_ ticket: PresentationTicket) -> Bool {
+        !invalidated && ticket.generation == itemGeneration
+            && currentItem.map { ObjectIdentifier($0) == ticket.item } == true
     }
 
     private func attachOutput(to item: AVPlayerItem) {
@@ -327,7 +356,11 @@ final class ContinuousPictureInPicture: NSObject {
         // Respect platform backpressure. No app-owned pixel-buffer queue or decoded-frame history.
         guard displayLayer.isReadyForMoreMediaData else { return }
         let requestedTime = CMTimebaseGetTime(timebase)
-        guard requestedTime.isNumeric, videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
+        guard requestedTime.isNumeric else { return }
+        #if DEBUG
+        if let item = currentItem { onFrameAcquisition?(item, requestedTime) }
+        #endif
+        guard videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
         var displayTime = CMTime.invalid
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
