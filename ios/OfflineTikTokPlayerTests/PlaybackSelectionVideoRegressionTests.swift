@@ -545,7 +545,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let screen = try SelectionVideoScreen(service: service, producerContext: context,
             producerWindowSeconds: 45, producerSampleCapacity: 512)
         defer { service.pause(); audio.graph.engine.stop(); screen.close() }
-        try await preparePositiveOffsetNaturalB(service, fixture: fixture)
+        try await preparePositiveOffsetNaturalB(service, fixture: fixture, audio: audio)
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "natural-B-positive-offset")
     }
 
@@ -575,7 +575,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             result?.dump(label: label)
             for summary in summaries { print(summary) }
         }
-        try await preparePositiveOffsetNaturalB(service, fixture: fixture)
+        try await preparePositiveOffsetNaturalB(service, fixture: fixture, audio: audio)
         let ready = await waitUntil {
             service.isVideoReady && (service.surface.playerLayer.isReadyForDisplay
                 || screen.customVideoLayer?.isReadyForDisplay == true)
@@ -640,10 +640,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         return "SelectionNaturalProducerProgress label=\(label) windowSeconds=\(seconds) samples=\(samples.count) wallSeconds=\(wall) pcmSeconds=\(pcm) maximumProgressSkewMs=\(skew * 1_000) maximumAcquisitionMs=\(acquisition * 1_000)"
     }
 
-    private func preparePositiveOffsetNaturalB(_ service: PlaybackService, fixture: SelectionVideoFixture) async throws {
+    private func preparePositiveOffsetNaturalB(_ service: PlaybackService, fixture: SelectionVideoFixture,
+                                               audio: ContinuousAudioPlayer) async throws {
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
-        try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 },
-                          "Both complete Saved sources must be ready")
+        guard await waitUntil({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 }) else {
+            XCTFail("Both complete Saved sources must be ready")
+            await traceFailedNaturalSetup(service, audio: audio, expectedA: fixture.aID, stage: "preparation")
+            throw SelectionVideoTestFailure.timeout
+        }
         let aToken = service.audioSnapshot.token
         let seekPosition = SelectionVideoFixture.duration - 2
         service.seek(seekPosition)
@@ -664,9 +668,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTFail("The real renderer must reach the seek runway or naturally enter B")
             // Sampling happens only after this existing setup guard has failed.
             // Abort this arm: A's failed seek cannot stand in for natural B.
-            let identifier = UUID().uuidString.lowercased()
-            let written = SelectionNativeWorkerSample.request(purpose: 0, identifier: identifier)
-            print("SelectionNativeWorkerRequest purposeCode=0 requestID=\(identifier) written=\(written)")
+            await traceFailedNaturalSetup(service, audio: audio, expectedA: fixture.aID, stage: "runway")
             throw SelectionVideoTestFailure.timeout
         }
         // The audio thread continues through the boundary while the main actor is briefly busy.
@@ -679,6 +681,30 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             && service.audioSnapshot.token != aToken
             && service.clock.position > 0 }, "The service must adopt naturally rendered B at a positive offset")
         assertSelection(service, fixture: fixture, id: fixture.bID)
+    }
+
+    private func traceFailedNaturalSetup(_ service: PlaybackService, audio: ContinuousAudioPlayer,
+                                         expectedA: String, stage: String) async {
+        func log(_ observation: String) {
+            let progress = audio.producerProgressRecorder.snapshot()
+            let sample = audio.renderer.diagnosticSnapshot
+            let now = DispatchTime.now().uptimeNanoseconds
+            let age = now >= progress.phaseEnteredUptimeNanoseconds && progress.phaseEnteredUptimeNanoseconds > 0
+                ? Double(now - progress.phaseEnteredUptimeNanoseconds) / 1_000_000 : -1
+            print("SelectionNaturalSetupFailure stage=\(stage) observation=\(observation) uptime=\(ProcessInfo.processInfo.systemUptime) workerID=\(audio.producerProgressRecorder.workerIdentifier) nativeTrace=\(progress.tracingEnabled) phase=\(progress.phase.rawValue) phaseAgeMs=\(age) phaseSequence=\(progress.phaseSequence) phaseToken=\(progress.token) slot=\(progress.slot) epoch=\(progress.epoch) pumpCount=\(progress.pumpCount) acceptedFrames=\(progress.acceptedFrames) coherent=\(progress.coherent) audioToken=\(sample?.token ?? -1) audioFrame=\(sample?.frame ?? -1) underrunFrames=\(sample?.underrunFrames ?? -1) preparedCount=\(service.preparedAudioCount) aAdvanced=\((sample?.frame ?? -1) > 2_400) bothPrepared=\(service.preparedAudioCount == 2) sourceA=\(service.queue.currentID == expectedA) currentIsA=\(service.current?.id == expectedA) isLoading=\(service.isLoading) videoReady=\(service.isVideoReady) messagePresent=\(service.message != nil) wantsToPlay=\(service.wantsToPlay) slot0Token=\(progress.slot0.token) slot0Epoch=\(progress.slot0.epoch) slot0Accepted=\(progress.slot0.acceptedFrames) slot1Token=\(progress.slot1.token) slot1Epoch=\(progress.slot1.epoch) slot1Accepted=\(progress.slot1.acceptedFrames) slot2Token=\(progress.slot2.token) slot2Epoch=\(progress.slot2.epoch) slot2Accepted=\(progress.slot2.acceptedFrames)")
+        }
+        let identifier = UUID().uuidString.lowercased()
+        let written = SelectionNativeWorkerSample.request(purpose: 0,
+            workerIdentifier: audio.producerProgressRecorder.workerIdentifier, identifier: identifier)
+        log("trigger")
+        print("SelectionNativeWorkerRequest purposeCode=0 requestID=\(identifier) written=\(written) stage=\(stage)")
+        if written {
+            // The guard has already failed. Keep this exact fixture alive for
+            // the host's bounded 1s PID + 1s bundle + 4s sampling commands.
+            // This grace cannot turn the original failed guard into a pass.
+            try? await Task.sleep(for: .seconds(7))
+        }
+        log("after")
     }
 
     func testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause() async throws {
@@ -1377,11 +1403,14 @@ private enum SelectionNativeWorkerSample {
         let requestID: String
         let processID: Int
         let purposeCode: Int
+        let workerID: String
     }
 
     @discardableResult
-    static func request(purpose: Int, identifier: String = UUID().uuidString.lowercased()) -> Bool {
-        guard (0...1).contains(purpose), UUID(uuidString: identifier)?.uuidString.lowercased() == identifier else { return false }
+    static func request(purpose: Int, workerIdentifier: String,
+                        identifier: String = UUID().uuidString.lowercased()) -> Bool {
+        guard (0...1).contains(purpose), UUID(uuidString: identifier)?.uuidString.lowercased() == identifier,
+              UUID(uuidString: workerIdentifier)?.uuidString.lowercased() == workerIdentifier else { return false }
         let manager = FileManager.default
         let temporary = manager.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
         let prefix = "OfflinePlayer-TestWorkerTrace-" + identifier
@@ -1395,8 +1424,8 @@ private enum SelectionNativeWorkerSample {
         var created = false
         defer { if created { try? manager.removeItem(at: partial) } }
         do {
-            let data = try JSONEncoder().encode(Request(schemaVersion: 1, requestID: identifier,
-                processID: Int(ProcessInfo.processInfo.processIdentifier), purposeCode: purpose))
+            let data = try JSONEncoder().encode(Request(schemaVersion: 2, requestID: identifier,
+                processID: Int(ProcessInfo.processInfo.processIdentifier), purposeCode: purpose, workerID: workerIdentifier))
             guard data.count <= 1_024 else { return false }
             try data.write(to: partial, options: .withoutOverwriting)
             created = true
@@ -1513,7 +1542,8 @@ private final class SelectionProducerProbe: @unchecked Sendable {
         nativeSampleRequested = true; nativeSampleWriteCode = 1
         // Serialize this small, failure-triggered file write with stop(). A
         // request must not appear after teardown and sample a later fixture.
-        let written = SelectionNativeWorkerSample.request(purpose: purpose, identifier: identifier)
+        let written = SelectionNativeWorkerSample.request(purpose: purpose,
+            workerIdentifier: context.producer.workerIdentifier, identifier: identifier)
         nativeSampleWriteCode = written ? 2 : 3
     }
 

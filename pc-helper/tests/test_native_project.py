@@ -62,20 +62,27 @@ def _worker_fixture(tmp_path, monkeypatch):
     return module, watcher, temporary.resolve(), executable.resolve()
 
 
+WORKER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+OTHER_WORKER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
 def _worker_request(module, temporary, purpose=0, changes=None):
     identifier = str(uuid.uuid4())
-    payload = {"schemaVersion": 1, "requestID": identifier, "processID": 4321, "purposeCode": purpose}
+    payload = {"schemaVersion": 2, "requestID": identifier, "processID": 4321,
+               "purposeCode": purpose, "workerID": WORKER_ID}
     payload.update(changes or {})
     request = temporary / f"{module.WORKER_PREFIX}{identifier}.request.json"
     request.write_text(json.dumps(payload), encoding="utf-8")
     return request, identifier
 
 
-WORKER_SAMPLE = """Sampling process 4321; PRIVATE_REPORT_HEADER
+WORKER_SAMPLE = f"""Sampling process 4321; PRIVATE_REPORT_HEADER
 Call graph:
     100 Thread_123 DispatchQueue_1: com.apple.main-thread (serial)
     + 100 PRIVATE_OTHER_THREAD
-    100 Thread_456 DispatchQueue_7: OfflineTikTokPlayer.PCMDecode (serial)
+    100 Thread_455 DispatchQueue_6: OfflineTikTokPlayer.PCMDecode.{OTHER_WORKER_ID} (serial)
+    + 100 PRIVATE_WRONG_DECODER
+    100 Thread_456 DispatchQueue_7: OfflineTikTokPlayer.PCMDecode.{WORKER_ID} (serial)
     + 100 synthetic_worker_frame (in SyntheticFramework)
     + ! 100 synthetic_reader_wait (in SyntheticFramework)
     100 Thread_789 DispatchQueue_8: PRIVATE_ANOTHER_QUEUE (serial)
@@ -116,7 +123,8 @@ def test_worker_trace_profiles_only_owned_pid_and_emits_only_worker_stack(tmp_pa
     watcher.poll_once()
     output = capsys.readouterr().out
     assert len(calls) == 3
-    assert f"requestID={identifier} purposeCode=0 statusCode=0" in output
+    assert f"requestID={identifier} purposeCode=0 workerID={WORKER_ID} statusCode=0" in output
+    assert "decoderQueueCount=2" in output
     assert "OfflineTikTokPlayer.PCMDecode" in output and "synthetic_reader_wait" in output
     assert "PRIVATE_" not in output
     assert "startUptime=" in output and "elapsedSeconds=" in output
@@ -125,10 +133,12 @@ def test_worker_trace_profiles_only_owned_pid_and_emits_only_worker_stack(tmp_pa
 
 
 @pytest.mark.parametrize("changes", [
-    {"extra": 1}, {"schemaVersion": True}, {"schemaVersion": 2},
+    {"extra": 1}, {"schemaVersion": True}, {"schemaVersion": 1},
     {"requestID": "22222222-2222-4222-8222-222222222222"},
     {"processID": True}, {"processID": 0}, {"processID": -1}, {"processID": "4321"},
     {"purposeCode": True}, {"purposeCode": 2}, {"purposeCode": None},
+    {"workerID": True}, {"workerID": None}, {"workerID": "invalid"},
+    {"workerID": WORKER_ID.upper()}, {"workerID": WORKER_ID.replace("-", "")},
 ])
 def test_worker_trace_rejects_invalid_schema_without_native_commands(tmp_path, monkeypatch, capsys, changes):
     module, watcher, temporary, _ = _worker_fixture(tmp_path, monkeypatch)
@@ -148,8 +158,8 @@ def test_worker_trace_rejects_bad_request_files(tmp_path, monkeypatch, capsys, k
         del payload["processID"]
         request.write_text(json.dumps(payload), encoding="utf-8")
     elif kind == "duplicate":
-        request.write_text('{"schemaVersion":1,"schemaVersion":1,"requestID":"' + identifier
-                           + '","processID":4321,"purposeCode":0}', encoding="utf-8")
+        request.write_text('{"schemaVersion":2,"schemaVersion":2,"requestID":"' + identifier
+                           + '","processID":4321,"purposeCode":0,"workerID":"' + WORKER_ID + '"}', encoding="utf-8")
     elif kind == "oversized":
         request.write_text(" " * 4097, encoding="utf-8")
     else:
@@ -257,14 +267,35 @@ def test_worker_trace_rejects_oversized_report_and_keeps_existing_files(tmp_path
 
 def test_worker_trace_filter_is_bounded_and_does_not_emit_other_sections():
     module = _capture_helper()
-    section, truncated = module.worker_section(WORKER_SAMPLE)
+    section, truncated, queue_count = module.worker_section(WORKER_SAMPLE, WORKER_ID)
     assert "synthetic_worker_frame" in section and "PRIVATE_" not in section
-    assert not truncated
-    report = "Call graph:\n    1 Thread_1 DispatchQueue_1: OfflineTikTokPlayer.PCMDecode (serial)\n" + "    + 1 " + "x" * 70_000
-    section, truncated = module.worker_section(report)
+    assert not truncated and queue_count == 2
+    report = f"Call graph:\n    1 Thread_1 DispatchQueue_1: OfflineTikTokPlayer.PCMDecode.{WORKER_ID} (serial)\n" + "    + 1 " + "x" * 70_000
+    section, truncated, _ = module.worker_section(report, WORKER_ID)
     assert truncated and len(section.encode("utf-8")) <= 64 * 1024
-    section, _ = module.worker_section("PRIVATE_REPORT_HEADER\nCall graph:\n    1 Thread_1 DispatchQueue_1: other\n    + 1 PRIVATE_OTHER\n")
+    section, _, queue_count = module.worker_section("PRIVATE_REPORT_HEADER\nCall graph:\n    1 Thread_1 DispatchQueue_1: other\n    + 1 PRIVATE_OTHER\n", WORKER_ID)
+    assert queue_count == 0
     assert not section
+
+
+def test_worker_trace_rejects_missing_requested_decoder_without_emitting_another(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    report = (f"Call graph:\n    1 Thread_1 DispatchQueue_1: OfflineTikTokPlayer.PCMDecode.{OTHER_WORKER_ID} (serial)\n"
+              "    + 1 PRIVATE_WRONG_DECODER\nBinary Images:\nPRIVATE_IMAGE\n")
+    _mock_worker_commands(monkeypatch, watcher, executable, report=report)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert "statusCode=10" in output and "decoderQueueCount=1" in output
+    assert "PRIVATE_" not in output and OTHER_WORKER_ID not in output
+    assert f"workerID={WORKER_ID}" in output
+
+
+@pytest.mark.parametrize("worker_id", ["", WORKER_ID.upper(), "OfflineTikTokPlayer.PCMDecode", True])
+def test_worker_trace_filter_requires_canonical_worker_uuid(worker_id):
+    module = _capture_helper()
+    with pytest.raises(ValueError):
+        module.worker_section(WORKER_SAMPLE, worker_id)
 
 
 def test_worker_trace_expired_deadline_never_invokes_native_tools(tmp_path, monkeypatch, capsys):

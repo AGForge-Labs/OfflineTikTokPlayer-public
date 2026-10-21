@@ -78,6 +78,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// observers make at most three attempts to read the fixed-size atomic record.
     /// A preempted writer produces coherent=false rather than blocking a probe.
     final class ProgressRecorder: @unchecked Sendable {
+        let workerIdentifier = UUID().uuidString.lowercased()
+
         private final class SlotCounters {
             let token = Atomic<Int>(0)
             let epoch = Atomic<Int>(0)
@@ -285,8 +287,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     private let renderer: ContinuousPCMRenderer
-    let progressRecorder = ProgressRecorder()
-    private let worker = DispatchQueue(label: "OfflineTikTokPlayer.PCMDecode", qos: .userInitiated)
+    let progressRecorder: ProgressRecorder
+    private let worker: DispatchQueue
     private var timer: DispatchSourceTimer?
     private var slots: [Slot?] = [nil, nil, nil]
     private var scratch = [Float](repeating: 0, count: 8_192 * 2)
@@ -299,7 +301,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     var cooperativeYieldCount: Int64 { yieldCount.load(ordering: .acquiring) }
 
     init(renderer: ContinuousPCMRenderer) {
+        let recorder = ProgressRecorder()
         self.renderer = renderer
+        progressRecorder = recorder
+        worker = DispatchQueue(label: "OfflineTikTokPlayer.PCMDecode." + recorder.workerIdentifier, qos: .userInitiated)
         let timer = DispatchSource.makeTimerSource(queue: worker)
         self.timer = timer
         timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(2))

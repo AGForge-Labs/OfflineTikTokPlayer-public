@@ -76,6 +76,27 @@ def split_diagnostic_timestamp_case(identity, status="passed", timestamp=False):
             "LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false"]
 
 
+def split_ordinary_diagnostic(timestamp=False):
+    """Observed Fig output interrupts an AQ diagnostic; neither record is a case."""
+    prefix = "2026-10-21T00:30:17.8060720Z " if timestamp else ""
+    tail_prefix = "2026-10-21T00:30:17.8167200Z " if timestamp else ""
+    return [prefix + "2026-10-21 00:30:16.802194+0000"
+            "2026-10-21 00:30:16.811662+0000 OfflineTikTokPlayer[7821:32557] [] "
+            "(Fig) signalled err=-12785 at <>:1469",
+            tail_prefix + " OfflineTikTokPlayer[7821:32359] [AQ]        "
+            "LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false"]
+
+
+def split_diagnostic_name_case(identity, status="passed", timestamp=False):
+    """A complete terminal interrupts the observed AQ diagnostic's file name."""
+    owner, method = identity.split("/")
+    prefix = "2026-10-21T00:55:41.2044580Z " if timestamp else ""
+    tail_prefix = "2026-10-21T00:55:41.2157110Z " if timestamp else ""
+    return [prefix + "2026-10-21 00:55:40.893716+0000 OfflineTikTokPlayer[6675:28545] [AQ]        "
+            + f"LoudnessManageTest Case '-[{owner} {method}]' {status} (0.037 seconds).",
+            tail_prefix + "r.mm:1215  IsHardwareSupported: no plist loaded, returning false"]
+
+
 class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -441,6 +462,183 @@ class NativeTestEvidenceTests(unittest.TestCase):
         failed = self.expected[1:4]
         others = [case_line(x) for x in self.expected if x not in [identity] + failed]
         lines = others + [case_line(identity, "started")] + split_diagnostic_timestamp_case(identity)
+        result = self.check_log(lines + [case_line(x, "failed") for x in failed] + ["** TEST FAILED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(identity, result.stderr)
+        for failure in failed:
+            self.assertIn(failure, result.stderr)
+        self.assertIn("TEST FAILED", result.stderr)
+
+    def test_accepts_the_observed_ordinary_diagnostic_pair_with_complete_case_evidence(self):
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                lines = self.full_log()
+                lines[1:1] = split_ordinary_diagnostic(timestamp=timestamp)
+                result = self.check_log(lines)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ordinary_diagnostic_pair_cannot_supply_a_missing_case_result(self):
+        identity = self.expected[0]
+        others = [case_line(x) for x in self.expected if x != identity]
+        for prior in ([], [case_line(identity, "started")]):
+            with self.subTest(prior=prior):
+                result = self.check_log(others + prior + split_ordinary_diagnostic() + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("missing passing cases", result.stderr)
+                self.assertIn(identity, result.stderr)
+
+    def test_ordinary_diagnostic_prefix_cannot_skip_a_case_before_the_aq_tail(self):
+        header, tail = split_ordinary_diagnostic()
+        identity = self.expected[0]
+        for status in ("failed", "skipped", "passed"):
+            with self.subTest(status=status):
+                # Every expected case already passed: skipping this intervening
+                # outcome would falsely accept a failure, skip or duplicate.
+                lines = self.full_log()[:-1] + [header, case_line(identity, status), tail, "** TEST SUCCEEDED **"]
+                result = self.check_log(lines)
+                self.assertNotEqual(result.returncode, 0)
+                if status == "passed":
+                    self.assertIn("duplicate", result.stderr.lower())
+                else:
+                    self.assertIn(status + " case", result.stderr)
+
+    def test_ordinary_diagnostic_tail_requires_the_exact_adjacent_prefix(self):
+        header, tail = split_ordinary_diagnostic()
+        fragments = ([header, "", tail], [header, "unrelated output", tail],
+                     [header, "** TEST SUCCEEDED **", tail],
+                     [header, "** TEST FAILED **", tail],
+                     [header.replace("(Fig)", "(Other)"), tail],
+                     [header.replace("err=-12785", "err=-12900"), tail],
+                     [header + " unrelated output", tail])
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                result = self.check_log(self.full_log()[:-1] + list(fragment) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_ordinary_diagnostic_pair_cannot_hide_malformed_native_case_text(self):
+        header, tail = split_ordinary_diagnostic()
+        malformed = case_line(self.expected[0]).replace(" passed ", " passed-with-noise ")
+        fragments = ([header, malformed, tail], [header + " " + malformed, tail],
+                     [header, tail + " " + malformed])
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                result = self.check_log(self.full_log()[:-1] + list(fragment) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Malformed", result.stderr)
+
+    def test_ordinary_diagnostic_pair_cannot_complete_a_pending_case(self):
+        identity = self.expected[0]
+        terminal, _ = split_diagnostic_timestamp_case(identity)
+        others = [case_line(x) for x in self.expected if x != identity]
+        lines = others + [case_line(identity, "started"), terminal] + split_ordinary_diagnostic()
+        result = self.check_log(lines + ["** TEST SUCCEEDED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unfinished interleaved case", result.stderr)
+        self.assertIn(identity, result.stderr)
+
+    def test_accepts_terminal_inside_the_observed_split_diagnostic_name(self):
+        identity = TARGETS[0] + ".PlaybackContinuityTests/testLoopReserveHasAFixedBoundAndExplicitSkipRemovesIt"
+        self.assertIn(identity, self.expected)
+        others = [case_line(x) for x in self.expected if x != identity]
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                result = self.check_log(others + [case_line(identity, "started")]
+                                        + split_diagnostic_name_case(identity, timestamp=timestamp)
+                                        + ["** TEST SUCCEEDED **"])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PASS " + identity + "\n", result.stdout)
+
+    def test_diagnostic_name_split_requires_the_exact_immediate_tail_and_prefix(self):
+        identity = self.expected[0]
+        terminal, tail = split_diagnostic_name_case(identity)
+        fragments = ([terminal], [terminal, "", tail], [terminal, "unrelated output", tail],
+                     [terminal, case_line(self.expected[1], "started"), tail],
+                     [terminal, "** TEST SUCCEEDED **", tail],
+                     [terminal, "** TEST FAILED **", tail],
+                     [terminal, tail.replace("r.mm:1215", "x.mm:1215")],
+                     [terminal, tail.replace("returning false", "returning true")],
+                     [terminal, tail + " unrelated output"],
+                     [terminal + " unrelated output", tail],
+                     [terminal.replace("LoudnessManageTest Case", "LoudnessManagerTest Case"), tail],
+                     [terminal.replace("OfflineTikTokPlayer[6675:28545]", "OtherPlayer[6675:28545]"), tail],
+                     [terminal.replace("2026-10-21 00:55:40.893716+0000", "unknown-time"), tail],
+                     [terminal, tail + " " + case_line(self.expected[1])])
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                # An earlier ordinary pass cannot make malformed extra native
+                # evidence or a missing diagnostic continuation disappear.
+                result = self.check_log(self.full_log()[:-1] + list(fragment) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_diagnostic_name_split_requires_one_prior_start_and_no_prior_outcome(self):
+        identity = self.expected[0]
+        others = [case_line(x) for x in self.expected if x != identity]
+        started = [case_line(identity, "started")]
+        for before, after in (([], []), (started * 2, []), ([], started)):
+            with self.subTest(before=before, after=after):
+                result = self.check_log(others + before + split_diagnostic_name_case(identity)
+                                        + after + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Ambiguous", result.stderr)
+        for prior in ("passed", "failed"):
+            with self.subTest(prior=prior):
+                result = self.check_log(others + started + [case_line(identity, prior)]
+                                        + split_diagnostic_name_case(identity) + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Ambiguous", result.stderr)
+        for target in TARGETS:
+            unexpected = target + ".NewTests/testUnexpected"
+            result = self.check_log([case_line(unexpected, "started")]
+                                    + split_diagnostic_name_case(unexpected) + self.full_log())
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unexpected", result.stderr.lower())
+
+    def test_diagnostic_name_split_preserves_failed_skipped_and_duplicate_results(self):
+        identity = self.expected[0]
+        others = [case_line(x) for x in self.expected if x != identity]
+        started = [case_line(identity, "started")]
+        for status in ("failed", "skipped"):
+            with self.subTest(status=status):
+                result = self.check_log(others + started + split_diagnostic_name_case(identity, status)
+                                        + ["** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(status + " case", result.stderr)
+        for status in ("passed", "failed"):
+            with self.subTest(retry_or_duplicate=status):
+                result = self.check_log(others + started + split_diagnostic_name_case(identity, status)
+                                        + [case_line(identity), "** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("duplicate", result.stderr.lower())
+
+    def test_diagnostic_name_tail_cannot_supply_a_missing_or_nonadjacent_case_result(self):
+        identity = self.expected[0]
+        terminal, tail = split_diagnostic_name_case(identity)
+        others = [case_line(x) for x in self.expected if x != identity]
+        for prior in ([], [case_line(identity, "started")]):
+            with self.subTest(prior=prior):
+                result = self.check_log(others + prior + [tail, "** TEST SUCCEEDED **"])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("missing passing cases", result.stderr)
+                self.assertIn(identity, result.stderr)
+        # Ordinary diagnostic handling must not skip physical lines before
+        # resolving this pending terminal and then borrow its later tail.
+        lines = others + [case_line(identity, "started"), terminal] + split_ordinary_diagnostic() + [tail]
+        result = self.check_log(lines + ["** TEST SUCCEEDED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unfinished interleaved case", result.stderr)
+        self.assertIn(identity, result.stderr)
+
+    def test_standalone_diagnostic_name_tail_is_rejected_beside_complete_evidence(self):
+        _, tail = split_diagnostic_name_case(self.expected[0])
+        result = self.check_log(self.full_log()[:-1] + [tail, "** TEST SUCCEEDED **"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Orphan case result suffix", result.stderr)
+
+    def test_diagnostic_name_split_does_not_hide_other_case_failures(self):
+        identity = self.expected[0]
+        failed = self.expected[1:4]
+        others = [case_line(x) for x in self.expected if x not in [identity] + failed]
+        lines = others + [case_line(identity, "started")] + split_diagnostic_name_case(identity)
         result = self.check_log(lines + [case_line(x, "failed") for x in failed] + ["** TEST FAILED **"])
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(identity, result.stderr)

@@ -39,34 +39,47 @@ def trace_termination_handler(stop):
     return terminate
 
 
-def worker_section(report):
-    """Return only the named worker's call-graph thread, never report metadata."""
+def canonical_worker_id(value):
+    try:
+        return type(value) is str and str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def worker_section(report, worker_id):
+    """Return only this decoder's call-graph sections, never another worker."""
+    if not canonical_worker_id(worker_id):
+        raise ValueError("Invalid worker UUID")
     thread = re.compile(r"^\s*(?:\d+\s+)?Thread[_ ](?:0x)?[0-9a-fA-F]+\b")
-    queue = re.compile(r"\bDispatchQueue[_ ]\d+:\s*OfflineTikTokPlayer\.PCMDecode(?=\s|\(|$)")
-    lines, size, in_graph, selected, truncated = [], 0, False, False, False
+    queue = re.compile(r"\bDispatchQueue[_ ]\d+:\s*OfflineTikTokPlayer\.PCMDecode\." + re.escape(worker_id) + r"(?=\s|\(|$)")
+    any_decoder = re.compile(r"\bDispatchQueue[_ ]\d+:\s*OfflineTikTokPlayer\.PCMDecode(?:\.[0-9a-fA-F-]+)?(?=\s|\(|$)")
+    lines, size, decoder_count = [], 0, 0
+    in_graph = selected = truncated = full = False
     for line in report.splitlines():
         if line.strip() == "Call graph:":
             in_graph = True
             continue
         if not in_graph:
             continue
+        if line.strip().startswith(("Total number in stack", "Sort by top of stack", "Binary Images:", "Analysis of sampling")):
+            break
         if thread.match(line):
-            if selected:
-                break
-            if not queue.search(line):
+            decoder_count += int(any_decoder.search(line) is not None)
+            selected = queue.search(line) is not None
+            if not selected:
                 continue
-            selected = True
         elif not selected:
             continue
         elif line.strip() and not re.match(r"^\s*(?:[+!:|]|\d+\s)", line):
-            break
+            selected = False
+            continue
         encoded = (line + "\n").encode("utf-8")
-        if size + len(encoded) > WORKER_SECTION_LIMIT:
-            truncated = True
-            break
+        if full or size + len(encoded) > WORKER_SECTION_LIMIT:
+            truncated = full = True
+            continue
         lines.append(line + "\n")
         size += len(encoded)
-    return "".join(lines), truncated
+    return "".join(lines), truncated, decoder_count
 
 
 def _unique_object(pairs):
@@ -213,6 +226,7 @@ class WorkerTraceWatcher:
         self.processed += 1
         purpose, code, section, truncated, native_returncode = -1, 1, "", False, -1
         sample_started, sample_elapsed = -1.0, 0.0
+        worker_id, decoder_count = None, 0
         request_identity = report_identity = None
         report = self.temporary / f"{WORKER_PREFIX}{identifier}.sample.txt"
         try:
@@ -225,13 +239,15 @@ class WorkerTraceWatcher:
             payload = json.loads(self._read(request, 4096, request_identity).decode("utf-8"),
                                  object_pairs_hook=_unique_object)
             if (not isinstance(payload, dict)
-                    or set(payload) != {"schemaVersion", "requestID", "processID", "purposeCode"}
-                    or type(payload["schemaVersion"]) is not int or payload["schemaVersion"] != 1
+                    or set(payload) != {"schemaVersion", "requestID", "processID", "purposeCode", "workerID"}
+                    or type(payload["schemaVersion"]) is not int or payload["schemaVersion"] != 2
                     or payload["requestID"] != identifier
                     or type(payload["processID"]) is not int or not 0 < payload["processID"] <= 2**31 - 1
-                    or type(payload["purposeCode"]) is not int or payload["purposeCode"] not in (0, 1)):
+                    or type(payload["purposeCode"]) is not int or payload["purposeCode"] not in (0, 1)
+                    or not canonical_worker_id(payload["workerID"])):
                 return
             purpose = payload["purposeCode"]
+            worker_id = payload["workerID"]
             if purpose in self.purposes or self.profile_count >= 2:
                 code = 3
                 return
@@ -264,7 +280,7 @@ class WorkerTraceWatcher:
             if self._owned_identity(report) != report_identity:
                 return
             raw = self._read(report, WORKER_REPORT_LIMIT, report_identity)
-            section, truncated = worker_section(raw.decode("utf-8", errors="replace"))
+            section, truncated, decoder_count = worker_section(raw.decode("utf-8", errors="replace"), worker_id)
             code = 0 if section else 10
         except WorkerTraceStopped:
             code = 4
@@ -279,7 +295,8 @@ class WorkerTraceWatcher:
         finally:
             self._remove(report, report_identity)
             self._remove(request, request_identity)
-            print(f"NativeWorkerTraceResult requestID={identifier} purposeCode={purpose} statusCode={code} nativeReturnCode={native_returncode} bytes={len(section.encode('utf-8'))} truncated={int(truncated)} startUptime={sample_started:.6f} elapsedSeconds={sample_elapsed:.6f}", flush=True)
+            worker_field = f" workerID={worker_id}" if worker_id is not None else ""
+            print(f"NativeWorkerTraceResult requestID={identifier} purposeCode={purpose}{worker_field} statusCode={code} nativeReturnCode={native_returncode} bytes={len(section.encode('utf-8'))} truncated={int(truncated)} decoderQueueCount={decoder_count} startUptime={sample_started:.6f} elapsedSeconds={sample_elapsed:.6f}", flush=True)
             if section:
                 print(section, end="", flush=True)
 
