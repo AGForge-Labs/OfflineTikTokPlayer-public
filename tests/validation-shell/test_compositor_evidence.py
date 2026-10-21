@@ -188,6 +188,30 @@ class CompositorEvidenceTests(unittest.TestCase):
                 self.module._inventory(directory)
         # Restore real scandir before the fixture's directory cleanup.
 
+    def test_format_rejection_reports_numeric_reason_without_names_or_contents(self):
+        original = self.payloads.copy()
+        cases = (
+            ({"capture.png": b"private"}, 1, 1, 1, 7),
+            ({"extra-private.txt": b"private"}, 2, 3, 2, 7),
+            ({"extra-private.jpeg": PNG}, 2, 4, 2, len(PNG)),
+            ({"extra-private.secret": b"private"}, 2, 0, 2, 7),
+        )
+        for changes, reason, format_code, ordinal, size in cases:
+            with self.subTest(reason=reason, format_code=format_code):
+                self.payloads = dict(original, **changes)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    with self.assertRaises(self.module.EvidenceError) as caught:
+                        self.export()
+                self.assertEqual(caught.exception.status_code, 6)
+                rows = [row for row in output.getvalue().splitlines()
+                        if row.startswith("CompositorEvidenceFormat ")]
+                self.assertEqual(rows, [f"CompositorEvidenceFormat rejectionCode={reason} "
+                                        f"formatCode={format_code} ordinal={ordinal} bytes={size}"])
+                self.assertNotIn("private", output.getvalue())
+                self.assertFalse(self.output.exists())
+                self.assertTrue(all(not path.exists() for path in self.export_roots))
+
     def test_enforces_image_file_count_per_file_and_total_retained_caps(self):
         original = self.payloads.copy()
         self.payloads = {f"{index}.png": PNG for index in range(25)}

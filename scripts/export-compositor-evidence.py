@@ -28,6 +28,15 @@ class EvidenceError(Exception):
         super().__init__(status_code)
 
 
+def _reject_format(reason, extension, ordinal, size):
+    # Fixed numeric categories only: no attachment names, paths or contents.
+    format_code = {".png": 1, ".json": 2, ".txt": 3, ".jpg": 4,
+                   ".jpeg": 4, ".heic": 5}.get(extension, 0)
+    print(f"CompositorEvidenceFormat rejectionCode={reason} formatCode={format_code} "
+          f"ordinal={ordinal} bytes={size}", flush=True)
+    raise EvidenceError(6)
+
+
 def _regular(path, directory=False):
     value = path.lstat()
     if stat.S_ISLNK(value.st_mode) or getattr(value, "st_file_attributes", 0) & 0x400:
@@ -185,12 +194,12 @@ def export_evidence(repo_root, environment, *, runner=run_bounded, platform_name
             images = metadata = total = 0
             records = []
             staged.mkdir()
-            for relative, path, before in files:
+            for ordinal, (relative, path, before) in enumerate(files, start=1):
                 extension = path.suffix.lower()
                 if extension == ".png":
                     with path.open("rb") as stream:
                         if stream.read(8) != b"\x89PNG\r\n\x1a\n":
-                            raise EvidenceError(6)
+                            _reject_format(1, extension, ordinal, before.st_size)
                     if before.st_size > MAX_PNG_BYTES:
                         raise EvidenceError(5)
                     images += 1
@@ -200,7 +209,7 @@ def export_evidence(repo_root, environment, *, runner=run_bounded, platform_name
                     metadata += 1
                     format_name = "json"
                 else:
-                    raise EvidenceError(6)
+                    _reject_format(2, extension, ordinal, before.st_size)
                 target = staged / "attachments" / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, target)
