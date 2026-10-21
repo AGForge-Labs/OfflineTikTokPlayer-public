@@ -9,7 +9,7 @@ jobs:
   native-reader-full-validation:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -43,12 +43,12 @@ jobs:
       - name: Verify existing strict native evidence regressions
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: python3 tests/validation-shell/test_native_test_evidence.py
-      - name: Run unchanged full unsigned playback validation
+      - name: Run all unsigned playback regressions with bounded XCTest watchdog
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
           bash scripts/check-native-reader-full-validation.sh --verify-source
           bash scripts/check-ios.sh
-      - name: Require all ninety-seven native and one UI identities
+      - name: Require all 106 native and one UI identities
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -60,8 +60,8 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          if len(native) != 97 or len(ui) != 1 or native | ui != expected:
-              raise SystemExit(f'Pinned full manifest must equal native=97 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
+          if len(native) != 106 or len(ui) != 1 or native | ui != expected:
+              raise SystemExit(f'Pinned full manifest must equal native=106 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('FULL source-manifest evidence native=97 ui=1; original guards retained; physical-device acceptance remains separate')
+          print('FULL source-manifest evidence native=106 ui=1; original guards retained; physical-device acceptance remains separate')
           PY

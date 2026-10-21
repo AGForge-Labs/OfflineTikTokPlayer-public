@@ -4,8 +4,8 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 # Require the reviewed final app/test commit and its exact ios tree.
-expected_code_source=4c338659cbe0a10d08d0dbe87b08aa68678d6043
-expected_ios_tree=27eba5f39e8dd2c2b4af64f2ae9c16a2626e7965
+expected_code_source=8f7af3d192e8c85a7d20dbe8bb766fee173a67f6
+expected_ios_tree=b3128730940eb36df8fa05959b946e7fd838d842
 verify_source() {
   case "$expected_code_source" in
     ''|PENDING|*[!0-9a-f]*) printf '%s\n' 'A final committed app/test source pin is required.' >&2; return 2 ;;
@@ -61,6 +61,7 @@ xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlaye
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/NativeReaderProduction-$(date +%Y%m%d-%H%M%S).xcresult" \
   -jobs 1 -parallel-testing-enabled NO \
+  -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
   -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture \
   SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
   CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
