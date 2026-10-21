@@ -1,0 +1,33 @@
+name: Native refill focused fresh-host controls
+on:
+  push:
+    branches: [diagnostic/native-reader-isolation]
+    paths: ['.github/workflows/native-refill-focus.yml', 'scripts/check-native-refill-focus.sh']
+permissions:
+  contents: read
+jobs:
+  native-refill-focus:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Require exact committed app and test source
+        id: source_pin
+        run: bash scripts/check-native-refill-focus.sh --verify-source
+      - name: Preserve strict native evidence and both harness regression routes
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+          python3 tests/validation-shell/test_native_control_harness.py
+          python3 tests/validation-shell/test_native_refill_focus_harness.py
+      - name: Compile once then run four fixed fresh-host singleton controls without capture
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: bash scripts/check-native-refill-focus.sh controls
+      - name: Require four exact singleton identities and all native and host receipts
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: bash scripts/check-native-refill-focus.sh --verify-controls
