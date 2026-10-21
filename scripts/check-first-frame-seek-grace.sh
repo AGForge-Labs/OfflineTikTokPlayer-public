@@ -3,7 +3,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 # Launch commits must preserve the reviewed app, test and fixture tree.
-expected_ios_tree=a5e7d8fd6841ed4bfff9958e448b786c0102d249
+expected_ios_tree=04ede18d838c5bb2e2064789dffed9c7c843ee9e
 test "$(git rev-parse HEAD:ios)" = "$expected_ios_tree"
 export SWIFTC_MAXIMUM_DETERMINISM=1
 mkdir -p artifacts/native
@@ -45,7 +45,7 @@ cleanup_capture() {
   exit "$cleanup_status"
 }
 trap cleanup_capture EXIT
-printf '%s\n' "StartupGraceScope appAndTestsSource=a3a7221df8fe39f4e06dbb0971f62189493ec572 iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 fullApplicationAcceptance=false"
+printf '%s\n' "StartupGraceScope appAndTestsSource=84fd8dd810ecf1ecef1da51e00e64f08f9152b57 iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 fullApplicationAcceptance=false"
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/StartupGrace-$(date +%Y%m%d-%H%M%S).xcresult" \
