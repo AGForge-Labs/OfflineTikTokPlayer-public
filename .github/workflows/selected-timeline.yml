@@ -31,3 +31,10 @@ jobs:
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
           print('SCOPED production-path benchmark native=1 ui=0; compositor/full playback acceptance NOT RUN')
           PY
+      - name: Preserve benchmark and run full unsigned playback regressions
+        if: always()
+        run: |
+          cp artifacts/native/xcodebuild-test.log artifacts/native/selected-production-benchmark.log
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+          bash scripts/check-ios.sh

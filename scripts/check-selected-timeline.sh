@@ -5,7 +5,7 @@ cd "$repo_root"
 mkdir -p artifacts/native
 native_log=artifacts/native/xcodebuild-test.log
 : > "$native_log"
-expected_ios_tree=e4c834383b52afd1112d154410dfa3307c3a113d
+expected_ios_tree=5ddfc6687f62b934bce9b068665a6153358fe8bc
 test "$(git rev-parse HEAD:ios)" = "$expected_ios_tree"
 export SWIFTC_MAXIMUM_DETERMINISM=1
 printf '' | xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/swift-driver-plan.log 2>&1
@@ -28,7 +28,7 @@ if result.returncode:
     raise SystemExit(result.returncode)
 PY
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
-printf '%s\n' "SelectedTimelineScope appAndTestsSource=a9ae2aa52e98156a4f2de7059ae57b15e6fc867a iosTree=$expected_ios_tree expectedNative=1 expectedUI=0 compositorRequests=0 externalProfilerRequests=0 fullApplicationAcceptance=false purpose=matched-production-path-before-repair"
+printf '%s\n' "SelectedTimelineScope appAndTestsSource=7dce4c95c543769887d0b261ac8ce946f6fcabdc iosTree=$expected_ios_tree expectedNative=1 expectedUI=0 compositorRequests=0 externalProfilerRequests=0 fullApplicationAcceptance=false purpose=matched-production-path-after-repair"
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/SelectedTimeline-$(date +%Y%m%d-%H%M%S).xcresult" \
