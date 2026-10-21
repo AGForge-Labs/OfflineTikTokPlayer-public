@@ -644,6 +644,30 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertLessThanOrEqual(witnesses.count, 4)
     }
 
+    func testMatchedNaturalBoundaryWithStagedNativeInputAndCaptureControls() async throws {
+        #if DEBUG
+        // Preserve the original four arms above. This additional fresh cohort
+        // stages input with the same video policy; buffering/pacing and the
+        // counter also differ. It is a falsification control, not an accepted
+        // correction or proof that SDK resources are quiescent.
+        var witnesses: [SelectionDecoderLifetimeWitness] = []
+        witnesses.reserveCapacity(4)
+        for condition in [(trace: false, capture: false), (trace: true, capture: false),
+                          (trace: false, capture: true), (trace: true, capture: true)] {
+            let boundary = "staged-input-trace-\(condition.trace)-capture-\(condition.capture)"
+            logDecoderLifetimes(boundary: "before-\(boundary)", witnesses: witnesses)
+            do {
+                try await measureNaturalProducer(trace: condition.trace, capture: condition.capture,
+                    nativeInputPlacement: .stagedBeforeConversion, witnesses: &witnesses)
+            } catch { XCTFail("Staged-input matched natural setup failed: \(error)") }
+            logDecoderLifetimes(boundary: "after-\(boundary)", witnesses: witnesses)
+        }
+        XCTAssertLessThanOrEqual(witnesses.count, 4)
+        #else
+        XCTFail("Staged native-input control requires DEBUG diagnostic code")
+        #endif
+    }
+
     private func logDecoderLifetimes(boundary: String, witnesses: [SelectionDecoderLifetimeWitness]) {
         let started = DispatchTime.now().uptimeNanoseconds
         let global = ContinuousPCMDecoder.lifecycleSnapshot()
@@ -664,20 +688,30 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     private func measureNaturalProducer(trace: Bool, capture: Bool,
+        nativeInputPlacement: ContinuousPCMDecoder.NativeInputPlacement = .converterCallback,
         witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
         // Fixture generation has yielded before the next decoder is created;
         // this separates immediate scope-release from survival into a later arm.
-        logDecoderLifetimes(boundary: "fixture-ready-before-new-decoder-trace-\(trace)-capture-\(capture)", witnesses: witnesses)
-        let audio = ContinuousAudioPlayer()
+        let placementLabel: String
+        switch nativeInputPlacement {
+        case .converterCallback: placementLabel = ""
+        #if DEBUG
+        case .stagedBeforeConversion: placementLabel = "-staged-input"
+        #endif
+        }
+        let label = "matched-natural\(placementLabel)-trace-\(trace)-capture-\(capture)"
+        let fixtureBoundary = placementLabel.isEmpty
+            ? "fixture-ready-before-new-decoder-trace-\(trace)-capture-\(capture)"
+            : "fixture-ready-before-new-decoder-\(label)"
+        logDecoderLifetimes(boundary: fixtureBoundary, witnesses: witnesses)
+        let audio = ContinuousAudioPlayer(nativeInputPlacement: nativeInputPlacement)
         audio.producerProgressRecorder.setTracingEnabled(trace)
         let service = fixture.service(continuousAudio: audio)
         precondition(witnesses.count < 4)
-        witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
-            label: "matched-natural-trace-\(trace)-capture-\(capture)"))
+        witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio, label: label))
         let screen = try SelectionVideoScreen(service: service)
-        let label = "matched-natural-trace-\(trace)-capture-\(capture)"
         let setupStart = ProcessInfo.processInfo.systemUptime
         var result: SelectionProducerProbe.Result?
         var summaries: [String] = []
@@ -701,6 +735,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let copyBaseline = SelectionNativeCopyBoundary(producer: audio.producerProgressRecorder,
             expectedAudioToken: baseline.token)
         copyBoundaries.append(("baseline", copyBaseline))
+        #if DEBUG
+        let stagedReadBaseline = placementLabel.isEmpty ? nil : audio.producerProgressRecorder.debugStagedNativeReadCount
+        #endif
         let setupMs = (ProcessInfo.processInfo.systemUptime - setupStart) * 1_000
         XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
         XCTAssertEqual(copyBaseline.snapshot.tracingEnabled, trace)
@@ -721,6 +758,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let copyFinal = SelectionNativeCopyBoundary(producer: audio.producerProgressRecorder,
             expectedAudioToken: baseline.token)
         copyBoundaries.append(("final", copyFinal))
+        #if DEBUG
+        let stagedReadFinal = placementLabel.isEmpty ? nil : audio.producerProgressRecorder.debugStagedNativeReadCount
+        #endif
         result = observed
         // The unchanged first-eight-second contract is checked separately from
         // the longer matched window. A slow capture's later tail stays visible.
@@ -734,6 +774,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertTrue(service.wantsToPlay && service.audioEngineRunning)
         assertSelection(service, fixture: fixture, id: fixture.bID)
         summaries.append("SelectionNaturalCondition label=\(label) nativeTrace=\(trace) capture=\(capture) setupMs=\(setupMs) captureSeconds=\(captureSeconds) baselineFrame=\(baseline.frame) baselineUnderruns=\(baseline.underrunFrames) finalUnderruns=\(service.audioSnapshot.underrunFrames)")
+        #if DEBUG
+        if let stagedReadBaseline, let stagedReadFinal {
+            XCTAssertGreaterThan(stagedReadFinal, stagedReadBaseline,
+                "The staged worker must complete outside-converter reads between the counter boundary observations")
+            summaries.append("SelectionStagedNativeInputEvidence label=\(label) baselineCompletedReads=\(stagedReadBaseline) finalCompletedReads=\(stagedReadFinal) counterScope=decoder-worker-all-streams countMeaning=completed-including-EOF placement=outside-converter capacityNativeFramesPerStream=4096 maximumSampleBytesPerStream=131072 interpretation=falsification-control-not-causal-proof")
+        }
+        #endif
     }
 
     private func assertNaturalProducerWindow(_ result: SelectionProducerProbe.Result,

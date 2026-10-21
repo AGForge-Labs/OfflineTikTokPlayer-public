@@ -6,6 +6,50 @@ import PlayerCore
 @testable import OfflineTikTokPlayer
 
 final class ContinuousPCMDecoderTests: XCTestCase {
+    func testStagedNativeInputMatchesCompleteCallbackPresentationsAcrossCodecsAndRateRatios() async throws {
+        #if DEBUG
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var urls: [URL] = []
+        for (name, rate, frames, compressed) in [
+            ("aac", 48_000.0, 12_345, true),
+            ("fractional", 44_100.0, 9_801, false),
+            ("upsample-partial", 8_000.0, 1_537, false),
+            ("downsample-multirefill", 384_000.0, 65_539, false)
+        ] {
+            let url = directory.appendingPathComponent(name + (compressed ? ".m4a" : ".caf"))
+            let samples = (0..<frames).flatMap { frame -> [Float] in
+                let quiet = frame < 17 || (name != "fractional" && frame >= frames - 13)
+                let value: Float = quiet ? 0 : Float(sin(Double(frame) * 0.071)) * 0.2
+                return [value, -value]
+            }
+            try writePCM(samples, to: url, compressed: compressed, sampleRate: rate)
+            urls.append(url)
+        }
+        let literal = directory.appendingPathComponent("literal.caf")
+        try writePCM([0, 0, 0, 0, 0.125, -0.125, 0.25, -0.25, 0, 0, 0.5, -0.5, 0, 0], to: literal)
+        urls.append(literal)
+        urls.append(try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-tone", withExtension: "mp3")))
+        urls.append(try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-slideshow-mp3.iphone", withExtension: "mp4")))
+        for url in urls {
+            let expected = try await independentlyDecode(AVURLAsset(url: url,
+                options: [AVURLAssetPreferPreciseDurationAndTimingKey: true]))
+            XCTAssertGreaterThan(expected.map { abs($0) }.max() ?? 0, 0.01)
+            if url.lastPathComponent == "fractional.caf" {
+                XCTAssertEqual(expected.count, 10_668 * 2)
+                XCTAssertGreaterThan(abs(try XCTUnwrap(expected.suffix(2).first)), 0.01,
+                    "The staged comparison must include the nonzero calculated fractional endpoint")
+            }
+            let baseline = try await decodePinnedPresentation(url: url, expected: expected, placement: .converterCallback)
+            let staged = try await decodePinnedPresentation(url: url, expected: expected, placement: .stagedBeforeConversion)
+            assertSamples(staged, equal: baseline)
+        }
+        #else
+        throw XCTSkip("The staged native-input control is compiled only in DEBUG")
+        #endif
+    }
+
     func testDecoderPreservesLeadingAndTrailingSourceSilenceAndTheLastFrame() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -297,30 +341,44 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         try writePCM(native, to: url, sampleRate: 44_100)
         let expected = try await independentlyDecode(AVURLAsset(url: url), diagnosticName: "streamed-44100-to-48000")
         XCTAssertEqual(expected.count, 10_668 * 2)
-        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
-        let decoder = ContinuousPCMDecoder(renderer: renderer)
-        defer { decoder.shutdown() }
-        _ = try await decoder.prepare(url: url, token: 1, slot: 0)
-        renderer.setSuccessor(token: 1, for: 1)
-        renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
-        var actual: [Float] = []
-        while actual.count < expected.count * 3 {
-            let count = min(127, (expected.count * 3 - actual.count) / 2)
-            try await Self.waitForPreparedFrames(renderer, count: count, totalFrames: 10_668)
-            var block = [Float](repeating: .nan, count: count * 2)
-            block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: count) }
-            actual.append(contentsOf: block)
+        #if DEBUG
+        let placements: [ContinuousPCMDecoder.NativeInputPlacement] = [.converterCallback, .stagedBeforeConversion]
+        #else
+        let placements: [ContinuousPCMDecoder.NativeInputPlacement] = [.converterCallback]
+        #endif
+        for placement in placements {
+            let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+            let decoder = ContinuousPCMDecoder(renderer: renderer, nativeInputPlacement: placement)
+            defer { decoder.shutdown() }
+            _ = try await decoder.prepare(url: url, token: 1, slot: 0)
+            renderer.setSuccessor(token: 1, for: 1)
+            renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+            var actual: [Float] = []
+            while actual.count < expected.count * 3 {
+                let count = min(127, (expected.count * 3 - actual.count) / 2)
+                try await Self.waitForPreparedFrames(renderer, count: count, totalFrames: 10_668)
+                var block = [Float](repeating: .nan, count: count * 2)
+                block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: count) }
+                actual.append(contentsOf: block)
+            }
+            assertSamples(actual, equal: expected + expected + expected)
+            // A paused render acknowledges the seek without consuming/starving it.
+            renderer.setPlaying(false); renderer.select(token: 1, frame: 7_891)
+            var block = [Float](repeating: .nan, count: 386)
+            block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 193) }
+            try await Self.waitForPreparedFrames(renderer, count: 193, totalFrames: 10_668)
+            renderer.setPlaying(true)
+            block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 193) }
+            assertSamples(block, equal: Array(expected[(7_891 * 2)..<((7_891 + 193) * 2)]))
+            XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+            #if DEBUG
+            if case .stagedBeforeConversion = placement {
+                XCTAssertGreaterThan(decoder.progressRecorder.debugStagedNativeReadCount, 0)
+            } else {
+                XCTAssertEqual(decoder.progressRecorder.debugStagedNativeReadCount, 0)
+            }
+            #endif
         }
-        assertSamples(actual, equal: expected + expected + expected)
-        // A paused render acknowledges the seek without consuming/starving it.
-        renderer.setPlaying(false); renderer.select(token: 1, frame: 7_891)
-        var block = [Float](repeating: .nan, count: 386)
-        block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 193) }
-        try await Self.waitForPreparedFrames(renderer, count: 193, totalFrames: 10_668)
-        renderer.setPlaying(true)
-        block.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 193) }
-        assertSamples(block, equal: Array(expected[(7_891 * 2)..<((7_891 + 193) * 2)]))
-        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
     }
 
     @MainActor
@@ -542,7 +600,37 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         var actual = [Float](repeating: .nan, count: 16_800 * 2)
         actual.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 16_800) }
         assertSamples(actual, equal: expected)
+        #if DEBUG
+        _ = try await decodePinnedPresentation(url: edited, expected: expected, placement: .stagedBeforeConversion)
+        #endif
     }
+
+    #if DEBUG
+    private func decodePinnedPresentation(url: URL, expected: [Float], placement: ContinuousPCMDecoder.NativeInputPlacement) async throws -> [Float] {
+        let frames = expected.count / 2
+        guard frames > 0, frames <= 960_000 else {
+            XCTFail("Only bounded public/synthetic fixtures enter this comparison")
+            throw ContinuousPCMDecoder.Failure.invalidTimeline
+        }
+        let renderer = ContinuousPCMRenderer(prefixFrames: frames + 1, ringFrames: 512)
+        let decoder = ContinuousPCMDecoder(renderer: renderer, nativeInputPlacement: placement)
+        defer { decoder.shutdown() }
+        let prepared = try await decoder.prepare(url: url, token: 1, slot: 0)
+        XCTAssertEqual(prepared.totalFrames, Int64(frames))
+        renderer.setSuccessor(token: 1, for: 1)
+        renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+        var actual = [Float](repeating: .nan, count: expected.count * 2)
+        actual.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: frames * 2) }
+        assertSamples(actual, equal: expected + expected)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        if case .stagedBeforeConversion = placement {
+            XCTAssertGreaterThan(decoder.progressRecorder.debugStagedNativeReadCount, 0)
+        } else {
+            XCTAssertEqual(decoder.progressRecorder.debugStagedNativeReadCount, 0)
+        }
+        return Array(actual.prefix(expected.count))
+    }
+    #endif
 
     private func writePCM(_ samples: [Float], to url: URL, compressed: Bool = false, sampleRate: Double = 48_000) throws {
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 2, interleaved: false)!

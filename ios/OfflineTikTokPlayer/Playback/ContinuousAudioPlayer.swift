@@ -21,9 +21,9 @@ final class ContinuousAudioPlayer {
     private var failedTokens = Set<Int>()
     private var pendingPosition: (version: Int, position: Double)?
 
-    init() {
+    init(nativeInputPlacement: ContinuousPCMDecoder.NativeInputPlacement = .converterCallback) {
         graph = ContinuousAudioGraph(renderer: renderer)
-        decoder = ContinuousPCMDecoder(renderer: renderer)
+        decoder = ContinuousPCMDecoder(renderer: renderer, nativeInputPlacement: nativeInputPlacement)
     }
     deinit { decoder.shutdown(); graph.engine.stop() }
     var isSelected: Bool { selectedID != nil }

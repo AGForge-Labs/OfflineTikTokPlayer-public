@@ -13,6 +13,13 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         case cannotDecode, slotInUse, cancelled
     }
 
+    enum NativeInputPlacement: Sendable {
+        case converterCallback
+        #if DEBUG
+        case stagedBeforeConversion
+        #endif
+    }
+
     struct Prepared: Sendable {
         let token: Int
         let totalFrames: Int64
@@ -211,6 +218,18 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// A preempted writer produces coherent=false rather than blocking a probe.
     final class ProgressRecorder: @unchecked Sendable {
         let workerIdentifier = UUID().uuidString.lowercased()
+
+        #if DEBUG
+        private let stagedNativeReads = Atomic<UInt64>(0)
+        /// Completed successful staged reads, including a true EOF return. This
+        /// is independent of tracing and does not count pending/blocked calls.
+        var debugStagedNativeReadCount: UInt64 { stagedNativeReads.load(ordering: .acquiring) }
+
+        fileprivate func noteStagedNativeRead() {
+            let count = stagedNativeReads.load(ordering: .relaxed)
+            stagedNativeReads.store(count == UInt64.max ? count : count + 1, ordering: .releasing)
+        }
+        #endif
 
         private final class SlotCounters {
             let token = Atomic<Int>(0)
@@ -626,10 +645,13 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let endTime: CMTime
         let nativeRate: Double
         let nativeChannels: UInt32
-        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32) {
+        let nativeInputPlacement: NativeInputPlacement
+        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32,
+             nativeInputPlacement: NativeInputPlacement) {
             self.asset = asset; self.track = track; self.totalFrames = totalFrames
             self.endTime = endTime
             self.nativeRate = nativeRate; self.nativeChannels = nativeChannels
+            self.nativeInputPlacement = nativeInputPlacement
         }
     }
 
@@ -649,6 +671,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     private let renderer: ContinuousPCMRenderer
+    private let nativeInputPlacement: NativeInputPlacement
     let progressRecorder: ProgressRecorder
     private let worker: DispatchQueue
     private var timer: DispatchSourceTimer?
@@ -662,9 +685,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// Numeric cooperative scheduling evidence; never includes source identity.
     var cooperativeYieldCount: Int64 { yieldCount.load(ordering: .acquiring) }
 
-    init(renderer: ContinuousPCMRenderer) {
+    init(renderer: ContinuousPCMRenderer, nativeInputPlacement: NativeInputPlacement = .converterCallback) {
         let recorder = ProgressRecorder()
         self.renderer = renderer
+        self.nativeInputPlacement = nativeInputPlacement
         progressRecorder = recorder
         worker = DispatchQueue(label: "OfflineTikTokPlayer.PCMDecode." + recorder.workerIdentifier, qos: .userInitiated)
         let timer = DispatchSource.makeTimerSource(queue: worker)
@@ -721,7 +745,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             nativeRate = asbd.pointee.mSampleRate; nativeChannels = asbd.pointee.mChannelsPerFrame
         }
         let description = Description(asset: asset, track: selected, totalFrames: frames, endTime: end,
-            nativeRate: nativeRate, nativeChannels: nativeChannels)
+            nativeRate: nativeRate, nativeChannels: nativeChannels, nativeInputPlacement: nativeInputPlacement)
         let hasAudio = selected != nil
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler {
@@ -936,6 +960,25 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// reader's implicit sample-rate conversion is deliberately avoided: native
     /// regression runs found that it could omit buffered resampler tail samples.
     private final class Stream {
+        #if DEBUG
+        /// Diagnostic storage only: one interleaved 4,096-frame native buffer,
+        /// at most 131,072 sample bytes at the accepted eight-channel limit.
+        /// Reader replacement may briefly retain the old and new Stream.
+        private final class StagedInput {
+            let buffer: AVAudioPCMBuffer
+            let channels: Int
+            var cursor = 0
+            var count = 0
+            var requestedRefillFrames = 0
+            var nativeEOF = false
+
+            init(format: AVAudioFormat) throws {
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_096) else { throw Failure.unsupportedPCM }
+                self.buffer = buffer; channels = Int(format.channelCount)
+            }
+        }
+        private let stagedInput: StagedInput?
+        #endif
         private let progress: ProgressRecorder
         private var progressContext: ProgressContext
         private let native: NativeReader?
@@ -968,6 +1011,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             self.shouldCancel = shouldCancel
             analysisValid = startFrame == 0
             guard description.track != nil else {
+                #if DEBUG
+                stagedInput = nil
+                #endif
                 native = nil; converter = nil; input = nil; output = nil; return
             }
             let native = try NativeReader(description: description, progress: progress, context: context)
@@ -982,6 +1028,12 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                   let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4_096) else { throw Failure.unsupportedPCM }
             if description.nativeChannels == 1 { converter.channelMap = [0, 0] }
             self.native = native; self.converter = converter; self.input = input; self.output = output
+            #if DEBUG
+            switch description.nativeInputPlacement {
+            case .converterCallback: stagedInput = nil
+            case .stagedBeforeConversion: stagedInput = try StagedInput(format: inputFormat)
+            }
+            #endif
             // A reopen starts from the source's beginning and discards converted
             // output up to the requested frame. This retains exactly the original
             // SRC phase/history with bounded storage. Ordinary loop/reversal
@@ -1057,6 +1109,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
 
         private func convertNext() throws {
+            #if DEBUG
+            if let stagedInput { try convertNextStaged(stagedInput); return }
+            #endif
             guard !converterFinished else { eof = true; return }
             guard let native, let converter, let input, let output else { throw Failure.cannotDecode }
             for _ in 0..<8 {
@@ -1113,6 +1168,105 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             }
             throw Failure.cannotDecode
         }
+
+        #if DEBUG
+        /// Default-off nesting control. Native pulls remain synchronous on the
+        /// same worker; this cannot cancel a blocked SDK call or ensure readiness.
+        /// A callback first requests missing input with noDataNow. Only after
+        /// convert returns may this path perform that bounded native read.
+        private func convertNextStaged(_ stage: StagedInput) throws {
+            guard !converterFinished else { eof = true; return }
+            guard let native, let converter, let input, let output else { throw Failure.cannotDecode }
+            var successfulRefills = 0
+            var noProgressConversions = 0
+            while true {
+                if shouldCancel() { throw Failure.cancelled }
+                if stage.requestedRefillFrames > 0, !stage.nativeEOF {
+                    // A large downsample can require more than eight native
+                    // pulls for one output buffer. Bound positive refill work
+                    // separately from eight consecutive no-progress conversions.
+                    guard successfulRefills < 64, stage.cursor == stage.count else { throw Failure.cannotDecode }
+                    let count = try native.read(into: stage.buffer, maximumFrames: stage.requestedRefillFrames)
+                    progress.noteStagedNativeRead()
+                    if shouldCancel() { throw Failure.cancelled }
+                    guard count > 0 || native.reachedEnd else { throw Failure.cannotDecode }
+                    stage.cursor = 0; stage.count = count
+                    stage.requestedRefillFrames = 0
+                    if count == 0 { stage.nativeEOF = true }
+                    successfulRefills += 1
+                    noProgressConversions = 0
+                }
+
+                output.frameLength = 0
+                var inputFailure: Failure?
+                var conversionError: NSError?
+                var consumedFrames = 0
+                let sourceTarget = totalFrames, rate = nativeRate
+                let previousSupport = supportFramesSupplied
+                var suppliedSupport = previousSupport
+                let previous = progress.enter(.converting, context: progressContext)
+                let status = converter.convert(to: output, error: &conversionError) { requested, status in
+                    do {
+                        guard requested > 0 else { status.pointee = .noDataNow; return nil }
+                        let maximum = min(Int(requested), Int(input.frameCapacity))
+                        let available = stage.count - stage.cursor
+                        if available > 0 {
+                            let count = min(maximum, available)
+                            guard let destination = input.floatChannelData?[0],
+                                  let source = stage.buffer.floatChannelData?[0] else { throw Failure.unsupportedPCM }
+                            destination.update(from: source.advanced(by: stage.cursor * stage.channels), count: count * stage.channels)
+                            input.frameLength = AVAudioFrameCount(count)
+                            stage.cursor += count; consumedFrames += count
+                            status.pointee = .haveData; return input
+                        }
+                        guard stage.nativeEOF else {
+                            // Remember the actual request instead of eagerly
+                            // reading 4,096 frames. Leftovers survive later calls.
+                            stage.requestedRefillFrames = max(1, min(maximum, 4_096))
+                            status.pointee = .noDataNow; return nil
+                        }
+                        // Identical finite native-domain support and persistent
+                        // EOS policy to the original callback path. No output
+                        // zeros or presentation-duration changes are introduced.
+                        let requiredNative = (sourceTarget * Int64(rate) + 47_999) / 48_000
+                        let support = max(0, requiredNative - native.totalFrames)
+                        let maximumSupport = Int64(ceil(rate / 96_000 + 0.5))
+                        guard support <= maximumSupport else { throw Failure.invalidTimeline }
+                        let needed = support - suppliedSupport
+                        if needed > 0 {
+                            let frames = min(Int(needed), maximum)
+                            guard frames > 0, let samples = input.floatChannelData?[0] else { throw Failure.cannotDecode }
+                            samples.update(repeating: 0, count: frames * stage.channels)
+                            input.frameLength = AVAudioFrameCount(frames)
+                            suppliedSupport += Int64(frames)
+                            status.pointee = .haveData; return input
+                        }
+                        status.pointee = .endOfStream; return nil
+                    } catch {
+                        inputFailure = (error as? Failure) ?? .cannotDecode
+                        status.pointee = .endOfStream; return nil
+                    }
+                }
+                progress.restore(previous)
+                supportFramesSupplied = suppliedSupport
+                if let inputFailure { throw inputFailure }
+                guard status != .error, conversionError == nil else { throw Failure.cannotDecode }
+                if status == .endOfStream { converterFinished = true }
+                outputStart = generatedFrames; outputCount = Int(output.frameLength)
+                generatedFrames += Int64(outputCount)
+                // inputRanDry may carry valid partial output. Publish it before
+                // servicing the remembered request on the next invocation.
+                if outputCount > 0 { return }
+                if converterFinished { eof = true; return }
+                if consumedFrames > 0 || suppliedSupport > previousSupport {
+                    noProgressConversions = 0
+                } else if stage.requestedRefillFrames == 0 || stage.nativeEOF {
+                    noProgressConversions += 1
+                    guard noProgressConversions < 8 else { throw Failure.cannotDecode }
+                }
+            }
+        }
+        #endif
     }
 
     /// Preserve native PCM sample counts; only explicit codec trim attachments
