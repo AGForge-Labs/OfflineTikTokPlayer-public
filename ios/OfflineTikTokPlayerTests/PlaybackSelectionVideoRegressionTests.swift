@@ -12,13 +12,29 @@ import PlayerCore
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testCommandToEngineToneAndSelectedCustomFrameLatency() async throws {
+        var witnesses: [SelectionDecoderLifetimeWitness] = []
+        witnesses.reserveCapacity(2)
+        for condition in [(nativeGetters: false, phaseBase: 0), (nativeGetters: true, phaseBase: 10)] {
+            defer {
+                logDecoderLifetimes(boundary: "getter-arm-after-phase-\(condition.phaseBase)", witnesses: witnesses)
+            }
+            try await measureSelectionLatencySequence(nativeVideoGetterControl: condition.nativeGetters,
+                phaseBase: condition.phaseBase, witnesses: &witnesses)
+        }
+    }
+
+    private func measureSelectionLatencySequence(nativeVideoGetterControl: Bool, phaseBase: Int,
+        witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
         let audio = ContinuousAudioPlayer()
         let tap = SelectionOutputTap()
-        let seeks = SelectionLatencySeekProbe()
+        let seeks = SelectionLatencySeekProbe(nativeVideoGetterControl: nativeVideoGetterControl)
         let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
         seeks.service = service
+        precondition(witnesses.count < 2)
+        witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
+            label: "getter-arm-phase-\(phaseBase)"))
         let screen = try SelectionVideoScreen(service: service)
         audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
             tap.append(buffer, time: time)
@@ -30,30 +46,32 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             seeks.dump()
         }
         service.isInteractingWithFeed = true
-        print("SelectionLatency scope=engineMixerTap-not-physical-speaker outputLimitMs=100 customReadyLimitMs=250 silenceWindowMs=10 importHashVerification=already-verified")
+        let arm = nativeVideoGetterControl ? "native-getter-control" : "primary"
+        let labelSuffix = nativeVideoGetterControl ? "-native-getter-control" : ""
+        print("SelectionLatency scope=engineMixerTap-not-physical-speaker arm=\(arm) phaseBase=\(phaseBase) videoNativeGetters=\(nativeVideoGetterControl) outputLimitMs=100 customReadyLimitMs=250 silenceWindowMs=10 importHashVerification=already-verified")
         let aReference = try await fixture.decodedTone(id: fixture.aID, startSeconds: 0)
         let bReference = try await fixture.decodedTone(id: fixture.bID, startSeconds: 0)
         let sourceQuiet = max(SelectionOutputTap.quietRun(aReference, rate: 48_000),
                               SelectionOutputTap.quietRun(bReference, rate: 48_000))
         XCTAssertEqual(sourceQuiet, 0, "Continuous-tone fixtures must provide no quiet-window allowance that could mask inserted silence")
 
-        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: 0,
+        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phaseBase,
                                       id: fixture.aID, frequency: 440, prepared: false, sourceQuiet: sourceQuiet) {
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         }
         assertSelection(service, fixture: fixture, id: fixture.aID)
-        await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-cold-A")
+        await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-cold-A" + labelSuffix)
         try await require({ service.preparedAudioCount == 2 }, "B must be prepared before timing Next")
 
-        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: 1,
+        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phaseBase + 1,
                                       id: fixture.bID, frequency: 880, prepared: true, sourceQuiet: sourceQuiet) { service.next() }
         assertSelection(service, fixture: fixture, id: fixture.bID)
-        await assertVisibleFrame(service, screen: screen, identity: .b, label: "latency-prepared-B")
+        await assertVisibleFrame(service, screen: screen, identity: .b, label: "latency-prepared-B" + labelSuffix)
 
-        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: 2,
+        await measureSelectionLatency(service, fixture: fixture, tap: tap, seeks: seeks, phase: phaseBase + 2,
                                       id: fixture.aID, frequency: 440, prepared: true, sourceQuiet: sourceQuiet) { service.previous() }
         assertSelection(service, fixture: fixture, id: fixture.aID)
-        await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-returned-A")
+        await assertVisibleFrame(service, screen: screen, identity: .a, label: "latency-returned-A" + labelSuffix)
         let validity = tap.validity()
         XCTAssertEqual(validity.invalidTimestamps, 0, "Engine-output timing requires valid host timestamps; no callback-wall-time fallback")
         XCTAssertEqual(validity.droppedFrames, 0, "The bounded tap must retain all measured PCM")
@@ -70,11 +88,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let submitted = service.submittedVideoFrameCount
         let underruns = service.audioSnapshot.underrunFrames
         let origin = SelectionOutputTap.hostSeconds()
-        seeks.phase = phase; seeks.origin = origin
+        seeks.phase = phase; seeks.origin = origin; seeks.isPreparedMeasurement = prepared
         command()
         var cursor = firstFrame
         var outgoing: SelectionOutputTap.Window?
         var tone: SelectionOutputTap.Window?
+        var customDisplayReady: Double?
         var visible: Double?
         let deadline = ProcessInfo.processInfo.systemUptime + (prepared ? 1 : 5)
         while ProcessInfo.processInfo.systemUptime < deadline {
@@ -96,9 +115,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                asset?.url.standardizedFileURL == fixture.savedURLs[id]?.standardizedFileURL,
                service.submittedVideoFrameCount > submitted, service.customVideoReadyForDisplay,
                let frame = service.videoFramePositionSeconds,
-               abs(frame - service.videoRequestedPositionSeconds) <= 0.080,
-               service.isVideoReady, !service.isLoading {
-                visible = SelectionOutputTap.hostSeconds()
+               abs(frame - service.videoRequestedPositionSeconds) <= 0.080 {
+                // The same selected/aligned custom-layer evidence can precede
+                // the native-layer/two-tick poster gate. This metric is neither
+                // compositor pixels nor physical first-frame output.
+                if customDisplayReady == nil { customDisplayReady = SelectionOutputTap.hostSeconds() }
+                if service.isVideoReady, !service.isLoading {
+                    visible = SelectionOutputTap.hostSeconds()
+                }
             }
             if tone != nil && visible != nil { break }
             do { try await Task.sleep(for: .milliseconds(5)) } catch { break }
@@ -110,9 +134,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let addedQuiet = max(0, quiet - sourceQuiet)
         let timelineHole = SelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
         let toneMs = tone.map { ($0.end - origin) * 1_000 }
+        let customDisplayMs = customDisplayReady.map { ($0 - origin) * 1_000 }
         let visibleMs = visible.map { ($0 - origin) * 1_000 }
         let underrunDelta = service.audioSnapshot.underrunFrames - underruns
-        print("SelectionLatency phase=\(phase) prepared=\(prepared) frequency=\(frequency) outputWindowStartMs=\(tone.map { String(($0.start - origin) * 1_000) } ?? "missing") outputWindowEndMs=\(toneMs.map { String($0) } ?? "missing") customReadyMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) sourceQuietMs=\(sourceQuiet * 1_000) addedQuietMs=\(addedQuiet * 1_000) timelineHoleMs=\(timelineHole * 1_000) underrunDelta=\(underrunDelta) tapRate=\(recorded.rate) tapFrames=\(recorded.values.count)")
+        print("SelectionLatency phase=\(phase) prepared=\(prepared) frequency=\(frequency) outputWindowStartMs=\(tone.map { String(($0.start - origin) * 1_000) } ?? "missing") outputWindowEndMs=\(toneMs.map { String($0) } ?? "missing") customReadyMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) sourceQuietMs=\(sourceQuiet * 1_000) addedQuietMs=\(addedQuiet * 1_000) timelineHoleMs=\(timelineHole * 1_000) underrunDelta=\(underrunDelta) tapRate=\(recorded.rate) tapFrames=\(recorded.values.count) customDisplayReadyMs=\(customDisplayMs.map { String($0) } ?? "missing")")
         XCTAssertNotNil(tone, "The independently classified target tone must reach the real engine mixer tap")
         XCTAssertNotNil(visible, "A fresh selected custom frame must become ready within the phase watchdog")
         if prepared {
@@ -135,6 +160,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         defer { fixture.remove() }
         let audio = ContinuousAudioPlayer()
         let tap = SelectionOutputTap()
+        // Natural-boundary milestones use paired primary observations too;
+        // this separate case has no independently matched getter-control arm.
         let seeks = SelectionLatencySeekProbe()
         let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
         seeks.service = service
@@ -165,7 +192,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertTrue(runway, "The complete A presentation must reach its final half second")
         guard runway else { return }
         let first = tap.begin(), submitted = service.submittedVideoFrameCount
-        seeks.phase = 3; seeks.origin = SelectionOutputTap.hostSeconds()
+        seeks.phase = 3; seeks.origin = SelectionOutputTap.hostSeconds(); seeks.isPreparedMeasurement = true
         let underruns = service.audioSnapshot.underrunFrames
         var cursor = first
         var outgoing: SelectionOutputTap.Window?
@@ -1148,26 +1175,59 @@ private final class SelectionLatencySeekProbe {
     var phase = -1 {
         didSet {
             videoMilestones.removeAll(keepingCapacity: true)
+            videoBatchID = 0
             diagnostics.prepare(phase: phase)
         }
     }
     var origin = 0.0
+    var isPreparedMeasurement = false
+    private let nativeVideoGetterControl: Bool
+    private var videoBatchID = 0
     private var videoMilestones = Set<String>()
     private let diagnostics = SelectionLatencyDiagnostics()
     private(set) var alignedPreparedSeekCount: [Int: Int] = [:]
     private(set) var nativeSeekCount: [Int: Int] = [:]
     var droppedCount: Int { diagnostics.droppedCount }
 
-    init() { videoMilestones.reserveCapacity(2); diagnostics.prepare(phase: phase) }
+    init(nativeVideoGetterControl: Bool = false) {
+        self.nativeVideoGetterControl = nativeVideoGetterControl
+        videoMilestones.reserveCapacity(2); diagnostics.prepare(phase: phase)
+    }
 
     func sampleVideo() {
         guard videoMilestones.count < 2, let service else { return }
-        for (name, position) in [("firstCopied", service.copiedVideoFramePositionSeconds),
-                                 ("firstSubmitted", service.videoFramePositionSeconds)] {
+        // These paired values are observed together, before any optional native
+        // getter. Separately timestamping rows would manufacture a frame gap
+        // from the acquisition cost of the preceding row's AVPlayer reads.
+        let observed = SelectionOutputTap.hostSeconds()
+        let copied = service.copiedVideoFramePositionSeconds
+        let submitted = service.videoFramePositionSeconds
+        let requested = service.videoRequestedPositionSeconds
+        guard copied != nil && !videoMilestones.contains("firstCopied")
+            || submitted != nil && !videoMilestones.contains("firstSubmitted") else { return }
+        videoBatchID += 1
+        let batchID = videoBatchID, phase = self.phase, origin = self.origin
+        let commandMs = (observed - origin) * 1_000
+        // Two milestones permit at most two arrival batches in each phase.
+        diagnostics.append(.videoBatch(batchID: batchID, commandMs: commandMs,
+            copiedPosition: copied, submittedPosition: submitted, requested: requested), phase: phase)
+        for (name, position) in [("firstCopied", copied), ("firstSubmitted", submitted)] {
             guard let position, videoMilestones.insert(name).inserted else { continue }
-            diagnostics.append(.video(name: name, commandMs: (SelectionOutputTap.hostSeconds() - origin) * 1_000,
-                framePosition: position, requested: service.videoRequestedPositionSeconds,
-                playerPosition: service.player.currentTime().seconds, playerRate: Double(service.player.rate)), phase: phase)
+            if nativeVideoGetterControl {
+                // Preserve the original per-milestone getter work only in the
+                // explicit control. Its native-clock evidence is a separate
+                // typed record, never a fabricated value in the primary arm.
+                let begin = SelectionOutputTap.hostSeconds()
+                let playerPosition = service.player.currentTime().seconds
+                let playerRate = Double(service.player.rate)
+                let end = SelectionOutputTap.hostSeconds()
+                diagnostics.append(.videoNativeGetter(batchID: batchID, name: name,
+                    beginMs: (begin - origin) * 1_000, endMs: (end - origin) * 1_000,
+                    acquisitionMs: (end - begin) * 1_000,
+                    playerPosition: playerPosition, playerRate: playerRate), phase: phase)
+            }
+            diagnostics.append(.video(name: name, batchID: batchID, commandMs: commandMs,
+                framePosition: position, requested: requested), phase: phase)
         }
     }
 
@@ -1176,7 +1236,7 @@ private final class SelectionLatencySeekProbe {
         let phase = self.phase, origin = self.origin, requested = time.seconds
         let current = player.currentTime().seconds, rate = Double(player.rate)
         nativeSeekCount[phase, default: 0] += 1
-        if phase > 0, abs(current - requested) <= 0.080, rate > 0.999 {
+        if isPreparedMeasurement, abs(current - requested) <= 0.080, rate > 0.999 {
             alignedPreparedSeekCount[phase, default: 0] += 1
         }
         let diagnostics = self.diagnostics
@@ -1215,7 +1275,10 @@ private final class SelectionLatencySeekProbe {
 private final class SelectionLatencyDiagnostics: @unchecked Sendable {
     enum Event: Sendable {
         case playback(name: String, commandMs: Double, eventUptime: Double, generation: Int, clockPosition: Double)
-        case video(name: String, commandMs: Double, framePosition: Double, requested: Double, playerPosition: Double, playerRate: Double)
+        case videoBatch(batchID: Int, commandMs: Double, copiedPosition: Double?, submittedPosition: Double?, requested: Double)
+        case video(name: String, batchID: Int, commandMs: Double, framePosition: Double, requested: Double)
+        case videoNativeGetter(batchID: Int, name: String, beginMs: Double, endMs: Double, acquisitionMs: Double,
+                              playerPosition: Double, playerRate: Double)
         case seekStart(commandMs: Double, requested: Double, playerPosition: Double, playerRate: Double)
         case nativeComplete(commandMs: Double, seekMs: Double, finished: Bool)
         case completionObserved(commandMs: Double, requested: Double, playerPosition: Double, playerRate: Double)
@@ -1224,8 +1287,12 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
             switch self {
             case let .playback(name, commandMs, eventUptime, generation, clockPosition):
                 return "SelectionLatencyEvent phase=\(phase) name=\(name) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) clockPosition=\(clockPosition)"
-            case let .video(name, commandMs, framePosition, requested, playerPosition, playerRate):
-                return "SelectionLatencyVideo phase=\(phase) name=\(name) commandMs=\(commandMs) framePosition=\(framePosition) requested=\(requested) playerPosition=\(playerPosition) playerRate=\(playerRate)"
+            case let .videoBatch(batchID, commandMs, copiedPosition, submittedPosition, requested):
+                return "SelectionLatencyVideoBatch phase=\(phase) batchID=\(batchID) commandMs=\(commandMs) copiedPresent=\(copiedPosition != nil) submittedPresent=\(submittedPosition != nil) copiedPosition=\(copiedPosition.map { String($0) } ?? "missing") submittedPosition=\(submittedPosition.map { String($0) } ?? "missing") requested=\(requested)"
+            case let .video(name, batchID, commandMs, framePosition, requested):
+                return "SelectionLatencyVideo phase=\(phase) name=\(name) batchID=\(batchID) commandMs=\(commandMs) framePosition=\(framePosition) requested=\(requested)"
+            case let .videoNativeGetter(batchID, name, beginMs, endMs, acquisitionMs, playerPosition, playerRate):
+                return "SelectionLatencyVideoNativeGetter phase=\(phase) batchID=\(batchID) name=\(name) beginMs=\(beginMs) endMs=\(endMs) acquisitionMs=\(acquisitionMs) playerPosition=\(playerPosition) playerRate=\(playerRate)"
             case let .seekStart(commandMs, requested, playerPosition, playerRate):
                 return "SelectionLatencySeek phase=\(phase) event=start commandMs=\(commandMs) requested=\(requested) playerPosition=\(playerPosition) drift=\(playerPosition - requested) playerRate=\(playerRate)"
             case let .nativeComplete(commandMs, seekMs, finished):
