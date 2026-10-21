@@ -36,6 +36,113 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame() async throws {
+        #if DEBUG
+        for (ordinal, alternative) in [false, true].enumerated() {
+            print("FrameMonitorBenchmarkArm schema=1 order=default-then-custom ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true playbackAcceptance=unchanged physicalPixels=unmeasured")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative)
+        }
+        #else
+        XCTFail("Frame-monitor diagnostic requires DEBUG controls")
+        #endif
+    }
+
+    func testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault() async throws {
+        #if DEBUG
+        for (ordinal, alternative) in [true, false].enumerated() {
+            print("FrameMonitorBenchmarkArm schema=1 order=custom-then-default ordinal=\(ordinal) alternative=\(alternative) serviceTracing=true playbackAcceptance=unchanged physicalPixels=unmeasured")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, frameMonitorAlternative: alternative)
+        }
+        #else
+        XCTFail("Frame-monitor diagnostic requires DEBUG controls")
+        #endif
+    }
+
+    func testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for alternative in [false, true] {
+            let buffer = PlaybackBuffer()
+            try await withOwnedNaturalFixture(buffer: buffer, recordHost: false) { fixture, audio, service, screen in
+                service.isInteractingWithFeed = true
+                service.debugUsesCurrentCustomFrameForReadiness = alternative
+                var starts = 0, overflow = false
+                var observedCount = -1, observedPreparedIdentity = false
+                var observedItem: ObjectIdentifier?, observedResource: ObjectIdentifier?, observedOutput: ObjectIdentifier?
+                service.debugAfterFirstFrameMonitorStart = { item in
+                    guard starts < 8 else { overflow = true; return }
+                    starts += 1
+                    let outputs = item.outputs
+                    observedCount = outputs.count
+                    let resource = buffer.resource(for: item)
+                    observedItem = ObjectIdentifier(item)
+                    observedResource = resource.map { ObjectIdentifier($0) }
+                    observedOutput = resource?.output.map { ObjectIdentifier($0) }
+                    observedPreparedIdentity = resource?.output.map { expected in
+                        outputs.contains { $0 === expected }
+                    } ?? false
+                }
+                defer { service.debugAfterFirstFrameMonitorStart = nil; service.onDebugInitialVideoReady = nil }
+                for phase in 0..<3 {
+                    if phase > 0 {
+                        try await require({ service.preparedAudioCount == 2
+                            && (phase == 1 ? buffer.hasPrepared(fixture.bID)
+                                : buffer.previousMediaID == fixture.aID && buffer.debugPreviousNeedsRewind == false) },
+                            "Both actual audio and the selected prepared video must exist before the control action")
+                    }
+                    let request = service.debugInitialVideoReadyState.generation + 1
+                    let gate = SelectionInitialReadyOrderingProbe(generation: request)
+                    service.onDebugInitialVideoReady = { generation in await gate.hold(request: generation) }
+                    defer { gate.release() }
+                    let beforeStarts = starts
+                    switch phase {
+                    case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+                    case 1: service.next()
+                    default: service.previous()
+                    }
+                    let held = await waitUntil(timeout: 3) { gate.isHolding && starts == beforeStarts + 1 }
+                    XCTAssertTrue(held)
+                    guard held else { throw SelectionVideoTestFailure.timeout }
+                    let current = try XCTUnwrap(service.player.currentItem)
+                    let resource = try XCTUnwrap(buffer.resource(for: current))
+                    let preparedOutput = try XCTUnwrap(resource.output)
+                    let outputs = current.outputs
+                    // The default monitor may legitimately finish and detach
+                    // before this async held observation. Its exact two-output
+                    // attachment is proved synchronously at start, before KVO.
+                    XCTAssertEqual(observedCount, alternative ? 1 : 2)
+                    if alternative { XCTAssertEqual(outputs.count, 1) }
+                    else { XCTAssertTrue(outputs.count == 1 || outputs.count == 2) }
+                    XCTAssertTrue(observedPreparedIdentity)
+                    XCTAssertEqual(observedItem, ObjectIdentifier(current))
+                    XCTAssertEqual(observedResource, ObjectIdentifier(resource))
+                    XCTAssertEqual(observedOutput, ObjectIdentifier(preparedOutput))
+                    XCTAssertTrue(outputs.contains { $0 === preparedOutput })
+                    XCTAssertTrue(resource.isAttached); XCTAssertTrue(resource.isBorrowed)
+                    XCTAssertFalse(resource.isRetired)
+                    XCTAssertNil(service.copiedVideoFramePositionSeconds)
+                    XCTAssertNil(service.videoFramePositionSeconds)
+                    XCTAssertNotEqual(service.debugInitialVideoReadyState.readyGeneration, request)
+                    XCTAssertFalse(gate.timedOut); XCTAssertFalse(gate.cancelled); XCTAssertFalse(gate.overflow)
+                    XCTAssertEqual(gate.dropped, 0); XCTAssertFalse(overflow)
+                    print("FrameMonitorHeldReady schema=1 alternative=\(alternative) phase=\(phase) startOutputs=\(observedCount) heldOutputs=\(outputs.count) expectedStartOutputs=\(alternative ? 1 : 2) preparedIdentity=\(observedPreparedIdentity) currentEpochImage=false request=\(request) held=true startBeforeStatusObservation=true")
+                    gate.release()
+                    try await require({ self.explicitInitialReadySourceSettled(service, screen: screen) },
+                                      "Actual selected custom/native readiness must settle after releasing the real callback")
+                    XCTAssertFalse(gate.isHolding, "This source's gate must be released before the next source action")
+                    assertSelection(service, fixture: fixture, id: phase == 1 ? fixture.bID : fixture.aID)
+                    XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
+                }
+                let visible = await assertVisibleFrame(service, screen: screen, identity: .a,
+                    label: alternative ? "monitor-single-output-returned-A" : "monitor-default-output-returned-A")
+                XCTAssertNotNil(visible)
+            }
+        }
+        #else
+        XCTFail("Frame-monitor diagnostic requires DEBUG controls")
+        #endif
+    }
+
     func testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation() throws {
         let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2))
         func buffer(left: Float, right: Float) throws -> AVAudioPCMBuffer {
@@ -96,7 +203,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertNil(overflow.run(at: 4))
     }
 
-    private func runProductionSelectionBenchmark(traceVideoSeeks: Bool) async throws {
+    private func runProductionSelectionBenchmark(traceVideoSeeks: Bool, frameMonitorAlternative: Bool? = nil) async throws {
         try recordRuntimeHost()
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
@@ -113,13 +220,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let tap = ProductionSelectionOutputTap()
         let seeks = ProductionSelectionSeekRecorder()
         let startup = ProductionVideoStartupTrace(serviceTracing: traceVideoSeeks)
+        let monitorBuffer = frameMonitorAlternative.map { _ in PlaybackBuffer() }
         let service: PlaybackService
         if traceVideoSeeks {
-            service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
+            service = fixture.service(buffer: monitorBuffer, continuousAudio: audio, seekVideo: seeks.seek)
         } else {
-            service = fixture.service(continuousAudio: audio)
+            service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        var monitorRows: [(phase: Int, selectedID: String?, expectedID: String?, outputs: Int, preparedIdentity: Bool)] = []
+        var monitorOverflow = false
+        var monitorPhase = -1
+        var monitorExpectedID: String?
+        if let alternative = frameMonitorAlternative {
+            service.debugUsesCurrentCustomFrameForReadiness = alternative
+            service.debugAfterFirstFrameMonitorStart = { [weak service] item in
+                guard monitorRows.count < 8 else { monitorOverflow = true; return }
+                let outputs = item.outputs
+                let matched = monitorBuffer?.resource(for: item)?.output.map { expected in
+                    outputs.contains { $0 === expected }
+                } ?? false
+                monitorRows.append((monitorPhase, service?.queue.currentID, monitorExpectedID, outputs.count, matched))
+            }
+        }
         if traceVideoSeeks {
             service.onDebugVideoSeekStamp = { [weak seeks, weak startup] stamp in
                 seeks?.record(stamp); startup?.recordSeek(stamp)
@@ -128,6 +251,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugVideoRenderStamp = { [weak startup] stamp in startup?.recordRender(stamp) }
         }
         defer {
+            if frameMonitorAlternative != nil { service.debugAfterFirstFrameMonitorStart = nil }
             if traceVideoSeeks {
                 service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil
                 service.onDebugVideoRenderStamp = nil
@@ -161,6 +285,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let measurement = await measureProductionSelection(service, screen: screen, fixture: fixture,
                 audio: audio, tap: tap, seeks: seeks, startup: startup, phase: phase, id: id,
                 frequency: frequency, prepared: prepared, preparedBefore: preparedBefore) {
+                #if DEBUG
+                if frameMonitorAlternative != nil {
+                    monitorPhase = phase
+                    monitorExpectedID = id
+                }
+                #endif
                 switch phase {
                 case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
                 case 1: service.next()
@@ -201,6 +331,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
         XCTAssertTrue(mayRemoveFixture, "Queued decoder cleanup must return before removing only this synthetic fixture")
         if !mayRemoveFixture { Self.targetedFixtureOwnershipLost = true; fixture.restorePreferences() }
+        #if DEBUG
+        if let alternative = frameMonitorAlternative {
+            print("FrameMonitorBenchmarkOutputs schema=1 alternative=\(alternative) rows=\(monitorRows.count) capacity=8 overflow=\(monitorOverflow) originalGuardsRetained=true physicalPixels=unmeasured")
+            XCTAssertGreaterThanOrEqual(monitorRows.count, 3)
+            XCTAssertLessThanOrEqual(monitorRows.count, 8)
+            XCTAssertFalse(monitorOverflow)
+            XCTAssertEqual(Set(monitorRows.map { $0.phase }), Set(0..<3))
+            for (ordinal, row) in monitorRows.enumerated() {
+                let expected = row.phase == 1 ? fixture.bID : fixture.aID
+                let selectedMatches = row.selectedID == expected && row.expectedID == expected
+                print("FrameMonitorBenchmarkOutput schema=1 alternative=\(alternative) ordinal=\(ordinal) phase=\(row.phase) outputs=\(row.outputs) expectedOutputs=\(alternative ? 1 : 2) preparedIdentity=\(row.preparedIdentity) selectedIDMatchesPhase=\(selectedMatches)")
+                XCTAssertEqual(row.outputs, alternative ? 1 : 2)
+                XCTAssertTrue(row.preparedIdentity)
+                XCTAssertTrue((0..<3).contains(row.phase))
+                XCTAssertTrue(selectedMatches)
+            }
+        }
+        #endif
         for reference in references {
             XCTAssertGreaterThanOrEqual(reference.samples.count, 10_000)
             XCTAssertTrue(ProductionSelectionOutputTap.isTone(reference.samples, rate: 48_000, frequency: reference.frequency))
@@ -1424,9 +1572,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     /// Cleanup runs on normal return and on a retained original error. File removal
     /// requires both existing acknowledgements; failure retains only this fixture.
-    private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, buffer: PlaybackBuffer? = nil, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
+    private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, buffer: PlaybackBuffer? = nil, recordHost: Bool = true, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
         PlaybackService, SelectionVideoScreen) async throws -> Void) async throws {
-        try recordRuntimeHost()
+        if recordHost { try recordRuntimeHost() }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             throw SelectionVideoTestFailure.timeout
@@ -1975,7 +2123,7 @@ private final class ProductionVideoStartupTrace {
             case .startup(let phase, let s):
                 print("ProductionSelectionStartup schema=1 ordinal=\(ordinal) phase=\(phase) kind=\(s.kind.rawValue) request=\(s.request) entryGeneration=\(s.entryGeneration) returnGeneration=\(s.returnGeneration) entryNs=\(s.entryNs) returnNs=\(s.returnNs) presentationRequest=\(s.presentationRequest.map { String($0) } ?? "unknown") presentationUnchanged=\(s.presentationUnchanged) token=\(s.audioToken) visit=\(s.audioVisit) readyGeneration=\(s.readyGeneration.map { String($0) } ?? "unknown") entryVideoReady=\(s.entryVideoReady) returnVideoReady=\(s.returnVideoReady) entryLoading=\(s.entryLoading) returnLoading=\(s.returnLoading) timelineInstalled=\(s.timelineInstalled) anchorHostSeconds=\(s.anchorHostSeconds.map { String($0) } ?? "unknown") anchorPosition=\(s.anchorPosition.map { String($0) } ?? "unknown")")
             case .seek(let phase, let seenNs, let s):
-                print("ProductionSelectionStartupSeekOrder schema=1 ordinal=\(ordinal) phase=\(phase) observedNs=\(seenNs) reason=\(s.reason.rawValue) request=\(s.request) generation=\(s.generation) nativeSeekTicket=\(s.nativeSeekTicket) force=\(s.force)")
+                print("ProductionSelectionStartupSeekOrder schema=1 ordinal=\(ordinal) phase=\(phase) observedNs=\(seenNs) reason=\(s.reason.rawValue) request=\(s.request) generation=\(s.generation) nativeSeekTicket=\(s.nativeSeekTicket) force=\(s.force) ordinaryDriftReadEntryNs=\(s.ordinaryDriftReadEntryNs.map { String($0) } ?? "unknown") ordinaryDriftReadReturnNs=\(s.ordinaryDriftReadReturnNs.map { String($0) } ?? "unknown") ordinaryDriftReadSpanNs=\(s.ordinaryDriftReadEntryNs.flatMap { begin in s.ordinaryDriftReadReturnNs.flatMap { end in end >= begin ? String(end - begin) : nil } } ?? "unknown")")
             }
         }
         XCTAssertEqual(dropped, 0); XCTAssertFalse(overflow)

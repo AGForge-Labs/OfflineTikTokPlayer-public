@@ -33,6 +33,9 @@ final class PlaybackService: NSObject {
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     #if DEBUG
+    @ObservationIgnored var debugUsesCurrentCustomFrameForReadiness = false
+    // One synchronous notification per start, no retained event history or SDK reads.
+    @ObservationIgnored var debugAfterFirstFrameMonitorStart: ((AVPlayerItem) -> Void)?
     enum DebugInitialLoadPhase: Int, Sendable {
         case idle = 0, savedLookup = 1, cachedLookupAndResolution = 2, localResolved = 3
         case audioPrepare = 4, audioPrepared = 5, bufferReplaceAndObserve = 6, observedCurrent = 7, error = 8
@@ -71,6 +74,8 @@ final class PlaybackService: NSObject {
         let force: Bool
         // The existing ordinary-drift guard read; forced requests do not read it.
         let ordinaryDriftVideoPositionSeconds: Double?
+        let ordinaryDriftReadEntryNs: UInt64?
+        let ordinaryDriftReadReturnNs: UInt64?
         // Cached actor-owned state, not another renderer/native snapshot.
         let cachedSelected: Bool
         let selectedMatchesQueue: Bool
@@ -790,7 +795,7 @@ final class PlaybackService: NSObject {
     }
 
     private func monitorFirstFrame(_ playerItem: AVPlayerItem, request: Int) {
-        frameMonitor.start(item: playerItem, layer: surface.playerLayer) { [weak self, weak playerItem] in
+        let completion: () -> Void = { [weak self, weak playerItem] in
             guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
             #if DEBUG
             self.debugTraceVideoStartup(.firstFrameEvent, request: request) {
@@ -802,6 +807,25 @@ final class PlaybackService: NSObject {
             self.recordPlaybackEvent("firstFrame")
             #endif
         }
+        #if DEBUG
+        if debugUsesCurrentCustomFrameForReadiness {
+            // Capture the raw ticket: audio eligibility can still be pending here.
+            let expected = videoPresentation
+            frameMonitor.start(item: playerItem, layer: surface.playerLayer, decodedFrameEpoch: { [weak self, weak playerItem] in
+                guard let self, let playerItem, let expected,
+                      expected.request == request, self.generation == request,
+                      self.observedItem === playerItem,
+                      self.videoPresentation?.request == request,
+                      self.videoPresentation?.ticket == expected.ticket else { return nil }
+                return self.continuousPiP.debugCurrentFrameEpoch(for: expected.ticket)
+            }, onReady: completion)
+        } else {
+            frameMonitor.start(item: playerItem, layer: surface.playerLayer, onReady: completion)
+        }
+        debugAfterFirstFrameMonitorStart?(playerItem)
+        #else
+        frameMonitor.start(item: playerItem, layer: surface.playerLayer, onReady: completion)
+        #endif
     }
 
     private var initialZeroStartOwnsPendingReady: Bool {
@@ -1084,10 +1108,19 @@ final class PlaybackService: NSObject {
         let position = continuousAudio.presentationPosition(at: hostTime)
         #if DEBUG
         let ordinaryDriftVideoPositionSeconds: Double?
+        var ordinaryDriftReadEntryNs: UInt64? = nil
+        var ordinaryDriftReadReturnNs: UInt64? = nil
         if force {
             ordinaryDriftVideoPositionSeconds = nil
         } else {
-            let sampledPosition = item.currentTime().seconds
+            let sampledPosition: Double
+            if onDebugVideoSeekStamp != nil {
+                ordinaryDriftReadEntryNs = DispatchTime.now().uptimeNanoseconds
+                sampledPosition = item.currentTime().seconds
+                ordinaryDriftReadReturnNs = DispatchTime.now().uptimeNanoseconds
+            } else {
+                sampledPosition = item.currentTime().seconds
+            }
             ordinaryDriftVideoPositionSeconds = sampledPosition
             guard abs(sampledPosition - position) > 0.080 else { return }
         }
@@ -1102,6 +1135,8 @@ final class PlaybackService: NSObject {
             observer(DebugVideoSeekStamp(reason: reason, request: request, generation: generation,
                 nativeSeekTicket: videoSeek, requestedPosition: position, force: force,
                 ordinaryDriftVideoPositionSeconds: ordinaryDriftVideoPositionSeconds,
+                ordinaryDriftReadEntryNs: ordinaryDriftReadEntryNs,
+                ordinaryDriftReadReturnNs: ordinaryDriftReadReturnNs,
                 cachedSelected: continuousAudio.isSelected,
                 selectedMatchesQueue: continuousAudio.selectedID == queue.currentID,
                 cachedAudioToken: audioToken, cachedAudioVisit: audioVisit,

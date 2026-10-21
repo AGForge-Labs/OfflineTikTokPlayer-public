@@ -1,0 +1,203 @@
+import XCTest
+import AVFoundation
+import UIKit
+@testable import OfflineTikTokPlayer
+
+/// Actual CPP enqueue proof and native layer readiness; no decoded substitute,
+/// screenshot, fabricated epoch or benchmark-latency allowance is used here.
+@MainActor
+final class PlaybackFrameMonitorTests: XCTestCase {
+    func testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource() async throws {
+        #if DEBUG
+        let presentation = try await makePresentation()
+        defer { presentation.close() }
+        let monitor = PlaybackFrameMonitor()
+        monitor.debugAutomaticallyTicks = false
+        defer { monitor.cancel() }
+        let output = try XCTUnwrap(presentation.resource.output)
+        let epoch = try XCTUnwrap(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket))
+        let submissions = presentation.bridge.submittedFrameCount
+        XCTAssertGreaterThan(submissions, 0)
+        XCTAssertNotNil(presentation.bridge.lastFramePositionSeconds)
+        XCTAssertEqual(presentation.player.rate, 0)
+        XCTAssertEqual(presentation.item.outputs.count, 1)
+        var completions = 0
+        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
+            presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket)
+        }, onReady: { completions += 1 })
+        XCTAssertEqual(presentation.item.outputs.count, 1)
+        monitor.debugTick(displayTime: 10)
+        XCTAssertEqual(completions, 0)
+        monitor.debugTick(displayTime: 10 + 1.0 / 60)
+        XCTAssertEqual(completions, 1, "An already-enqueued paused image must not need a new output buffer")
+        XCTAssertEqual(presentation.bridge.submittedFrameCount, submissions)
+        XCTAssertEqual(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket), epoch)
+        monitor.cancel()
+        XCTAssertTrue(presentation.resource.output === output)
+        XCTAssertTrue(presentation.resource.isAttached)
+        XCTAssertTrue(presentation.resource.isBorrowed)
+        XCTAssertFalse(presentation.resource.isRetired)
+
+        let staleTicket = presentation.ticket
+        let current = try XCTUnwrap(presentation.bridge.setCurrentItem(presentation.item,
+                                                                      preparedVideo: presentation.resource))
+        XCTAssertNil(presentation.bridge.debugCurrentFrameEpoch(for: staleTicket))
+        XCTAssertNil(presentation.bridge.debugCurrentFrameEpoch(for: current))
+        XCTAssertFalse(presentation.bridge.activate(staleTicket))
+        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
+            presentation.bridge.debugCurrentFrameEpoch(for: staleTicket)
+        }, onReady: { completions += 1 })
+        monitor.debugTick(displayTime: 11)
+        monitor.debugTick(displayTime: 11 + 1.0 / 60)
+        XCTAssertEqual(completions, 1, "A stale ticket cannot supply an old image to the new presentation")
+        monitor.cancel()
+        XCTAssertEqual(presentation.item.outputs.count, 1)
+        XCTAssertTrue(presentation.resource.output === output)
+        XCTAssertFalse(presentation.resource.isRetired)
+        #else
+        XCTFail("Current custom-frame contracts require DEBUG controls")
+        #endif
+    }
+
+    func testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks() async throws {
+        #if DEBUG
+        let presentation = try await makePresentation()
+        defer { presentation.close() }
+        let monitor = PlaybackFrameMonitor()
+        monitor.debugAutomaticallyTicks = false
+        defer { monitor.cancel() }
+        let originalEpoch = try XCTUnwrap(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket))
+        let originalSubmissions = presentation.bridge.submittedFrameCount
+        var completions = 0
+        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
+            presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket)
+        }, onReady: { completions += 1 })
+        monitor.debugTick(displayTime: 20)
+        XCTAssertEqual(completions, 0)
+        presentation.bridge.flushForSeek()
+        XCTAssertNil(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket))
+        // Deliberately do not sample nil: the entire real flush/seek/enqueue
+        // occurs between monitor ticks. Comparing only nil/non-nil is unsafe.
+
+        let seek = SeekCompletion()
+        presentation.item.seek(to: CMTime(seconds: 0.25, preferredTimescale: 60_000),
+                               toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+            Task { @MainActor in seek.finished = finished }
+        }
+        let sought = await waitUntil { seek.finished != nil }
+        XCTAssertTrue(sought); XCTAssertEqual(seek.finished, true)
+        guard sought, seek.finished == true else { throw SetupFailure.notReady }
+        let enqueued = await waitUntil {
+            presentation.bridge.updatePlayback(positionSeconds: 0.25, durationSeconds: 1.2, isPlaying: false)
+            return presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket) != nil
+                && presentation.layer.isReadyForDisplay
+        }
+        XCTAssertTrue(enqueued)
+        guard enqueued else { throw SetupFailure.notReady }
+        let freshEpoch = try XCTUnwrap(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket))
+        XCTAssertNotEqual(freshEpoch, originalEpoch)
+        XCTAssertGreaterThan(presentation.bridge.submittedFrameCount, originalSubmissions)
+        monitor.debugTick(displayTime: 21)
+        XCTAssertEqual(completions, 0, "The new epoch must not inherit the pre-flush display tick")
+        monitor.debugTick(displayTime: 21 + 1.0 / 60)
+        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(presentation.item.outputs.count, 1)
+        XCTAssertTrue(presentation.resource.isAttached)
+        XCTAssertFalse(presentation.resource.isRetired)
+
+        // Also exercise nil with no replacement image: it cannot preserve a
+        // prior decoded latch or complete the second tick after a flush.
+        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
+            presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket)
+        }, onReady: { completions += 1 })
+        monitor.debugTick(displayTime: 22)
+        presentation.bridge.flushForSeek()
+        XCTAssertNil(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket))
+        monitor.debugTick(displayTime: 22 + 1.0 / 60)
+        XCTAssertEqual(completions, 1)
+        #else
+        XCTFail("Current custom-frame contracts require DEBUG controls")
+        #endif
+    }
+
+    private enum SetupFailure: Error { case notReady }
+    @MainActor private final class SeekCompletion { var finished: Bool? }
+
+    @MainActor private final class Presentation {
+        let item: AVPlayerItem
+        let resource: ContinuousPictureInPicture.PreparedVideoResource
+        let bridge: ContinuousPictureInPicture
+        let ticket: ContinuousPictureInPicture.PresentationTicket
+        let player: AVPlayer
+        let layer: AVPlayerLayer
+        let window: UIWindow
+        weak var previousKeyWindow: UIWindow?
+        init(item: AVPlayerItem, resource: ContinuousPictureInPicture.PreparedVideoResource,
+             bridge: ContinuousPictureInPicture, ticket: ContinuousPictureInPicture.PresentationTicket,
+             player: AVPlayer, layer: AVPlayerLayer, window: UIWindow, previous: UIWindow?) {
+            self.item = item; self.resource = resource; self.bridge = bridge; self.ticket = ticket
+            self.player = player; self.layer = layer; self.window = window; previousKeyWindow = previous
+        }
+        func close() {
+            player.pause(); bridge.invalidate(); player.replaceCurrentItem(with: nil)
+            resource.retire(); window.isHidden = true; window.rootViewController = nil
+            previousKeyWindow?.makeKey()
+        }
+    }
+
+    private func makePresentation() async throws -> Presentation {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let item = AVPlayerItem(url: url)
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+        let resource = try XCTUnwrap(plan.install(ifEligible: { true }))
+        let bridge = ContinuousPictureInPicture()
+        var completed = false
+        defer { if !completed { bridge.invalidate(); resource.retire() } }
+        let ticket = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = scene.coordinateSpace.bounds; window.windowLevel = .alert + 1
+        let controller = UIViewController()
+        window.rootViewController = controller
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true
+        let layer = AVPlayerLayer(player: player)
+        layer.frame = window.bounds
+        controller.view.layer.addSublayer(layer)
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
+        let result = Presentation(item: item, resource: resource, bridge: bridge, ticket: ticket,
+                                  player: player, layer: layer, window: window, previous: previous)
+        do {
+            player.playImmediately(atRate: 1)
+            let nativeReady = await waitUntil { item.status == .readyToPlay && layer.isReadyForDisplay }
+            player.pause()
+            XCTAssertTrue(nativeReady)
+            guard nativeReady else { throw SetupFailure.notReady }
+            XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0, durationSeconds: 1.2, isPlaying: false))
+            XCTAssertTrue(bridge.activate(ticket))
+            let actualImage = await waitUntil {
+                bridge.updatePlayback(positionSeconds: 0, durationSeconds: 1.2, isPlaying: false)
+                #if DEBUG
+                return bridge.debugCurrentFrameEpoch(for: ticket) != nil
+                #else
+                return false
+                #endif
+            }
+            XCTAssertTrue(actualImage)
+            guard actualImage else { throw SetupFailure.notReady }
+            completed = true
+            return result
+        } catch { result.close(); throw error }
+    }
+
+    private func waitUntil(_ condition: () -> Bool) async -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 4
+        while true {
+            if condition() { return true }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { return false }
+            do { try await Task.sleep(nanoseconds: 10_000_000) } catch { return false }
+        }
+    }
+}

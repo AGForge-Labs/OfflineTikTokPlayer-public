@@ -116,6 +116,20 @@ final class ContinuousPictureInPicture: NSObject {
     #if DEBUG
     /// Observes the actual SDK request without replacing its result.
     var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
+    // Cached proof only: no output pull or SDK query is performed by its getter.
+    private var debugImageEpoch: UInt64 = 0
+    private var debugImageEpochSaturated = false
+    private var debugEnqueuedImageEpoch: UInt64?
+    func debugCurrentFrameEpoch(for ticket: PresentationTicket) -> UInt64? {
+        guard owns(ticket), !debugImageEpochSaturated,
+              debugEnqueuedImageEpoch == debugImageEpoch else { return nil }
+        return debugImageEpoch
+    }
+    private func debugInvalidateCurrentFrameProof() {
+        debugEnqueuedImageEpoch = nil
+        if debugImageEpoch == UInt64.max { debugImageEpochSaturated = true }
+        else { debugImageEpoch += 1 }
+    }
     enum DebugRenderStage: Int, Sendable {
         case attempt = 0, hasNewFalse = 1, hasNewTrue = 2, copied = 3, enqueued = 4
         case seekBegin = 5, compositionAssigned = 6, outputAttached = 7, seekBlocked = 8
@@ -307,6 +321,9 @@ final class ContinuousPictureInPicture: NSObject {
         orientationPrepared = false
         format = nil
         hasReportedFrameFailure = false
+        #if DEBUG
+        debugInvalidateCurrentFrameProof()
+        #endif
         displayLayer.flushAndRemoveImage()
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
@@ -457,6 +474,9 @@ final class ContinuousPictureInPicture: NSObject {
 
     /// A seek starts a new frame epoch, including the image held by a paused timebase.
     func flushForSeek() {
+        #if DEBUG
+        debugInvalidateCurrentFrameProof()
+        #endif
         displayLayer.flushAndRemoveImage()
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
@@ -516,6 +536,9 @@ final class ContinuousPictureInPicture: NSObject {
         releaseCurrentResource()
         videoOutput = nil
         currentItem = nil
+        #if DEBUG
+        debugInvalidateCurrentFrameProof()
+        #endif
         displayLayer.flushAndRemoveImage()
         displayLayer.controlTimebase = nil
         timebase = nil
@@ -546,8 +569,10 @@ final class ContinuousPictureInPicture: NSObject {
     private func renderFrame() {
         guard !invalidated, frameFeedEnabled, let videoOutput, let timebase else { return }
         #if DEBUG
-        let debugSourceTicket = onDebugRenderStamp == nil ? nil
-            : currentItem.map { PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0)) }
+        let debugEnqueueTicket = currentItem.map {
+            PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0))
+        }
+        let debugSourceTicket = onDebugRenderStamp == nil ? nil : debugEnqueueTicket
         #endif
         guard activeSeekTicket == nil else {
             #if DEBUG
@@ -561,10 +586,16 @@ final class ContinuousPictureInPicture: NSObject {
         debugTraceRender(.attempt, sourceTicket: debugSourceTicket)
         #endif
         if displayLayer.status == .failed {
+            #if DEBUG
+            debugEnqueuedImageEpoch = nil
+            #endif
             if !hasReportedFrameFailure {
                 onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)
                 hasReportedFrameFailure = true
             }
+            #if DEBUG
+            debugInvalidateCurrentFrameProof()
+            #endif
             displayLayer.flushAndRemoveImage()
             lastEnqueuedTime = .invalid
         }
@@ -625,11 +656,18 @@ final class ContinuousPictureInPicture: NSObject {
                                                               sampleTiming: &timing,
                                                               sampleBufferOut: &sample)
         guard status == noErr, let sample else { reportFrameFailure(status); return }
+        #if DEBUG
+        let debugEnqueueEpoch = debugImageEpoch
+        #endif
         displayLayer.enqueue(sample)
         lastEnqueuedTime = displayTime
         lastFramePositionSeconds = CMTimeGetSeconds(displayTime)
         submittedFrameCount &+= 1
         #if DEBUG
+        if let debugEnqueueTicket, owns(debugEnqueueTicket),
+           !debugImageEpochSaturated, debugImageEpoch == debugEnqueueEpoch {
+            debugEnqueuedImageEpoch = debugEnqueueEpoch
+        }
         debugTraceRender(.enqueued, requested: requestedTime, sample: displayTime, sourceTicket: debugSourceTicket)
         #endif
     }
