@@ -17,6 +17,7 @@ import uuid
 MAX_LOG_BYTES = 1024 * 1024
 MAX_SECTION_BYTES = 65536
 MAX_ELAPSED_SECONDS = 4.5
+MAX_LOOKUP_SECONDS = 1.5
 INTEGER = rb"(?:0|[1-9][0-9]*|-[1-9][0-9]*)"
 SECONDS = rb"-?(?:0|[1-9][0-9]*)\.[0-9]{6}"
 HEADER = re.compile(
@@ -25,7 +26,12 @@ HEADER = re.compile(
     rb" statusCode=(?P<status>" + INTEGER + rb") nativeReturnCode=(?P<native>" + INTEGER + rb")"
     rb" bytes=(?P<size>" + INTEGER + rb") truncated=(?P<truncated>" + INTEGER + rb")"
     rb" decoderQueueCount=(?P<queues>" + INTEGER + rb") startUptime=(?P<start>" + SECONDS + rb")"
-    rb" elapsedSeconds=(?P<elapsed>" + SECONDS + rb")")
+    rb" elapsedSeconds=(?P<elapsed>" + SECONDS + rb")"
+    rb" stageCode=(?P<stage>" + INTEGER + rb") ownershipCode=(?P<ownership>" + INTEGER + rb")"
+    rb" psReturnCode=(?P<ps_return>" + INTEGER + rb") bundleReturnCode=(?P<bundle_return>" + INTEGER + rb")"
+    rb" psElapsedSeconds=(?P<ps_elapsed>" + SECONDS + rb")"
+    rb" bundleElapsedSeconds=(?P<bundle_elapsed>" + SECONDS + rb")"
+    rb" bundleCacheHit=(?P<cache_hit>" + INTEGER + rb")")
 CAPTURE = re.compile(
     rb"SimulatorCaptureResult errorCode=" + INTEGER + rb" startUptime=" + SECONDS
     + rb" elapsedSeconds=" + SECONDS)
@@ -72,14 +78,17 @@ def verify_trace(raw):
             fields["request"] = canonical_uuid(fields["request"])
             fields["worker"] = canonical_uuid(fields["worker"])
             try:
-                for key in ("purpose", "status", "native", "size", "truncated", "queues"):
+                for key in ("purpose", "status", "native", "size", "truncated", "queues",
+                            "stage", "ownership", "ps_return", "bundle_return", "cache_hit"):
                     fields[key] = int(fields[key])
-                for key in ("start", "elapsed"):
+                for key in ("start", "elapsed", "ps_elapsed", "bundle_elapsed"):
                     fields[key] = float(fields[key])
             except (ValueError, OverflowError):
                 raise EvidenceError(3) from None
             require(fields["purpose"] in (0, 1, 2), 3)
-            require(math.isfinite(fields["start"]) and math.isfinite(fields["elapsed"]), 3)
+            require(0 <= fields["stage"] <= 8 and 0 <= fields["ownership"] <= 6
+                    and fields["cache_hit"] in (0, 1), 3)
+            require(all(math.isfinite(fields[key]) for key in ("start", "elapsed", "ps_elapsed", "bundle_elapsed")), 3)
             records.append((offset, offset + len(physical), fields))
             boundaries.append(offset)
         elif b"SimulatorCaptureResult" in line:
@@ -96,6 +105,12 @@ def verify_trace(raw):
     require(0 < fields["size"] <= MAX_SECTION_BYTES
             and fields["truncated"] == 0 and fields["queues"] >= 1, 6)
     require(fields["start"] > 0 and 0 < fields["elapsed"] <= MAX_ELAPSED_SECONDS, 7)
+    require(fields["stage"] == 8 and fields["ownership"] == 1 and fields["ps_return"] == 0, 10)
+    require(0 < fields["ps_elapsed"] <= MAX_LOOKUP_SECONDS, 11)
+    if fields["cache_hit"] == 0:
+        require(fields["bundle_return"] == 0 and 0 < fields["bundle_elapsed"] <= MAX_LOOKUP_SECONDS, 11)
+    else:
+        require(fields["bundle_return"] == -1 and fields["bundle_elapsed"] == 0, 11)
     section_end = next((position for position in boundaries if position > header_offset), len(raw))
     section = raw[section_start:section_end]
     require(len(section) == fields["size"] and len(section) <= MAX_SECTION_BYTES, 8)

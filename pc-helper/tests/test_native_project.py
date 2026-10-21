@@ -141,6 +141,11 @@ def _mock_worker_commands(monkeypatch, watcher, executable, report=WORKER_SAMPLE
     return calls
 
 
+def _worker_results(output):
+    return [dict(field.split("=", 1) for field in line.split()[1:])
+            for line in output.splitlines() if line.startswith("NativeWorkerTraceResult ")]
+
+
 def test_worker_trace_profiles_only_owned_pid_and_emits_only_worker_stack(tmp_path, monkeypatch, capsys):
     module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
     calls = _mock_worker_commands(monkeypatch, watcher, executable)
@@ -153,6 +158,13 @@ def test_worker_trace_profiles_only_owned_pid_and_emits_only_worker_stack(tmp_pa
     assert "OfflineTikTokPlayer.PCMDecode" in output and "synthetic_reader_wait" in output
     assert "PRIVATE_" not in output
     assert "startUptime=" in output and "elapsedSeconds=" in output
+    fields = _worker_results(output)[0]
+    assert list(fields)[-7:] == ["stageCode", "ownershipCode", "psReturnCode", "bundleReturnCode",
+                                "psElapsedSeconds", "bundleElapsedSeconds", "bundleCacheHit"]
+    assert fields["stageCode"] == "8" and fields["ownershipCode"] == "1"
+    assert fields["psReturnCode"] == fields["bundleReturnCode"] == "0"
+    assert fields["bundleCacheHit"] == "0"
+    assert float(fields["psElapsedSeconds"]) >= 0 and float(fields["bundleElapsedSeconds"]) >= 0
     assert not request.exists()
     assert not list(temporary.glob(module.WORKER_PREFIX + "*.sample.txt"))
 
@@ -233,7 +245,14 @@ def test_worker_trace_profiles_at_most_once_per_purpose_and_twice_total(tmp_path
     assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 2
     assert len([call for call in calls if call[0][0] == "/usr/bin/xcrun"]) == 1
     assert watcher.profile_count == 2 and watcher.purposes == {0, 1}
-    assert capsys.readouterr().out.count("statusCode=3") == 2
+    output = capsys.readouterr().out
+    assert output.count("statusCode=3") == 2
+    successes = [fields for fields in _worker_results(output) if fields["statusCode"] == "0"]
+    assert [fields["bundleCacheHit"] for fields in successes] == ["0", "1"]
+    assert successes[0]["bundleReturnCode"] == "0"
+    assert successes[1]["bundleReturnCode"] == "-1" and float(successes[1]["bundleElapsedSeconds"]) == 0
+    assert all(fields["stageCode"] == "8" and fields["ownershipCode"] == "1"
+               and fields["psReturnCode"] == "0" for fields in successes)
 
 
 def test_worker_trace_calibration_purpose_is_explicit_and_single_use(tmp_path, monkeypatch, capsys):
@@ -278,6 +297,106 @@ def test_worker_trace_rejects_same_app_name_in_another_bundle_container(tmp_path
     assert "statusCode=2" in capsys.readouterr().out
 
 
+def test_worker_trace_app_lookup_timeout_does_not_poison_later_calibration(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    successful_command = watcher._command
+    app_lookups = 0
+
+    def first_app_lookup_times_out(arguments, timeout):
+        nonlocal app_lookups
+        if arguments[0] == "/usr/bin/xcrun":
+            app_lookups += 1
+            if app_lookups == 1:
+                calls.append((arguments, timeout))
+                assert timeout == 1
+                raise subprocess.TimeoutExpired(arguments, timeout)
+        return successful_command(arguments, timeout)
+
+    monkeypatch.setattr(watcher, "_command", first_app_lookup_times_out)
+    request, identifier = _worker_request(module, temporary, purpose=0)
+    watcher.process_request(request, identifier)
+    first_output = capsys.readouterr().out
+    assert "statusCode=11" in first_output and "startUptime=-1.000000" in first_output
+    first_fields = _worker_results(first_output)[0]
+    assert first_fields["stageCode"] == "3" and first_fields["ownershipCode"] == "0"
+    assert first_fields["psReturnCode"] == "0" and first_fields["bundleReturnCode"] == "-1"
+    assert first_fields["bundleCacheHit"] == "0"
+    assert watcher.profile_count == 0 and watcher.purposes == set()
+    assert watcher.application is None
+    assert not any(call[0][0] == "/usr/bin/sample" for call in calls)
+
+    # A distinct later request must be able to validate the same exact app;
+    # timing out before profiling must not cache an unverified None forever.
+    request, identifier = _worker_request(module, temporary, purpose=2)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert app_lookups == 2, "Only successfully validated app paths may be cached"
+    assert f"purposeCode=2 workerID={WORKER_ID} statusCode=0" in output
+    fields = _worker_results(output)[0]
+    assert fields["stageCode"] == "8" and fields["ownershipCode"] == "1"
+    assert fields["bundleCacheHit"] == "0" and fields["bundleReturnCode"] == "0"
+    assert watcher.application == executable.parent
+    assert watcher.profile_count == 1 and watcher.purposes == {2}
+    assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 1
+
+
+@pytest.mark.parametrize("command_name,stage", [("/bin/ps", "1"), ("/usr/bin/xcrun", "3")])
+def test_worker_trace_preflight_timeout_reports_exact_stage_without_profiling(tmp_path, monkeypatch, capsys, command_name, stage):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    successful_command = watcher._command
+
+    def command(arguments, timeout):
+        if arguments[0] == command_name:
+            calls.append((arguments, timeout))
+            assert timeout == 1
+            raise subprocess.TimeoutExpired(arguments, timeout)
+        return successful_command(arguments, timeout)
+
+    monkeypatch.setattr(watcher, "_command", command)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    fields = _worker_results(output)[0]
+    assert fields["statusCode"] == "11" and fields["stageCode"] == stage
+    assert fields["ownershipCode"] == "0" and fields["startUptime"] == "-1.000000"
+    assert fields["psReturnCode"] == ("-1" if stage == "1" else "0")
+    assert fields["bundleReturnCode"] == "-1" and fields["bundleCacheHit"] == "0"
+    assert float(fields["psElapsedSeconds"]) >= 0 and float(fields["bundleElapsedSeconds"]) >= 0
+    assert watcher.profile_count == 0 and watcher.purposes == set()
+    assert not any(call[0][0] == "/usr/bin/sample" for call in calls)
+    assert "PRIVATE_" not in output
+
+
+@pytest.mark.parametrize("command_name,stage,ownership,status", [
+    ("/bin/ps", "1", "2", "5"), ("/usr/bin/xcrun", "3", "4", "2"),
+])
+def test_worker_trace_preflight_nonzero_reports_stage_and_returncode(tmp_path, monkeypatch, capsys, command_name, stage, ownership, status):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    successful_command = watcher._command
+
+    def command(arguments, timeout):
+        if arguments[0] == command_name:
+            calls.append((arguments, timeout))
+            assert timeout == 1
+            return subprocess.CompletedProcess(arguments, 19, "", "PRIVATE_ERROR")
+        return successful_command(arguments, timeout)
+
+    monkeypatch.setattr(watcher, "_command", command)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    fields = _worker_results(output)[0]
+    assert fields["statusCode"] == status and fields["stageCode"] == stage
+    assert fields["ownershipCode"] == ownership and fields["startUptime"] == "-1.000000"
+    assert fields["psReturnCode"] == ("19" if stage == "1" else "0")
+    assert fields["bundleReturnCode"] == ("19" if stage == "3" else "-1")
+    assert watcher.profile_count == 0 and not any(call[0][0] == "/usr/bin/sample" for call in calls)
+    assert "PRIVATE_" not in output
+
+
 def test_worker_trace_limits_request_processing_and_seen_ids_to_32(tmp_path, monkeypatch, capsys):
     module, watcher, temporary, _ = _worker_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(watcher, "_command", lambda *args, **kwargs: pytest.fail("Invalid payloads must not invoke native tools"))
@@ -296,7 +415,11 @@ def test_worker_trace_reports_unavailable_protected_and_timed_out_sampling(tmp_p
     _mock_worker_commands(monkeypatch, watcher, executable, failure=failure)
     request, identifier = _worker_request(module, temporary)
     watcher.process_request(request, identifier)
-    assert f"statusCode={status}" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert f"statusCode={status}" in output
+    fields = _worker_results(output)[0]
+    assert fields["stageCode"] == "6" and fields["ownershipCode"] == "1"
+    assert fields["psReturnCode"] == fields["bundleReturnCode"] == "0"
     assert watcher.profile_count == 1 and watcher.purposes == {0}
     assert not request.exists() and not list(temporary.glob("*.sample.txt"))
 

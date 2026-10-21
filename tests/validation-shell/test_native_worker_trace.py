@@ -24,7 +24,9 @@ def trace(section=None, **overrides):
         section = worker_section()
     fields = dict(requestID=REQUEST, purposeCode=2, workerID=WORKER, statusCode=0,
                   nativeReturnCode=0, bytes=len(section.encode("utf-8")), truncated=0,
-                  decoderQueueCount=1, startUptime="100.000000", elapsedSeconds="1.000000")
+                  decoderQueueCount=1, startUptime="100.000000", elapsedSeconds="1.000000",
+                  stageCode=8, ownershipCode=1, psReturnCode=0, bundleReturnCode=0,
+                  psElapsedSeconds="0.010000", bundleElapsedSeconds="0.020000", bundleCacheHit=0)
     fields.update(overrides)
     header = "NativeWorkerTraceResult " + " ".join(f"{key}={value}" for key, value in fields.items())
     return header + "\n" + section
@@ -90,6 +92,65 @@ class NativeWorkerTraceTests(unittest.TestCase):
                              ("elapsedSeconds", "inf"), ("elapsedSeconds", "1e309")):
             with self.subTest(field=field, value=value):
                 self.assert_rejected(trace(**{field: value}))
+
+    def test_accepts_completed_lookups_or_a_verified_cache_hit_after_an_ordinary_failure(self):
+        failed_lookup = trace("", requestID=OTHER_REQUEST, purposeCode=0, statusCode=11,
+                              nativeReturnCode=-1, decoderQueueCount=0,
+                              startUptime="-1.000000", elapsedSeconds="0.000000",
+                              stageCode=1, ownershipCode=2, psReturnCode=1, bundleReturnCode=-1,
+                              psElapsedSeconds="0.010000", bundleElapsedSeconds="0.000000")
+        for calibration in (trace(psElapsedSeconds="1.500000", bundleElapsedSeconds="1.500000"),
+                            trace(bundleCacheHit=1, bundleReturnCode=-1, bundleElapsedSeconds="0.000000")):
+            with self.subTest(calibration=calibration):
+                result = self.check_log(failed_lookup + CAPTURE + calibration)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_missing_or_malformed_stage_and_ownership_metadata(self):
+        valid = trace()
+        header, section = valid.split("\n", 1)
+        names = ("stageCode", "ownershipCode", "psReturnCode", "bundleReturnCode",
+                 "psElapsedSeconds", "bundleElapsedSeconds", "bundleCacheHit")
+        for name in names:
+            with self.subTest(missing=name):
+                missing = " ".join(token for token in header.split(" ") if not token.startswith(name + "="))
+                self.assert_rejected(missing + "\n" + section)
+        old_header = " ".join(token for token in header.split(" ")
+                              if not any(token.startswith(name + "=") for name in names))
+        self.assert_rejected(old_header + "\n" + section)
+        for malformed in (header.replace("stageCode=8", "stageCode=eight"),
+                          header.replace("ownershipCode=1", "ownershipCode=1.0"),
+                          header.replace("psReturnCode=0", "psReturnCode=zero"),
+                          header.replace("bundleCacheHit=0", "bundleCacheHit=0 bundleCacheHit=1")):
+            with self.subTest(malformed=malformed):
+                # An invalid calibration cannot vanish beside a valid retry.
+                self.assert_rejected(malformed + "\n" + section + valid)
+
+    def test_requires_filter_completion_and_verified_process_ownership(self):
+        for values in ({"stageCode": 0}, {"stageCode": 6}, {"stageCode": 7}, {"stageCode": 9},
+                       {"ownershipCode": 0}, {"ownershipCode": 2}, {"ownershipCode": 6},
+                       {"psReturnCode": -1}, {"psReturnCode": 1},
+                       {"bundleReturnCode": -1}, {"bundleReturnCode": 1}):
+            with self.subTest(values=values):
+                self.assert_rejected(trace(**values))
+
+    def test_lookup_durations_must_be_finite_positive_and_at_most_one_point_five_seconds(self):
+        for field in ("psElapsedSeconds", "bundleElapsedSeconds"):
+            for value in ("0.000000", "-0.010000", "1.500001", "nan", "inf", "1e309"):
+                with self.subTest(field=field, value=value):
+                    self.assert_rejected(trace(**{field: value}))
+
+    def test_cache_hit_requires_a_skipped_bundle_query_and_exactly_zero_bundle_elapsed(self):
+        for values in ({"bundleCacheHit": -1}, {"bundleCacheHit": 2},
+                       {"bundleCacheHit": 1, "bundleReturnCode": 0, "bundleElapsedSeconds": "0.000000"},
+                       {"bundleCacheHit": 1, "bundleReturnCode": 1, "bundleElapsedSeconds": "0.000000"},
+                       {"bundleCacheHit": 1, "bundleReturnCode": -1},
+                       {"bundleCacheHit": 1, "bundleReturnCode": -1, "bundleElapsedSeconds": "0.000001"},
+                       {"bundleCacheHit": 1, "bundleReturnCode": -1, "bundleElapsedSeconds": "-0.000001"},
+                       {"bundleCacheHit": 1, "bundleReturnCode": -1, "bundleElapsedSeconds": "0.000000", "psReturnCode": -1},
+                       {"bundleCacheHit": 1, "bundleReturnCode": -1, "bundleElapsedSeconds": "0.000000", "psElapsedSeconds": "0.000000"},
+                       {"bundleCacheHit": 1, "bundleReturnCode": -1, "bundleElapsedSeconds": "0.000000", "psElapsedSeconds": "1.500001"}):
+            with self.subTest(values=values):
+                self.assert_rejected(trace(**values))
 
     def test_requires_exact_nonempty_utf8_byte_length_with_a_65536_byte_limit(self):
         for size in (0, -1, 65537, len(worker_section().encode("utf-8")) + 1):

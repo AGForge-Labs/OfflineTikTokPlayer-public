@@ -101,6 +101,16 @@ class WorkerTraceWatcher:
         self.profile_count = 0
         self.application_queried = False
         self.application = None
+        self._reset_preflight()
+
+    def _reset_preflight(self):
+        self.stage_code = 0
+        self.ownership_code = 0
+        self.ps_returncode = -1
+        self.bundle_returncode = -1
+        self.ps_elapsed = 0.0
+        self.bundle_elapsed = 0.0
+        self.bundle_cache_hit = 0
 
     def _owned_identity(self, path):
         if (self.temporary.is_symlink() or self.temporary.resolve(strict=True) != self.temporary
@@ -166,9 +176,18 @@ class WorkerTraceWatcher:
                     pass
 
     def _owns_process(self, process_id):
-        result = self._command(["/bin/ps", "-ww", "-p", str(process_id), "-o", "comm="], timeout=1)
+        self.stage_code = 1  # Same-PID executable lookup.
+        started = time.monotonic()
+        try:
+            result = self._command(["/bin/ps", "-ww", "-p", str(process_id), "-o", "comm="], timeout=1)
+        finally:
+            self.ps_elapsed = time.monotonic() - started
+        self.ps_returncode = result.returncode
         if result.returncode:
+            self.ownership_code = 2
             return None
+        self.stage_code = 2  # Validate the executable and selected-device path.
+        self.ownership_code = 3
         output = result.stdout.strip()
         if not output or len(output) > 4096 or len(output.splitlines()) != 1:
             return False
@@ -197,11 +216,21 @@ class WorkerTraceWatcher:
         if (executable.is_symlink() or not executable.is_file()
                 or executable.resolve(strict=True) != executable):
             return False
+        self.ownership_code = 0
+        self.bundle_cache_hit = int(self.application_queried)
         if not self.application_queried:
-            self.application_queried = True
-            result = self._command(["/usr/bin/xcrun", "simctl", "get_app_container", self.udid, BUNDLE, "app"], timeout=1)
+            self.stage_code = 3  # Resolve only this exact installed bundle.
+            started = time.monotonic()
+            try:
+                result = self._command(["/usr/bin/xcrun", "simctl", "get_app_container", self.udid, BUNDLE, "app"], timeout=1)
+            finally:
+                self.bundle_elapsed = time.monotonic() - started
+            self.bundle_returncode = result.returncode
             if result.returncode:
+                self.ownership_code = 4
                 return False
+            self.stage_code = 4  # Validate the resolved app before caching it.
+            self.ownership_code = 5
             output = result.stdout.strip()
             if not output or len(output) > 4096 or len(output.splitlines()) != 1:
                 return False
@@ -217,13 +246,18 @@ class WorkerTraceWatcher:
                 return False
             uuid.UUID(parts[0])
             self.application = application
-        return self.application is not None and executable == self.application / "OfflineTikTokPlayer"
+            self.application_queried = True
+        self.stage_code = 5  # Require the exact executable in the bound app.
+        owned = self.application is not None and executable == self.application / "OfflineTikTokPlayer"
+        self.ownership_code = 1 if owned else 6
+        return owned
 
     def process_request(self, request, identifier):
         if identifier in self.seen or self.processed >= 32:
             return
         self.seen.add(identifier)
         self.processed += 1
+        self._reset_preflight()
         purpose, code, section, truncated, native_returncode = -1, 1, "", False, -1
         sample_started, sample_elapsed = -1.0, 0.0
         worker_id, decoder_count = None, 0
@@ -268,6 +302,7 @@ class WorkerTraceWatcher:
             self.purposes.add(purpose)
             self.profile_count += 1
             code = 8
+            self.stage_code = 6
             sample_started = time.monotonic()
             try:
                 result = self._command(["/usr/bin/sample", str(payload["processID"]), "1", "-file", str(report)], timeout=4)
@@ -277,9 +312,11 @@ class WorkerTraceWatcher:
             if result.returncode:
                 return
             code = 9
+            self.stage_code = 7
             if self._owned_identity(report) != report_identity:
                 return
             raw = self._read(report, WORKER_REPORT_LIMIT, report_identity)
+            self.stage_code = 8
             section, truncated, decoder_count = worker_section(raw.decode("utf-8", errors="replace"), worker_id)
             code = 0 if section else 10
         except WorkerTraceStopped:
@@ -296,7 +333,7 @@ class WorkerTraceWatcher:
             self._remove(report, report_identity)
             self._remove(request, request_identity)
             worker_field = f" workerID={worker_id}" if worker_id is not None else ""
-            print(f"NativeWorkerTraceResult requestID={identifier} purposeCode={purpose}{worker_field} statusCode={code} nativeReturnCode={native_returncode} bytes={len(section.encode('utf-8'))} truncated={int(truncated)} decoderQueueCount={decoder_count} startUptime={sample_started:.6f} elapsedSeconds={sample_elapsed:.6f}", flush=True)
+            print(f"NativeWorkerTraceResult requestID={identifier} purposeCode={purpose}{worker_field} statusCode={code} nativeReturnCode={native_returncode} bytes={len(section.encode('utf-8'))} truncated={int(truncated)} decoderQueueCount={decoder_count} startUptime={sample_started:.6f} elapsedSeconds={sample_elapsed:.6f} stageCode={self.stage_code} ownershipCode={self.ownership_code} psReturnCode={self.ps_returncode} bundleReturnCode={self.bundle_returncode} psElapsedSeconds={self.ps_elapsed:.6f} bundleElapsedSeconds={self.bundle_elapsed:.6f} bundleCacheHit={self.bundle_cache_hit}", flush=True)
             if section:
                 print(section, end="", flush=True)
 
