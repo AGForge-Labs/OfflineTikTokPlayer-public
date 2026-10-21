@@ -511,18 +511,21 @@ final class PlaybackService: NSObject {
                     self.isLoading = false
                     self.recordPlaybackEvent("itemReady")
                     // A new or prebuffered item is already at zero; an exact zero seek discards that benefit.
-                    if naturalHandoff, !rewind, self.intent.canPlay, self.videoAllowed,
+                    let startsAtAudibleClock = naturalHandoff || (position == 0 && self.pendingAudioSeek == nil)
+                    if startsAtAudibleClock, !rewind, self.intent.canPlay, self.videoAllowed,
                        self.continuousAudio.selectedID == self.queue.currentID,
                        self.syncingVideoGeneration != request {
-                        // Audio has already crossed this boundary. Schedule the
-                        // arriving video from its fresh host-clock position;
-                        // seeking to an older poll position adds a decode barrier.
+                        // Audio already owns the selected timeline. Starting a
+                        // ready zero-position item at zero lets its native clock
+                        // fall behind and adds a catch-up seek before first frame.
+                        // Use the same fresh audio/host anchor as a natural handoff.
                         let host = CMClockGetTime(CMClockGetHostTimeClock())
                         let desired = self.continuousAudio.presentationPosition(at: host)
                         self.continuousPiP.updatePlayback(positionSeconds: desired,
                             durationSeconds: self.clock.duration, isPlaying: true)
                         self.monitorFirstFrame(playerItem, request: request)
                         self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
+                        self.recordPlaybackEvent("videoHostClockStarted")
                     } else if position > 0 || rewind {
                         self.recordPlaybackEvent(rewind ? "videoRewindRequested" : "videoRestoreRequested")
                         // Audio already owns its position. Readiness of a reused
@@ -758,6 +761,9 @@ final class PlaybackService: NSObject {
     }
 
     private func synchronizeVideoToAudio(force: Bool = false) {
+        // KVO's ready handler owns the initial host-clock anchor. The poll can
+        // see native readiness before that queued MainActor handler has run.
+        guard force || readyGeneration == generation else { return }
         guard videoAllowed, continuousAudio.isSelected, audioLoadingID == nil, syncingVideoGeneration != generation,
               let item = player.currentItem, item.status == .readyToPlay else { return }
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())

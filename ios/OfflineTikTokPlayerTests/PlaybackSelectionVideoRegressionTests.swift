@@ -95,6 +95,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var tone: SelectionOutputTap.Window?
         var customDisplayReady: Double?
         var visible: Double?
+        var nativeSeekCountAtFirstReadiness: Int?
         let deadline = ProcessInfo.processInfo.systemUptime + (prepared ? 1 : 5)
         while ProcessInfo.processInfo.systemUptime < deadline {
             while tone == nil, let window = tap.window(at: cursor) {
@@ -120,8 +121,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 // the native-layer/two-tick poster gate. This metric is neither
                 // compositor pixels nor physical first-frame output.
                 if customDisplayReady == nil { customDisplayReady = SelectionOutputTap.hostSeconds() }
-                if service.isVideoReady, !service.isLoading {
+                if service.isVideoReady, !service.isLoading, visible == nil {
                     visible = SelectionOutputTap.hostSeconds()
+                    nativeSeekCountAtFirstReadiness = seeks.nativeSeekCount[phase, default: 0]
                 }
             }
             if tone != nil && visible != nil { break }
@@ -138,6 +140,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let visibleMs = visible.map { ($0 - origin) * 1_000 }
         let underrunDelta = service.audioSnapshot.underrunFrames - underruns
         print("SelectionLatency phase=\(phase) prepared=\(prepared) frequency=\(frequency) outputWindowStartMs=\(tone.map { String(($0.start - origin) * 1_000) } ?? "missing") outputWindowEndMs=\(toneMs.map { String($0) } ?? "missing") customReadyMs=\(visibleMs.map { String($0) } ?? "missing") maxQuietMs=\(quiet * 1_000) sourceQuietMs=\(sourceQuiet * 1_000) addedQuietMs=\(addedQuiet * 1_000) timelineHoleMs=\(timelineHole * 1_000) underrunDelta=\(underrunDelta) tapRate=\(recorded.rate) tapFrames=\(recorded.values.count) customDisplayReadyMs=\(customDisplayMs.map { String($0) } ?? "missing")")
+        print("SelectionLatencyStartup phase=\(phase) nativeSeeksAtFirstReadiness=\(nativeSeekCountAtFirstReadiness.map { String($0) } ?? "missing")")
         XCTAssertNotNil(tone, "The independently classified target tone must reach the real engine mixer tap")
         XCTAssertNotNil(visible, "A fresh selected custom frame must become ready within the phase watchdog")
         if prepared {
