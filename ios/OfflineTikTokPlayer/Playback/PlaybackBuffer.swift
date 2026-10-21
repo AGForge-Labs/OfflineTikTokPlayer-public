@@ -4,6 +4,25 @@ import AVFoundation
 /// The second item is prepared while the current item plays, never after a swipe.
 @MainActor
 final class PlaybackBuffer {
+    enum NativePauseOwner: Int, Sendable { case service = 1, buffer = 2 }
+    enum NativePauseReason: Int, Sendable {
+        case queueAdvanceMismatch = 1, pauseRequested = 2, scrollQueueExhausted = 3, coldReplacement = 4
+        case engineRestartFailed = 5, audioSessionActivationFailed = 6, foregroundInterrupted = 7
+        case interruptionBegan = 8, presentationVideoDisabled = 9
+        case recoverMissingCurrent = 101, previousAdoption = 102
+    }
+    struct NativePauseEvent: Sendable {
+        let owner: NativePauseOwner
+        let reason: NativePauseReason
+        // Each owner has its own command namespace. Once saturated, this is no
+        // longer a unique command ID; the explicit flag preserves that limit.
+        let commandID: UInt64
+        let commandIDSaturated: Bool
+        let entryUptime: Double
+        let returnUptime: Double
+        // Buffer callbacks cannot learn service identity before the native call.
+        let entryGeneration: Int?
+    }
     enum DiagnosticAction: Int, Sendable {
         case offscreenSeekBegin = 0, offscreenSeekNativeCompletion = 1, offscreenSeekObserved = 2
         case cancelPendingSeeks = 3, previousAdoptionBegin = 4, previousAdoptionObserved = 5
@@ -36,6 +55,11 @@ final class PlaybackBuffer {
     private var observation: NSKeyValueObservation?
     var onDiagnosticEvent: ((DiagnosticEvent) -> Void)?
     private var diagnosticOperationID: UInt64 = 0
+    #if DEBUG
+    var debugNativePlayerTraceEnabled = false
+    var onNativePauseDiagnostic: ((NativePauseEvent) -> Void)?
+    private(set) var debugNativePlayerPauseCount: UInt64 = 0
+    #endif
     var didAdvance: ((Prepared) -> Void)?
     var automaticAdvancementEnabled = true { didSet { updateEndAction() } }
     var usesExternalClock = false { didSet { updateEndAction() } }
@@ -135,6 +159,25 @@ final class PlaybackBuffer {
         item.cancelPendingSeeks()
     }
 
+    private func pauseNativePlayer(reason: NativePauseReason) {
+        #if DEBUG
+        if debugNativePlayerTraceEnabled, let observer = onNativePauseDiagnostic {
+            let increment = debugNativePlayerPauseCount.addingReportingOverflow(1)
+            debugNativePlayerPauseCount = increment.overflow ? .max : increment.partialValue
+            let commandID = debugNativePlayerPauseCount
+            let entry = ProcessInfo.processInfo.systemUptime
+            player.pause()
+            let returned = ProcessInfo.processInfo.systemUptime
+            // Publish only after the real call. The interval includes existing
+            // synchronous callbacks/descheduling, not just SDK execution time.
+            observer(NativePauseEvent(owner: .buffer, reason: reason, commandID: commandID,
+                commandIDSaturated: increment.overflow, entryUptime: entry, returnUptime: returned, entryGeneration: nil))
+            return
+        }
+        #endif
+        player.pause()
+    }
+
     /// KVO may be delivered after a swipe. Always reconcile actual object identity.
     func synchronize() {
         let prepared: Prepared
@@ -153,7 +196,7 @@ final class PlaybackBuffer {
             prepared = Prepared(mediaID: last.mediaID, item: last.item, isLocal: last.isLocal,
                                 needsRewind: repeating, reachedEnd: !repeating)
             next = nil
-            player.pause()
+            pauseNativePlayer(reason: .recoverMissingCurrent)
             player.insert(last.item, after: nil)
         } else { return }
         active = prepared; loopReserve = nil; updateEndAction()
@@ -219,7 +262,7 @@ final class PlaybackBuffer {
            prepared.isLocal || allowRemote {
             let operationID = onDiagnosticEvent == nil ? nil
                 : beginDiagnostic(.previousAdoptionBegin, targetIsCurrent: player.currentItem === prepared.item)
-            player.pause()
+            pauseNativePlayer(reason: .previousAdoption)
             previous = nil
             replace(with: prepared.item, mediaID: mediaID, isLocal: prepared.isLocal)
             if operationID != nil, onDiagnosticEvent != nil {

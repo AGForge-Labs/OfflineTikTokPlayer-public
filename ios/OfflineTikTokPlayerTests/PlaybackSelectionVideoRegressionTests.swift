@@ -13,20 +13,23 @@ import PlayerCore
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testCommandToEngineToneAndSelectedCustomFrameLatency() async throws {
         var witnesses: [SelectionDecoderLifetimeWitness] = []
-        witnesses.reserveCapacity(3)
-        for condition in [(nativeGetters: false, phaseBase: 0, reanchor: false),
-                          (nativeGetters: true, phaseBase: 10, reanchor: false),
-                          (nativeGetters: false, phaseBase: 20, reanchor: true)] {
+        witnesses.reserveCapacity(4)
+        for condition in [(nativeGetters: false, phaseBase: 0, reanchor: false, nativePlayerTrace: false),
+                          (nativeGetters: true, phaseBase: 10, reanchor: false, nativePlayerTrace: false),
+                          (nativeGetters: false, phaseBase: 20, reanchor: true, nativePlayerTrace: false),
+                          (nativeGetters: false, phaseBase: 30, reanchor: false, nativePlayerTrace: true)] {
             defer {
                 logDecoderLifetimes(boundary: "getter-arm-after-phase-\(condition.phaseBase)", witnesses: witnesses)
             }
             try await measureSelectionLatencySequence(nativeVideoGetterControl: condition.nativeGetters,
-                phaseBase: condition.phaseBase, pausedVideoReanchorControl: condition.reanchor, witnesses: &witnesses)
+                phaseBase: condition.phaseBase, pausedVideoReanchorControl: condition.reanchor,
+                nativePlayerTraceControl: condition.nativePlayerTrace, witnesses: &witnesses)
         }
     }
 
     private func measureSelectionLatencySequence(nativeVideoGetterControl: Bool, phaseBase: Int,
-        pausedVideoReanchorControl: Bool, witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
+        pausedVideoReanchorControl: Bool, nativePlayerTraceControl: Bool,
+        witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
         let audio = ContinuousAudioPlayer()
@@ -34,8 +37,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let seeks = SelectionLatencySeekProbe(nativeVideoGetterControl: nativeVideoGetterControl,
             pausedVideoReanchorControl: pausedVideoReanchorControl)
         let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
+        #if DEBUG
+        service.debugNativePlayerTraceEnabled = nativePlayerTraceControl
+        #else
+        XCTAssertFalse(nativePlayerTraceControl, "The explicit native-player trace requires DEBUG")
+        #endif
         seeks.service = service
-        precondition(witnesses.count < 3)
+        precondition(witnesses.count < 4)
         witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
             label: "getter-arm-phase-\(phaseBase)"))
         let screen = try SelectionVideoScreen(service: service)
@@ -49,9 +57,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             seeks.dump()
         }
         service.isInteractingWithFeed = true
-        let arm = pausedVideoReanchorControl ? "paused-video-reanchor-control" : (nativeVideoGetterControl ? "native-getter-control" : "primary")
-        let labelSuffix = pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : "")
+        let arm = nativePlayerTraceControl ? "native-player-trace-control" : (pausedVideoReanchorControl ? "paused-video-reanchor-control" : (nativeVideoGetterControl ? "native-getter-control" : "primary"))
+        let labelSuffix = nativePlayerTraceControl ? "-native-player-trace-control" : (pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : ""))
         print("SelectionLatency scope=engineMixerTap-not-physical-speaker arm=\(arm) phaseBase=\(phaseBase) videoNativeGetters=\(nativeVideoGetterControl) outputLimitMs=100 customReadyLimitMs=250 silenceWindowMs=10 importHashVerification=already-verified")
+        print("SelectionNativePlayerTraceScope phaseBase=\(phaseBase) enabled=\(nativePlayerTraceControl) nativeGetters=\(nativeVideoGetterControl) reanchor=\(pausedVideoReanchorControl) maximumEventsPerPhase=256 publication=post-call-or-policy-decision itemEndClock=handler-delivery pauseClock=entry-return-inclusive design=fresh-ordered-cohort-not-causal-proof")
         if pausedVideoReanchorControl {
             print("SelectionReanchorScope phaseBase=\(phaseBase) eligiblePhase=22 maximumAttempts=1 acceptedZero=inconclusive design=fresh-ordered-cohort-not-causal-proof publicationCost=includes-intentional-reanchor-and-reentrancy")
         }
@@ -117,6 +126,86 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(result, expected, "The active user-action guard must reject the explicit Debug operation")
             XCTAssertEqual(service.debugVideoReanchorAppliedCount, 0)
         }
+        // Extend this identity with controlled delivery through the real
+        // notification observer. This is not proof of a native EOF occurrence.
+        let fixture = try await SelectionVideoFixture()
+        defer { fixture.remove() }
+        let service = fixture.service()
+        defer { service.onPlaybackEvent = nil; service.pause() }
+        var completedPause: PlaybackBuffer.NativePauseEvent?
+        var endEvents: [PlaybackService.NativeItemEndEvent] = []
+        endEvents.reserveCapacity(2)
+        var checkedTrace = false
+        service.onPlaybackEvent = { [weak service] event in
+            guard let service else { return }
+            if case let .nativePause(pause)? = event.detail {
+                XCTAssertNil(completedPause, "Exactly one controlled service pause is observed")
+                completedPause = pause
+            }
+            if case let .nativeItemEnd(end)? = event.detail {
+                guard endEvents.count < 2 else { XCTFail("The fixed two-delivery control must remain bounded"); return }
+                endEvents.append(end)
+            }
+            guard event.name == "videoHostClockStarted", !checkedTrace,
+                  let item = service.player.currentItem else { return }
+            checkedTrace = true
+            XCTAssertFalse(service.debugNativePlayerTraceEnabled)
+            XCTAssertEqual(service.debugNativePlayerPauseCount, 0, "Default-off startup must do no new counter work")
+            service.debugNativePlayerTraceEnabled = true
+            service.pause()
+            XCTAssertEqual(service.debugNativePlayerPauseCount, 1)
+            XCTAssertFalse(service.wantsToPlay)
+            let selectedID = service.queue.currentID
+            NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: item)
+            XCTAssertEqual(service.queue.currentID, selectedID, "Selected continuous audio retains the original native-end early return")
+            let stale = AVPlayerItem(asset: AVMutableComposition())
+            NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: stale)
+        }
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await require({ checkedTrace && endEvents.count == 2 }, "Real selected startup must reach both controlled item-end deliveries")
+        let pause = try XCTUnwrap(completedPause)
+        XCTAssertEqual(pause.owner, .service)
+        XCTAssertEqual(pause.reason, .pauseRequested)
+        XCTAssertEqual(pause.commandID, 1)
+        XCTAssertFalse(pause.commandIDSaturated)
+        XCTAssertGreaterThan(pause.entryUptime, 0)
+        XCTAssertGreaterThanOrEqual(pause.returnUptime, pause.entryUptime)
+        XCTAssertEqual(pause.entryGeneration, endEvents[0].entryGeneration)
+        XCTAssertTrue(endEvents[0].observedItemMatches)
+        XCTAssertEqual(endEvents[0].selectedAudio, true)
+        XCTAssertGreaterThanOrEqual(endEvents[0].handlerEntryUptime, pause.returnUptime)
+        XCTAssertFalse(endEvents[1].observedItemMatches)
+        XCTAssertNil(endEvents[1].selectedAudio)
+        XCTAssertGreaterThanOrEqual(endEvents[1].handlerEntryUptime, endEvents[0].handlerEntryUptime)
+        service.onPlaybackEvent = nil
+        service.pause()
+        XCTAssertEqual(service.debugNativePlayerPauseCount, 1, "Nil observer must preserve the native call without trace counter work")
+        service.debugNativePlayerTraceEnabled = false
+        service.onPlaybackEvent = { event in
+            if case .nativePause? = event.detail { XCTFail("Disabled tracing must not publish a completed pause") }
+            if case .nativeItemEnd? = event.detail { XCTFail("Disabled tracing must not publish an item-end detail") }
+        }
+        service.pause()
+        XCTAssertEqual(service.debugNativePlayerPauseCount, 1)
+
+        // Exercise the actual previous-adoption native call with empty items;
+        // no synthetic native status or encoded-media timing is supplied.
+        let buffer = PlaybackBuffer()
+        defer { buffer.onNativePauseDiagnostic = nil; buffer.replace(with: nil) }
+        buffer.replace(with: AVPlayerItem(asset: AVMutableComposition()), mediaID: "first")
+        buffer.replace(with: AVPlayerItem(asset: AVMutableComposition()), mediaID: "second")
+        var bufferPause: PlaybackBuffer.NativePauseEvent?
+        buffer.debugNativePlayerTraceEnabled = true
+        buffer.onNativePauseDiagnostic = { bufferPause = $0 }
+        XCTAssertNotNil(buffer.advance(to: "first"))
+        let adoptedPause = try XCTUnwrap(bufferPause)
+        XCTAssertEqual(adoptedPause.owner, .buffer)
+        XCTAssertEqual(adoptedPause.reason, .previousAdoption)
+        XCTAssertEqual(adoptedPause.commandID, 1)
+        XCTAssertFalse(adoptedPause.commandIDSaturated)
+        XCTAssertNil(adoptedPause.entryGeneration, "The buffer must not query its service before native pause")
+        XCTAssertGreaterThanOrEqual(adoptedPause.returnUptime, adoptedPause.entryUptime)
         #else
         XCTFail("The explicit reanchor control requires the Debug test configuration")
         #endif
@@ -1464,6 +1553,10 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
                     return "SelectionLatencyTimeControl phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) publishedStatus=\(publishedStatus.map { String($0) } ?? "unavailable") notificationUptime=\(notificationUptime) observedStatus=\(observedStatus) observedUptime=\(observedUptime) finalStatus=\(finalStatus) finalUptime=\(finalUptime)"
                 case let .buffer(event):
                     return "SelectionLatencyBufferAction phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) actionCode=\(event.action.rawValue) reasonCode=\(event.reason.rawValue) operationID=\(event.operationID) actionUptime=\(event.actionUptime) targetIsCurrent=\(event.targetIsCurrent.map { String($0) } ?? "unavailable") finished=\(event.finished.map { String($0) } ?? "unavailable")"
+                case let .nativePause(event):
+                    return "SelectionLatencyNativePause phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) ownerCode=\(event.owner.rawValue) reasonCode=\(event.reason.rawValue) commandID=\(event.commandID) commandIDSaturated=\(event.commandIDSaturated) entryUptime=\(event.entryUptime) returnUptime=\(event.returnUptime) entryGeneration=\(event.entryGeneration.map { String($0) } ?? "unavailable")"
+                case let .nativeItemEnd(event):
+                    return "SelectionLatencyNativeItemEnd phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) observedItemMatches=\(event.observedItemMatches) selectedAudio=\(event.selectedAudio.map { String($0) } ?? "unavailable") handlerEntryUptime=\(event.handlerEntryUptime) entryGeneration=\(event.entryGeneration)"
                 }
             case let .videoBatch(batchID, commandMs, copiedPosition, submittedPosition, requested):
                 return "SelectionLatencyVideoBatch phase=\(phase) batchID=\(batchID) commandMs=\(commandMs) copiedPresent=\(copiedPosition != nil) submittedPresent=\(submittedPosition != nil) copiedPosition=\(copiedPosition.map { String($0) } ?? "missing") submittedPosition=\(submittedPosition.map { String($0) } ?? "missing") requested=\(requested)"

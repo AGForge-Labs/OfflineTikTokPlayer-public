@@ -30,6 +30,17 @@ final class PlaybackService: NSObject {
         case timeControl(publishedStatus: Int?, notificationUptime: Double, observedStatus: Int, observedUptime: Double,
                          finalStatus: Int, finalUptime: Double)
         case buffer(PlaybackBuffer.DiagnosticEvent)
+        case nativePause(PlaybackBuffer.NativePauseEvent)
+        case nativeItemEnd(NativeItemEndEvent)
+    }
+    struct NativeItemEndEvent: Sendable {
+        let observedItemMatches: Bool
+        // Unknown for stale notifications: the selected-audio policy read is
+        // deliberately not performed until the original identity guard passes.
+        let selectedAudio: Bool?
+        // Handler delivery time, not the native item's underlying EOF instant.
+        let handlerEntryUptime: Double
+        let entryGeneration: Int
     }
     struct PlaybackEvent {
         let name: String
@@ -49,11 +60,21 @@ final class PlaybackService: NSObject {
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
     @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)? {
         didSet {
-            if onPlaybackEvent == nil { buffer.onDiagnosticEvent = nil }
+            if onPlaybackEvent == nil {
+                buffer.onDiagnosticEvent = nil
+                #if DEBUG
+                buffer.onNativePauseDiagnostic = nil
+                #endif
+            }
             else {
                 buffer.onDiagnosticEvent = { [weak self] event in
                     self?.recordPlaybackEvent("bufferAction", detail: .buffer(event))
                 }
+                #if DEBUG
+                buffer.onNativePauseDiagnostic = { [weak self] event in
+                    self?.recordPlaybackEvent("nativePauseCompleted", detail: .nativePause(event))
+                }
+                #endif
             }
         }
     }
@@ -62,6 +83,11 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var firstProgressGeneration: Int?
     @ObservationIgnored private var firstPreservedPresentationGeneration: Int?
     #if DEBUG
+    // Explicit diagnostic cohort only. No production call enables this flag.
+    @ObservationIgnored var debugNativePlayerTraceEnabled = false {
+        didSet { buffer.debugNativePlayerTraceEnabled = debugNativePlayerTraceEnabled }
+    }
+    @ObservationIgnored private(set) var debugNativePlayerPauseCount: UInt64 = 0
     // Explicit test control only. Nothing in normal playback calls the helper.
     enum DebugVideoReanchorResult: Int {
         case applied = 1, notPaused, generationChanged, currentItemChanged, notReady
@@ -216,7 +242,7 @@ final class PlaybackService: NSObject {
             if self.continuousAudio.isSelected { return }
             var advanced = self.queue
             guard advanced.next(explicit: false) == prepared.mediaID else {
-                self.player.pause(); self.loadCurrent(position: self.clock.position); return
+                self.pauseNativePlayer(reason: .queueAdvanceMismatch); self.loadCurrent(position: self.clock.position); return
             }
             self.queue = advanced
             self.loadCurrent(adopting: prepared)
@@ -308,7 +334,7 @@ final class PlaybackService: NSObject {
         continuousAudio.suspend()
         continuousPiP.updatePlayback(positionSeconds: clock.position, durationSeconds: clock.duration, isPlaying: false)
         cancelStallRecovery()
-        player.pause(); persist(); updateNowPlaying()
+        pauseNativePlayer(reason: .pauseRequested); persist(); updateNowPlaying()
     }
 
     func next(explicit: Bool = true) {
@@ -400,7 +426,7 @@ final class PlaybackService: NSObject {
             var following = queue
             if following.next(explicit: false) != nil {
                 if intent.canPlay { queue = following; loadCurrent(); return }
-            } else { intent.pause(); player.pause() }
+            } else { intent.pause(); pauseNativePlayer(reason: .scrollQueueExhausted) }
         }
         endedDuringScroll = false
         let resume = MediaResumePosition(mediaID: queue.currentID, seconds: position)
@@ -441,7 +467,7 @@ final class PlaybackService: NSObject {
             return
         }
         if !selectedAtRequest && !audioAlreadySelected { continuousAudio.clearSelection() }
-        player.pause(); buffer.replace(with: nil)
+        pauseNativePlayer(reason: .coldReplacement); buffer.replace(with: nil)
         loadTask = Task { [weak self] in
             guard let self else { return }
             var visited = Set<String>()
@@ -735,7 +761,7 @@ final class PlaybackService: NSObject {
         do { try continuousAudio.setPlaying(true) }
         catch {
             intent.activationCompleted(succeeded: false)
-            continuousAudio.suspend(); player.pause()
+            continuousAudio.suspend(); pauseNativePlayer(reason: .engineRestartFailed)
             message = "Audio could not restart. Tap Play to try again."
             recordPlaybackEvent("engineStartFailed")
         }
@@ -975,7 +1001,7 @@ final class PlaybackService: NSObject {
             recordDiagnostic(.audioSessionActivated)
             recordPlaybackEvent("activationCompleted")
         } catch {
-            intent.activationCompleted(succeeded: false); continuousAudio.suspend(); player.pause(); cancelStallRecovery()
+            intent.activationCompleted(succeeded: false); continuousAudio.suspend(); pauseNativePlayer(reason: .audioSessionActivationFailed); cancelStallRecovery()
             recordDiagnostic(.audioSessionActivationFailed, error: PlaybackDiagnosticError(family: .audioSession, code: (error as NSError).code))
             message = "Audio is in use. Tap Play after the camera or call finishes."
             recordPlaybackEvent("activationFailed")
@@ -987,7 +1013,7 @@ final class PlaybackService: NSObject {
         recordDiagnostic(.appForegrounded)
         let interrupted = intent.isInterrupted
         intent.enteredForeground()
-        if interrupted { continuousAudio.suspend(); player.pause(); message = "Audio was interrupted. Tap Play to resume." }
+        if interrupted { continuousAudio.suspend(); pauseNativePlayer(reason: .foregroundInterrupted); message = "Audio was interrupted. Tap Play to resume." }
         else { synchronizeVideoToAudio(force: true) }
     }
 
@@ -996,7 +1022,7 @@ final class PlaybackService: NSObject {
         if began {
             intent.interruptionBegan(); cancelStallRecovery()
             continuousAudio.suspend()
-            player.pause(); persist()
+            pauseNativePlayer(reason: .interruptionBegan); persist()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
             activateAudio()
             resumeContinuousAudio()
@@ -1024,7 +1050,7 @@ final class PlaybackService: NSObject {
         surface.isHidden = audioOnly
         pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
-        if !videoAllowed { player.pause(); continuousPiP.suspendFrameFeed() }
+        if !videoAllowed { pauseNativePlayer(reason: .presentationVideoDisabled); continuousPiP.suspendFrameFeed() }
         else { continuousPiP.resumeFrameFeed() }
         if actions.restoreInlineVideo { synchronizeVideoToAudio(force: true) }
     }
@@ -1117,6 +1143,27 @@ final class PlaybackService: NSObject {
         } catch { return nil }
     }
 
+    private func pauseNativePlayer(reason: PlaybackBuffer.NativePauseReason) {
+        #if DEBUG
+        if debugNativePlayerTraceEnabled, onPlaybackEvent != nil {
+            let increment = debugNativePlayerPauseCount.addingReportingOverflow(1)
+            debugNativePlayerPauseCount = increment.overflow ? .max : increment.partialValue
+            let commandID = debugNativePlayerPauseCount
+            let entryGeneration = generation
+            let entry = ProcessInfo.processInfo.systemUptime
+            player.pause()
+            let returned = ProcessInfo.processInfo.systemUptime
+            // No observer runs before the native call. This interval includes
+            // existing synchronous KVO/reentrancy and is not pure SDK cost.
+            recordPlaybackEvent("nativePauseCompleted", detail: .nativePause(PlaybackBuffer.NativePauseEvent(
+                owner: .service, reason: reason, commandID: commandID, commandIDSaturated: increment.overflow,
+                entryUptime: entry, returnUptime: returned, entryGeneration: entryGeneration)))
+            return
+        }
+        #endif
+        player.pause()
+    }
+
     private func recordPlaybackEvent(_ name: StaticString, detail: PlaybackEventDetail? = nil) {
         // Phase recording must not query native player state or allocate an item
         // inventory on the playback path. Resource checks remain separate.
@@ -1188,8 +1235,28 @@ final class PlaybackService: NSObject {
         })
         notifications.append(center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
-                guard let self, note.object as? AVPlayerItem === self.observedItem else { return }
-                guard !self.continuousAudio.isSelected else { return }
+                guard let self else { return }
+                #if DEBUG
+                let traceEntry = self.debugNativePlayerTraceEnabled && self.onPlaybackEvent != nil
+                    ? (uptime: ProcessInfo.processInfo.systemUptime, generation: self.generation) : nil
+                var selectedAudio: Bool?
+                #endif
+                let observedItemMatches = note.object as? AVPlayerItem === self.observedItem
+                defer {
+                    #if DEBUG
+                    if let traceEntry {
+                        self.recordPlaybackEvent("nativeItemEndObserved", detail: .nativeItemEnd(NativeItemEndEvent(
+                            observedItemMatches: observedItemMatches, selectedAudio: selectedAudio,
+                            handlerEntryUptime: traceEntry.uptime, entryGeneration: traceEntry.generation)))
+                    }
+                    #endif
+                }
+                guard observedItemMatches else { return }
+                let isSelected = self.continuousAudio.isSelected
+                #if DEBUG
+                selectedAudio = isSelected
+                #endif
+                guard !isSelected else { return }
                 self.buffer.synchronize()
                 guard note.object as? AVPlayerItem === self.player.currentItem else { return }
                 if self.isInteractingWithFeed { self.endedDuringScroll = true }
