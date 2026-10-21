@@ -33,6 +33,29 @@ final class PlaybackService: NSObject {
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     #if DEBUG
+    enum DebugInitialLoadPhase: Int, Sendable {
+        case idle = 0, savedLookup = 1, cachedLookupAndResolution = 2, localResolved = 3
+        case audioPrepare = 4, audioPrepared = 5, bufferReplaceAndObserve = 6, observedCurrent = 7, error = 8
+    }
+    struct DebugInitialLoadPhaseState: Sendable {
+        let enabled: Bool
+        let request: Int
+        let generation: Int
+        let phase: DebugInitialLoadPhase
+    }
+    @ObservationIgnored var debugInitialLoadPhaseEnabled = false
+    @ObservationIgnored private var debugInitialLoadPhaseRequest = 0
+    @ObservationIgnored private var debugInitialLoadPhase: DebugInitialLoadPhase = .idle
+    var debugInitialLoadPhaseState: DebugInitialLoadPhaseState {
+        DebugInitialLoadPhaseState(enabled: debugInitialLoadPhaseEnabled,
+            request: debugInitialLoadPhaseRequest, generation: generation, phase: debugInitialLoadPhase)
+    }
+    private func debugMarkInitialLoadPhase(_ phase: DebugInitialLoadPhase, request: Int) {
+        guard debugInitialLoadPhaseEnabled, generation == request else { return }
+        debugInitialLoadPhaseRequest = request
+        debugInitialLoadPhase = phase
+    }
+
     enum DebugVideoSeekReason: Int, Sendable {
         case unattributed = 0, readyRestore = 1, readyRewind = 2, sourceVisit = 3, drift = 4
         case userPausedSeek = 5, latestPausedTarget = 6, foreground = 7
@@ -140,6 +163,8 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var warmRevision = 0
     @ObservationIgnored private weak var observedItem: AVPlayerItem?
     @ObservationIgnored private var videoPresentation: (request: Int, ticket: ContinuousPictureInPicture.PresentationTicket)?
+    @ObservationIgnored private var pendingInitialZeroStart: (request: Int, ticket: ContinuousPictureInPicture.PresentationTicket)?
+    @ObservationIgnored private var explicitVideoSeekGeneration: Int?
     @ObservationIgnored private var readyGeneration: Int?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var itemObservation: NSKeyValueObservation?
@@ -375,6 +400,8 @@ final class PlaybackService: NSObject {
     func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
+        explicitVideoSeekGeneration = generation
+        pendingInitialZeroStart = nil
         if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
            let version = continuousAudio.seek(seek.target) {
             pendingAudioSeek = (seek, version)
@@ -419,6 +446,7 @@ final class PlaybackService: NSObject {
     private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil,
                              audioAlreadySelected: Bool = false) {
         pendingAudioSeek = nil; completePiPSkip()
+        pendingInitialZeroStart = nil
         if !audioAlreadySelected { audioLoadingID = queue.currentID }
         reachedPreparedEnd = adopting?.reachedEnd ?? false
         if reachedPreparedEnd {
@@ -430,6 +458,9 @@ final class PlaybackService: NSObject {
         endedDuringScroll = false
         let resume = MediaResumePosition(mediaID: queue.currentID, seconds: position)
         generation += 1; let request = generation
+        #if DEBUG
+        debugMarkInitialLoadPhase(.idle, request: request)
+        #endif
         recordPlaybackEvent("loadRequested")
         cancelStallRecovery()
         loadTask?.cancel(); itemObservation = nil; frameMonitor.cancel(); observedItem = nil; readyGeneration = nil
@@ -468,7 +499,13 @@ final class PlaybackService: NSObject {
                 let itemPosition = resume.seconds(for: item.id)
                 self.clock.reset(position: itemPosition, duration: item.duration)
                 do {
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.savedLookup, request: request)
+                    #endif
                     let saved = await self.downloads.localURL(for: item)
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.cachedLookupAndResolution, request: request)
+                    #endif
                     let cached: URL?
                     if let asset = item.asset { cached = await self.mediaCache?.file(for: asset) } else { cached = nil }
                     var local = saved ?? cached
@@ -485,29 +522,50 @@ final class PlaybackService: NSObject {
                     else {
                         throw AppError.message("This video must finish preparing before playback.")
                     }
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.localResolved, request: request)
+                    #endif
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
                     self.currentIsLocal = local != nil
                     let playerItem = AVPlayerItem(url: url)
                     playerItem.preferredForwardBufferDuration = 8
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.audioPrepare, request: request)
+                    #endif
                     _ = try await self.continuousAudio.prepare(id: item.id, url: url, currentPriority: true)
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.audioPrepared, request: request)
+                    #endif
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
                     if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
                     self.resumeContinuousAudio()
                     self.recordPlaybackEvent("coldAudioPrepared")
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.bufferReplaceAndObserve, request: request)
+                    #endif
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
                     self.observeCurrent(playerItem, position: itemPosition, request: request)
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.observedCurrent, request: request)
+                    #endif
                     self.prepareUpcoming()
                     self.persist(); return
                 } catch is CancellationError { return }
                 catch ContinuousPCMDecoder.Failure.cancelled {
                     guard self.generation == request, !Task.isCancelled else { return }
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.error, request: request)
+                    #endif
                     self.loadCurrent(position: itemPosition)
                     return
                 }
                 catch ContinuousAudioPlayer.PreparationError.windowBusy {
                     guard self.generation == request else { return }
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.error, request: request)
+                    #endif
                     do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
                     guard self.generation == request else { return }
                     self.loadCurrent(position: itemPosition)
@@ -515,6 +573,9 @@ final class PlaybackService: NSObject {
                 }
                 catch {
                     guard self.generation == request, !Task.isCancelled else { return }
+                    #if DEBUG
+                    self.debugMarkInitialLoadPhase(.error, request: request)
+                    #endif
                     self.continuousAudio.clearSelection()
                     self.audioLoadingID = nil; self.isLoading = false
                     self.pause()
@@ -524,6 +585,9 @@ final class PlaybackService: NSObject {
                 }
             }
             guard self.generation == request else { return }
+            #if DEBUG
+            self.debugMarkInitialLoadPhase(.error, request: request)
+            #endif
             self.isLoading = false; self.pause()
             self.message = "No available videos in this queue. Connect to your library or choose downloaded videos."
         }
@@ -532,6 +596,10 @@ final class PlaybackService: NSObject {
     private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
         observedItem = playerItem
         videoPresentation = continuousPiP.setCurrentItem(playerItem).map { (request, $0) }
+        if position == 0, !rewind, explicitVideoSeekGeneration != request,
+           let ticket = currentVideoPresentation(for: playerItem, request: request) {
+            pendingInitialZeroStart = (request, ticket)
+        }
         refreshAudioProcessing()
         audioCheckTask = Task { [weak self, weak playerItem] in
             guard let playerItem else { return }
@@ -558,6 +626,10 @@ final class PlaybackService: NSObject {
                               self.readyGeneration != request else { return }
                     }
                     #endif
+                    if let owner = self.pendingInitialZeroStart, owner.request == request,
+                       self.currentVideoPresentation(for: playerItem, request: request) == owner.ticket {
+                        self.pendingInitialZeroStart = nil
+                    }
                     self.readyGeneration = request
                     self.refreshAudioProcessing()
                     self.clock.updateDuration(playerItem.duration.seconds)
@@ -602,6 +674,13 @@ final class PlaybackService: NSObject {
             self.isVideoReady = true
             self.recordPlaybackEvent("firstFrame")
         }
+    }
+
+    private var initialZeroStartOwnsPendingReady: Bool {
+        guard intent.canPlay, readyGeneration == nil, let owner = pendingInitialZeroStart,
+              owner.request == generation, explicitVideoSeekGeneration != generation,
+              let item = observedItem else { return false }
+        return currentVideoPresentation(for: item, request: owner.request) == owner.ticket
     }
 
     private func currentVideoPresentation(for item: AVPlayerItem, request: Int)
@@ -778,7 +857,7 @@ final class PlaybackService: NSObject {
                 queue = following
                 let video = buffer.advance(to: entry.id)
                 loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
-            } else {
+            } else if !(changedSource && initialZeroStartOwnsPendingReady) {
                 #if DEBUG
                 synchronizeVideoToAudio(force: true, reason: .sourceVisit)
                 #else
@@ -803,11 +882,13 @@ final class PlaybackService: NSObject {
                 else { pause() }
             }
         }
-        #if DEBUG
-        synchronizeVideoToAudio(reason: .drift)
-        #else
-        synchronizeVideoToAudio()
-        #endif
+        if !initialZeroStartOwnsPendingReady {
+            #if DEBUG
+            synchronizeVideoToAudio(reason: .drift)
+            #else
+            synchronizeVideoToAudio()
+            #endif
+        }
         if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
     }
 
