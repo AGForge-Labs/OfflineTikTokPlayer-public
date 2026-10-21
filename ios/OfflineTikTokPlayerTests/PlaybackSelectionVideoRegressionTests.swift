@@ -1394,10 +1394,10 @@ private struct SelectionProducerContext: Sendable {
     }
 }
 
-/// Synthetic native tests request one bounded CI worker stack only after an
-/// existing setup failure or an observed new underrun. The host verifies PID,
+/// Synthetic native tests request bounded CI worker stacks after an existing
+/// setup failure, a new underrun, or the separate tool calibration. The host verifies PID,
 /// exact Simulator/app ownership and a two-sample run cap before profiling.
-private enum SelectionNativeWorkerSample {
+enum SelectionNativeWorkerSample {
     private struct Request: Encodable {
         let schemaVersion: Int
         let requestID: String
@@ -1409,7 +1409,7 @@ private enum SelectionNativeWorkerSample {
     @discardableResult
     static func request(purpose: Int, workerIdentifier: String,
                         identifier: String = UUID().uuidString.lowercased()) -> Bool {
-        guard (0...1).contains(purpose), UUID(uuidString: identifier)?.uuidString.lowercased() == identifier,
+        guard (0...2).contains(purpose), UUID(uuidString: identifier)?.uuidString.lowercased() == identifier,
               UUID(uuidString: workerIdentifier)?.uuidString.lowercased() == workerIdentifier else { return false }
         let manager = FileManager.default
         let temporary = manager.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()

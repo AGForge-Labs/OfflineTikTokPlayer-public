@@ -634,6 +634,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "755E32E3A2AF2197C8E50246";
 		};
+		"85D86B2CD378922D593C52D8" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "WorkerTraceCalibrationTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"8F093C3045241E5898CEF3BD" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "85D86B2CD378922D593C52D8";
+		};
 		"843D8AE50F397108A8B1285E" = {
 			"isa" = "PBXGroup";
 			"children" = (
@@ -656,6 +666,7 @@
 				"0738E822CA97616F6E5DC8F9",
 				"5FC8AFE1EF84ED8F701F9F07",
 				"755E32E3A2AF2197C8E50246",
+				"85D86B2CD378922D593C52D8",
 			);
 			"path" = "OfflineTikTokPlayerTests";
 			"sourceTree" = "<group>";
@@ -954,6 +965,7 @@
 				"EA1C6B26B3BD87B81B138C2A",
 				"C661944F396B5236683903C4",
 				"55ED0563DA5CDECEA34A3877",
+				"8F093C3045241E5898CEF3BD",
 			);
 			"runOnlyForDeploymentPostprocessing" = 0;
 		};

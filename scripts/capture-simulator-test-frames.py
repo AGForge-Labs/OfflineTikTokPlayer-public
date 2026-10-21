@@ -92,7 +92,7 @@ def _unique_object(pairs):
 
 
 class WorkerTraceWatcher:
-    """Failure-only, fixed-target observer; never launches or discovers processes."""
+    """Explicit failure/calibration observer; never launches or discovers processes."""
     def __init__(self, udid, temporary, stop):
         self.udid, self.temporary, self.stop = udid, temporary, stop
         self.seen = set()
@@ -243,7 +243,7 @@ class WorkerTraceWatcher:
                     or type(payload["schemaVersion"]) is not int or payload["schemaVersion"] != 2
                     or payload["requestID"] != identifier
                     or type(payload["processID"]) is not int or not 0 < payload["processID"] <= 2**31 - 1
-                    or type(payload["purposeCode"]) is not int or payload["purposeCode"] not in (0, 1)
+                    or type(payload["purposeCode"]) is not int or payload["purposeCode"] not in (0, 1, 2)
                     or not canonical_worker_id(payload["workerID"])):
                 return
             purpose = payload["purposeCode"]

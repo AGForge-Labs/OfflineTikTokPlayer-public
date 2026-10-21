@@ -136,7 +136,7 @@ def test_worker_trace_profiles_only_owned_pid_and_emits_only_worker_stack(tmp_pa
     {"extra": 1}, {"schemaVersion": True}, {"schemaVersion": 1},
     {"requestID": "22222222-2222-4222-8222-222222222222"},
     {"processID": True}, {"processID": 0}, {"processID": -1}, {"processID": "4321"},
-    {"purposeCode": True}, {"purposeCode": 2}, {"purposeCode": None},
+    {"purposeCode": True}, {"purposeCode": 3}, {"purposeCode": None},
     {"workerID": True}, {"workerID": None}, {"workerID": "invalid"},
     {"workerID": WORKER_ID.upper()}, {"workerID": WORKER_ID.replace("-", "")},
 ])
@@ -209,6 +209,33 @@ def test_worker_trace_profiles_at_most_once_per_purpose_and_twice_total(tmp_path
     assert len([call for call in calls if call[0][0] == "/usr/bin/xcrun"]) == 1
     assert watcher.profile_count == 2 and watcher.purposes == {0, 1}
     assert capsys.readouterr().out.count("statusCode=3") == 2
+
+
+def test_worker_trace_calibration_purpose_is_explicit_and_single_use(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    for _ in range(2):
+        request, identifier = _worker_request(module, temporary, purpose=2)
+        watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert watcher.profile_count == 1 and watcher.purposes == {2}
+    assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 1
+    assert f"purposeCode=2 workerID={WORKER_ID} statusCode=0" in output
+    assert f"purposeCode=2 workerID={WORKER_ID} statusCode=3" in output
+    assert "PRIVATE_" not in output
+
+
+@pytest.mark.parametrize("purposes", [(0, 2, 1), (2, 0, 1), (0, 1, 2)])
+def test_worker_trace_calibration_and_failures_share_the_two_profile_total_cap(tmp_path, monkeypatch, capsys, purposes):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    for purpose in purposes:
+        request, identifier = _worker_request(module, temporary, purpose=purpose)
+        watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert watcher.profile_count == 2 and watcher.purposes == set(purposes[:2])
+    assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 2
+    assert f"purposeCode={purposes[2]} workerID={WORKER_ID} statusCode=3" in output
 
 
 def test_worker_trace_rejects_same_app_name_in_another_bundle_container(tmp_path, monkeypatch, capsys):
