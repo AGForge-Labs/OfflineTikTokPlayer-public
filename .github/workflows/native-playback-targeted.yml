@@ -26,28 +26,10 @@ jobs:
         run: |
           python3 tests/validation-shell/test_check_ios_shell.py
           python3 tests/validation-shell/test_native_test_evidence.py
-      - name: Original production benchmark before causal controls
+      - name: Default SDK and traced production benchmarks before causal controls
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require original benchmark exact native identity
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
-        run: |
-          python3 - <<'PY'
-          import importlib.util
-          from pathlib import Path
-          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
-          evidence = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(evidence)
-          expected = {'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
-          if not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('Original benchmark missing from pinned source')
-          evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected)
-          print('Targeted benchmark native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
-          PY
-      - name: Matched natural tracing and initial-readiness/composition controls
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
-        run: bash scripts/check-native-playback-targeted.sh controls
-      - name: Require all four exact causal-control identities
+      - name: Require both benchmark exact native identities
         if: ${{ always() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -58,12 +40,34 @@ jobs:
           spec.loader.exec_module(evidence)
           prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
           expected = {prefix + name for name in (
+              'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+              'testProductionSelectionLatencyAndStreamingContinuityWithoutCapture')}
+          if len(expected) != 2 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('Default or original benchmark missing from pinned source')
+          evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected)
+          print('Targeted benchmarks native=2 ui=0; original guards retained; no physical-output/full acceptance claim')
+          PY
+      - name: Matched natural tracing and readiness explicit-seek controls
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: bash scripts/check-native-playback-targeted.sh controls
+      - name: Require all five exact causal-control identities
+        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
+          evidence = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(evidence)
+          prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
+          expected = {prefix + name for name in (
+              'testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
               'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
               'testNaturalBoundaryWithNativeLaneActivityRevealsB',
-              'testPrecomposedOffscreenItemsUseOriginalSelectionBenchmarkWithoutCapture',
+              'testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
               'testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek')}
-          if len(expected) != 4 or not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('Four causal-control identities missing from pinned source')
+          if len(expected) != 5 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('Five causal-control identities missing from pinned source')
           evidence.verify_log(Path('artifacts/native/native-playback-controls.log').read_text(), expected)
-          print('Targeted controls native=4 ui=0; no threshold or original compositor/progress assertion removed')
+          print('Targeted controls native=5 ui=0; invalid precomposition experiment not rerun; no original playback threshold or compositor/progress assertion removed')
           PY

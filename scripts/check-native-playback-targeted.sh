@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=e865a2c90d8e6c6c5d6b08478da1299bbd95ea78
-expected_ios_tree=e9c2bec59a51dde029bac9b526113da7278a8c9d
+expected_code_source=da866ce5064a1968fb192b85b8031eb5be6962b1
+expected_ios_tree=5a7a28c05d9e28dad97fd1245e215d414c446d2c
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -22,8 +22,8 @@ verify_source
 if [ "$1" = --verify-source ]; then exit 0; fi
 mode="$1"
 case "$mode" in
-  benchmark) cases=(testProductionSelectionLatencyAndStreamingContinuityWithoutCapture) ;;
-  controls) cases=(testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testPrecomposedOffscreenItemsUseOriginalSelectionBenchmarkWithoutCapture testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek) ;;
+  benchmark) cases=(testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture testProductionSelectionLatencyAndStreamingContinuityWithoutCapture) ;;
+  controls) cases=(testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
