@@ -13,22 +13,25 @@ import PlayerCore
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testCommandToEngineToneAndSelectedCustomFrameLatency() async throws {
         var witnesses: [SelectionDecoderLifetimeWitness] = []
-        witnesses.reserveCapacity(4)
-        for condition in [(nativeGetters: false, phaseBase: 0, reanchor: false, nativePlayerTrace: false),
-                          (nativeGetters: true, phaseBase: 10, reanchor: false, nativePlayerTrace: false),
-                          (nativeGetters: false, phaseBase: 20, reanchor: true, nativePlayerTrace: false),
-                          (nativeGetters: false, phaseBase: 30, reanchor: false, nativePlayerTrace: true)] {
+        witnesses.reserveCapacity(6)
+        for condition in [(nativeGetters: false, phaseBase: 0, reanchor: false, nativePlayerTrace: false, startupSeekGrace: false),
+                          (nativeGetters: true, phaseBase: 10, reanchor: false, nativePlayerTrace: false, startupSeekGrace: false),
+                          (nativeGetters: false, phaseBase: 20, reanchor: true, nativePlayerTrace: false, startupSeekGrace: false),
+                          (nativeGetters: false, phaseBase: 30, reanchor: false, nativePlayerTrace: true, startupSeekGrace: false),
+                          (nativeGetters: false, phaseBase: 40, reanchor: false, nativePlayerTrace: true, startupSeekGrace: true),
+                          (nativeGetters: false, phaseBase: 50, reanchor: false, nativePlayerTrace: true, startupSeekGrace: false)] {
             defer {
                 logDecoderLifetimes(boundary: "getter-arm-after-phase-\(condition.phaseBase)", witnesses: witnesses)
             }
             try await measureSelectionLatencySequence(nativeVideoGetterControl: condition.nativeGetters,
                 phaseBase: condition.phaseBase, pausedVideoReanchorControl: condition.reanchor,
-                nativePlayerTraceControl: condition.nativePlayerTrace, witnesses: &witnesses)
+                nativePlayerTraceControl: condition.nativePlayerTrace,
+                startupSeekGraceControl: condition.startupSeekGrace, witnesses: &witnesses)
         }
     }
 
     private func measureSelectionLatencySequence(nativeVideoGetterControl: Bool, phaseBase: Int,
-        pausedVideoReanchorControl: Bool, nativePlayerTraceControl: Bool,
+        pausedVideoReanchorControl: Bool, nativePlayerTraceControl: Bool, startupSeekGraceControl: Bool,
         witnesses: inout [SelectionDecoderLifetimeWitness]) async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
@@ -39,11 +42,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
         #if DEBUG
         service.debugNativePlayerTraceEnabled = nativePlayerTraceControl
+        service.debugStartupSeekGraceEnabled = startupSeekGraceControl
         #else
         XCTAssertFalse(nativePlayerTraceControl, "The explicit native-player trace requires DEBUG")
+        XCTAssertFalse(startupSeekGraceControl, "The startup native-seek grace requires DEBUG")
         #endif
         seeks.service = service
-        precondition(witnesses.count < 4)
+        precondition(witnesses.count < 6)
         witnesses.append(SelectionDecoderLifetimeWitness(service: service, audio: audio,
             label: "getter-arm-phase-\(phaseBase)"))
         let screen = try SelectionVideoScreen(service: service)
@@ -55,12 +60,22 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
             audio.graph.engine.stop(); screen.close()
             seeks.dump()
+            #if DEBUG
+            let counts = service.debugStartupSeekGraceCounts
+            print("SelectionStartupSeekGraceSummary phaseBase=\(phaseBase) enabled=\(startupSeekGraceControl) deferredCount=\(counts.deferredCount) deadlineExpiredCount=\(counts.deadlineExpiredCount) frameAvailableCount=\(counts.frameAvailableCount) saturated=\(counts.saturated) deferredZero=inconclusive")
+            if !startupSeekGraceControl {
+                XCTAssertEqual(counts.deferredCount, 0)
+                XCTAssertEqual(counts.deadlineExpiredCount, 0)
+                XCTAssertEqual(counts.frameAvailableCount, 0)
+            }
+            #endif
         }
         service.isInteractingWithFeed = true
-        let arm = nativePlayerTraceControl ? "native-player-trace-control" : (pausedVideoReanchorControl ? "paused-video-reanchor-control" : (nativeVideoGetterControl ? "native-getter-control" : "primary"))
-        let labelSuffix = nativePlayerTraceControl ? "-native-player-trace-control" : (pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : ""))
+        let arm = startupSeekGraceControl ? "startup-seek-grace-control" : (phaseBase == 50 ? "native-player-trace-after-control" : (nativePlayerTraceControl ? "native-player-trace-control" : (pausedVideoReanchorControl ? "paused-video-reanchor-control" : (nativeVideoGetterControl ? "native-getter-control" : "primary"))))
+        let labelSuffix = startupSeekGraceControl ? "-startup-seek-grace-control" : (phaseBase == 50 ? "-native-player-trace-after-control" : (nativePlayerTraceControl ? "-native-player-trace-control" : (pausedVideoReanchorControl ? "-paused-video-reanchor-control" : (nativeVideoGetterControl ? "-native-getter-control" : ""))))
         print("SelectionLatency scope=engineMixerTap-not-physical-speaker arm=\(arm) phaseBase=\(phaseBase) videoNativeGetters=\(nativeVideoGetterControl) outputLimitMs=100 customReadyLimitMs=250 silenceWindowMs=10 importHashVerification=already-verified")
         print("SelectionNativePlayerTraceScope phaseBase=\(phaseBase) enabled=\(nativePlayerTraceControl) nativeGetters=\(nativeVideoGetterControl) reanchor=\(pausedVideoReanchorControl) maximumEventsPerPhase=256 publication=post-call-or-policy-decision itemEndClock=handler-delivery pauseClock=entry-return-inclusive design=fresh-ordered-cohort-not-causal-proof")
+        print("SelectionStartupSeekGraceScope phaseBase=\(phaseBase) enabled=\(startupSeekGraceControl) maximumMs=250 until=first-current-epoch-frame-or-deadline nativeGetters=\(nativeVideoGetterControl) reanchor=\(pausedVideoReanchorControl) nativePlayerTrace=\(nativePlayerTraceControl) maximumEventsPerPhase=256 deferredZero=inconclusive design=fresh-ordered-ABA-not-causal-proof")
         if pausedVideoReanchorControl {
             print("SelectionReanchorScope phaseBase=\(phaseBase) eligiblePhase=22 maximumAttempts=1 acceptedZero=inconclusive design=fresh-ordered-cohort-not-causal-proof publicationCost=includes-intentional-reanchor-and-reentrancy")
         }
@@ -132,6 +147,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         defer { fixture.remove() }
         let service = fixture.service()
         defer { service.onPlaybackEvent = nil; service.pause() }
+        service.debugStartupSeekGraceEnabled = true
         var completedPause: PlaybackBuffer.NativePauseEvent?
         var endEvents: [PlaybackService.NativeItemEndEvent] = []
         endEvents.reserveCapacity(2)
@@ -151,8 +167,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             checkedTrace = true
             XCTAssertFalse(service.debugNativePlayerTraceEnabled)
             XCTAssertEqual(service.debugNativePlayerPauseCount, 0, "Default-off startup must do no new counter work")
+            XCTAssertTrue(service.debugStartupSeekGraceHasAnchor, "The real initial host-anchor path must arm the opt-in window")
             service.debugNativePlayerTraceEnabled = true
             service.pause()
+            XCTAssertFalse(service.debugStartupSeekGraceHasAnchor, "A real user pause invalidates grace before any resume")
             XCTAssertEqual(service.debugNativePlayerPauseCount, 1)
             XCTAssertFalse(service.wantsToPlay)
             let selectedID = service.queue.currentID
@@ -206,6 +224,35 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertFalse(adoptedPause.commandIDSaturated)
         XCTAssertNil(adoptedPause.entryGeneration, "The buffer must not query its service before native pause")
         XCTAssertGreaterThanOrEqual(adoptedPause.returnUptime, adoptedPause.entryUptime)
+        // This pure control boundary has no manufactured SDK state or latency
+        // credit. The original actions above test reanchor refusals with grace
+        // off; grace's force/intent/seek exclusions have structural coverage.
+        XCTAssertEqual(PlaybackService.debugStartupSeekGraceDecision(anchorEntryUptime: 10,
+            observedUptime: 10.249, hasCurrentEpochFrame: false), .deferred)
+        XCTAssertEqual(PlaybackService.debugStartupSeekGraceDecision(anchorEntryUptime: 10,
+            observedUptime: 10.250, hasCurrentEpochFrame: false), .deadlineExpired)
+        XCTAssertEqual(PlaybackService.debugStartupSeekGraceDecision(anchorEntryUptime: 10,
+            observedUptime: 10.249, hasCurrentEpochFrame: true), .frameAvailable)
+        XCTAssertEqual(PlaybackService.debugStartupSeekGraceDecision(anchorEntryUptime: 10,
+            observedUptime: 10.251, hasCurrentEpochFrame: true), .deadlineExpired)
+        XCTAssertEqual(PlaybackService.debugStartupSeekGraceDecision(anchorEntryUptime: 10,
+            observedUptime: 9, hasCurrentEpochFrame: false), .invalidClock)
+        XCTAssertEqual(PlaybackService.debugStartupSeekGraceDecision(anchorEntryUptime: .nan,
+            observedUptime: 10, hasCurrentEpochFrame: false), .invalidClock)
+        // Model invalidation while the outer SDK command's candidate has not
+        // yet been installed. This proves the ticket boundary, not occurrence
+        // of synchronous SDK reentrancy in this test run.
+        let captured = PlaybackService.DebugStartupSeekGraceTicket(revision: 7, saturated: false)
+        XCTAssertTrue(PlaybackService.debugStartupSeekGraceTicketMatches(captured: captured, current: captured))
+        let invalidated = PlaybackService.debugNextStartupSeekGraceTicket(captured)
+        XCTAssertFalse(PlaybackService.debugStartupSeekGraceTicketMatches(captured: captured, current: invalidated))
+        let exhausted = PlaybackService.debugNextStartupSeekGraceTicket(
+            .init(revision: .max - 1, saturated: false))
+        XCTAssertEqual(exhausted.revision, .max)
+        XCTAssertTrue(exhausted.saturated)
+        XCTAssertFalse(PlaybackService.debugStartupSeekGraceTicketMatches(captured: exhausted, current: exhausted))
+        XCTAssertEqual(PlaybackService.debugNextStartupSeekGraceTicket(exhausted), exhausted,
+            "A saturated ticket must disable eligibility permanently instead of wrapping")
         #else
         XCTFail("The explicit reanchor control requires the Debug test configuration")
         #endif
@@ -1557,6 +1604,10 @@ private final class SelectionLatencyDiagnostics: @unchecked Sendable {
                     return "SelectionLatencyNativePause phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) ownerCode=\(event.owner.rawValue) reasonCode=\(event.reason.rawValue) commandID=\(event.commandID) commandIDSaturated=\(event.commandIDSaturated) entryUptime=\(event.entryUptime) returnUptime=\(event.returnUptime) entryGeneration=\(event.entryGeneration.map { String($0) } ?? "unavailable")"
                 case let .nativeItemEnd(event):
                     return "SelectionLatencyNativeItemEnd phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) observedItemMatches=\(event.observedItemMatches) selectedAudio=\(event.selectedAudio.map { String($0) } ?? "unavailable") handlerEntryUptime=\(event.handlerEntryUptime) entryGeneration=\(event.entryGeneration)"
+                #if DEBUG
+                case let .startupSeekGrace(event):
+                    return "SelectionLatencyStartupSeekGrace phase=\(phase) commandMs=\(commandMs) eventUptime=\(eventUptime) generation=\(generation) resultCode=\(event.result.rawValue) elapsedMs=\(event.elapsedMilliseconds.map { String($0) } ?? "unavailable") maximumMs=250 anchorEntryUptime=\(event.anchorEntryUptime) anchorFrameEpoch=\(event.anchorFrameEpoch) frameEpoch=\(event.frameEpoch) hasCurrentEpochFrame=\(event.hasCurrentEpochFrame) ordinarySourceChanged=\(event.ordinarySourceChanged) deferredCount=\(event.counts.deferredCount) deadlineExpiredCount=\(event.counts.deadlineExpiredCount) frameAvailableCount=\(event.counts.frameAvailableCount) saturated=\(event.counts.saturated)"
+                #endif
                 }
             case let .videoBatch(batchID, commandMs, copiedPosition, submittedPosition, requested):
                 return "SelectionLatencyVideoBatch phase=\(phase) batchID=\(batchID) commandMs=\(commandMs) copiedPresent=\(copiedPosition != nil) submittedPresent=\(submittedPosition != nil) copiedPosition=\(copiedPosition.map { String($0) } ?? "missing") submittedPosition=\(submittedPosition.map { String($0) } ?? "missing") requested=\(requested)"

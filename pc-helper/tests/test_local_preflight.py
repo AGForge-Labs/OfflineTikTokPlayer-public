@@ -27,6 +27,118 @@ def sampler_workflow():
                      Loader=yaml.BaseLoader)
 
 
+def seek_grace_workflow():
+    return yaml.load((ROOT / ".github/workflows/first-frame-seek-grace.yml").read_text(encoding="utf-8"),
+                     Loader=yaml.BaseLoader)
+
+
+def test_first_frame_seek_grace_accepts_only_the_reviewed_scoped_diagnostic(preflight):
+    preflight.validate_first_frame_seek_grace_workflow(seek_grace_workflow())
+
+
+@pytest.mark.parametrize("change", [
+    "wrong_branch", "extra_branch", "wrong_path", "extra_path", "manual_trigger", "schedule", "pull_request_target",
+    "private_guard", "repository_guard", "missing_guard", "runner", "timeout", "shorter_timeout", "missing_timeout",
+    "extra_job", "matrix", "workflow_permissions", "write_permissions", "extra_permissions", "job_permissions",
+    "workflow_env", "job_env", "environment", "concurrency", "extra_step", "missing_step", "step_env", "step_shell",
+    "continue_on_error", "unpinned_checkout", "different_checkout", "credential_persistence", "missing_credential_policy",
+    "checkout_ref", "checkout_submodules", "broad_command", "extra_command", "secret", "secret_brackets", "signing",
+    "upload", "missing_always", "conditional_gate", "missing_identity", "extra_identity", "wrong_identity",
+    "missing_manifest_exit", "missing_evidence_verification", "wrong_evidence_log", "full_acceptance_claim",
+    "missing_calibration_gate", "wrong_calibration_command", "name_expression",
+])
+def test_first_frame_seek_grace_rejects_scope_execution_or_evidence_extensions(preflight, change):
+    config = copy.deepcopy(seek_grace_workflow())
+    job = config["jobs"]["natural"]
+    checkout, run, gate, calibration = job["steps"]
+    identity = "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDebugPausedVideoReanchorRejectsUserActionsBeforeFirstFrame"
+    if change == "wrong_branch": config["on"]["push"]["branches"] = ["fix/playback-start-latency"]
+    elif change == "extra_branch": config["on"]["push"]["branches"].append("main")
+    elif change == "wrong_path": config["on"]["push"]["paths"] = ["ios/**"]
+    elif change == "extra_path": config["on"]["push"]["paths"].append("ios/**")
+    elif change == "manual_trigger": config["on"]["workflow_dispatch"] = {}
+    elif change == "schedule": config["on"]["schedule"] = [{"cron": "0 * * * *"}]
+    elif change == "pull_request_target": config["on"]["pull_request_target"] = {}
+    elif change == "private_guard": job["if"] = "true"
+    elif change == "repository_guard": job["if"] = job["if"].replace("OfflineTikTokPlayer-public", "OfflineTikTokPlayer")
+    elif change == "missing_guard": job.pop("if")
+    elif change == "runner": job["runs-on"] = "macos-26-xlarge"
+    elif change == "timeout": job["timeout-minutes"] = "21"
+    elif change == "shorter_timeout": job["timeout-minutes"] = "19"
+    elif change == "missing_timeout": job.pop("timeout-minutes")
+    elif change == "extra_job": config["jobs"]["release"] = copy.deepcopy(job)
+    elif change == "matrix": job["strategy"] = {"matrix": {"value": ["1", "2"]}}
+    elif change == "workflow_permissions": config["permissions"] = {}
+    elif change == "write_permissions": config["permissions"] = {"contents": "write"}
+    elif change == "extra_permissions": config["permissions"]["id-token"] = "write"
+    elif change == "job_permissions": job["permissions"] = {"contents": "write"}
+    elif change == "workflow_env": config["env"] = {"PLAYER_TESTS": "all"}
+    elif change == "job_env": job["env"] = {"PLAYER_TESTS": "all"}
+    elif change == "environment": job["environment"] = {"name": "release"}
+    elif change == "concurrency": config["concurrency"] = {"group": "unreviewed"}
+    elif change == "extra_step": job["steps"].append({"run": "true"})
+    elif change == "missing_step": job["steps"].pop(1)
+    elif change == "step_env": run["env"] = {"PLAYER_TESTS": "all"}
+    elif change == "step_shell": run["shell"] = "python"
+    elif change == "continue_on_error": run["continue-on-error"] = "true"
+    elif change == "unpinned_checkout": checkout["uses"] = "actions/checkout@main"
+    elif change == "different_checkout": checkout["uses"] = "actions/checkout@" + "a" * 40
+    elif change == "credential_persistence": checkout["with"]["persist-credentials"] = "true"
+    elif change == "missing_credential_policy": checkout["with"].pop("persist-credentials")
+    elif change == "checkout_ref": checkout["with"]["ref"] = "main"
+    elif change == "checkout_submodules": checkout["with"]["submodules"] = "recursive"
+    elif change == "broad_command": run["run"] = "bash scripts/check-ios.sh"
+    elif change == "extra_command": run["run"] += "\nprintf unreviewed\n"
+    elif change == "secret": run["run"] += "\n${{ secrets.APPLE_PRIVATE_DELIVERY }}\n"
+    elif change == "secret_brackets": run["env"] = {"KEY": "${{ secrets['DELIVERY'] }}"}
+    elif change == "signing": run["run"] += "\ncodesign --sign example unsigned.app\n"
+    elif change == "upload": job["steps"].append({"uses": "actions/upload-artifact@" + "a" * 40})
+    elif change == "missing_always": gate.pop("if")
+    elif change == "conditional_gate": gate["if"] = "success()"
+    elif change == "missing_identity": gate["run"] = gate["run"].replace("    '" + identity + "',\n", "")
+    elif change == "extra_identity": gate["run"] = gate["run"].replace("expected = {\n", "expected = {\n    'OfflineTikTokPlayerTests.OtherTests/testUnreviewed',\n")
+    elif change == "wrong_identity": gate["run"] = gate["run"].replace(identity, "OfflineTikTokPlayerTests.OtherTests/testUnreviewed")
+    elif change == "missing_manifest_exit": gate["run"] = gate["run"].replace("raise SystemExit('Scoped identities are missing from this immutable checkout')", "print('Scoped identities are missing from this immutable checkout')")
+    elif change == "missing_evidence_verification": gate["run"] = gate["run"].replace("verifier.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)", "print('unchecked')")
+    elif change == "wrong_evidence_log": gate["run"] = gate["run"].replace("artifacts/native/xcodebuild-test.log", "artifacts/other.log")
+    elif change == "full_acceptance_claim": gate["run"] = gate["run"].replace("not full-suite acceptance", "full-suite acceptance")
+    elif change == "missing_calibration_gate": calibration.pop("if")
+    elif change == "wrong_calibration_command": calibration["run"] = "true"
+    elif change == "name_expression": config["name"] = "${{ github.token }}"
+    assert config != seek_grace_workflow(), "Each mutation must alter the reviewed workflow"
+    with pytest.raises(ValueError):
+        preflight.validate_first_frame_seek_grace_workflow(config)
+
+
+@pytest.mark.parametrize("name,allowed", [
+    ("first-frame-seek-grace.yml", True), ("first-frame-seek-grace.yaml", False),
+    ("first-frame-seek-grace.YML", False), ("First-frame-seek-grace.yml", False),
+    ("renamed-first-frame-seek-grace.yml", False), ("playback-validation.yml", False),
+    ("public-testflight.yml", False), ("native-sampler-capability.yml", False),
+])
+def test_first_frame_seek_grace_is_routed_only_by_its_exact_filename(preflight, tmp_path, name, allowed):
+    directory = tmp_path / ".github/workflows"
+    directory.mkdir(parents=True)
+    (directory / name).write_text((ROOT / ".github/workflows/first-frame-seek-grace.yml").read_text(encoding="utf-8"),
+                                 encoding="utf-8")
+    draft = tmp_path / ".github/workflow-drafts/native-check.yml"
+    draft.parent.mkdir(parents=True)
+    draft.write_text((ROOT / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), encoding="utf-8")
+    commands = []
+    runner = lambda args, **kwargs: commands.append(args)
+    if allowed:
+        complete = preflight.run_checks(tmp_path, runner=runner, platform="linux")
+        assert len(commands) == 5
+        assert len(complete) == 6
+        assert any("scripts/test-core.sh" in args for args in commands)
+        assert any("scripts/test-native-cloud.sh" in args for args in commands)
+        assert not any("gh" in args or "xcodebuild" in args for args in commands)
+    else:
+        with pytest.raises(ValueError):
+            preflight.run_checks(tmp_path, runner=runner, platform="linux")
+        assert commands == []
+
+
 def test_sampler_capability_is_only_the_exact_public_documentation_job(preflight):
     config = sampler_workflow()
     assert config["on"] == {"push": {"branches": ["diagnostic/native-sampler-capability"],

@@ -147,6 +147,49 @@ PY
         raise ValueError("Sampler capability differs from its reviewed public scope, documentation body or resource policy.")
 
 
+def validate_first_frame_seek_grace_workflow(config):
+    """Allow only the reviewed public, unsigned three-case diagnostic workflow."""
+    scoped_evidence = """python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('native_evidence', 'scripts/verify-native-test-log.py')
+verifier = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verifier)
+expected = {
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testCommandToEngineToneAndSelectedCustomFrameLatency',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDebugPausedVideoReanchorRejectsUserActionsBeforeFirstFrame',
+    'OfflineTikTokPlayerTests.ZZZWorkerTraceCalibrationTests/testKnownWorkerWaitPublishesBoundedSamplerCalibration',
+}
+if not expected.issubset(verifier.source_manifest(Path('.'))):
+    raise SystemExit('Scoped identities are missing from this immutable checkout')
+verifier.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
+print('SCOPED diagnostic identities verified: native=3 ui=0; not full-suite acceptance')
+PY
+"""
+    expected = {
+        "name": "First-frame native seek grace diagnostic",
+        "on": {"push": {"branches": ["diagnostic/first-frame-native-seek-grace"],
+                        "paths": [".github/workflows/first-frame-seek-grace.yml", "scripts/check-first-frame-seek-grace.sh"]}},
+        "permissions": {"contents": "read"},
+        "jobs": {"natural": {
+            "if": "${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}",
+            "runs-on": "macos-26", "timeout-minutes": "20",
+            "steps": [
+                {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+                 "with": {"persist-credentials": "false"}},
+                {"name": "Run exact manual control and calibration cases",
+                 "run": "bash scripts/check-first-frame-seek-grace.sh"},
+                {"name": "Verify the three scoped identities without accepting the full application",
+                 "if": "always()", "run": scoped_evidence},
+                {"name": "Report calibrated sampler availability separately", "if": "always()",
+                 "run": "python3 scripts/verify-native-worker-trace.py --log artifacts/native/worker-trace.log"},
+            ],
+        }},
+    }
+    if config != expected:
+        raise ValueError("First-frame seek grace differs from its reviewed public scope, three-case evidence gate or resource policy.")
+
+
 def validate_public_release_workflow(config):
     """A separate strict policy for the explicitly approved release infrastructure.
 
@@ -216,9 +259,10 @@ def run_checks(root, *, runner=subprocess.run, platform=sys.platform):
     if active:
         validators = {"playback-validation.yml": validate_public_workflow,
                       "public-testflight.yml": validate_public_release_workflow,
-                      "native-sampler-capability.yml": validate_native_sampler_capability_workflow}
+                      "native-sampler-capability.yml": validate_native_sampler_capability_workflow,
+                      "first-frame-seek-grace.yml": validate_first_frame_seek_grace_workflow}
         if any(path.name not in validators for path in active):
-            raise ValueError("Only the reviewed public validation, protected release and sampler documentation workflows may be present.")
+            raise ValueError("Only the reviewed public validation, protected release, sampler documentation and first-frame diagnostic workflows may be present.")
         for path in active:
             validators[path.name](yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader))
     workflow = yaml.load((root / ".github/workflow-drafts/native-check.yml").read_text(encoding="utf-8"), Loader=yaml.BaseLoader)

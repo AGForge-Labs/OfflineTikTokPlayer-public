@@ -32,6 +32,9 @@ final class PlaybackService: NSObject {
         case buffer(PlaybackBuffer.DiagnosticEvent)
         case nativePause(PlaybackBuffer.NativePauseEvent)
         case nativeItemEnd(NativeItemEndEvent)
+        #if DEBUG
+        case startupSeekGrace(DebugStartupSeekGraceEvent)
+        #endif
     }
     struct NativeItemEndEvent: Sendable {
         let observedItemMatches: Bool
@@ -88,6 +91,42 @@ final class PlaybackService: NSObject {
         didSet { buffer.debugNativePlayerTraceEnabled = debugNativePlayerTraceEnabled }
     }
     @ObservationIgnored private(set) var debugNativePlayerPauseCount: UInt64 = 0
+    // Separate, default-off diagnostic. The first anchor's finite deadline is
+    // never refreshed by polling, subsequent host anchors, or deferred seeks.
+    @ObservationIgnored var debugStartupSeekGraceEnabled = false {
+        didSet {
+            // A disable transition must also invalidate a candidate captured
+            // while enabled. OFF-to-OFF assignment performs no ticket work.
+            if oldValue || debugStartupSeekGraceEnabled { debugInvalidateStartupSeekGrace() }
+        }
+    }
+    struct DebugStartupSeekGraceTicket: Sendable, Equatable {
+        let revision: UInt64
+        let saturated: Bool
+    }
+    enum DebugStartupSeekGraceResult: Int, Sendable {
+        case deferred = 1, frameAvailable = 2, deadlineExpired = 3, invalidClock = 4
+    }
+    struct DebugStartupSeekGraceCounts: Sendable {
+        var deferredCount: UInt64 = 0
+        var deadlineExpiredCount: UInt64 = 0
+        var frameAvailableCount: UInt64 = 0
+        var saturated = false
+    }
+    struct DebugStartupSeekGraceEvent: Sendable {
+        let result: DebugStartupSeekGraceResult
+        let elapsedMilliseconds: Double?
+        let anchorEntryUptime: Double
+        let anchorFrameEpoch: UInt64
+        let frameEpoch: UInt64
+        let hasCurrentEpochFrame: Bool
+        let ordinarySourceChanged: Bool
+        let counts: DebugStartupSeekGraceCounts
+    }
+    @ObservationIgnored private var debugStartupSeekGraceTicket = DebugStartupSeekGraceTicket(revision: 0, saturated: false)
+    @ObservationIgnored private var debugStartupSeekGraceAnchor: (entryUptime: Double, frameEpoch: UInt64, ticket: DebugStartupSeekGraceTicket)?
+    @ObservationIgnored private(set) var debugStartupSeekGraceCounts = DebugStartupSeekGraceCounts()
+    var debugStartupSeekGraceHasAnchor: Bool { debugStartupSeekGraceAnchor != nil }
     // Explicit test control only. Nothing in normal playback calls the helper.
     enum DebugVideoReanchorResult: Int {
         case applied = 1, notPaused, generationChanged, currentItemChanged, notReady
@@ -120,6 +159,9 @@ final class PlaybackService: NSObject {
     }
     var audioOnly = false {
         didSet {
+            #if DEBUG
+            if audioOnly, debugStartupSeekGraceEnabled { debugInvalidateStartupSeekGrace() }
+            #endif
             applyPresentation(presentationPolicy.setAudioOnly(audioOnly))
             recordDiagnostic(audioOnly ? .audioOnlySelected : .videoSelected)
         }
@@ -330,6 +372,9 @@ final class PlaybackService: NSObject {
     }
     func pause() {
         intent.pause()
+        #if DEBUG
+        if debugStartupSeekGraceEnabled { debugInvalidateStartupSeekGrace() }
+        #endif
         recordDiagnostic(.pauseRequested)
         continuousAudio.suspend()
         continuousPiP.updatePlayback(positionSeconds: clock.position, durationSeconds: clock.duration, isPlaying: false)
@@ -379,6 +424,7 @@ final class PlaybackService: NSObject {
         #if DEBUG
         // An explicit request cannot inherit this ordinary-startup experiment.
         debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        if debugStartupSeekGraceEnabled { debugInvalidateStartupSeekGrace() }
         #endif
         if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
            let version = continuousAudio.seek(seek.target) {
@@ -433,6 +479,7 @@ final class PlaybackService: NSObject {
         generation += 1; let request = generation
         #if DEBUG
         debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        if debugStartupSeekGraceEnabled { debugInvalidateStartupSeekGrace() }
         // Capture before selection. A same-ID repeat/reload is not an ordinary
         // source handoff even when its prepared native item happens to be zero.
         debugStartupChangedSource = continuousAudio.selectedID != queue.currentID
@@ -594,17 +641,39 @@ final class PlaybackService: NSObject {
                         // ready zero-position item at zero lets its native clock
                         // fall behind and adds a catch-up seek before first frame.
                         // Use the same fresh audio/host anchor as a natural handoff.
+                        #if DEBUG
+                        // Start no later than the original host-clock anchor
+                        // read. Neither SDK/CPP work nor setRate return can move
+                        // this fixed deadline forward.
+                        let graceCandidate: (entryUptime: Double, ticket: DebugStartupSeekGraceTicket)?
+                        if self.debugStartupSeekGraceEnabled, !naturalHandoff, position == 0,
+                           self.pendingAudioSeek == nil, self.debugStartupChangedSource,
+                           !self.debugStartupSeekGraceTicket.saturated {
+                            let ticket = self.debugStartupSeekGraceTicket
+                            graceCandidate = (ProcessInfo.processInfo.systemUptime, ticket)
+                        } else { graceCandidate = nil }
+                        #endif
                         let host = CMClockGetTime(CMClockGetHostTimeClock())
                         let desired = self.continuousAudio.presentationPosition(at: host)
                         self.continuousPiP.updatePlayback(positionSeconds: desired,
                             durationSeconds: self.clock.duration, isPlaying: true)
                         self.monitorFirstFrame(playerItem, request: request)
+                        #if DEBUG
+                        let graceAnchor: (entryUptime: Double, frameEpoch: UInt64, ticket: DebugStartupSeekGraceTicket)?
+                        if let graceCandidate {
+                            graceAnchor = (graceCandidate.entryUptime, self.continuousPiP.frameEpoch, graceCandidate.ticket)
+                        } else { graceAnchor = nil }
+                        #endif
                         self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
                         #if DEBUG
                         if !naturalHandoff, position == 0, self.pendingAudioSeek == nil,
                            self.debugStartupChangedSource {
                             self.debugOrdinaryStartupItem = playerItem
                             self.debugOrdinaryStartupGeneration = request
+                            if let graceAnchor, self.debugStartupSeekGraceEnabled, self.debugStartupSeekGraceAnchor == nil,
+                               Self.debugStartupSeekGraceTicketMatches(captured: graceAnchor.ticket, current: self.debugStartupSeekGraceTicket) {
+                                self.debugStartupSeekGraceAnchor = graceAnchor
+                            }
                         }
                         #endif
                         self.recordPlaybackEvent("videoHostClockStarted")
@@ -843,6 +912,77 @@ final class PlaybackService: NSObject {
     }
 
     #if DEBUG
+    static func debugNextStartupSeekGraceTicket(_ current: DebugStartupSeekGraceTicket) -> DebugStartupSeekGraceTicket {
+        guard !current.saturated else { return current }
+        let increment = current.revision.addingReportingOverflow(1)
+        let revision = increment.overflow ? UInt64.max : increment.partialValue
+        return DebugStartupSeekGraceTicket(revision: revision, saturated: increment.overflow || revision == .max)
+    }
+
+    static func debugStartupSeekGraceTicketMatches(captured: DebugStartupSeekGraceTicket,
+                                                   current: DebugStartupSeekGraceTicket) -> Bool {
+        !captured.saturated && !current.saturated && captured.revision == current.revision
+    }
+
+    private func debugInvalidateStartupSeekGrace() {
+        // Callers gate this on an enabled scope (including an ON-to-OFF flag
+        // transition). Invalidation advances even when no anchor is installed:
+        // a synchronous action can happen while setRate owns a local candidate.
+        debugStartupSeekGraceTicket = Self.debugNextStartupSeekGraceTicket(debugStartupSeekGraceTicket)
+        debugStartupSeekGraceAnchor = nil
+    }
+
+    /// Pure boundary control, shared with native tests. The result describes
+    /// this observation; it does not timestamp when a frame first appeared.
+    static func debugStartupSeekGraceDecision(anchorEntryUptime: Double, observedUptime: Double,
+                                              hasCurrentEpochFrame: Bool) -> DebugStartupSeekGraceResult {
+        guard anchorEntryUptime.isFinite, observedUptime.isFinite,
+              observedUptime >= anchorEntryUptime else { return .invalidClock }
+        if observedUptime - anchorEntryUptime >= 0.250 { return .deadlineExpired }
+        if hasCurrentEpochFrame { return .frameAvailable }
+        return .deferred
+    }
+
+    /// Called only after the original non-force drift/presentation policy has
+    /// required a real seek. All native reads remain at their original sites.
+    private func debugEvaluateStartupSeekGrace(item: AVPlayerItem, selectedAudioOwnsItem: Bool) -> DebugStartupSeekGraceEvent? {
+        guard debugStartupSeekGraceEnabled, intent.canPlay, videoAllowed, pendingAudioSeek == nil,
+              selectedAudioOwnsItem, debugStartupChangedSource,
+              debugOrdinaryStartupGeneration == generation, debugOrdinaryStartupItem === item,
+              observedItem === item, let anchor = debugStartupSeekGraceAnchor,
+              Self.debugStartupSeekGraceTicketMatches(captured: anchor.ticket, current: debugStartupSeekGraceTicket) else { return nil }
+        let epoch = continuousPiP.frameEpoch
+        guard epoch == anchor.frameEpoch else { return nil }
+        // These are stored Swift properties. The item was bound by the original
+        // currentItem guard, and this epoch was captured at its initial anchor.
+        // An enqueued frame ends grace even before the readiness monitor's gate.
+        let hasFrame = continuousPiP.lastFramePositionSeconds != nil
+        let now = ProcessInfo.processInfo.systemUptime
+        let result = Self.debugStartupSeekGraceDecision(anchorEntryUptime: anchor.entryUptime,
+            observedUptime: now, hasCurrentEpochFrame: hasFrame)
+        var counts = debugStartupSeekGraceCounts
+        switch result {
+        case .deferred:
+            let increment = counts.deferredCount.addingReportingOverflow(1)
+            counts.deferredCount = increment.overflow ? .max : increment.partialValue
+            counts.saturated = counts.saturated || increment.overflow
+        case .deadlineExpired:
+            let increment = counts.deadlineExpiredCount.addingReportingOverflow(1)
+            counts.deadlineExpiredCount = increment.overflow ? .max : increment.partialValue
+            counts.saturated = counts.saturated || increment.overflow
+        case .frameAvailable:
+            let increment = counts.frameAvailableCount.addingReportingOverflow(1)
+            counts.frameAvailableCount = increment.overflow ? .max : increment.partialValue
+            counts.saturated = counts.saturated || increment.overflow
+        case .invalidClock: break
+        }
+        debugStartupSeekGraceCounts = counts
+        let elapsed = (now - anchor.entryUptime) * 1_000
+        return DebugStartupSeekGraceEvent(result: result, elapsedMilliseconds: elapsed.isFinite ? elapsed : nil,
+            anchorEntryUptime: anchor.entryUptime, anchorFrameEpoch: anchor.frameEpoch, frameEpoch: epoch,
+            hasCurrentEpochFrame: hasFrame, ordinarySourceChanged: debugStartupChangedSource, counts: counts)
+    }
+
     /// One opt-in, once-per-generation startup experiment. The caller supplies
     /// the final status from the existing KVO handler; this performs no extra
     /// native status/item-clock query, exact seek, epoch flush, wait, or drift suppression.
@@ -881,6 +1021,14 @@ final class PlaybackService: NSObject {
               let item = player.currentItem, item.status == .readyToPlay else { return }
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         let position = continuousAudio.presentationPosition(at: hostTime)
+        #if DEBUG
+        var startupGraceEvent: DebugStartupSeekGraceEvent?
+        defer {
+            // Deferred corrections publish after their return decision; an
+            // expired/frame-present correction publishes after seek initiation.
+            if let startupGraceEvent { recordPlaybackEvent("videoStartupSeekGrace", detail: .startupSeekGrace(startupGraceEvent)) }
+        }
+        #endif
         if !force {
             let nativePosition = item.currentTime().seconds
             guard abs(nativePosition - position) > 0.080 else { return }
@@ -889,9 +1037,15 @@ final class PlaybackService: NSObject {
             // clock still reports the departing/start position. Recheck ownership
             // now; a prior copied frame or latched readiness is insufficient.
             let presentation: (frame: Double, timebase: Double)?
+            #if DEBUG
+            var selectedAudioOwnsItem = false
+            #endif
             if readyGeneration == generation, let id = queue.currentID,
                continuousAudio.selectedID == id, continuousAudio.entry(forToken: audioToken)?.id == id {
                 presentation = continuousPiP.currentSubmittedPresentation(for: item)
+                #if DEBUG
+                selectedAudioOwnsItem = true
+                #endif
             } else { presentation = nil }
             guard PlaybackVideoSynchronization.requiresExactSeek(force: false, canPlay: intent.canPlay,
                 nativeRate: player.rate, nativePosition: nativePosition, audioPosition: position,
@@ -902,11 +1056,18 @@ final class PlaybackService: NSObject {
                 }
                 return
             }
+            #if DEBUG
+            if debugStartupSeekGraceEnabled {
+                startupGraceEvent = debugEvaluateStartupSeekGrace(item: item, selectedAudioOwnsItem: selectedAudioOwnsItem)
+                if startupGraceEvent?.result == .deferred { return }
+            }
+            #endif
         }
         #if DEBUG
         // Any real correction ends ordinary startup eligibility. Its exact
         // seek/callback/flush policy below is unchanged in all configurations.
         debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        if debugStartupSeekGraceEnabled { debugInvalidateStartupSeekGrace() }
         #endif
         recordPlaybackEvent(force ? "videoForcedSeek" : "videoDriftSeek")
         let request = generation
@@ -1021,6 +1182,9 @@ final class PlaybackService: NSObject {
         recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
             intent.interruptionBegan(); cancelStallRecovery()
+            #if DEBUG
+            if debugStartupSeekGraceEnabled { debugInvalidateStartupSeekGrace() }
+            #endif
             continuousAudio.suspend()
             pauseNativePlayer(reason: .interruptionBegan); persist()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
