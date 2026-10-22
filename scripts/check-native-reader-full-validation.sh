@@ -4,8 +4,11 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 # Require the reviewed final app/test commit and its exact ios tree.
-expected_code_source=a9f596f6ebb7587494ae35f177eda22958de0f19
-expected_ios_tree=48e169b67baf898b380b375417d03c2426d54819
+expected_code_source=f5e4fc6461cb396ba0f34fc00d0507fee66f7ad0
+expected_ios_tree=969b29ce45210688ecda99ba98ef26f5e6335481
+expected_native=173
+expected_ui=1
+expected_core=105
 verify_source() {
   case "$expected_code_source" in
     ''|PENDING|*[!0-9a-f]*) printf '%s\n' 'A final committed app/test source pin is required.' >&2; return 2 ;;
@@ -15,6 +18,12 @@ verify_source() {
   esac
   test "${#expected_code_source}" -eq 40
   test "${#expected_ios_tree}" -eq 40
+  for expected_count in "$expected_native" "$expected_ui" "$expected_core"; do
+    case "$expected_count" in
+      ''|PENDING|*[!0-9]*) printf '%s\n' 'Final committed full-manifest counts are required.' >&2; return 2 ;;
+    esac
+    test "$expected_count" -gt 0
+  done
   git cat-file -e "$expected_code_source^{commit}"
   git merge-base --is-ancestor "$expected_code_source" HEAD
   test "$(git rev-parse "$expected_code_source:ios")" = "$expected_ios_tree"
@@ -35,5 +44,5 @@ verify_source
 # including the traced benchmark previously run twice. This is one full-suite
 # invocation, not a fresh-host singleton comparison. Its native exit propagates
 # unchanged; the workflow separately verifies all identities after a failed run.
-printf '%s\n' "NativeReaderFullScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=149 expectedUI=1 expectedCore=101 maximumBuildJobs=1 fullApplicationAcceptance=pending physicalOutput=unverified"
+printf '%s\n' "NativeReaderFullScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=$expected_native expectedUI=$expected_ui expectedCore=$expected_core maximumBuildJobs=1 fullApplicationAcceptance=pending physicalOutput=unverified"
 exec bash scripts/check-ios.sh

@@ -12,7 +12,7 @@ jobs:
   native-reader-full-validation:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -55,7 +55,7 @@ jobs:
       - name: Collect only bounded case-attributed preroll crash excerpts
         if: ${{ !cancelled() && steps.xcresult_export.outcome == 'success' }}
         run: python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
-      - name: Independently require all 149 native and one UI identities after the attempt
+      - name: Independently require the final pinned native and UI identities after the attempt
         id: full_evidence
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
@@ -68,10 +68,13 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          if len(native) != 149 or len(ui) != 1 or native | ui != expected:
-              raise SystemExit(f'Pinned full manifest must equal native=149 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
+          expected_native, expected_ui = '173', '1'
+          if not all(value.isdigit() and int(value) > 0 for value in (expected_native, expected_ui)):
+              raise SystemExit('Final committed full-manifest counts are required.')
+          if len(native) != int(expected_native) or len(ui) != int(expected_ui) or native | ui != expected:
+              raise SystemExit(f'Pinned full manifest must equal native={expected_native} ui={expected_ui}; found native={len(native)} ui={len(ui)} total={len(expected)}')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('FULL source-manifest evidence native=149 ui=1; original guards retained; physical-device acceptance remains separate')
+          print(f'FULL source-manifest evidence native={expected_native} ui={expected_ui}; original guards retained; physical-device acceptance remains separate')
           PY
       - name: Compile the qualified full source as an unsigned Release app
         if: ${{ !cancelled() && steps.native.outcome == 'success' && steps.full_evidence.outcome == 'success' }}
