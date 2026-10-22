@@ -1603,6 +1603,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(traceDefaultFrameMonitor)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
             if enabled {
+                startup.enableEarlyNativePulls(baseRequest: service.debugInitialVideoReadyState.generation)
+                service.onDebugCPPNativePullStamp = { [weak startup] value in startup?.recordEarlyNativePull(value) }
                 service.onDebugAlignedVideoEnqueue = { [weak remainingWitness] value in remainingWitness?.record(value) }
                 service.onDebugVideoRateHandoff = { [weak handoffTrace] value in handoffTrace?.record(value) }
                 service.onDebugVideoPositionRead = { [weak handoffTrace] value in handoffTrace?.record(value) }
@@ -1657,6 +1659,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if handoffTrace != nil {
                 service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
                 service.onDebugAlignedVideoEnqueue = nil
+                service.onDebugCPPNativePullStamp = nil
             }
             if nativePositionReadTrace != nil { service.onDebugVideoPositionRead = nil }
             if traceDefaultFrameMonitor != nil {
@@ -1767,6 +1770,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if handoffTrace != nil {
             service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
             service.onDebugAlignedVideoEnqueue = nil
+            service.onDebugCPPNativePullStamp = nil
         }
         handoffTrace?.dumpAndAssert()
         remainingWitness?.dumpAndAssert()
@@ -4265,6 +4269,91 @@ private final class ProductionVideoStartupTrace {
     // Three phases x three seek regions x nine first-only scalar stages. No item/image ownership.
     private var renderSlots: [PlaybackService.DebugVideoRenderStamp?] = []
     private var renderConflicts = 0, renderOwnershipFailures = 0
+    private final class EarlyPullPhase {
+        var anchorNs: UInt64?
+        var rows: [PlaybackService.DebugCPPNativePullStamp] = []
+        var outsideWindow: UInt64 = 0, capacityDropped: UInt64 = 0, qualityFailures: UInt64 = 0
+        init() { rows.reserveCapacity(256) }
+    }
+    private var earlyPullBaseRequest: Int?
+    private var earlyPullPhases: [EarlyPullPhase] = []
+    private var earlyPullOrphans: UInt64 = 0, earlyPullCounterOverflow = false
+    private let earlyPullWindowNs: UInt64 = 750_000_000
+    private func incrementEarly(_ value: inout UInt64) {
+        if value == .max { earlyPullCounterOverflow = true } else { value += 1 }
+    }
+    func enableEarlyNativePulls(baseRequest: Int) {
+        XCTAssertTrue(serviceTracing); XCTAssertNil(earlyPullBaseRequest)
+        guard serviceTracing, earlyPullBaseRequest == nil else { return }
+        earlyPullBaseRequest = baseRequest
+        earlyPullPhases = (0..<3).map { _ in EarlyPullPhase() }
+        print("NativeClockEarlyPullScope schema=1 enabled=true phases=3 capacityPerPhase=256 windowNs=750000000 anchor=first-native-pull-entry windowUsesCallEntry=true renderPoints=existing-first-only returnedCallsOnly=true operationResultRecorded=false imageEpoch=unavailable newlyEnabledTiming=existing-native-pull-spans newClockSites=0 extraSDKQueries=0 publication=after-cleanup playbackAcceptance=unchanged")
+    }
+    func recordEarlyNativePull(_ owner: PlaybackService.DebugCPPNativePullStamp) {
+        guard let base = earlyPullBaseRequest else { return }
+        guard owner.request > base, owner.request - base <= 3 else {
+            incrementEarly(&earlyPullOrphans); return
+        }
+        let slot = earlyPullPhases[owner.request - base - 1], pull = owner.pull
+        guard pull.entryNs > 0, pull.returnNs >= pull.entryNs else {
+            incrementEarly(&slot.qualityFailures); return
+        }
+        if slot.anchorNs == nil { slot.anchorNs = pull.entryNs }
+        guard let anchor = slot.anchorNs, pull.entryNs >= anchor else {
+            incrementEarly(&slot.qualityFailures); return
+        }
+        guard pull.entryNs - anchor <= earlyPullWindowNs else {
+            incrementEarly(&slot.outsideWindow); return
+        }
+        guard slot.rows.count < 256 else { incrementEarly(&slot.capacityDropped); return }
+        if let previous = slot.rows.last, pull.entryNs < previous.pull.entryNs {
+            incrementEarly(&slot.qualityFailures)
+        }
+        // Scalar metadata only. A call entering within the window is retained even if its return crosses it.
+        slot.rows.append(owner)
+    }
+    private func earlySourceQualified(_ owner: PlaybackService.DebugCPPNativePullStamp) -> Bool {
+        let p = owner.pull
+        return owner.request == owner.generation && owner.sourceItemMatches && owner.observedItemMatches
+            && p.ticket?.debugItemIdentity == owner.sourceItem && p.entryOwnerCoherent && p.ownerUnchanged
+            && p.entryRevision == p.returnRevision && p.sourceNativeSeekTicket == p.nativeSeekTicket
+            && p.activeSeekTicket == nil
+    }
+    private func dumpEarlyNativePulls() {
+        guard let base = earlyPullBaseRequest else { return }
+        func ns(_ value: UInt64?) -> String { value.map(String.init) ?? "unknown" }
+        func identity(_ value: ObjectIdentifier?) -> String { value.map { String(describing: $0) } ?? "unknown" }
+        for (phase, slot) in earlyPullPhases.enumerated() {
+            // Existing first-only points are unchanged; choose the earliest actual true return point across seek regions.
+            let first = (0..<3).compactMap { renderSlots[phase * 27 + $0 * 9 + 2] }
+                .min { $0.render.entryNs < $1.render.entryNs }
+            let preceding = first.flatMap { point in slot.rows.indices.last {
+                slot.rows[$0].pull.stage == .availability && slot.rows[$0].pull.returnNs <= point.render.entryNs
+            } }
+            let covered: Bool
+            if let anchor = slot.anchorNs, let first, let preceding {
+                let owner = slot.rows[preceding], p = owner.pull, r = first.render
+                covered = slot.capacityDropped == 0 && slot.qualityFailures == 0
+                    && r.entryNs >= anchor && r.entryNs - anchor <= earlyPullWindowNs
+                    && p.ticket == r.ticket && p.returnRevision == r.presentationRevision
+                    && first.presentationRequest == base + phase + 1 && first.generation == first.presentationRequest
+                    && r.ownershipUnchanged && first.presentationMatches && earlySourceQualified(owner)
+            } else { covered = false }
+            let unqualified = slot.rows.filter { !earlySourceQualified($0) }.count
+            let crossingReturns = slot.rows.filter { row in
+                slot.anchorNs.map { row.pull.returnNs >= $0 && row.pull.returnNs - $0 > earlyPullWindowNs } ?? false
+            }.count
+            print("NativeClockEarlyPullSummary schema=1 phase=\(phase) request=\(base + phase + 1) firstPullEntryNs=\(ns(slot.anchorNs)) firstAvailablePointNs=\(ns(first?.render.entryNs)) firstAvailableRecord=\(preceding.map(String.init) ?? "unknown") firstAvailableCovered=\(covered) records=\(slot.rows.count) capacity=256 outsideWindow=\(slot.outsideWindow) capacityDropped=\(slot.capacityDropped) qualityFailures=\(slot.qualityFailures) sourceUnqualified=\(unqualified) orphans=\(earlyPullOrphans) returnsCrossingWindow=\(crossingReturns) overflow=\(earlyPullCounterOverflow || slot.capacityDropped > 0) returnedCallsOnly=true unreturnedCalls=unverified gapCause=unattributed imageEpoch=unavailable clock=DispatchTime")
+            for (ordinal, o) in slot.rows.enumerated() {
+                let p = o.pull
+                print("NativeClockEarlyPullSpan schema=1 phase=\(phase) ordinal=\(ordinal) stage=\(p.stage.rawValue) request=\(o.request) generation=\(o.generation) rawSourceItem=\(o.sourceItem) item=\(identity(p.item)) ticketRevision=\(p.ticket.map { String($0.debugGeneration) } ?? "unknown") output=\(p.output) entryRevision=\(p.entryRevision) returnRevision=\(p.returnRevision) sourceSeekSerial=\(ns(p.sourceNativeSeekTicket)) seekSerial=\(p.nativeSeekTicket) activeSeek=\(ns(p.activeSeekTicket)) entryNs=\(p.entryNs) returnNs=\(p.returnNs) spanNs=\(p.returnNs - p.entryNs) entryOwnerCoherent=\(p.entryOwnerCoherent) ownerUnchanged=\(p.ownerUnchanged) sourceItemMatches=\(o.sourceItemMatches) observedItemMatches=\(o.observedItemMatches) presentationRequest=\(o.presentationRequest.map(String.init) ?? "unknown") presentationMatches=\(o.presentationMatches) sourceQualified=\(earlySourceQualified(o)) cachedAudioToken=\(o.cachedAudioToken) cachedAudioVisit=\(o.cachedAudioVisit) imageEpoch=unavailable operationResultRecorded=false clock=DispatchTime")
+            }
+            XCTAssertNotNil(slot.anchorNs); XCTAssertEqual(slot.capacityDropped, 0)
+            XCTAssertEqual(slot.qualityFailures, 0)
+            XCTAssertTrue(covered, "The first available point must retain its actual returned availability call within the bounded early window")
+        }
+        XCTAssertEqual(earlyPullOrphans, 0); XCTAssertFalse(earlyPullCounterOverflow)
+    }
     #endif
     init(serviceTracing: Bool) {
         self.serviceTracing = serviceTracing
@@ -4375,6 +4464,7 @@ private final class ProductionVideoStartupTrace {
         XCTAssertEqual(dropped, 0); XCTAssertFalse(overflow)
         dumpRenderRows()
         XCTAssertEqual(renderConflicts, 0); XCTAssertEqual(renderOwnershipFailures, 0)
+        dumpEarlyNativePulls()
         #endif
     }
 }
