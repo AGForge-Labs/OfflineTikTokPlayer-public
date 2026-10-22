@@ -114,6 +114,14 @@ final class ContinuousPictureInPicture: NSObject {
         return VideoResourcePreparation(item: item, original: original, composition: composition)
     }
     #if DEBUG
+    struct DebugNativeSeekState: Equatable, Sendable {
+        let serial: UInt64
+        let activeTicket: UInt64?
+    }
+    // App-owned scalars only: no player, item, output or timebase query.
+    var debugNativeSeekState: DebugNativeSeekState {
+        DebugNativeSeekState(serial: seekTicket, activeTicket: activeSeekTicket)
+    }
     /// Observes the actual SDK request without replacing its result.
     var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
     enum DebugNativePullStage: Int, CaseIterable, Sendable {

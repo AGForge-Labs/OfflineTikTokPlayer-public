@@ -42,7 +42,33 @@ final class PlaybackService: NSObject {
         let entryNs: UInt64, returnNs: UInt64
         let position: Double
         let observedItemMatches: Bool, presentationUnchanged: Bool
+        let presentationRequest: Int?, returnPresentationRequest: Int?
+        let presentationTicket: ContinuousPictureInPicture.PresentationTicket?
+        let returnPresentationTicket: ContinuousPictureInPicture.PresentationTicket?
+        let entrySeekState: ContinuousPictureInPicture.DebugNativeSeekState
+        let returnSeekState: ContinuousPictureInPicture.DebugNativeSeekState
+        // Queried from the same freshly fetched item timebase, only with a read observer.
+        let itemTimebaseEffectiveRate: Double?
     }
+    enum DebugVideoRateHandoffCause: Int, Sendable {
+        case initialReady = 0, correctionCompletion = 1
+    }
+    struct DebugVideoRateHandoff: Sendable {
+        let cause: DebugVideoRateHandoffCause
+        let request: Int, entryGeneration: Int, returnGeneration: Int
+        let item: ObjectIdentifier
+        let requestedRate: Float
+        let anchorTime: CMTime, anchorHostTime: CMTime
+        let entryNs: UInt64, returnNs: UInt64
+        let presentationRequest: Int?, returnPresentationRequest: Int?
+        let presentationTicket: ContinuousPictureInPicture.PresentationTicket?
+        let returnPresentationTicket: ContinuousPictureInPicture.PresentationTicket?
+        let entrySeekState: ContinuousPictureInPicture.DebugNativeSeekState
+        let returnSeekState: ContinuousPictureInPicture.DebugNativeSeekState
+        let entryObservedItemMatches: Bool, returnObservedItemMatches: Bool
+        let presentationUnchanged: Bool
+    }
+    @ObservationIgnored var onDebugVideoRateHandoff: (@MainActor (DebugVideoRateHandoff) -> Void)?
     @ObservationIgnored var onDebugVideoPositionReadAttempt: (@MainActor (DebugVideoPositionReadKind, ObjectIdentifier) -> Void)?
     @ObservationIgnored var onDebugVideoPositionRead: (@MainActor (DebugVideoPositionRead) -> Void)?
     @ObservationIgnored var onDebugPeriodicCurrentItemReadAttempt: (@MainActor (ObjectIdentifier) -> Void)?
@@ -804,8 +830,8 @@ final class PlaybackService: NSObject {
                                 #if DEBUG
                                 self.debugTraceVideoStartup(.setRate, request: request, installed: installed,
                                     anchorHostSeconds: anchor.host.seconds, anchorPosition: anchor.position) {
-                                    self.player.setRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
-                                                        atHostTime: anchor.host)
+                                    self.debugSetVideoRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
+                                        atHostTime: anchor.host, item: playerItem, request: request, cause: .initialReady)
                                 }
                                 #else
                                 self.player.setRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
@@ -1175,29 +1201,69 @@ final class PlaybackService: NSObject {
         if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
     }
 
+    #if DEBUG
+    private func debugSetVideoRate(_ rate: Float, time: CMTime, atHostTime host: CMTime,
+        item: AVPlayerItem, request: Int, cause: DebugVideoRateHandoffCause) {
+        guard let observer = onDebugVideoRateHandoff else {
+            player.setRate(rate, time: time, atHostTime: host)
+            return
+        }
+        let enteredGeneration = generation, presentation = videoPresentation
+        let enteredSeek = continuousPiP.debugNativeSeekState
+        let enteredObserved = observedItem === item
+        let entered = DispatchTime.now().uptimeNanoseconds
+        player.setRate(rate, time: time, atHostTime: host)
+        let returned = DispatchTime.now().uptimeNanoseconds
+        let returnedPresentation = videoPresentation
+        observer(DebugVideoRateHandoff(cause: cause, request: request,
+            entryGeneration: enteredGeneration, returnGeneration: generation,
+            item: ObjectIdentifier(item), requestedRate: rate, anchorTime: time, anchorHostTime: host,
+            entryNs: entered, returnNs: returned,
+            presentationRequest: presentation?.request, returnPresentationRequest: returnedPresentation?.request,
+            presentationTicket: presentation?.ticket, returnPresentationTicket: returnedPresentation?.ticket,
+            entrySeekState: enteredSeek, returnSeekState: continuousPiP.debugNativeSeekState,
+            entryObservedItemMatches: enteredObserved, returnObservedItemMatches: observedItem === item,
+            presentationUnchanged: presentation != nil
+                && presentation?.request == returnedPresentation?.request
+                && presentation?.ticket == returnedPresentation?.ticket))
+    }
+    #endif
+
     private func readOrdinaryVideoPosition(_ item: AVPlayerItem) -> Double {
+        #if DEBUG
+        let kind: DebugVideoPositionReadKind = .itemTimebase
+        let observer = onDebugVideoPositionRead
+        let request = generation, presentation = videoPresentation
+        let enteredSeek = observer.map { _ in continuousPiP.debugNativeSeekState }
+        var sampledEffectiveRate: Double?
+        #endif
         @MainActor func read() -> Double {
             guard let timebase = item.timebase else { return .nan }
             let time = CMTimebaseGetTime(timebase)
+            #if DEBUG
+            if observer != nil { sampledEffectiveRate = CMTimebaseGetEffectiveRate(timebase) }
+            #endif
             guard time.isNumeric else { return .nan }
             let seconds = time.seconds
             return seconds.isFinite ? seconds : .nan
         }
         #if DEBUG
-        let kind: DebugVideoPositionReadKind = .itemTimebase
-        let observer = onDebugVideoPositionRead
-        let request = generation, presentation = videoPresentation
         onDebugVideoPositionReadAttempt?(kind, ObjectIdentifier(item))
-        if let observer {
+        if let observer, let enteredSeek {
             let entered = DispatchTime.now().uptimeNanoseconds
             let position = read()
             let returned = DispatchTime.now().uptimeNanoseconds
+            let returnedPresentation = videoPresentation
             observer(DebugVideoPositionRead(kind: kind, item: ObjectIdentifier(item),
                 request: request, returnGeneration: generation, entryNs: entered, returnNs: returned,
                 position: position, observedItemMatches: observedItem === item,
                 presentationUnchanged: presentation != nil
-                    && presentation?.request == videoPresentation?.request
-                    && presentation?.ticket == videoPresentation?.ticket))
+                    && presentation?.request == returnedPresentation?.request
+                    && presentation?.ticket == returnedPresentation?.ticket,
+                presentationRequest: presentation?.request, returnPresentationRequest: returnedPresentation?.request,
+                presentationTicket: presentation?.ticket, returnPresentationTicket: returnedPresentation?.ticket,
+                entrySeekState: enteredSeek, returnSeekState: continuousPiP.debugNativeSeekState,
+                itemTimebaseEffectiveRate: sampledEffectiveRate))
             return position
         }
         #endif
@@ -1315,8 +1381,13 @@ final class PlaybackService: NSObject {
                 // AVPlayer schedules the muted video on the system host clock;
                 // it never gates the audio render callback or its next boundary.
                 if self.intent.canPlay {
+                    #if DEBUG
+                    self.debugSetVideoRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000),
+                        atHostTime: host, item: item, request: request, cause: .correctionCompletion)
+                    #else
                     self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000),
                                         atHostTime: host)
+                    #endif
                 }
                 if self.currentVideoPresentation(for: item, request: request) == ticket {
                     _ = self.continuousPiP.activate(ticket)
