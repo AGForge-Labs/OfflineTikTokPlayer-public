@@ -2,14 +2,18 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=f3689f5e4096dc54cb6f7dbb88c276b2de06881c
-expected_ios_tree=32c0cd07b7e628e3f4dcf1933ea829cc6f831e76
+expected_code_source=cea5ca7f1df5c274ce3846458a66eba1ce94cf41
+expected_ios_tree=a0edc016d81e4f73904c4527ad227b738a229f2a
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -35,9 +39,13 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption'}
-if len(expected) != 1 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly one held-completion diagnostic identity must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOnThenOff'}
+if len(expected) != 5 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly five warm-handoff/accounting diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -46,7 +54,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=1 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=5 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -141,8 +149,9 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=1 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# One unchanged test body localizes rejected injected commands; this cannot accept the app repair.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=5 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# Default then Issued must be qualified by actual order and runtime PID/module nonce.
+# Accounting cases use the unchanged nil-default workload; no full acceptance follows.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
