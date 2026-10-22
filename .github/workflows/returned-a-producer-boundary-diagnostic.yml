@@ -1,0 +1,76 @@
+name: Returned A producer boundary and cache proof on fresh serial Mac hosts
+on:
+  push:
+    branches: [diagnostic/native-reader-isolation]
+    paths: ['.github/workflows/returned-a-producer-boundary-diagnostic.yml', 'scripts/check-returned-a-producer-boundary-diagnostic.sh', 'tests/validation-shell/test_returned_a_producer_boundary_diagnostic.py']
+permissions:
+  contents: read
+concurrency:
+  group: offline-player-native-validation
+  cancel-in-progress: true
+jobs:
+  returned-a-producer-boundary-diagnostic:
+    name: Returned A boundary (${{ matrix.arm }})
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        arm: [trace-off, trace-on, service-reuse]
+    env:
+      RETURNED_A_DIAGNOSTIC_ARM: ${{ matrix.arm }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+          ref: ${{ github.sha }}
+      - name: Require the exact committed app and tests before diagnostic work
+        id: source_pin
+        run: |
+          mkdir -p artifacts/native
+          bash scripts/check-returned-a-producer-boundary-diagnostic.sh --verify-source
+      - name: Preserve portable launcher evidence bootstrap and export guards
+        id: harness
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+          python3 tests/validation-shell/test_simulator_boot_preflight.py
+          python3 tests/validation-shell/test_simulator_destination_resolution.py
+          python3 tests/validation-shell/test_native_xcresult_export.py
+          python3 tests/validation-shell/test_native_frame_read_diagnostic.py
+          python3 tests/validation-shell/test_returned_a_producer_boundary_diagnostic.py
+          python3 tests/validation-shell/test_preroll_crash_evidence.py
+      - name: Compile exact source with bounded SDK work before simulator boot
+        id: prepared
+        if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
+        run: bash scripts/check-returned-a-producer-boundary-diagnostic.sh --prepare
+      - name: Resolve within sixty seconds and boot within four minutes
+        id: simulator_boot
+        if: ${{ !cancelled() && steps.prepared.outcome == 'success' }}
+        run: |
+          simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
+          printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
+      - name: Run the same four promotion cases then only this arm benchmark
+        id: native
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
+        env:
+          SIMULATOR_DESTINATION: platform=iOS Simulator,id=${{ steps.simulator_boot.outputs.simulator_id }}
+        run: bash scripts/check-returned-a-producer-boundary-diagnostic.sh --prepared-native
+      - name: Export bounded raw structured records after an actual attempt
+        id: xcresult_export
+        if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
+        run: python3 scripts/export-native-xcresult.py
+      - name: Collect bounded case-attributed crash excerpts from this exact attempt
+        if: ${{ !cancelled() && steps.xcresult_export.outcome == 'success' }}
+        run: |
+          cp artifacts/native/native-frame-read.log artifacts/native/xcodebuild-test.log
+          python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
+      - name: Require the exact five passing cases prefix order and zero native exit
+        id: evidence
+        if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
+        run: bash scripts/check-returned-a-producer-boundary-diagnostic.sh --verify-results
