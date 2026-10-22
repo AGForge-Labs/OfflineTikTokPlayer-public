@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=cea5ca7f1df5c274ce3846458a66eba1ce94cf41
+expected_code_source=946635e4fa5dd63f2af55717bbab22fea8177f28
 expected_ios_tree=a0edc016d81e4f73904c4527ad227b738a229f2a
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
@@ -87,6 +87,12 @@ shopt -s nullglob dotglob nocaseglob
 existing_results=(artifacts/native/*.xcresult)
 shopt -u nullglob dotglob nocaseglob
 test "${#existing_results[@]}" -eq 0 || { printf '%s\n' 'A fresh job with no preexisting xcresult is required.' >&2; exit 2; }
+# This diagnostic prepares only the architecture exercised by its ARM runner.
+# Check the host without an SDK query; native device architecture is separate evidence.
+if ! host_arch="$(uname -m)" || [ "$host_arch" != arm64 ]; then
+  printf '%s\n' 'An arm64 host is required for this arm64 Simulator diagnostic.' >&2
+  exit 2
+fi
 export SWIFTC_MAXIMUM_DETERMINISM=1
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode on macOS is required.' >&2; exit 2; }
 if [ "$mode" = prepared-native ]; then
@@ -118,7 +124,7 @@ if [ "$mode" = prepare ]; then
     -destination 'generic/platform=iOS Simulator' -derivedDataPath artifacts/DerivedData \
     -jobs 1 -parallel-testing-enabled NO \
     SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
-    CODE_SIGNING_ALLOWED=NO build-for-testing 2>&1 | tee "$build_log"
+    ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build-for-testing 2>&1 | tee "$build_log"
   build_status=("${PIPESTATUS[@]}")
   set -e
   if [ "${build_status[0]}" -ne 0 ]; then exit "${build_status[0]}"; fi
@@ -160,7 +166,7 @@ xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlaye
   -jobs 1 -parallel-testing-enabled NO \
   -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
   "${arguments[@]}" SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
-  CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 printf '%s\t%s\n' "${pipeline_status[0]}" "${pipeline_status[1]}" > "$native_status"

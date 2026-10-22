@@ -103,6 +103,12 @@ class NativeFrameReadDiagnosticTests(unittest.TestCase):
             write(root / "native-output.log", "\n".join(lines) + "\n")
             write(scripts / "test-core.sh", '#!/usr/bin/env bash\nprintf "core\\n" >> "$FRAME_READ_ROOT/order.log"\nexit "${FRAME_READ_CORE_EXIT}"\n')
             write(scripts / "test-apple-buffer.sh", '#!/usr/bin/env bash\nprintf "apple\\n" >> "$FRAME_READ_ROOT/order.log"\nexit 0\n')
+            write(tools / "uname", '''#!/usr/bin/env bash
+printf '%s\\n' "$@" > "$FRAME_READ_ROOT/host.args"
+if [ "$*" != -m ]; then exit 98; fi
+printf '%s\\n' "$FRAME_READ_HOST"
+exit "$FRAME_READ_HOST_EXIT"
+''')
             write(tools / "git", '''#!/usr/bin/env bash
 if [ "$1" = rev-parse ]; then printf '%s\\n' "$FRAME_READ_TREE"; fi
 exit 0
@@ -155,6 +161,8 @@ exit "$FRAME_READ_TEE_EXIT"
             environment = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
                 FRAME_READ_ROOT=root.as_posix(), FRAME_READ_PYTHON=Path(sys.executable).as_posix(),
                 FRAME_READ_TREE=tree, FRAME_READ_SIMULATOR=SIMULATOR,
+                FRAME_READ_HOST="x86_64" if scenario == "wrong-host" else "arm64",
+                FRAME_READ_HOST_EXIT="7" if scenario == "host-query-failure" else "0",
                 FRAME_READ_NATIVE_EXIT="65" if scenario == "native-failure" else "0",
                 FRAME_READ_TEE_EXIT="17" if scenario in ("tee-failure", "build-tee-failure") else "0",
                 FRAME_READ_CORE_EXIT="19" if scenario == "core-failure" else "0",
@@ -177,7 +185,9 @@ exit "$FRAME_READ_TEE_EXIT"
                 self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
                 self.assertFalse((root / "native.args").exists())
                 self.assertFalse((root / "step.outputs").exists())
-                if scenario == "prepared-wrong-source":
+                if scenario == "prepared-wrong-host":
+                    environment["FRAME_READ_HOST"] = "x86_64"
+                elif scenario == "prepared-wrong-source":
                     prepared_receipt.write_text("0" * 40 + "\t" + tree + "\t0\t0\n")
                 elif scenario == "prepared-nonzero":
                     prepared_receipt.write_text(prepared_receipt.read_text().replace("\t0\t0", "\t29\t0"))
@@ -197,6 +207,10 @@ exit "$FRAME_READ_TEE_EXIT"
                 self.assertEqual(build[build.index("-jobs") + 1], "1")
                 self.assertEqual(build[build.index("-destination") + 1], "generic/platform=iOS Simulator")
                 self.assertIn("build-for-testing", build)
+                for setting in ("ARCHS=arm64", "ONLY_ACTIVE_ARCH=YES"):
+                    self.assertEqual(build.count(setting), 1)
+                self.assertFalse(any(value.startswith("ARCHS=") and value != "ARCHS=arm64" for value in build))
+                self.assertEqual((root / "host.args").read_text().splitlines(), ["-m"])
                 self.assertIn("CODE_SIGNING_ALLOWED=NO", build)
                 self.assertEqual((root / "order.log").read_text().splitlines(), ["driver", "core", "apple", "build"])
                 self.assertNotIn("-resultBundlePath", build, "Build bundles cannot contaminate native-only export")
@@ -205,7 +219,21 @@ exit "$FRAME_READ_TEE_EXIT"
                     self.assertEqual(prepared_receipt.read_text(), "", "A failed build cannot authorize native execution")
             if scenario == "prepared-success":
                 self.assertEqual((root / "order.log").read_text().splitlines(), ["driver", "core", "apple", "build"])
+            if scenario in ("wrong-host", "host-query-failure", "prepared-wrong-host"):
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("An arm64 host is required", result.stderr)
+                self.assertEqual((root / "host.args").read_text().splitlines(), ["-m"])
+                self.assertEqual(arguments, [])
+                if not scenario.startswith("prepared-"):
+                    self.assertFalse((root / "order.log").exists(), "Host rejection must precede driver/Core/SDK work")
+                    self.assertFalse((root / "build.args").exists())
+                else:
+                    self.assertEqual((root / "order.log").read_text().splitlines(), ["driver", "core", "apple", "build"])
             if arguments:
+                self.assertEqual((root / "host.args").read_text().splitlines(), ["-m"])
+                for setting in ("ARCHS=arm64", "ONLY_ACTIVE_ARCH=YES"):
+                    self.assertEqual(arguments.count(setting), 1)
+                self.assertFalse(any(value.startswith("ARCHS=") and value != "ARCHS=arm64" for value in arguments))
                 self.assertTrue((root / "helper.pid").is_file(), result.stdout + result.stderr)
                 self.assertTrue((root / "helper.stopped").is_file(), "Owned capture helper must be reaped")
                 self.assertEqual((root / "step.outputs").read_text(), "attempted=true\n")
@@ -347,6 +375,24 @@ exit "$FRAME_READ_TEE_EXIT"
                          {".github/workflows/native-frame-read-diagnostic.yml",
                           "scripts/check-native-frame-read-diagnostic.sh",
                           "tests/validation-shell/test_native_frame_read_diagnostic.py"})
+
+
+    def test_non_arm64_host_cannot_prepare_or_launch_native_work(self):
+        for mode in (None, "--prepare"):
+            with self.subTest(mode=mode):
+                result, arguments, _, verified = self.exercise("wrong-host", mode=mode)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(arguments, []); self.assertIsNone(verified)
+
+    def test_failed_host_query_cannot_authorize_prepare_even_with_arm64_stdout(self):
+        result, arguments, _, verified = self.exercise("host-query-failure", mode="--prepare")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(arguments, []); self.assertIsNone(verified)
+
+    def test_prepared_native_rechecks_host_before_helper_or_native_attempt(self):
+        result, arguments, _, verified = self.exercise("prepared-wrong-host", mode="--prepared-native")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(arguments, []); self.assertIsNone(verified)
 
 
 if __name__ == "__main__":
