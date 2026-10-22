@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=8ccfb8402f419e2d4672f17368e3a4178a447bdc
-expected_ios_tree=01a9664176177af252090786d03a60fcf98750c4
+expected_code_source=a7947a0536e27be4a13223d0b11ed0551e8953fd
+expected_ios_tree=138ded8401ffdb30fdb335d7dec426535a99fca5
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
@@ -21,6 +21,8 @@ cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitPausedSeekSupersedesPendingStart
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingPauseBeforeApplicationCannotResumeAndRecovers
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh
@@ -28,6 +30,9 @@ cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOnThenOff
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSupersededInitialOrdinaryCompletionCannotClearNewExplicitPausedSeek
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -65,15 +70,20 @@ expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitPausedSeekSupersedesPendingStart',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingPauseBeforeApplicationCannotResumeAndRecovers',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek'}
-if len(expected) != 19 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly nineteen cadence, initial-zero and playback identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOnThenOff',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSupersededInitialOrdinaryCompletionCannotClearNewExplicitPausedSeek'}
+if len(expected) != 24 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly twenty-four cadence, initial-zero, native-clock and source-output identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -82,7 +92,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=19 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=24 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -183,7 +193,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=19 expectedUI=0 expectedCore=105 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=24 expectedUI=0 expectedCore=107 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # This exact subset retains strict default-composition and cadence assertions.
 # Initial-zero, explicit seek/pause, stereo and restoration guards stay intact.
 # Default and startup-traced benchmarks keep their distinct original callbacks.
