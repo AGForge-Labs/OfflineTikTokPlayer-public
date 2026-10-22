@@ -4026,6 +4026,81 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "returned-A")
     }
 
+    #if DEBUG
+    private enum HeldCompletionFailureSentinel: Error { case afterHeldNativeCompletion }
+    #endif
+
+    func testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn() async throws {
+        #if DEBUG
+        let farTarget = SelectionVideoFixture.duration - 2
+        let completion = NaturalCompletionSeekHold(minimumTarget: farTarget, maximumTarget: SelectionVideoFixture.duration)
+        let buffer = PlaybackBuffer()
+        var caughtExpectedSentinel = false
+        defer {
+            completion.release()
+            print("NaturalSeekCompletionFailureCleanup schema=1 caughtExpectedSentinel=\(caughtExpectedSentinel) nativeCallbacks=\(completion.nativeCallbacks) nativeFinished=\(completion.nativeFinished.map { String($0) } ?? "missing") forwarded=\(completion.forwarded) cleanupAcknowledged=\(completion.cleanupAcknowledged) ownerLatchSet=\(Self.targetedFixtureOwnershipLost) latencyAcceptance=false xctestOutcome=external")
+            completion.dumpCommandTrace()
+        }
+        do {
+            try await withOwnedNaturalFixture(buffer: buffer,
+                seekVideo: { player, time, callback in completion.seek(player, time, callback) },
+                additionalCleanupAcknowledged: { completion.cleanupAcknowledged }) { fixture, audio, service, screen in
+                defer {
+                    service.onDebugVideoSeekStamp = nil; service.onDebugVideoSeekCompletionTerminal = nil
+                    completion.release()
+                }
+                service.isInteractingWithFeed = false
+                service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+                try await self.require({ self.explicitInitialReadySourceSettled(service, screen: screen)
+                    && service.preparedAudioCount == 2 && buffer.hasPrepared(fixture.bID) },
+                    "Real ready A and both complete Saved sources must precede the error-cleanup control")
+                self.assertSelection(service, fixture: fixture, id: fixture.aID)
+                let itemA = try XCTUnwrap(service.player.currentItem)
+                let aToken = try XCTUnwrap(audio.entry(for: fixture.aID)).token
+                let bToken = try XCTUnwrap(audio.entry(for: fixture.bID)).token
+                let before = service.audioSnapshot, request = service.debugInitialVideoReadyState.generation
+                XCTAssertGreaterThan(aToken, 0); XCTAssertGreaterThan(bToken, 0); XCTAssertNotEqual(aToken, bToken)
+                guard before.visit < Int64.max else { XCTFail("The real next visit must remain representable"); throw SelectionVideoTestFailure.timeout }
+                var issuedCount = 0, issueOverflow = false
+                service.onDebugVideoSeekStamp = { stamp in
+                    completion.recordIssued(stamp)
+                    guard completion.matchesIssued(stamp) else { return }
+                    if issuedCount < 8 { issuedCount += 1 } else { issueOverflow = true }
+                }
+                service.onDebugVideoSeekCompletionTerminal = { [weak completion] terminal in completion?.recordTerminal(terminal) }
+                completion.arm(player: service.player, request: request, generation: request,
+                    aToken: aToken, visit: before.visit + 1)
+                let setupDeadline = ProcessInfo.processInfo.systemUptime + 10
+                service.seek(farTarget)
+                let heldOnA = await self.waitUntil(timeout: max(0, setupDeadline - ProcessInfo.processInfo.systemUptime)) {
+                    let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                    return completion.isHolding && issuedCount == 1 && !issueOverflow && !completion.overflow
+                        && completion.rejectedCommands == 0 && state.generation == request
+                        && state.readyGeneration == request && state.syncingVideoGeneration == request
+                        && state.audioVisit == sample.visit && sample.token == aToken
+                        && sample.visit == before.visit + 1 && sample.selectionVersion > before.selectionVersion
+                        && sample.frame >= Int64((farTarget + 0.05) * 48_000) && !sample.ended
+                        && !audio.isSelectionPending(in: sample) && service.queue.currentID == fixture.aID
+                        && audio.selectedID == fixture.aID && service.player.currentItem === itemA
+                        && service.wantsToPlay && service.audioEngineRunning && !service.isLoading && !service.audioOnly
+                }
+                XCTAssertTrue(heldOnA, "The actual successful native completion must be held after fresh real A PCM acknowledges the far seek")
+                guard heldOnA else { throw SelectionVideoTestFailure.timeout }
+                XCTAssertEqual(completion.nativeCallbacks, 1); XCTAssertEqual(completion.forwarded, 0)
+                XCTAssertFalse(completion.cleanupAcknowledged, "The held, unforwarded callback cannot acknowledge cleanup")
+                throw HeldCompletionFailureSentinel.afterHeldNativeCompletion
+            }
+            XCTFail("The exact held-completion sentinel must survive owned cleanup")
+        } catch HeldCompletionFailureSentinel.afterHeldNativeCompletion {
+            caughtExpectedSentinel = true
+            XCTAssertTrue(completion.cleanupAcknowledged, "The matching real service task must return during owned cleanup")
+            XCTAssertFalse(Self.targetedFixtureOwnershipLost, "A fully acknowledged error cleanup must not poison the owner latch")
+        }
+        #else
+        XCTFail("Real held-completion error cleanup requires DEBUG ownership hooks")
+        #endif
+    }
+
     func testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption() async throws {
         #if DEBUG
         let farTarget = SelectionVideoFixture.duration - 2
@@ -4094,10 +4169,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             var issued: PlaybackService.DebugVideoSeekStamp?, issuedCount = 0, issueOverflow = false
             service.onDebugVideoSeekStamp = { stamp in
                 completion.recordIssued(stamp)
-                guard stamp.request == request, stamp.requestedPosition >= farTarget,
-                      stamp.requestedPosition < SelectionVideoFixture.duration else { return }
+                guard completion.matchesIssued(stamp) else { return }
                 if issuedCount < 8 { issuedCount += 1; if issued == nil { issued = stamp } }
                 else { issueOverflow = true }
+            }
+            service.onDebugVideoSeekCompletionTerminal = { [weak completion] terminal in
+                completion?.recordTerminal(terminal)
             }
             service.shouldDebugDeferAudioVisit = { generation in
                 guard holdAdoption, generation == request,
@@ -4119,12 +4196,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 holdAdoption = false
                 service.shouldDebugDeferAudioVisit = nil
                 service.onDebugVideoSeekStamp = nil
+                service.onDebugVideoSeekCompletionTerminal = nil
                 service.onDebugVideoRateHandoff = nil
                 service.onDebugVideoRenderStamp = nil
+                // The issued callback captured its terminal observer before this clear.
                 // Forward even if teardown wins before the actual SDK callback.
                 completion.release()
             }
-            completion.arm(player: service.player)
+            completion.arm(player: service.player, request: request, generation: request,
+                aToken: aToken, visit: beforeSeek.visit + 1)
             let setupDeadline = ProcessInfo.processInfo.systemUptime + 10
             service.seek(farTarget)
             let heldOnA = await waitUntil(timeout: max(0, setupDeadline - ProcessInfo.processInfo.systemUptime)) {
@@ -4248,7 +4328,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugVideoSeekStamp = nil
             XCTAssertTrue(completionQualified, "The actual A completion must finish while only the healthy B adoption gate remains held")
             guard completionQualified else { throw SelectionVideoTestFailure.timeout }
-            completion.acknowledgeDelivery()
+            XCTAssertTrue(completion.cleanupAcknowledged,
+                "The exact real completion task must return before cleanup is acknowledged")
             stage = 5
             // Intended RED: do not allow A's completed seek to install/activate its
             // stale ticket using the position of the already audible natural B.
@@ -4310,8 +4391,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let playerMatches: Bool, numeric: Bool, lowerBoundMatches: Bool, upperBoundMatches: Bool
             let armed: Bool, intercepted: Bool, eligible: Bool
         }
+        private struct OwnerBinding {
+            let request: Int, generation: Int, aToken: Int
+            let visit: Int64
+        }
         private let minimumTarget: Double, maximumTarget: Double
         private var expectedPlayer: ObjectIdentifier?
+        private var ownerBinding: OwnerBinding?
+        private var interceptedStamp: PlaybackService.DebugVideoSeekStamp?
+        private var terminalEvents = 0
         private var armed = false, released = false, deliveryObserved = false
         private var callback: (@Sendable (Bool) -> Void)?
         private var issueForNextCommand: PlaybackService.DebugVideoSeekStamp?
@@ -4323,17 +4411,39 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         private(set) var targetSeconds: Double?
         var isHolding: Bool { intercepted && nativeFinished == true && callback != nil && !released }
         var cleanupAcknowledged: Bool {
-            !intercepted || (nativeCallbacks == 1 && forwarded == 1 && callback == nil && !overflow && deliveryObserved)
+            !intercepted || (nativeCallbacks == 1 && forwarded == 1 && callback == nil
+                && !overflow && terminalEvents == 1 && deliveryObserved)
         }
         init(minimumTarget: Double, maximumTarget: Double) {
             self.minimumTarget = minimumTarget; self.maximumTarget = maximumTarget
             commandTrace.reserveCapacity(8)
         }
-        func arm(player: AVPlayer) { expectedPlayer = ObjectIdentifier(player); armed = true }
+        func arm(player: AVPlayer, request: Int, generation: Int, aToken: Int, visit: Int64) {
+            expectedPlayer = ObjectIdentifier(player)
+            ownerBinding = OwnerBinding(request: request, generation: generation, aToken: aToken, visit: visit)
+            armed = true
+        }
         func recordIssued(_ stamp: PlaybackService.DebugVideoSeekStamp) { issueForNextCommand = stamp }
+        // Shared by issuedCount and interception, before the real native seek.
+        // The existing 80 ms position allowance binds the actual source-visit target.
+        func matchesIssued(_ stamp: PlaybackService.DebugVideoSeekStamp) -> Bool {
+            guard armed, let ownerBinding, stamp.force, stamp.reason == .sourceVisit,
+                  stamp.request == ownerBinding.request, stamp.generation == ownerBinding.generation,
+                  stamp.cachedAudioToken == ownerBinding.aToken, stamp.cachedAudioVisit == ownerBinding.visit,
+                  stamp.requestedPosition.isFinite,
+                  abs(stamp.requestedPosition - minimumTarget) <= 0.080,
+                  stamp.requestedPosition < maximumTarget else { return false }
+            let quantized = CMTime(seconds: stamp.requestedPosition, preferredTimescale: 48_000)
+            return quantized.isNumeric && quantized.timescale == 48_000
+                && abs(quantized.seconds - minimumTarget) <= 0.080 && quantized.seconds < maximumTarget
+        }
         func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
+            let issued = issueForNextCommand
+            let quantized = issued.map { CMTime(seconds: $0.requestedPosition, preferredTimescale: 48_000) }
             let eligible = armed && !intercepted && expectedPlayer == ObjectIdentifier(player)
-                && time.isNumeric && time.seconds >= minimumTarget && time.seconds < maximumTarget
+                && issued.map { matchesIssued($0) } == true && time.isNumeric
+                && time.timescale == 48_000 && quantized?.isNumeric == true
+                && time.value == quantized?.value && time.epoch == quantized?.epoch
             let target = time.isNumeric ? time.seconds : nil
             if commandTrace.count < 8 {
                 commandTrace.append(CommandTrace(issued: issueForNextCommand, target: target,
@@ -4347,7 +4457,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if armed, !intercepted, !eligible {
                 if rejectedCommands < 8 { rejectedCommands += 1 } else { overflow = true }
             }
-            if eligible { intercepted = true; targetSeconds = time.seconds }
+            if eligible { intercepted = true; interceptedStamp = issued; targetSeconds = time.seconds }
             // Identical real SDK seek/tolerances to the default injection. There
             // is no synthetic completion, reader gate, second item or player.
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
@@ -4368,13 +4478,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if forwarded == 0 { forwarded = 1 } else { overflow = true }
             callback(nativeFinished)
         }
-        func acknowledgeDelivery() {
-            deliveryObserved = nativeCallbacks == 1 && forwarded == 1 && callback == nil && !overflow
+        func recordTerminal(_ terminal: PlaybackService.DebugVideoSeekCompletionTerminal) {
+            guard let interceptedStamp, terminal.request == interceptedStamp.request,
+                  terminal.nativeSeekTicket == interceptedStamp.nativeSeekTicket else { return }
+            if terminalEvents < 2 { terminalEvents += 1 } else { overflow = true }
+            if terminalEvents != 1 { overflow = true }
+            deliveryObserved = terminalEvents == 1 && nativeCallbacks == 1
+                && forwarded == 1 && callback == nil && !overflow
         }
         // Dump only after owned cleanup, including when the original setup throws.
         // This is command metadata, not an additional SDK position/ownership read.
         func dumpCommandTrace() {
-            print("NaturalSeekCompletionInjectionCoverage schema=1 retained=\(commandTrace.count) capacity=8 dropped=\(traceDropped) saturated=\(traceSaturated) minimumTarget=\(minimumTarget) maximumTarget=\(maximumTarget) setupGuards=unchanged playbackAcceptance=false")
+            print("NaturalSeekCompletionInjectionCoverage schema=1 retained=\(commandTrace.count) capacity=8 dropped=\(traceDropped) saturated=\(traceSaturated) minimumTarget=\(minimumTarget) maximumTarget=\(maximumTarget) targetAllowanceSeconds=0.080 interceptedRequest=\(interceptedStamp.map { String($0.request) } ?? "missing") interceptedNativeSeekTicket=\(interceptedStamp.map { String($0.nativeSeekTicket) } ?? "missing") terminalEvents=\(terminalEvents) deliveryObserved=\(deliveryObserved) callbackPending=\(callback != nil) deliveryScope=real-service-task-return interventionOwner=forced-source-visit playbackGuards=unchanged playbackAcceptance=false")
             for (index, command) in commandTrace.enumerated() {
                 let issue = command.issued
                 print("NaturalSeekCompletionInjection schema=1 index=\(index) issuePresent=\(issue != nil) issueReason=\(issue?.reason.rawValue ?? -1) issueRequest=\(issue?.request ?? -1) issueGeneration=\(issue?.generation ?? -1) issueSeekTicket=\(issue.map { String($0.nativeSeekTicket) } ?? "missing") issueTarget=\(issue.map { String($0.requestedPosition) } ?? "missing") issueForce=\(issue.map { String($0.force) } ?? "missing") issueCachedToken=\(issue.map { String($0.cachedAudioToken) } ?? "missing") issueCachedVisit=\(issue.map { String($0.cachedAudioVisit) } ?? "missing") nativeTarget=\(command.target.map { String($0) } ?? "missing") playerMatches=\(command.playerMatches) numeric=\(command.numeric) lowerBoundMatches=\(command.lowerBoundMatches) upperBoundMatches=\(command.upperBoundMatches) armed=\(command.armed) alreadyIntercepted=\(command.intercepted) eligible=\(command.eligible) playbackAcceptance=false")
@@ -4738,7 +4853,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let decoder = ProductionSelectionShutdown()
         service.debugStopPreparation { preparation.complete(true) }
         audio.debugShutdown { decoder.complete($0) }
-        let returned = await waitUntil(timeout: 3) { preparation.result != nil && decoder.result != nil }
+        let returned = await waitUntil(timeout: 3) {
+            preparation.result != nil && decoder.result != nil && additionalCleanupAcknowledged()
+        }
         let canRemove = returned && preparation.result == true && decoder.result == true
             && additionalCleanupAcknowledged()
         print("NaturalFixtureCleanup schema=1 ownedTasksJoined=\(preparation.result == true) decoderClosed=\(decoder.result == true) removeAllowed=\(canRemove) originalErrorRetained=\(originalError != nil) syntheticFilesRetained=\(!canRemove) sdkInternalQuiescence=unverified olderCancelledTasks=unverified")

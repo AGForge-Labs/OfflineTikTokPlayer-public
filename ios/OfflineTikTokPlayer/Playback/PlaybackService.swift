@@ -156,6 +156,13 @@ final class PlaybackService: NSObject {
         let videoAllowed: Bool
     }
     @ObservationIgnored var onDebugVideoSeekStamp: ((DebugVideoSeekStamp) -> Void)?
+    struct DebugVideoSeekCompletionTerminal: Sendable {
+        let request: Int
+        let nativeSeekTicket: UInt64
+    }
+    // Nil-default scalar observation of the existing real completion task's return.
+    @ObservationIgnored var onDebugVideoSeekCompletionTerminal:
+        (@MainActor @Sendable (DebugVideoSeekCompletionTerminal) -> Void)?
     @ObservationIgnored private var debugVideoSeekReason: DebugVideoSeekReason = .unattributed
     enum DebugVideoStartupKind: Int, Sendable {
         case itemReadyEvent = 0, setRate = 1, playImmediately = 2, startSkipped = 3, firstFrameEvent = 4, readyAccepted = 5
@@ -1467,8 +1474,18 @@ final class PlaybackService: NSObject {
                 audioLoading: audioLoadingID != nil, canPlay: intent.canPlay, videoAllowed: videoAllowed))
         }
         #endif
+        #if DEBUG
+        let completionTerminalObserver = onDebugVideoSeekCompletionTerminal
+        #endif
         seekVideo(player, CMTime(seconds: position, preferredTimescale: 48_000)) { [weak self, weak item] finished in
             Task { @MainActor in
+                #if DEBUG
+                // Declared first: runs after every original task defer, on every exit.
+                defer {
+                    completionTerminalObserver?(DebugVideoSeekCompletionTerminal(
+                        request: request, nativeSeekTicket: videoSeek))
+                }
+                #endif
                 guard let self else { return }
                 self.continuousPiP.beginReadinessUpdates()
                 defer { self.continuousPiP.endReadinessUpdates() }
