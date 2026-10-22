@@ -341,7 +341,8 @@ final class PlaybackService: NSObject {
         var item: ObjectIdentifier?
         var ticket: ContinuousPictureInPicture.PresentationTicket?
         var nativeSeek: UInt64?
-        var completedEpoch: UInt64?
+        var completedTimeline: ContinuousPictureInPicture.ActiveTimelineReceipt?
+        var completedEpoch: UInt64? { completedTimeline?.imageEpoch }
     }
     @ObservationIgnored private var pausedExplicitVisitOwnership: PausedExplicitVisitOwnership?
     #if DEBUG
@@ -1280,25 +1281,33 @@ final class PlaybackService: NSObject {
         return owner
     }
 
-    // Consume before adoption side effects. Only a completed exact command with
-    // an existing current frame may keep its epoch across its delayed PCM ACK.
+    // Consume before adoption side effects. A completed exact command keeps its
+    // active timeline across a delayed PCM ACK, including a pending first image.
     private func consumePausedExplicitVisit(_ sample: ContinuousPCMRenderer.Snapshot,
         entry: ContinuousAudioPlayer.Entry) -> Bool {
         let owner = pausedExplicitVisitOwnership
         pausedExplicitVisitOwnership = nil
         guard let owner, let item = observedItem, let ticket = owner.ticket,
-              let nativeSeek = owner.nativeSeek, let epoch = owner.completedEpoch,
+              let nativeSeek = owner.nativeSeek, let timeline = owner.completedTimeline,
               ownsPausedExplicitVisit(owner, item: item),
               syncingVideoGeneration == nil, syncingVideoSeek == nil,
+              timeline.ticket == ticket, timeline.seekSerial == nativeSeek,
+              continuousPiP.activeTimelineReceipt(for: ticket) == timeline,
               entry.id == owner.mediaID, entry.token == owner.token,
               sample.token == owner.token, sample.visit == owner.visit,
               sample.selectionVersion == owner.selectionVersion, !sample.ended,
               !continuousAudio.isSelectionPending(in: sample), sample.frame >= 0,
-              abs(Double(sample.frame) / 48_000 - owner.target) <= 1.0 / 48_000,
-              let receipt = continuousPiP.currentFrameReceipt(for: ticket),
-              receipt.seekSerial == nativeSeek, receipt.imageEpoch == epoch,
-              let position = continuousPiP.lastFramePositionSeconds, position.isFinite,
-              abs(position - owner.target) < 0.080 else { return false }
+              abs(Double(sample.frame) / 48_000 - owner.target) <= 1.0 / 48_000 else { return false }
+        if let frame = continuousPiP.currentFrameReceipt(for: ticket) {
+            guard frame.seekSerial == nativeSeek, frame.imageEpoch == timeline.imageEpoch,
+                  let position = continuousPiP.lastFramePositionSeconds, position.isFinite,
+                  abs(position - owner.target) < 0.080 else { return false }
+        } else {
+            // A copied-but-unsubmitted paused image can require a fresh seek to
+            // reacquire it. Preserve only a genuinely unacquired first image.
+            guard continuousPiP.lastFramePositionSeconds == nil,
+                  continuousPiP.lastCopiedFramePositionSeconds == nil else { return false }
+        }
         return true
     }
 
@@ -1962,10 +1971,11 @@ final class PlaybackService: NSObject {
                        self.pausedExplicitVisitOwnership == owner,
                        self.ownsPausedExplicitVisit(owner, item: item),
                        owner.ticket == ticket, owner.nativeSeek == videoSeek,
-                       let epoch = self.continuousPiP.frameReadinessEpoch(for: ticket) {
-                        // Completion need not have a frame yet. The delayed ACK
-                        // must still find a current receipt in this exact epoch.
-                        owner.completedEpoch = epoch
+                       let timeline = self.continuousPiP.activeTimelineReceipt(for: ticket),
+                       timeline.seekSerial == videoSeek {
+                        // Seal actual post-activation ownership without granting
+                        // frame credit. Any later output/epoch/seek change refuses it.
+                        owner.completedTimeline = timeline
                         self.pausedExplicitVisitOwnership = owner
                     }
                 }

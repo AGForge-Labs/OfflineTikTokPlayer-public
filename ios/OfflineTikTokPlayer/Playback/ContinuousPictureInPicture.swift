@@ -28,6 +28,13 @@ final class ContinuousPictureInPicture: NSObject {
         let imageEpoch: UInt64
         let seekSerial: UInt64
     }
+    /// Ownership of an installed, active timeline. This never credits an image.
+    struct ActiveTimelineReceipt: Equatable, Sendable {
+        let ticket: PresentationTicket
+        let output: ObjectIdentifier
+        let imageEpoch: UInt64
+        let seekSerial: UInt64
+    }
     private var imageEpoch: UInt64 = 0
     private var imageEpochSaturated = false
     private var submittedReceipt: CurrentFrameReceipt?
@@ -70,6 +77,21 @@ final class ContinuousPictureInPicture: NSObject {
     func currentFrameReceipt(for ticket: PresentationTicket) -> CurrentFrameReceipt? {
         guard let receipt = submittedReceipt, receipt.ticket == ticket,
               ownsFramePull(receipt) else { return nil }
+        return receipt
+    }
+    /// Cached proof only. A completed paused seek may still await its first image.
+    func activeTimelineReceipt(for ticket: PresentationTicket) -> ActiveTimelineReceipt? {
+        guard owns(ticket), presentationActive, frameFeedEnabled,
+              installedTimeline == ticket, activeSeekTicket == nil,
+              !imageEpochSaturated, let videoOutput else { return nil }
+        let receipt = ActiveTimelineReceipt(ticket: ticket, output: ObjectIdentifier(videoOutput),
+            imageEpoch: imageEpoch, seekSerial: seekTicket)
+        // A missing current-frame receipt must not launder stale submitted credit.
+        if let submittedReceipt {
+            guard submittedReceipt.ticket == receipt.ticket, submittedReceipt.output == receipt.output,
+                  submittedReceipt.imageEpoch == receipt.imageEpoch,
+                  submittedReceipt.seekSerial == receipt.seekSerial else { return nil }
+        }
         return receipt
     }
     private func ownsFramePull(_ receipt: CurrentFrameReceipt) -> Bool {

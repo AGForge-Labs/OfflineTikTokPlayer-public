@@ -4290,6 +4290,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         var receipt: String?
         var pendingImageReceipt: String?
+        var warmPreparationReceipt: String?
+        var warmPreparationTask: Task<Void, Never>?
+        var warmPreparationStarted = false, warmPreparationSettled = false
+        var warmPreparationResult: Result<ContinuousAudioPlayer.Entry, Error>?
+        weak var warmPreparationAudio: ContinuousAudioPlayer?
         let diagnostic = beforeInitialStart || pausedTarget == nil ? InitialClockTransferTrace() : nil
         var coldObservation: (probe: NaturalNativeRunwayProbe, reached: Bool)?
         defer {
@@ -4297,6 +4302,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if let coldObservation { coldObservation.probe.dumpAndAssert(reached: coldObservation.reached) }
             diagnostic?.dumpAndAssert(); if let receipt { print(receipt) }
             if let pendingImageReceipt { print(pendingImageReceipt) }
+            if let warmPreparationReceipt { print(warmPreparationReceipt) }
+            warmPreparationTask?.cancel()
         }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
@@ -4304,7 +4311,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         let buffer = PlaybackBuffer()
         let traceCold = traceColdBoundary && beforeInitialStart
-        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceCold, buffer: buffer) { fixture, audio, service, screen in
+        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceCold, buffer: buffer,
+            additionalCleanupAcknowledged: {
+                guard completedOwnerPendingImage, warmPreparationStarted else { return true }
+                guard warmPreparationSettled, let audio = warmPreparationAudio else { return false }
+                let state = audio.debugPreparationState
+                return state.activeCalls == 0 && state.sharedTasks == 0 && state.reservedSlots == 0
+                    && !state.counterOverflowed
+            }) { fixture, audio, service, screen in
             if traceCold { service.debugInitialLoadPhaseEnabled = true }
             let request = service.debugInitialVideoReadyState.generation + 1
             var starts = 0, overflow = false, qualified = false
@@ -4409,6 +4423,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             defer {
                 holdPendingImage = false; holdPendingImageAdoption = false
                 if completedOwnerPendingImage {
+                    warmPreparationTask?.cancel()
                     service.shouldDebugAcquireVideoFrame = nil
                     service.shouldDebugDeferAudioVisit = nil
                 }
@@ -4426,6 +4441,58 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 let sample = audio.renderer.snapshot
                 coldRenderer = sample
                 coldProbe.sample(audio: audio, service: service, renderer: sample, force: true)
+            }
+            if completedOwnerPendingImage {
+                // Warm state-contract qualification only. Original cold identities never enter here.
+                warmPreparationAudio = audio
+                audio.setWindow([fixture.aID]) // finishPreparation otherwise evicts an unselected empty-window entry.
+                let savedAURL = try XCTUnwrap(fixture.savedURLs[fixture.aID])
+                let before = audio.renderer.snapshot
+                let generationBefore = service.debugInitialVideoReadyState.generation
+                let unstarted = audio.selectedID == nil && !audio.graph.engine.isRunning
+                    && before.token == 0 && before.frame == 0 && before.underrunFrames == 0
+                    && starts == 0 && readyAccepts == 0 && !userSeekIssued
+                XCTAssertTrue(unstarted, "Warm PCM preparation must precede all selection, engine progress and ready intervention")
+                guard unstarted else { throw SelectionVideoTestFailure.timeout }
+                let began = ProcessInfo.processInfo.systemUptime
+                warmPreparationStarted = true
+                warmPreparationTask = Task { @MainActor in
+                    defer { warmPreparationSettled = true }
+                    do {
+                        let entry = try await audio.prepare(id: fixture.aID, url: savedAURL, currentPriority: true)
+                        warmPreparationResult = .success(entry)
+                    } catch { warmPreparationResult = .failure(error) }
+                }
+                // This is an owned caller; timeout cancels it before fixture cleanup begins.
+                let settled = await waitUntil(timeout: 3) { warmPreparationSettled }
+                let elapsed = ProcessInfo.processInfo.systemUptime - began
+                warmPreparationReceipt = "WarmCompletedOwnerPreparation schema=1 prepared=false callerSettled=\(settled) resultPresent=\(warmPreparationResult != nil) maximumSeconds=3 observedSeconds=\(elapsed) preparationCurrentPriority=true savedAURL=true selectionBeforeStart=false coldStartupAcceptance=false output=after-owned-cleanup-attempt xctestOutcome=external"
+                guard settled else {
+                    warmPreparationTask?.cancel()
+                    XCTFail("Actual Saved A PCM preparation must settle within the bounded warm setup")
+                    throw SelectionVideoTestFailure.timeout
+                }
+                let prepared = try XCTUnwrap(warmPreparationResult).get()
+                let cached = audio.entry(for: fixture.aID)
+                let after = audio.renderer.snapshot
+                let state = audio.debugPreparationState
+                let stillUnstarted = audio.selectedID == nil && !audio.graph.engine.isRunning
+                    && after.token == before.token && after.visit == before.visit
+                    && after.selectionVersion == before.selectionVersion && after.frame == before.frame
+                    && after.underrunFrames == 0
+                    && service.debugInitialVideoReadyState.generation == generationBefore
+                    && starts == 0 && readyAccepts == 0 && !userSeekIssued
+                let preparedExactly = prepared.id == fixture.aID && prepared.token > 0 && prepared.frames > 0
+                    && prepared.slot >= 0 && prepared.slot < 3
+                    && cached?.id == prepared.id && cached?.token == prepared.token
+                    && cached?.slot == prepared.slot && cached?.frames == prepared.frames
+                    && audio.preparedCount == 1
+                    && state.activeCalls == 0 && state.sharedTasks == 0 && state.reservedSlots == 0
+                    && !state.counterOverflowed
+                XCTAssertTrue(stillUnstarted, "PCM preparation cannot stand in for selected/rendered startup")
+                XCTAssertTrue(preparedExactly, "The real completed Saved A cache entry must survive until the original start")
+                warmPreparationReceipt = "WarmCompletedOwnerPreparation schema=1 prepared=\(preparedExactly && stillUnstarted) callerSettled=\(settled) resultPresent=true maximumSeconds=3 observedSeconds=\(elapsed) preparationCurrentPriority=true savedAURL=true token=\(prepared.token) slot=\(prepared.slot) frames=\(prepared.frames) cacheEntries=\(audio.preparedCount) activeCalls=\(state.activeCalls) sharedTasks=\(state.sharedTasks) reservedSlots=\(state.reservedSlots) overflow=\(state.counterOverflowed) rendererTokenBefore=\(before.token) rendererTokenAfter=\(after.token) rendererFrameBefore=\(before.frame) rendererFrameAfter=\(after.frame) selectionBeforeStart=false coldStartupAcceptance=false originalPredicates=unchanged output=after-owned-cleanup-attempt xctestOutcome=external"
+                guard preparedExactly, stillUnstarted else { throw SelectionVideoTestFailure.timeout }
             }
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
             if completedOwnerPendingImage {

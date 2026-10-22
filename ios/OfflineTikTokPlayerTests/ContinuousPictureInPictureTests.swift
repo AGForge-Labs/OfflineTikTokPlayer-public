@@ -10,6 +10,111 @@ import UIKit
 
 @MainActor
 final class ContinuousPictureInPictureTests: XCTestCase {
+    func testActiveTimelineReceiptRequiresLiveOwnerWithoutGrantingPendingImageCredit() async throws {
+        #if DEBUG
+        let urlA = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let urlB = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-b", withExtension: "mp4"))
+        let itemA = AVPlayerItem(url: urlA), itemB = AVPlayerItem(url: urlB)
+        let bridge = ContinuousPictureInPicture()
+        var ownedA: ContinuousPictureInPicture.PreparedVideoResource?
+        var ownedB: ContinuousPictureInPicture.PreparedVideoResource?
+        // Established before every resource unwrap/await. No player, window or temporary media.
+        defer {
+            bridge.shouldDebugAcquireFrame = nil; bridge.onFrameAcquisition = nil
+            bridge.invalidate(); ownedA?.retire(); ownedB?.retire()
+            XCTAssertTrue(itemA.outputs.isEmpty); XCTAssertTrue(itemB.outputs.isEmpty)
+            XCTAssertNil(itemA.videoComposition); XCTAssertNil(itemB.videoComposition)
+        }
+        let planA = try await ContinuousPictureInPicture.prepareVideoResource(for: itemA)
+        ownedA = planA.install()
+        let resourceA = try XCTUnwrap(ownedA), outputA = try XCTUnwrap(resourceA.output)
+        let planB = try await ContinuousPictureInPicture.prepareVideoResource(for: itemB)
+        ownedB = planB.install()
+        let resourceB = try XCTUnwrap(ownedB), outputB = try XCTUnwrap(resourceB.output)
+        XCTAssertFalse(outputA === outputB)
+        XCTAssertEqual(itemA.outputs.count, 1); XCTAssertTrue(itemA.outputs.first === outputA)
+        XCTAssertEqual(itemB.outputs.count, 1); XCTAssertTrue(itemB.outputs.first === outputB)
+        var vetoCalls = 0, acquisitionCalls = 0
+        bridge.shouldDebugAcquireFrame = { _ in vetoCalls += 1; return false }
+        bridge.onFrameAcquisition = { _, _ in acquisitionCalls += 1 }
+        @MainActor func assertNoImage(_ ticket: ContinuousPictureInPicture.PresentationTicket) {
+            XCTAssertNil(bridge.currentFrameReceipt(for: ticket))
+            XCTAssertNil(bridge.lastCopiedFramePositionSeconds)
+            XCTAssertNil(bridge.lastFramePositionSeconds)
+            XCTAssertEqual(bridge.submittedFrameCount, 0)
+            XCTAssertFalse(bridge.isVideoReadyForDisplay)
+            XCTAssertEqual(acquisitionCalls, 0)
+        }
+
+        let ticketA = try XCTUnwrap(bridge.setCurrentItem(itemA, preparedVideo: resourceA))
+        XCTAssertTrue(resourceA.isBorrowed); XCTAssertFalse(resourceB.isBorrowed)
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA), "Adoption alone cannot authorize a timeline")
+        XCTAssertTrue(bridge.installTimeline(ticketA, positionSeconds: 0.4, durationSeconds: 30, isPlaying: false))
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA), "Installed but inactive is not an active owner")
+        XCTAssertTrue(bridge.activate(ticketA))
+        let initial = try XCTUnwrap(bridge.activeTimelineReceipt(for: ticketA))
+        XCTAssertEqual(initial.ticket, ticketA); XCTAssertEqual(initial.output, ObjectIdentifier(outputA))
+        XCTAssertEqual(initial.seekSerial, 0)
+        XCTAssertEqual(bridge.activeTimelineReceipt(for: ticketA), initial)
+        XCTAssertGreaterThan(vetoCalls, 0, "Actual activation must reach the acquisition veto before any SDK pull")
+        assertNoImage(ticketA)
+
+        bridge.flushForSeek()
+        let flushed = try XCTUnwrap(bridge.activeTimelineReceipt(for: ticketA))
+        XCTAssertEqual(flushed.ticket, initial.ticket); XCTAssertEqual(flushed.output, initial.output)
+        XCTAssertEqual(flushed.seekSerial, initial.seekSerial)
+        XCTAssertGreaterThan(flushed.imageEpoch, initial.imageEpoch)
+        XCTAssertNotEqual(flushed, initial, "A held receipt cannot survive an image-epoch flush")
+        assertNoImage(ticketA)
+
+        let seek = bridge.beginSeek()
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA), "An active native seek withdraws timeline eligibility")
+        // Mirror real completion ordering: install while gated, release the matching seek, then activate.
+        XCTAssertTrue(bridge.installTimeline(ticketA, positionSeconds: 0.4, durationSeconds: 30, isPlaying: false))
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA))
+        XCTAssertFalse(bridge.activate(ticketA), "Activation cannot bypass the active seek barrier")
+        bridge.completeSeek(seek)
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA), "Releasing a barrier cannot activate an installed timeline")
+        XCTAssertTrue(bridge.activate(ticketA))
+        let afterSeek = try XCTUnwrap(bridge.activeTimelineReceipt(for: ticketA))
+        XCTAssertEqual(afterSeek.ticket, ticketA); XCTAssertEqual(afterSeek.output, initial.output)
+        XCTAssertEqual(afterSeek.seekSerial, seek); XCTAssertGreaterThan(afterSeek.seekSerial, initial.seekSerial)
+        XCTAssertGreaterThan(afterSeek.imageEpoch, flushed.imageEpoch)
+        XCTAssertNotEqual(afterSeek, flushed)
+        assertNoImage(ticketA)
+
+        bridge.suspendFrameFeed()
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA), "Suspension withdraws eligibility without manufacturing an image")
+        bridge.resumeFrameFeed()
+        XCTAssertEqual(bridge.activeTimelineReceipt(for: ticketA), afterSeek,
+            "Without a source/seek/flush change, resumption can restore the same timeline owner")
+        assertNoImage(ticketA)
+
+        let ticketB = try XCTUnwrap(bridge.setCurrentItem(itemB, preparedVideo: resourceB))
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA), "A departing ticket never qualifies the new source/output")
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketB))
+        XCTAssertFalse(resourceA.isBorrowed); XCTAssertTrue(resourceB.isBorrowed)
+        XCTAssertTrue(resourceA.isAttached); XCTAssertTrue(resourceB.isAttached)
+        XCTAssertEqual(itemA.outputs.count, 1); XCTAssertEqual(itemB.outputs.count, 1)
+        XCTAssertTrue(bridge.installTimeline(ticketB, positionSeconds: 0.4, durationSeconds: 30, isPlaying: false))
+        XCTAssertTrue(bridge.activate(ticketB))
+        let replacement = try XCTUnwrap(bridge.activeTimelineReceipt(for: ticketB))
+        XCTAssertEqual(replacement.ticket, ticketB); XCTAssertEqual(replacement.output, ObjectIdentifier(outputB))
+        XCTAssertNotEqual(replacement.output, initial.output); XCTAssertNotEqual(replacement, afterSeek)
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketA))
+        assertNoImage(ticketB)
+        bridge.invalidate()
+        XCTAssertNil(bridge.activeTimelineReceipt(for: ticketB))
+        resourceA.retire(); resourceB.retire()
+        XCTAssertFalse(resourceA.isBorrowed); XCTAssertFalse(resourceB.isBorrowed)
+        XCTAssertFalse(resourceA.isAttached); XCTAssertFalse(resourceB.isAttached)
+        XCTAssertNil(resourceA.output); XCTAssertNil(resourceB.output)
+        print("ActiveTimelineReceiptLifecycle schema=1 realBundledItems=2 noPlayer=true noWindow=true noTemporaryMedia=true initialEpoch=\(initial.imageEpoch) flushedEpoch=\(flushed.imageEpoch) seekEpoch=\(afterSeek.imageEpoch) seekSerial=\(afterSeek.seekSerial) vetoCalls=\(vetoCalls) acquisitionCalls=\(acquisitionCalls) submitted=\(bridge.submittedFrameCount) frameCredit=absent latencyAcceptance=false xctestOutcome=external")
+        #else
+        XCTFail("The pending-image timeline contract requires the DEBUG acquisition veto")
+        #endif
+    }
+
     func testOnlyExplicitPiPCommandsReachAudioIntent() {
         let bridge = ContinuousPictureInPicture()
         defer { bridge.invalidate() }
