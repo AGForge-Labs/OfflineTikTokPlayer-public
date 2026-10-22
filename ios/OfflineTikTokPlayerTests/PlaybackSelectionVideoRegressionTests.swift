@@ -2119,7 +2119,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             NativeClockHandoffTrace(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation)
         }
         if let enabled = traceClockHandoff {
-            print("NativeClockHandoffInstrumentationBundle schema=2 enabled=\(enabled) actualRateAndOrdinaryRead=true snapshotReadReceipt=\(enabled) firstAlignedEnqueue=\(enabled) compoundPollPair=\(enabled) observersBundled=true individualObserverAttribution=false acceptance=unchanged")
+            print("NativeClockHandoffInstrumentationBundle schema=3 enabled=\(enabled) actualRateAndOrdinaryRead=true snapshotReadReceipt=\(enabled) firstAlignedEnqueue=\(enabled) compoundPollPair=\(enabled) firstPositiveExistingRead=\(enabled) addedReadValueCapacity=6 noNewReadCalls=true noNewClockSites=true observersBundled=true individualObserverAttribution=false acceptance=unchanged")
             XCTAssertEqual(traceVideoSeeks, enabled); XCTAssertFalse(traceNativeRefill)
             XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(traceDefaultFrameMonitor)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
@@ -7833,6 +7833,12 @@ private final class NativeClockHandoffTrace {
         var point: PlaybackService.DebugVideoRenderStamp?
         var source: PlaybackService.DebugCPPNativePullStamp?
         var sourceCovered = false
+        // Two value slots per phase: last stopped candidate, then frozen first-positive pair.
+        var startStopped: PlaybackService.DebugVideoPositionRead?, startPositive: PlaybackService.DebugVideoPositionRead?
+        var startStoppedOrdinal: UInt64 = 0, startPositiveOrdinal: UInt64 = 0
+        var startReads: UInt64 = 0, startBeforeHandoff: UInt64 = 0, startRejected: UInt64 = 0
+        var startUnavailable: UInt64 = 0, startOtherFinite: UInt64 = 0, startStoppedCount: UInt64 = 0
+        var startOrderFailures: UInt64 = 0, startLastReturnNs: UInt64 = 0
     }
     private let enabled: Bool, baseRequest: Int
     private var slots = Array(repeating: Slot(), count: 6)
@@ -7844,6 +7850,7 @@ private final class NativeClockHandoffTrace {
         self.enabled = enabled; self.baseRequest = baseRequest
         if enabled {
             availabilitySlots = Array(repeating: AvailabilitySlot(), count: 3)
+            print("NativeClockStartScope schema=1 enabled=true phases=3 additionalReadValueCapacity=6 selection=first-qualified-returned-positive-after-sole-initial-setRate positive=rate-and-raw-and-decision-position-greater-than-zero predecessor=immediately-previous-returned-callback-stopped-rate-zero seekSerialRequired=0 counters=saturating extraGetters=0 newClockSites=0 timebaseIdentity=unavailable jointSnapshot=false unreturnedCalls=unverified publication=after-cleanup playbackAcceptance=unchanged")
             print("NativeClockAvailabilityScope schema=1 enabled=true phases=3 retainedReadsCapacity=6 nativeBoundaryCapacity=3 firstRenderPointCapacity=3 selection=last-existing-read-before-point-and-first-existing-read-after-point noAdditionalGetters=true newClockSites=0 outputIdentity=CPP-boundary-only timebaseIdentity=unavailable imageEpoch=unavailable jointSnapshot=false nativeTimeAndRateAtomic=false missingOrChangedOwnerIsUnqualified=true publication=after-cleanup playbackAcceptance=unchanged")
         }
     }
@@ -7911,6 +7918,93 @@ private final class NativeClockHandoffTrace {
         }
         XCTAssertEqual(availabilityOrphans, 0); XCTAssertFalse(availabilityOverflow)
     }
+    private func initialClockHandoffQualified(_ h: PlaybackService.DebugVideoRateHandoff, phase: Int) -> Bool {
+        guard h.cause == .initialReady, slots[phase * 2].commands == 1,
+              h.request == baseRequest + phase + 1, h.entryGeneration == h.request, h.returnGeneration == h.request,
+              h.presentationRequest == h.request, h.returnPresentationRequest == h.request,
+              let ticket = h.presentationTicket, ticket == h.returnPresentationTicket,
+              ticket.debugItemIdentity == h.item, h.presentationUnchanged,
+              h.entryObservedItemMatches, h.returnObservedItemMatches,
+              h.entrySeekState == h.returnSeekState, h.entrySeekState.serial == 0,
+              h.entrySeekState.activeTicket == nil, h.requestedRate == 1,
+              h.entryNs > 0, h.returnNs >= h.entryNs else { return false }
+        return true
+    }
+    private func startReadJoined(_ r: PlaybackService.DebugVideoPositionRead,
+        handoff h: PlaybackService.DebugVideoRateHandoff, phase: Int) -> Bool {
+        initialClockHandoffQualified(h, phase: phase) && r.kind == .itemTimebase
+            && r.request == h.request && r.returnGeneration == h.request && r.item == h.item
+            && r.presentationRequest == h.request && r.returnPresentationRequest == h.request
+            && r.presentationTicket == h.returnPresentationTicket && r.returnPresentationTicket == h.returnPresentationTicket
+            && r.observedItemMatches && r.presentationUnchanged
+            && r.entrySeekState == h.returnSeekState && r.returnSeekState == h.returnSeekState
+            && r.entryNs >= h.returnNs && r.returnNs >= r.entryNs
+    }
+    private func recordClockStart(_ value: PlaybackService.DebugVideoPositionRead, phase: Int) {
+        guard enabled else { return }
+        incrementAvailability(&availabilitySlots[phase].startReads)
+        if value.entryNs < availabilitySlots[phase].startLastReturnNs || value.returnNs < value.entryNs {
+            incrementAvailability(&availabilitySlots[phase].startOrderFailures)
+        }
+        availabilitySlots[phase].startLastReturnNs = max(availabilitySlots[phase].startLastReturnNs, value.returnNs)
+        // Continue detecting overlap after selection; a late returned outer read must not silently validate it.
+        guard availabilitySlots[phase].startPositive == nil else { return }
+        guard let handoff = slots[phase * 2].handoff else {
+            incrementAvailability(&availabilitySlots[phase].startBeforeHandoff)
+            availabilitySlots[phase].startStopped = nil; availabilitySlots[phase].startStoppedOrdinal = 0
+            return
+        }
+        guard startReadJoined(value, handoff: handoff, phase: phase) else {
+            incrementAvailability(&availabilitySlots[phase].startRejected)
+            availabilitySlots[phase].startStopped = nil; availabilitySlots[phase].startStoppedOrdinal = 0
+            return
+        }
+        guard let raw = value.rawItemTimebasePosition, raw.isFinite, raw >= 0,
+              let rate = value.itemTimebaseEffectiveRate, rate.isFinite,
+              (value.position.isFinite && value.position >= 0) || (rate == 0 && value.position.isNaN) else {
+            incrementAvailability(&availabilitySlots[phase].startUnavailable)
+            availabilitySlots[phase].startStopped = nil; availabilitySlots[phase].startStoppedOrdinal = 0
+            return
+        }
+        if rate > 0, raw > 0, value.position.isFinite, value.position > 0 {
+            let next = availabilitySlots[phase].startStoppedOrdinal.addingReportingOverflow(1)
+            let adjacent = availabilitySlots[phase].startStopped.map {
+                !next.overflow && next.partialValue == reads && $0.returnNs <= value.entryNs
+            } ?? false
+            if !adjacent {
+                availabilitySlots[phase].startStopped = nil; availabilitySlots[phase].startStoppedOrdinal = 0
+            }
+            availabilitySlots[phase].startPositive = value
+            availabilitySlots[phase].startPositiveOrdinal = reads
+        } else if rate == 0, value.position.isNaN || (value.position.isFinite && value.position >= 0) {
+            incrementAvailability(&availabilitySlots[phase].startStoppedCount)
+            availabilitySlots[phase].startStopped = value
+            availabilitySlots[phase].startStoppedOrdinal = reads
+        } else {
+            incrementAvailability(&availabilitySlots[phase].startOtherFinite)
+            availabilitySlots[phase].startStopped = nil; availabilitySlots[phase].startStoppedOrdinal = 0
+        }
+    }
+    private func dumpClockStartRead(_ read: PlaybackService.DebugVideoPositionRead?, phase: Int, role: Int, ordinal: UInt64) {
+        guard let r = read else {
+            print("NativeClockStartRead schema=1 phase=\(phase) role=\(role) available=false")
+            return
+        }
+        print("NativeClockStartRead schema=1 phase=\(phase) role=\(role) available=true callbackOrdinal=\(ordinal) kind=\(r.kind.rawValue) request=\(r.request) returnGeneration=\(r.returnGeneration) item=\(r.item) entryNs=\(r.entryNs) returnNs=\(r.returnNs) position=\(r.position) rawPosition=\(r.rawItemTimebasePosition.map { String($0) } ?? "unavailable") effectiveRate=\(r.itemTimebaseEffectiveRate.map { String($0) } ?? "unavailable") presentationRequest=\(r.presentationRequest.map(String.init) ?? "unknown") returnPresentationRequest=\(r.returnPresentationRequest.map(String.init) ?? "unknown") ticketRevision=\(r.presentationTicket.map { String($0.debugGeneration) } ?? "unknown") returnTicketRevision=\(r.returnPresentationTicket.map { String($0.debugGeneration) } ?? "unknown") entrySeekSerial=\(r.entrySeekState.serial) returnSeekSerial=\(r.returnSeekState.serial) observedItemMatches=\(r.observedItemMatches) presentationUnchanged=\(r.presentationUnchanged) timebaseIdentity=unavailable imageEpoch=unavailable outputIdentity=unavailable jointSnapshot=false nativeTimeAndRateAtomic=false unreturnedCalls=unverified clock=DispatchTime")
+    }
+    private func dumpClockStarts() {
+        for phase in 0..<3 {
+            let s = availabilitySlots[phase], h = slots[phase * 2].handoff
+            let handoffQualified = h.map { initialClockHandoffQualified($0, phase: phase) } ?? false
+            let positiveJoined = s.startPositive.flatMap { r in h.map { startReadJoined(r, handoff: $0, phase: phase) } } ?? false
+            let stoppedJoined = s.startStopped.flatMap { r in h.map { startReadJoined(r, handoff: $0, phase: phase) } } ?? false
+            let positiveQualified = positiveJoined && s.startOrderFailures == 0 && !overflow && !availabilityOverflow
+            let pairQualified = positiveQualified && stoppedJoined && s.startStopped != nil
+            print("NativeClockStartSummary schema=1 phase=\(phase) request=\(baseRequest + phase + 1) initialHandoffPresent=\(h != nil) initialHandoffQualified=\(handoffQualified) observedReads=\(s.startReads) beforeHandoff=\(s.startBeforeHandoff) ownerOrTimeRejected=\(s.startRejected) unavailableValues=\(s.startUnavailable) stoppedReadsBeforePositive=\(s.startStoppedCount) otherFiniteBeforePositive=\(s.startOtherFinite) readOrderFailures=\(s.startOrderFailures) positiveAvailable=\(s.startPositive != nil) immediatelyPrecedingStoppedAvailable=\(s.startPositive != nil && s.startStopped != nil) firstPositiveQualified=\(positiveQualified) sequentialStoppedPositiveBracketQualified=\(pairQualified) overflow=\(overflow || availabilityOverflow) classificationStopsAtFirstPositive=true adjacency=global-returned-callback-ordinal unreturnedCalls=unverified jointSnapshot=false timebaseIdentity=unavailable outputIdentity=unavailable clock=DispatchTime")
+            dumpClockStartRead(s.startPositive == nil ? nil : s.startStopped, phase: phase, role: 0, ordinal: s.startStoppedOrdinal)
+            dumpClockStartRead(s.startPositive, phase: phase, role: 1, ordinal: s.startPositiveOrdinal)
+        }
+    }
     private func increment(_ value: inout UInt64) {
         if value == .max { overflow = true } else { value += 1 }
     }
@@ -7928,6 +8022,7 @@ private final class NativeClockHandoffTrace {
         let phase = value.request - baseRequest - 1
         guard (0..<3).contains(phase) else { increment(&orphans); return }
         if enabled {
+            recordClockStart(value, phase: phase)
             if availabilitySlots[phase].point == nil {
                 incrementAvailability(&availabilitySlots[phase].beforeCount)
                 availabilitySlots[phase].before = value
@@ -7992,6 +8087,7 @@ private final class NativeClockHandoffTrace {
             XCTAssertTrue(joined, "The first following read must retain the exact handoff owner")
         }
         dumpAvailabilityClocks()
+        dumpClockStarts()
     }
 }
 

@@ -1,6 +1,7 @@
 import XCTest
 import AVFoundation
 import CoreVideo
+import CryptoKit
 import UIKit
 @testable import OfflineTikTokPlayer
 
@@ -53,6 +54,153 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         restoreCompletion?(true)
         restoreCompletion?(false)
         XCTAssertEqual(results, [false, true])
+    }
+
+    func testIdentitySourceNeedsNoCompositionAndPreservesEveryDecodedVideoFrame() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let asset = AVURLAsset(url: url)
+        let item = AVPlayerItem(asset: asset)
+        let bridge = ContinuousPictureInPicture()
+        var owned: ContinuousPictureInPicture.PreparedVideoResource?
+        // No player/window or temporary asset. Cleanup precedes every resource unwrap.
+        defer {
+            bridge.invalidate(); owned?.retire()
+            XCTAssertTrue(item.outputs.isEmpty)
+        }
+        XCTAssertNil(item.videoComposition)
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+        owned = plan.install()
+        let resource = try XCTUnwrap(owned), output = try XCTUnwrap(resource.output)
+        // Primary RED on the current implementation: it always assigns a composition.
+        XCTAssertNil(item.videoComposition, "The uncomposed public identity source must retain its native geometry path")
+        XCTAssertTrue(resource.item === item); XCTAssertTrue(resource.output === output)
+        XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
+        XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(item.outputs.first === output)
+        _ = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+        XCTAssertTrue(resource.isBorrowed)
+        XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
+
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        XCTAssertEqual(tracks.count, 1)
+        let track = try XCTUnwrap(tracks.first)
+        let natural = try await track.load(.naturalSize), transform = try await track.load(.preferredTransform)
+        let duration = try await asset.load(.duration), range = try await track.load(.timeRange)
+        let formats = try await track.load(.formatDescriptions)
+        XCTAssertEqual(formats.count, 1)
+        let format = try XCTUnwrap(formats.first)
+        let encoded = CMVideoFormatDescriptionGetDimensions(format)
+        let clean = CMVideoFormatDescriptionGetCleanAperture(format, originIsAtTopLeft: true)
+        let par = CMFormatDescriptionGetExtension(format,
+            extensionKey: kCMFormatDescriptionExtension_PixelAspectRatio) as? NSDictionary
+        let parH = par?[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing] as? NSNumber
+        let parV = par?[kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing] as? NSNumber
+        let parHLabel = parH.map { String($0.doubleValue) } ?? "absent"
+        let parVLabel = parV.map { String($0.doubleValue) } ?? "absent"
+        print("NativeGeometryFixture schema=1 naturalWidth=\(natural.width) naturalHeight=\(natural.height) transformA=\(transform.a) transformB=\(transform.b) transformC=\(transform.c) transformD=\(transform.d) transformTX=\(transform.tx) transformTY=\(transform.ty) encodedWidth=\(encoded.width) encodedHeight=\(encoded.height) cleanX=\(clean.minX) cleanY=\(clean.minY) cleanWidth=\(clean.width) cleanHeight=\(clean.height) parH=\(parHLabel) parV=\(parVLabel) nativeEligibilityFromTransformAlone=false latencyEvidence=false")
+        XCTAssertEqual(natural, CGSize(width: 160, height: 96)); XCTAssertTrue(transform.isIdentity)
+        XCTAssertEqual(encoded.width, 160); XCTAssertEqual(encoded.height, 96)
+        XCTAssertEqual(CMTimeCompare(duration, CMTime(seconds: 30, preferredTimescale: 24)), 0)
+        XCTAssertEqual(CMTimeCompare(range.start, .zero), 0)
+        XCTAssertEqual(CMTimeCompare(CMTimeRangeGetEnd(range), duration), 0)
+        let baseline = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
+        XCTAssertEqual(baseline.sourceTrackIDForFrameTiming, track.trackID)
+        XCTAssertEqual(baseline.renderSize, CGSize(width: 160, height: 96))
+
+        struct Summary {
+            let count: Int, bytes: Int64
+            let first: CMTime, last: CMTime
+            let ptsHash: String, pixelHash: String, firstFrameHash: String, lastFrameHash: String
+        }
+        enum DecodeFailure: Error { case contract }
+        func hex(_ digest: SHA256.Digest) -> String { digest.map { String(format: "%02x", $0) }.joined() }
+        @MainActor func decode(_ composition: AVVideoComposition?) throws -> Summary {
+            let reader = try AVAssetReader(asset: asset)
+            let settings: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+            let decoded: AVAssetReaderOutput
+            if let composition {
+                let composed = AVAssetReaderVideoCompositionOutput(videoTracks: [track], videoSettings: settings)
+                composed.videoComposition = composition; decoded = composed
+            } else {
+                decoded = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+            }
+            decoded.alwaysCopiesSampleData = false
+            defer { reader.cancelReading() }
+            guard reader.canAdd(decoded) else { XCTFail("The complete video reader must accept its output"); throw DecodeFailure.contract }
+            reader.add(decoded) // Intentionally no reader.timeRange: consume the complete source.
+            guard reader.startReading() else { throw reader.error ?? DecodeFailure.contract }
+            var count = 0, bytes: Int64 = 0
+            var first = CMTime.invalid, last = CMTime.invalid
+            var ptsHash = SHA256(), pixelHash = SHA256()
+            var firstFrameHash = "", lastFrameHash = ""
+            while true {
+                try Task.checkCancellation()
+                let ended = try autoreleasepool { () throws -> Bool in
+                    guard let sample = decoded.copyNextSampleBuffer() else { return true }
+                    guard count < 720, CMSampleBufferGetNumSamples(sample) == 1 else {
+                        XCTFail("The public source must contain exactly 720 individual video frames"); throw DecodeFailure.contract
+                    }
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                    let tick = CMTimeConvertScale(pts, timescale: 24, method: .default)
+                    guard pts.isNumeric, tick.isNumeric, pts.epoch == 0, tick.epoch == 0,
+                          CMTimeCompare(pts, tick) == 0, tick.value == Int64(count) else {
+                        XCTFail("Every actual PTS must cover the complete ordered 24fps source"); throw DecodeFailure.contract
+                    }
+                    let pixel = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+                    let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+                    let rowBytes = CVPixelBufferGetBytesPerRow(pixel), storage = CVPixelBufferGetDataSize(pixel)
+                    guard !CVPixelBufferIsPlanar(pixel), CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
+                          width == 160, height == 96, rowBytes >= 640, rowBytes <= 4_096,
+                          storage >= rowBytes * height, storage <= 1_048_576 else {
+                        XCTFail("Every actual frame must retain the bounded full native geometry"); throw DecodeFailure.contract
+                    }
+                    guard CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else {
+                        XCTFail("The complete frame's pixels must be readable"); throw DecodeFailure.contract
+                    }
+                    defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+                    let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixel))
+                    var frameHash = SHA256()
+                    for row in 0..<height {
+                        // Hash every BGRA pixel; stride padding is not image content.
+                        let active = Data(bytes: base.advanced(by: row * rowBytes), count: width * 4)
+                        frameHash.update(data: active); pixelHash.update(data: active)
+                    }
+                    let frameDigest = hex(frameHash.finalize())
+                    if count == 0 { first = pts; firstFrameHash = frameDigest }
+                    last = pts; lastFrameHash = frameDigest
+                    ptsHash.update(data: Data("\(tick.value);".utf8))
+                    count += 1; bytes += Int64(width * height * 4)
+                    return false
+                }
+                if ended { break }
+            }
+            guard reader.status == .completed, count == 720 else {
+                XCTFail("The entire source, including its last frame, must reach completed EOF")
+                throw reader.error ?? DecodeFailure.contract
+            }
+            return Summary(count: count, bytes: bytes, first: first, last: last,
+                ptsHash: hex(ptsHash.finalize()), pixelHash: hex(pixelHash.finalize()),
+                firstFrameHash: firstFrameHash, lastFrameHash: lastFrameHash)
+        }
+        // Each helper's cancelReading defer runs before the next reader is created.
+        // One prepared output + one reader output: at most two output owners.
+        let native = try decode(nil)
+        let composed = try decode(baseline)
+        XCTAssertEqual(native.count, 720); XCTAssertEqual(composed.count, native.count)
+        XCTAssertEqual(native.bytes, 44_236_800); XCTAssertEqual(composed.bytes, native.bytes)
+        XCTAssertEqual(CMTimeCompare(native.first, .zero), 0)
+        XCTAssertEqual(CMTimeCompare(native.last, CMTime(value: 719, timescale: 24)), 0)
+        XCTAssertEqual(CMTimeCompare(composed.first, native.first), 0)
+        XCTAssertEqual(CMTimeCompare(composed.last, native.last), 0)
+        XCTAssertEqual(composed.ptsHash, native.ptsHash)
+        XCTAssertEqual(composed.pixelHash, native.pixelHash)
+        XCTAssertEqual(composed.firstFrameHash, native.firstFrameHash)
+        XCTAssertEqual(composed.lastFrameHash, native.lastFrameHash)
+        XCTAssertNotEqual(native.firstFrameHash, native.lastFrameHash)
+        XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(resource.isBorrowed)
+        XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
+        print("NativeGeometryVideoDecode schema=1 nativeFrames=\(native.count) composedFrames=\(composed.count) activeBytesPerReader=\(native.bytes) nativePTSHash=\(native.ptsHash) composedPTSHash=\(composed.ptsHash) nativePixelHash=\(native.pixelHash) composedPixelHash=\(composed.pixelHash) nativeLastFrameHash=\(native.lastFrameHash) composedLastFrameHash=\(composed.lastFrameHash) completeEOF=true scope=full-source-video-decode playbackEvidence=false latencyEvidence=false")
     }
 
     func testPortraitAndMirrorCompositionProducesOrientedPixelsAndPreservesSourceTiming() async throws {
