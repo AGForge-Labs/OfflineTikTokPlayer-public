@@ -1392,6 +1392,22 @@ final class PlaybackService: NSObject {
         return read()
     }
 
+    // A completed native seek can outlive the audio source it was correcting.
+    // This uses cached service ownership and a fresh render snapshot; it must
+    // follow SDK reads, which can return after a natural audio transition.
+    private func ownsVideoCorrectionCompletion(for item: AVPlayerItem, request: Int,
+                                                selectedID: String?) -> Bool {
+        guard generation == request, syncingVideoGeneration == nil, observedItem === item,
+              videoAllowed, audioLoadingID == nil, let selectedID,
+              continuousAudio.isSelected, continuousAudio.selectedID == selectedID,
+              queue.currentID == selectedID,
+              let token = continuousAudio.entry(for: selectedID)?.token, token > 0 else { return false }
+        let sample = continuousAudio.snapshot
+        // An unacknowledged explicit selection owns its requested position.
+        // Otherwise the actual rendered source must still be this video.
+        return continuousAudio.isSelectionPending(in: sample) || sample.token == token
+    }
+
     private func synchronizeVideoToAudio(force: Bool = false) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
@@ -1496,11 +1512,19 @@ final class PlaybackService: NSObject {
                       self.player.currentItem === item, self.videoAllowed else { return }
                 let host = CMClockGetTime(CMClockGetHostTimeClock())
                 let desired = self.continuousAudio.presentationPosition(at: host)
+                guard self.ownsVideoCorrectionCompletion(for: item, request: request,
+                    selectedID: selectedID) else { return }
                 // A newer paused request must win even within the drift threshold;
                 // compare requested targets rather than native seek quantization.
                 let requestedFrameChanged = abs(position - desired) > 0.5 / 48_000
-                if !self.intent.canPlay,
-                   requestedFrameChanged || abs(item.currentTime().seconds - desired) > 0.080 {
+                var needsPausedCorrection = requestedFrameChanged
+                if !self.intent.canPlay && !requestedFrameChanged {
+                    let nativePosition = item.currentTime().seconds
+                    guard self.ownsVideoCorrectionCompletion(for: item, request: request,
+                        selectedID: selectedID) else { return }
+                    needsPausedCorrection = abs(nativePosition - desired) > 0.080
+                }
+                if !self.intent.canPlay && needsPausedCorrection {
                     #if DEBUG
                     self.synchronizeVideoToAudio(force: true, reason: .latestPausedTarget)
                     #else
@@ -1512,11 +1536,20 @@ final class PlaybackService: NSObject {
                 // even before the engine has acknowledged its first selection command.
                 // The epoch was reset before seeking. Release acquisition only
                 // now; never flush a target frame already pulled by the timer.
-                guard let ticket = self.currentVideoPresentation(for: item, request: request),
+                guard let ticket = self.currentVideoPresentation(for: item, request: request) else { return }
+                // Resolve the live ticket here: initial owner installation may
+                // legitimately follow issuance. Revalidate after its SDK query.
+                @MainActor func ownsPresentation() -> Bool {
+                    self.ownsVideoCorrectionCompletion(for: item, request: request, selectedID: selectedID)
+                        && self.videoPresentation?.request == request && self.videoPresentation?.ticket == ticket
+                }
+                guard ownsPresentation(),
                       self.continuousPiP.installTimeline(ticket, positionSeconds: desired,
                           durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay) else { return }
+                guard ownsPresentation() else { return }
                 self.continuousPiP.completeSeek(videoSeek)
                 if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
+                guard ownsPresentation() else { return }
                 // AVPlayer schedules the muted video on the system host clock;
                 // it never gates the audio render callback or its next boundary.
                 if self.intent.canPlay {
@@ -1528,7 +1561,7 @@ final class PlaybackService: NSObject {
                                         atHostTime: host)
                     #endif
                 }
-                if self.currentVideoPresentation(for: item, request: request) == ticket {
+                if ownsPresentation() {
                     _ = self.continuousPiP.activate(ticket)
                 }
             }
