@@ -1272,6 +1272,157 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         } else { XCTFail("Playing A must retain coherent custom progress through helper work") }
     }
 
+    func testProductionDefaultReadinessRequiresTheSelectedCPPOutput() async throws {
+        #if DEBUG
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            service.isInteractingWithFeed = true
+            // Intentionally use the production default. Do not select the DEBUG
+            // alternative, native-read tracing, a different layer or another player.
+            let expectedID = fixture.aID
+            var gate: SelectionInitialReadyOrderingProbe?
+            var starts = 0, ownerCaptures = 0, sameOwnerRestarts = 0
+            var rejectedStarts = 0, staleReadyDeliveries = 0, readyDeliveries = 0
+            var ownerConflict = false, overflow = false
+            var startOutputs = -1, preparedIdentity = false
+            var observedItem: ObjectIdentifier?, observedResource: ObjectIdentifier?
+            var observedOutput: ObjectIdentifier?
+            service.debugAfterFirstFrameMonitorStart = { [weak service] item in
+                guard let service else { return }
+                guard starts < 8 else { overflow = true; return }
+                starts += 1
+                let outputs = item.outputs
+                let state = service.debugInitialVideoReadyState
+                guard service.queue.currentID == expectedID, audio.selectedID == expectedID,
+                      let resource = buffer.resource(for: item), resource.item === item,
+                      let output = resource.output, resource.isAttached, resource.isBorrowed,
+                      !resource.isRetired, outputs.contains(where: { $0 === output }) else {
+                    rejectedStarts += 1; return
+                }
+                if let gate {
+                    if state.generation == gate.generation,
+                       observedItem == ObjectIdentifier(item), observedResource == ObjectIdentifier(resource),
+                       observedOutput == ObjectIdentifier(output) { sameOwnerRestarts += 1 }
+                    else { ownerConflict = true }
+                    return // A new owner must not silently replace this control.
+                }
+                // This hook is synchronous immediately after the real monitor
+                // starts, before status KVO registration or a later detach can
+                // hide a second output. All identity witnesses are scalar IDs.
+                startOutputs = outputs.count; preparedIdentity = true
+                observedItem = ObjectIdentifier(item); observedResource = ObjectIdentifier(resource)
+                observedOutput = ObjectIdentifier(output)
+                gate = SelectionInitialReadyOrderingProbe(generation: state.generation)
+                ownerCaptures += 1
+            }
+            service.onDebugInitialVideoReady = { [weak service] request in
+                guard readyDeliveries < 8 else { overflow = true; return }
+                readyDeliveries += 1
+                guard let service, let gate, request == gate.generation,
+                      service.debugInitialVideoReadyState.generation == gate.generation,
+                      service.queue.currentID == expectedID, audio.selectedID == expectedID else {
+                    staleReadyDeliveries += 1; return
+                }
+                await gate.hold(request: request)
+            }
+            defer {
+                gate?.release()
+                service.debugAfterFirstFrameMonitorStart = nil
+                service.onDebugInitialVideoReady = nil
+            }
+            let initialUnderruns = service.audioSnapshot.underrunFrames
+            service.start(playlistIDs: [fixture.playlist], at: expectedID)
+            let held = await waitUntil(timeout: 3) {
+                guard let gate else { return false }
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return gate.isHolding && ownerCaptures == 1 && rejectedStarts == 0 && !ownerConflict
+                    && readyDeliveries > 0 && staleReadyDeliveries == 0
+                    && starts == ownerCaptures + sameOwnerRestarts && state.generation == gate.generation
+                    && state.readyGeneration != gate.generation && state.syncingVideoGeneration == nil
+                    && service.queue.currentID == expectedID && audio.selectedID == expectedID
+                    && sample.token > 0 && state.audioVisit == sample.visit && !sample.ended
+            }
+            XCTAssertTrue(held, "The real selected owner and real initial-ready callback must be held")
+            guard held, let gate else { throw SelectionVideoTestFailure.timeout }
+            let item = try XCTUnwrap(service.player.currentItem)
+            let resource = try XCTUnwrap(buffer.resource(for: item))
+            let output = try XCTUnwrap(resource.output)
+            let displayLayer = try XCTUnwrap(screen.customVideoLayer)
+            let token = try XCTUnwrap(audio.entry(for: expectedID)).token
+            XCTAssertTrue(displayLayer.superlayer === service.surface.layer)
+            XCTAssertEqual(observedItem, ObjectIdentifier(item))
+            XCTAssertEqual(observedResource, ObjectIdentifier(resource))
+            XCTAssertEqual(observedOutput, ObjectIdentifier(output))
+            XCTAssertTrue(preparedIdentity)
+            XCTAssertTrue(resource.isAttached); XCTAssertTrue(resource.isBorrowed)
+            XCTAssertFalse(resource.isRetired)
+            XCTAssertTrue(item.outputs.contains { $0 === output })
+            assertSelection(service, fixture: fixture, id: expectedID)
+
+            // RED contract: the default monitor must observe the actual selected
+            // CPP output, rather than attach a second native output. This assertion
+            // is independent of AVFoundation scheduling or a screenshot timeout.
+            XCTAssertEqual(startOutputs, 1,
+                "Production first-frame readiness must reuse the selected CPP output without attaching another output")
+            XCTAssertEqual(item.outputs.count, 1)
+            XCTAssertFalse(service.isVideoReady,
+                "A native-player image cannot uncover the poster while the actual CPP presentation is inactive")
+            XCTAssertEqual(service.submittedVideoFrameCount, 0)
+            XCTAssertNil(service.copiedVideoFramePositionSeconds)
+            XCTAssertNil(service.videoFramePositionSeconds)
+            XCTAssertFalse(displayLayer.isReadyForDisplay)
+
+            let baseline = service.audioSnapshot
+            let progressed = await waitUntil(timeout: 0.75) {
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return gate.isHolding && state.generation == gate.generation
+                    && state.readyGeneration != gate.generation && state.syncingVideoGeneration == nil
+                    && state.audioVisit == sample.visit && sample.token == token
+                    && sample.visit == baseline.visit && sample.frame >= baseline.frame + 9_600 && !sample.ended
+            }
+            let heldClock = captureInitialReadyNativeClock(service)
+            let heldSample = service.audioSnapshot
+            let heldSubmitted = service.submittedVideoFrameCount
+            let heldCopied = service.copiedVideoFramePositionSeconds
+            let heldFrame = service.videoFramePositionSeconds
+            let heldServiceReady = service.isVideoReady
+            let heldCustomReady = displayLayer.isReadyForDisplay
+            print("ProductionDefaultReadinessHeld schema=1 defaultMode=true debugModeOverrideWritten=false startOutputs=\(startOutputs) expectedStartOutputs=1 preparedIdentity=\(preparedIdentity) request=\(gate.generation) ownerCaptures=\(ownerCaptures) sameOwnerRestarts=\(sameOwnerRestarts) rejectedStarts=\(rejectedStarts) ownerConflict=\(ownerConflict) readyDeliveries=\(readyDeliveries) staleReadyDeliveries=\(staleReadyDeliveries) progressed=\(progressed) token=\(heldSample.token) visit=\(heldSample.visit) pcmDelta=\(heldSample.frame - baseline.frame) underrunDelta=\(heldSample.underrunFrames - initialUnderruns) submitted=\(heldSubmitted) copiedPresent=\(heldCopied != nil) submittedPTSPresent=\(heldFrame != nil) serviceReady=\(heldServiceReady) customLayerReady=\(heldCustomReady) nativeAcquisitionMs=\(heldClock.acquisitionSeconds * 1000) gateTimedOut=\(gate.timedOut) gateCancelled=\(gate.cancelled) overflow=\(overflow) latencyAcceptance=false physicalOutput=unverified")
+            XCTAssertTrue(progressed, "Actual PCM must keep advancing in the same visit while CPP activation is withheld")
+            XCTAssertEqual(heldSample.token, token); XCTAssertEqual(heldSample.visit, baseline.visit)
+            XCTAssertEqual(heldSample.underrunFrames, initialUnderruns)
+            XCTAssertTrue(heldClock.sameIdentity); XCTAssertLessThanOrEqual(heldClock.acquisitionSeconds, 0.005)
+            XCTAssertEqual(heldSubmitted, 0); XCTAssertNil(heldCopied); XCTAssertNil(heldFrame)
+            XCTAssertFalse(heldServiceReady); XCTAssertFalse(heldCustomReady)
+            XCTAssertTrue(gate.isHolding); XCTAssertFalse(gate.timedOut); XCTAssertFalse(gate.cancelled)
+            XCTAssertFalse(gate.overflow); XCTAssertEqual(gate.dropped, 0)
+            XCTAssertFalse(overflow); XCTAssertFalse(ownerConflict); XCTAssertEqual(rejectedStarts, 0)
+            XCTAssertEqual(staleReadyDeliveries, 0)
+            guard progressed, heldClock.sameIdentity, heldClock.acquisitionSeconds <= 0.005,
+                  gate.isHolding, !gate.timedOut, !gate.cancelled, !overflow, !ownerConflict,
+                  staleReadyDeliveries == 0,
+                  heldSample.token == token, heldSample.visit == baseline.visit,
+                  heldSample.underrunFrames == initialUnderruns else { throw SelectionVideoTestFailure.timeout }
+
+            // Do not abort on the intended one-output/readiness RED assertions:
+            // still exercise real activation, fresh submission, 80 ms alignment,
+            // same PCM visit/no underrun and actual moving composite pixels.
+            try await finishExplicitInitialReadyControl(service, screen: screen, fixture: fixture,
+                probe: gate, token: token, baselineUnderruns: initialUnderruns,
+                label: "production-default-current-CPP-A")
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertTrue(buffer.resource(for: item) === resource)
+            XCTAssertTrue(resource.output === output)
+            XCTAssertTrue(screen.customVideoLayer === displayLayer)
+            XCTAssertTrue(displayLayer.superlayer === service.surface.layer)
+            XCTAssertTrue(resource.isAttached); XCTAssertTrue(resource.isBorrowed)
+            XCTAssertFalse(resource.isRetired); XCTAssertEqual(item.outputs.count, 1)
+        }
+        #else
+        XCTFail("Production-default readiness contract requires existing DEBUG test hooks")
+        #endif
+    }
+
     func testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld() async throws {
         try recordRuntimeHost()
         #if DEBUG

@@ -592,36 +592,66 @@ extension ContinuousPCMRenderer {
         private var state = DebugRenderAccountingSnapshot() // Render writer only.
         private let sequence = Atomic<UInt64>(0)
         private let publicationExhausted = Atomic<Bool>(false)
-        private let sourceCallbacksEntered = Atomic<UInt64>(0)
-        private let sourceCallbacksCompleted = Atomic<UInt64>(0)
-        private let sourceFramesRequested = Atomic<UInt64>(0)
-        private let sourceFramesCompleted = Atomic<UInt64>(0)
-        private let invalidLayoutCallbacks = Atomic<UInt64>(0)
-        private let invalidLayoutFrames = Atomic<UInt64>(0)
-        private let kernelCallsEntered = Atomic<UInt64>(0)
-        private let kernelCallsCompleted = Atomic<UInt64>(0)
-        private let kernelFramesRequested = Atomic<UInt64>(0)
-        private let kernelFramesClassified = Atomic<UInt64>(0)
-        private let copiedPCMFrames = Atomic<UInt64>(0)
-        private let pausedPositiveTokenFrames = Atomic<UInt64>(0)
-        private let inactiveFrames = Atomic<UInt64>(0)
-        private let eofRemainderFrames = Atomic<UInt64>(0)
-        private let underrunFrames = Atomic<UInt64>(0)
-        private let lastKernelToken = Atomic<Int>(0)
-        private let lastKernelVisit = Atomic<Int64>(0)
-        private let lastSourceFrameCount = Atomic<UInt64>(0)
-        private let lastSourceHostTimeValid = Atomic<Bool>(false)
-        private let lastSourceHostTime = Atomic<UInt64>(0)
-        private let overflowed = Atomic<Bool>(false)
-        private let originValid = Atomic<Bool>(false)
-        private let originCompletion = Atomic<UInt64>(0)
-        private let originToken = Atomic<Int>(0)
-        private let originVisit = Atomic<Int64>(0)
-        private let originEpoch = Atomic<Int>(0)
-        private let originFirst = Atomic<Int64>(0)
-        private let originEnd = Atomic<Int64>(0)
+        private final class PublicationBank: @unchecked Sendable {
+            // .max is odd and can never be a published accounting sequence.
+            let sequence = Atomic<UInt64>(.max)
+            var value = DebugRenderAccountingSnapshot()
+        }
+        private let first = PublicationBank()
+        private let second = PublicationBank()
+        private let third = PublicationBank()
+        private var publishedBank = 0 // Render writer only.
+        private let observerActive = Atomic<Bool>(false)
+        private let observerHazard = Atomic<Int>(-1)
+        private let testHooks: PublicationTestHooks?
 
-        public init(capturePCMOrigin: Bool = false) { capturesPCMOrigin = capturePCMOrigin }
+        /// Internal test seam only; the public/app initializer cannot install hooks.
+        /// Deliberately blocking hooks are used solely by bounded portable tests.
+        struct PublicationTestHooks: Sendable {
+            let initialSequence: UInt64
+            let initialSourceFramesRequested: UInt64
+            let publicationPrepared: (@Sendable () -> Void)?
+            let readerPinned: (@Sendable () -> Void)?
+            init(initialSequence: UInt64 = 0, initialSourceFramesRequested: UInt64 = 0,
+                 publicationPrepared: (@Sendable () -> Void)? = nil,
+                 readerPinned: (@Sendable () -> Void)? = nil) {
+                self.initialSequence = initialSequence
+                self.initialSourceFramesRequested = initialSourceFramesRequested
+                self.publicationPrepared = publicationPrepared; self.readerPinned = readerPinned
+            }
+        }
+
+        public init(capturePCMOrigin: Bool = false) {
+            capturesPCMOrigin = capturePCMOrigin; testHooks = nil
+            if capturePCMOrigin {
+                state.pcmOrigin = DebugPCMOriginReceipt(valid: false, completion: 0,
+                    token: 0, visit: 0, epoch: 0, firstFrame: 0, endFrame: 0)
+            }
+            first.value = state
+            first.sequence.store(0, ordering: .sequentiallyConsistent)
+        }
+        init(capturePCMOrigin: Bool = false, testHooks: PublicationTestHooks) {
+            precondition(testHooks.initialSequence & 1 == 0)
+            capturesPCMOrigin = capturePCMOrigin; self.testHooks = testHooks
+            if capturePCMOrigin {
+                state.pcmOrigin = DebugPCMOriginReceipt(valid: false, completion: 0,
+                    token: 0, visit: 0, epoch: 0, firstFrame: 0, endFrame: 0)
+            }
+            state.sequence = testHooks.initialSequence
+            state.sourceFramesRequested = testHooks.initialSourceFramesRequested
+            first.value = state
+            first.sequence.store(state.sequence, ordering: .sequentiallyConsistent)
+            sequence.store(state.sequence, ordering: .sequentiallyConsistent)
+        }
+
+        private func bank(at index: Int) -> PublicationBank {
+            switch index {
+            case 0: return first
+            case 1: return second
+            case 2: return third
+            default: preconditionFailure("Three publication banks")
+            }
+        }
 
         /// Only supplied callback arguments are observed; no host-clock conversion occurs here.
         public func sourceCallbackEntered(frames: Int, hostTimeValid: Bool, hostTime: UInt64) {
@@ -670,7 +700,7 @@ extension ContinuousPCMRenderer {
                 origin.completion = state.kernelCallsCompleted
                 state.pcmOrigin = origin
             }
-            publish(includePCMOrigin: capturesPCMOrigin)
+            publish()
         }
 
         static func saturatingAdd(_ value: UInt64, _ amount: UInt64) -> (value: UInt64, overflowed: Bool) {
@@ -684,7 +714,7 @@ extension ContinuousPCMRenderer {
             return result.value
         }
 
-        private func publish(includePCMOrigin: Bool = false) {
+        private func publish() {
             // Sequence exhaustion fails closed without wrapping/reusing a version.
             // Rendering continues; no writer waits for an observer.
             guard !publicationExhausted.load(ordering: .relaxed) else { return }
@@ -693,82 +723,54 @@ extension ContinuousPCMRenderer {
                 return
             }
             state.sequence += 2
-            sequence.store(state.sequence - 1, ordering: .sequentiallyConsistent)
-            sourceCallbacksEntered.store(state.sourceCallbacksEntered, ordering: .sequentiallyConsistent)
-            sourceCallbacksCompleted.store(state.sourceCallbacksCompleted, ordering: .sequentiallyConsistent)
-            sourceFramesRequested.store(state.sourceFramesRequested, ordering: .sequentiallyConsistent)
-            sourceFramesCompleted.store(state.sourceFramesCompleted, ordering: .sequentiallyConsistent)
-            invalidLayoutCallbacks.store(state.invalidLayoutCallbacks, ordering: .sequentiallyConsistent)
-            invalidLayoutFrames.store(state.invalidLayoutFrames, ordering: .sequentiallyConsistent)
-            kernelCallsEntered.store(state.kernelCallsEntered, ordering: .sequentiallyConsistent)
-            kernelCallsCompleted.store(state.kernelCallsCompleted, ordering: .sequentiallyConsistent)
-            kernelFramesRequested.store(state.kernelFramesRequested, ordering: .sequentiallyConsistent)
-            kernelFramesClassified.store(state.kernelFramesClassified, ordering: .sequentiallyConsistent)
-            copiedPCMFrames.store(state.copiedPCMFrames, ordering: .sequentiallyConsistent)
-            pausedPositiveTokenFrames.store(state.pausedPositiveTokenFrames, ordering: .sequentiallyConsistent)
-            inactiveFrames.store(state.inactiveFrames, ordering: .sequentiallyConsistent)
-            eofRemainderFrames.store(state.eofRemainderFrames, ordering: .sequentiallyConsistent)
-            underrunFrames.store(state.underrunFrames, ordering: .sequentiallyConsistent)
-            lastKernelToken.store(state.lastKernelToken, ordering: .sequentiallyConsistent)
-            lastKernelVisit.store(state.lastKernelVisit, ordering: .sequentiallyConsistent)
-            lastSourceFrameCount.store(state.lastSourceFrameCount, ordering: .sequentiallyConsistent)
-            lastSourceHostTimeValid.store(state.lastSourceHostTimeValid, ordering: .sequentiallyConsistent)
-            lastSourceHostTime.store(state.lastSourceHostTime, ordering: .sequentiallyConsistent)
-            overflowed.store(state.overflowed, ordering: .sequentiallyConsistent)
-            // Only the existing kernel completion publication writes receipt fields.
-            if includePCMOrigin, let origin = state.pcmOrigin {
-                originValid.store(origin.valid, ordering: .sequentiallyConsistent)
-                originCompletion.store(origin.completion, ordering: .sequentiallyConsistent)
-                originToken.store(origin.token, ordering: .sequentiallyConsistent)
-                originVisit.store(origin.visit, ordering: .sequentiallyConsistent)
-                originEpoch.store(origin.epoch, ordering: .sequentiallyConsistent)
-                originFirst.store(origin.firstFrame, ordering: .sequentiallyConsistent)
-                originEnd.store(origin.endFrame, ordering: .sequentiallyConsistent)
-            }
+            let hazard = observerHazard.load(ordering: .sequentiallyConsistent)
+            // With one observer, the current bank and hazard exclude at most two.
+            // Selection is constant work; rendering never waits for its observer.
+            let next: Int
+            if publishedBank != 0 && hazard != 0 { next = 0 }
+            else if publishedBank != 1 && hazard != 1 { next = 1 }
+            else { next = 2 }
+            let target = bank(at: next)
+            target.value = state
+            testHooks?.publicationPrepared?()
+            target.sequence.store(state.sequence, ordering: .sequentiallyConsistent)
             sequence.store(state.sequence, ordering: .sequentiallyConsistent)
+            publishedBank = next
         }
 
         /// Bounded off-render observation. Nil means unavailable, including exhausted publication.
         public func snapshot() -> DebugRenderAccountingSnapshot? {
+            // One off-render observer only. Overlap stays explicitly unavailable;
+            // no caller waits and no prior sample is synthesized as a fresh read.
+            guard observerActive.compareExchange(expected: false, desired: true,
+                ordering: .sequentiallyConsistent).exchanged else { return nil }
+            defer {
+                observerHazard.store(-1, ordering: .sequentiallyConsistent)
+                observerActive.store(false, ordering: .sequentiallyConsistent)
+            }
             for _ in 0..<3 {
                 guard !publicationExhausted.load(ordering: .sequentiallyConsistent) else { return nil }
                 let before = sequence.load(ordering: .sequentiallyConsistent)
-                if before & 1 != 0 { continue }
-                var result = DebugRenderAccountingSnapshot()
-                result.sequence = before
-                result.sourceCallbacksEntered = sourceCallbacksEntered.load(ordering: .sequentiallyConsistent)
-                result.sourceCallbacksCompleted = sourceCallbacksCompleted.load(ordering: .sequentiallyConsistent)
-                result.sourceFramesRequested = sourceFramesRequested.load(ordering: .sequentiallyConsistent)
-                result.sourceFramesCompleted = sourceFramesCompleted.load(ordering: .sequentiallyConsistent)
-                result.invalidLayoutCallbacks = invalidLayoutCallbacks.load(ordering: .sequentiallyConsistent)
-                result.invalidLayoutFrames = invalidLayoutFrames.load(ordering: .sequentiallyConsistent)
-                result.kernelCallsEntered = kernelCallsEntered.load(ordering: .sequentiallyConsistent)
-                result.kernelCallsCompleted = kernelCallsCompleted.load(ordering: .sequentiallyConsistent)
-                result.kernelFramesRequested = kernelFramesRequested.load(ordering: .sequentiallyConsistent)
-                result.kernelFramesClassified = kernelFramesClassified.load(ordering: .sequentiallyConsistent)
-                result.copiedPCMFrames = copiedPCMFrames.load(ordering: .sequentiallyConsistent)
-                result.pausedPositiveTokenFrames = pausedPositiveTokenFrames.load(ordering: .sequentiallyConsistent)
-                result.inactiveFrames = inactiveFrames.load(ordering: .sequentiallyConsistent)
-                result.eofRemainderFrames = eofRemainderFrames.load(ordering: .sequentiallyConsistent)
-                result.underrunFrames = underrunFrames.load(ordering: .sequentiallyConsistent)
-                result.lastKernelToken = lastKernelToken.load(ordering: .sequentiallyConsistent)
-                result.lastKernelVisit = lastKernelVisit.load(ordering: .sequentiallyConsistent)
-                result.lastSourceFrameCount = lastSourceFrameCount.load(ordering: .sequentiallyConsistent)
-                result.lastSourceHostTimeValid = lastSourceHostTimeValid.load(ordering: .sequentiallyConsistent)
-                result.lastSourceHostTime = lastSourceHostTime.load(ordering: .sequentiallyConsistent)
-                result.overflowed = overflowed.load(ordering: .sequentiallyConsistent)
-                if capturesPCMOrigin {
-                    result.pcmOrigin = DebugPCMOriginReceipt(
-                        valid: originValid.load(ordering: .sequentiallyConsistent),
-                        completion: originCompletion.load(ordering: .sequentiallyConsistent),
-                        token: originToken.load(ordering: .sequentiallyConsistent),
-                        visit: originVisit.load(ordering: .sequentiallyConsistent),
-                        epoch: originEpoch.load(ordering: .sequentiallyConsistent),
-                        firstFrame: originFirst.load(ordering: .sequentiallyConsistent),
-                        endFrame: originEnd.load(ordering: .sequentiallyConsistent))
+                var selected = -1
+                for index in 0..<3 {
+                    if bank(at: index).sequence.load(ordering: .sequentiallyConsistent) == before {
+                        selected = index; break
+                    }
                 }
-                if before == sequence.load(ordering: .sequentiallyConsistent),
-                   !publicationExhausted.load(ordering: .sequentiallyConsistent) { return result }
+                guard selected >= 0 else { continue }
+                observerHazard.store(selected, ordering: .sequentiallyConsistent)
+                let selectedBank = bank(at: selected)
+                guard before == sequence.load(ordering: .sequentiallyConsistent),
+                      selectedBank.sequence.load(ordering: .sequentiallyConsistent) == before else {
+                    observerHazard.store(-1, ordering: .sequentiallyConsistent)
+                    continue
+                }
+                // The matching descriptor was still published after the hazard.
+                // The writer excludes this bank until our unconditional release.
+                testHooks?.readerPinned?()
+                let result = selectedBank.value
+                guard !publicationExhausted.load(ordering: .sequentiallyConsistent) else { return nil }
+                return result
             }
             return nil
         }

@@ -1,5 +1,10 @@
 import XCTest
 @testable import PlayerCore
+#if DEBUG
+import Dispatch
+import Foundation
+import Synchronization
+#endif
 
 /// Actual kernel branches, not a PCM-energy classifier or mocked render result.
 final class ContinuousRenderAccountingTests: XCTestCase {
@@ -143,6 +148,125 @@ final class ContinuousRenderAccountingTests: XCTestCase {
         #endif
     }
 
+    func testAccountingReadsPreviousCompleteRecordWhilePublicationIsHeld() throws {
+        #if DEBUG
+        let gate = AccountingPublicationGate()
+        let recorder = ContinuousPCMRenderer.DebugRenderAccountingRecorder(capturePCMOrigin: true, testHooks: .init(
+            publicationPrepared: { gate.holdOnce() }))
+        recorder.sourceCallbackEntered(frames: 3, hostTimeValid: true, hostTime: 100)
+        recorder.sourceCallbackCompleted(frames: 3, invalidLayout: false)
+        let before = try XCTUnwrap(recorder.snapshot())
+        XCTAssertNotNil(before.pcmOrigin)
+        XCTAssertEqual(before.pcmOrigin?.valid, false)
+        XCTAssertEqual(before.pcmOrigin?.completion, 0)
+        let finished = DispatchSemaphore(value: 0)
+        gate.arm()
+        defer { gate.release() }
+        DispatchQueue(label: "test.accounting-held-publication").async {
+            recorder.sourceCallbackEntered(frames: 7, hostTimeValid: true, hostTime: 200)
+            finished.signal()
+        }
+        XCTAssertTrue(gate.waitForEntry())
+        let held = recorder.snapshot()
+        XCTAssertNotNil(held, "An unpublished bank must not hide the previous complete publication")
+        if let held {
+            XCTAssertEqual(held.sequence, before.sequence)
+            XCTAssertEqual(held.sourceCallbacksEntered, 1); XCTAssertEqual(held.sourceCallbacksCompleted, 1)
+            XCTAssertEqual(held.sourceFramesRequested, 3); XCTAssertEqual(held.sourceFramesCompleted, 3)
+            XCTAssertEqual(held.lastSourceHostTime, 100)
+            XCTAssertEqual(held.pcmOrigin, before.pcmOrigin)
+            XCTAssertFalse(held.overflowed)
+        }
+        gate.release()
+        XCTAssertEqual(finished.wait(timeout: .now() + .seconds(2)), .success)
+        XCTAssertFalse(gate.didTimeOut, "The test must release the writer before its safety timeout")
+        let after = try XCTUnwrap(recorder.snapshot())
+        XCTAssertEqual(after.sequence, before.sequence + 2)
+        XCTAssertEqual(after.sourceCallbacksEntered, 2); XCTAssertEqual(after.sourceCallbacksCompleted, 1)
+        XCTAssertEqual(after.sourceFramesRequested, 10); XCTAssertEqual(after.sourceFramesCompleted, 3)
+        XCTAssertEqual(after.lastSourceHostTime, 200)
+        #else
+        XCTFail("Accounting publication controls require DEBUG")
+        #endif
+    }
+
+    func testAccountingReaderPinSurvivesPublicationsAndRejectsConcurrentObserver() throws {
+        #if DEBUG
+        let gate = AccountingPublicationGate()
+        let recorder = ContinuousPCMRenderer.DebugRenderAccountingRecorder(testHooks: .init(
+            readerPinned: { gate.holdOnce() }))
+        recorder.sourceCallbackEntered(frames: 3, hostTimeValid: true, hostTime: 100)
+        recorder.sourceCallbackCompleted(frames: 3, invalidLayout: false)
+        let before = try XCTUnwrap(recorder.snapshot())
+        let result = AccountingSnapshotBox()
+        let finished = DispatchSemaphore(value: 0)
+        gate.arm()
+        defer { gate.release() }
+        DispatchQueue(label: "test.accounting-pinned-observer").async {
+            result.store(recorder.snapshot())
+            finished.signal()
+        }
+        XCTAssertTrue(gate.waitForEntry())
+        // A pinned reader keeps its old bank. The sole writer must continue
+        // publishing through the other two banks without waiting for that reader.
+        for ordinal in 0..<256 {
+            recorder.sourceCallbackEntered(frames: 1, hostTimeValid: true, hostTime: UInt64(ordinal + 200))
+            recorder.sourceCallbackCompleted(frames: 1, invalidLayout: false)
+        }
+        XCTAssertNil(recorder.snapshot(), "Concurrent observers remain explicitly unavailable")
+        let heldStatus = finished.wait(timeout: .now())
+        XCTAssertEqual(heldStatus, .timedOut, "The original observer must still hold its pinned bank")
+        XCTAssertFalse(gate.didTimeOut, "Writer publications must not wait for the observer timeout")
+        gate.release()
+        if heldStatus == .timedOut {
+            XCTAssertEqual(finished.wait(timeout: .now() + .seconds(2)), .success)
+        }
+        XCTAssertFalse(gate.didTimeOut)
+        let held = try XCTUnwrap(result.load())
+        XCTAssertEqual(held.sequence, before.sequence)
+        XCTAssertEqual(held.sourceCallbacksEntered, 1); XCTAssertEqual(held.sourceCallbacksCompleted, 1)
+        XCTAssertEqual(held.sourceFramesRequested, 3); XCTAssertEqual(held.sourceFramesCompleted, 3)
+        XCTAssertEqual(held.lastSourceHostTime, 100)
+        let after = try XCTUnwrap(recorder.snapshot())
+        XCTAssertEqual(after.sequence, before.sequence + 1_024)
+        XCTAssertEqual(after.sourceCallbacksEntered, 257); XCTAssertEqual(after.sourceCallbacksCompleted, 257)
+        XCTAssertEqual(after.sourceFramesRequested, 259); XCTAssertEqual(after.sourceFramesCompleted, 259)
+        XCTAssertFalse(after.overflowed)
+        #else
+        XCTFail("Accounting publication controls require DEBUG")
+        #endif
+    }
+
+    func testAccountingPublicationExhaustionRemainsUnavailableWithoutVersionReuse() throws {
+        #if DEBUG
+        let recorder = ContinuousPCMRenderer.DebugRenderAccountingRecorder(testHooks: .init(
+            initialSequence: UInt64.max - 3))
+        XCTAssertEqual(try XCTUnwrap(recorder.snapshot()).sequence, UInt64.max - 3)
+        recorder.sourceCallbackEntered(frames: 1, hostTimeValid: true, hostTime: 1)
+        XCTAssertEqual(try XCTUnwrap(recorder.snapshot()).sequence, UInt64.max - 1)
+        recorder.sourceCallbackCompleted(frames: 1, invalidLayout: false)
+        XCTAssertNil(recorder.snapshot())
+        recorder.sourceCallbackEntered(frames: 1, hostTimeValid: true, hostTime: 2)
+        XCTAssertNil(recorder.snapshot(), "Exhaustion cannot fall back to the last complete bank")
+        #else
+        XCTFail("Accounting publication controls require DEBUG")
+        #endif
+    }
+
+    func testAccountingCounterOverflowRemainsVisibleInCompletePublication() throws {
+        #if DEBUG
+        let recorder = ContinuousPCMRenderer.DebugRenderAccountingRecorder(testHooks: .init(
+            initialSourceFramesRequested: UInt64.max))
+        recorder.sourceCallbackEntered(frames: 1, hostTimeValid: true, hostTime: 1)
+        let value = try XCTUnwrap(recorder.snapshot())
+        XCTAssertEqual(value.sourceFramesRequested, UInt64.max)
+        XCTAssertEqual(value.sourceCallbacksEntered, 1)
+        XCTAssertTrue(value.overflowed, "A complete publication must retain the quality failure")
+        #else
+        XCTFail("Accounting publication controls require DEBUG")
+        #endif
+    }
+
     #if DEBUG
     private func assertConservation(_ value: ContinuousPCMRenderer.DebugRenderAccountingSnapshot,
                                     requested: UInt64, completedCalls: UInt64) {
@@ -167,3 +291,33 @@ final class ContinuousRenderAccountingTests: XCTestCase {
         return output
     }
 }
+
+#if DEBUG
+/// These waits exist only in a test-installed immutable hook, never an app initializer.
+private final class AccountingPublicationGate: @unchecked Sendable {
+    private let armed = Atomic<Bool>(false)
+    private let timedOut = Atomic<Bool>(false)
+    private let entered = DispatchSemaphore(value: 0)
+    private let released = DispatchSemaphore(value: 0)
+    func arm() { armed.store(true, ordering: .releasing) }
+    func waitForEntry() -> Bool { entered.wait(timeout: .now() + .seconds(2)) == .success }
+    func release() { released.signal() }
+    var didTimeOut: Bool { timedOut.load(ordering: .acquiring) }
+    func holdOnce() {
+        guard armed.exchange(false, ordering: .acquiringAndReleasing) else { return }
+        entered.signal()
+        timedOut.store(released.wait(timeout: .now() + .seconds(5)) == .timedOut, ordering: .releasing)
+    }
+}
+
+private final class AccountingSnapshotBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: ContinuousPCMRenderer.DebugRenderAccountingSnapshot?
+    func store(_ value: ContinuousPCMRenderer.DebugRenderAccountingSnapshot?) {
+        lock.lock(); self.value = value; lock.unlock()
+    }
+    func load() -> ContinuousPCMRenderer.DebugRenderAccountingSnapshot? {
+        lock.lock(); defer { lock.unlock() }; return value
+    }
+}
+#endif

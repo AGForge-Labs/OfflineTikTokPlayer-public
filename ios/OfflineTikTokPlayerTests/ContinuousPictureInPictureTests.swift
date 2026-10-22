@@ -280,6 +280,204 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         #endif
     }
 
+    func testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame() async throws {
+        #if DEBUG
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let item = AVPlayerItem(url: url)
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+        let resource = try XCTUnwrap(plan.install())
+        let bridge = ContinuousPictureInPicture()
+        let player = AVPlayer(playerItem: item)
+        player.isMuted = true; player.automaticallyWaitsToMinimizeStalling = false
+        var ownedWindow: UIWindow?, ownedPlayerLayer: AVPlayerLayer?
+        weak var previousKeyWindow: UIWindow?
+        var heldSeek: UInt64?
+        // Cleanup is registered before any optional scene/window/ticket unwrap.
+        // The fixture is bundled public synthetic media, so no file is deleted.
+        defer {
+            bridge.onDebugRenderStamp = nil
+            if let heldSeek { bridge.completeSeek(heldSeek) }
+            bridge.invalidate()
+            item.cancelPendingSeeks(); player.pause(); player.replaceCurrentItem(with: nil)
+            resource.retire(); ownedPlayerLayer?.player = nil
+            bridge.displayLayer.removeFromSuperlayer(); ownedPlayerLayer?.removeFromSuperlayer()
+            ownedWindow?.isHidden = true; ownedWindow?.rootViewController = nil
+            previousKeyWindow?.makeKey()
+        }
+        let ticket = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+        let output = try XCTUnwrap(resource.output)
+        let outputID = ObjectIdentifier(output), itemID = ObjectIdentifier(item)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene), host = UIViewController()
+        ownedWindow = window
+        window.frame = scene.coordinateSpace.bounds; window.windowLevel = .alert + 1
+        window.rootViewController = host; host.view.backgroundColor = .black
+        window.makeKeyAndVisible(); host.view.layoutIfNeeded()
+        let playerLayer = AVPlayerLayer(player: player)
+        ownedPlayerLayer = playerLayer
+        playerLayer.frame = host.view.bounds; host.view.layer.addSublayer(playerLayer)
+        bridge.displayLayer.frame = host.view.bounds; host.view.layer.addSublayer(bridge.displayLayer)
+        XCTAssertEqual(item.outputs.count, 1)
+        XCTAssertTrue(resource.isBorrowed); XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
+
+        // Establish actual native readiness and an actually enqueued/display-ready
+        // paused CPP image before arming the intervention. No test-side hasNew or
+        // copy call is used; all output pulls remain inside the real bridge.
+        player.playImmediately(atRate: 1)
+        let nativeReady = await waitForPresentation {
+            item.status == .readyToPlay && playerLayer.isReadyForDisplay
+        }
+        player.pause()
+        XCTAssertTrue(nativeReady)
+        guard nativeReady, await seekPresentationPlayer(player, to: 0.25) else {
+            XCTFail("The public fixture must complete a real paused baseline seek"); return
+        }
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0.25, durationSeconds: 30, isPlaying: false))
+        XCTAssertTrue(bridge.activate(ticket))
+        let baselineReady = await waitForPresentation {
+            bridge.updatePlayback(positionSeconds: 0.25, durationSeconds: 30, isPlaying: false)
+            guard let copied = bridge.lastCopiedFramePositionSeconds,
+                  let submitted = bridge.lastFramePositionSeconds else { return false }
+            return bridge.debugCurrentFrameEpoch(for: ticket) != nil && bridge.displayLayer.isReadyForDisplay
+                && copied <= 0.25 + 0.000_01 && submitted <= 0.25 + 0.000_01
+                && abs(copied - 0.25) <= 1.0 / 24 + 0.000_01
+                && abs(submitted - 0.25) <= 1.0 / 24 + 0.000_01
+        }
+        XCTAssertTrue(baselineReady)
+        guard baselineReady else { XCTFail("An actual displayed paused CPP baseline is required"); return }
+        let baselineEpoch = try XCTUnwrap(bridge.debugCurrentFrameEpoch(for: ticket))
+        let baselineSubmitted = bridge.submittedFrameCount
+        XCTAssertGreaterThan(baselineSubmitted, 0)
+
+        // Prepare a distinct real copy while CPP is inactive. Installing the
+        // timeline flushes the baseline image; activation below is the only pull.
+        bridge.flushForSeek()
+        guard await seekPresentationPlayer(player, to: 0.5) else {
+            XCTFail("The distinct pre-intervention native seek must finish"); return
+        }
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0.5, durationSeconds: 30, isPlaying: false))
+        XCTAssertNil(bridge.debugCurrentFrameEpoch(for: ticket))
+        let beforeActivation = bridge.debugAlignedPollState
+        let originalSeek = bridge.debugNativeSeekState
+        XCTAssertEqual(beforeActivation.ticket, ticket); XCTAssertEqual(beforeActivation.output, outputID)
+        XCTAssertGreaterThan(beforeActivation.imageEpoch, baselineEpoch)
+        XCTAssertNil(originalSeek.activeTicket)
+        XCTAssertEqual(bridge.submittedFrameCount, baselineSubmitted)
+
+        var copiedCallbacks = 0, callbackOverflow = false
+        var copiedObserved = false, copiedQualified = false
+        var copiedStamp: ContinuousPictureInPicture.DebugRenderStamp?
+        var copyState: ContinuousPictureInPicture.DebugAlignedPollState?
+        var heldState: ContinuousPictureInPicture.DebugAlignedPollState?
+        var creditClearedAtBegin = false, nativeSeekIssued = false
+        var enqueuedWhileHeld = 0
+        let nativeCompletion = PresentationSeekCompletion()
+        bridge.onDebugRenderStamp = { [weak bridge, weak player] stamp in
+            guard let bridge, let player else { return }
+            if stamp.stage == .enqueued {
+                if let heldSeek, bridge.debugNativeSeekState.activeTicket == heldSeek {
+                    if enqueuedWhileHeld == 0 { enqueuedWhileHeld = 1 }
+                    else { callbackOverflow = true }
+                }
+                return
+            }
+            guard stamp.stage == .copied else { return }
+            guard copiedCallbacks == 0 else { callbackOverflow = true; return }
+            copiedCallbacks = 1; copiedObserved = true; copiedStamp = stamp
+            let state = bridge.debugAlignedPollState
+            copyState = state
+            guard let requested = stamp.requestedSeconds, let sample = stamp.sampleSeconds,
+                  let copied = stamp.copiedPTS else { return }
+            copiedQualified = stamp.ticket == ticket && stamp.ownershipUnchanged && stamp.region == 0
+                && stamp.nativeSeekTicket == nil && stamp.resourceOwnership == 2
+                && state.ticket == ticket && ticket.debugItemIdentity == itemID && state.output == outputID
+                && state.coherent && state.activeSeekTicket == nil && state.seekSerial == originalSeek.serial
+                && state.imageEpoch == beforeActivation.imageEpoch
+                && resource.item === item && resource.output === output
+                && resource.isAttached && resource.isBorrowed && !resource.isRetired
+                && requested.isFinite && abs(requested - 0.5) < 0.000_01
+                && sample.isFinite && copied.isFinite && abs(copied - sample) < 0.000_01
+                && sample <= requested + 0.000_01 && abs(sample - requested) <= 1.0 / 24 + 0.000_01
+                && stamp.submittedPTS == nil && stamp.submittedCount == baselineSubmitted
+                && bridge.submittedFrameCount == baselineSubmitted
+            guard copiedQualified else { return }
+            // This event follows a successful real copy and precedes enqueue.
+            // It is NOT reentry inside the SDK copy call. Only cached app fields
+            // above/below are read; this is the one intentional native seek command.
+            let seek = bridge.beginSeek()
+            heldSeek = seek
+            heldState = bridge.debugAlignedPollState
+            creditClearedAtBegin = bridge.debugCurrentFrameEpoch(for: ticket) == nil
+            nativeSeekIssued = true
+            player.seek(to: CMTime(seconds: 0.75, preferredTimescale: 24),
+                        toleranceBefore: .zero, toleranceAfter: .zero) { [weak nativeCompletion] finished in
+                Task { @MainActor [weak nativeCompletion] in nativeCompletion?.result = finished }
+            }
+            // Deliberately withhold CPP completeSeek even when native completes.
+        }
+        XCTAssertTrue(bridge.activate(ticket))
+        let intercepted = await waitForPresentation {
+            if copiedObserved { return true } // Never start a second pull after interception.
+            bridge.updatePlayback(positionSeconds: 0.5, durationSeconds: 30, isPlaying: false)
+            return copiedObserved
+        }
+        let after = bridge.debugAlignedPollState
+        let currentCredit = bridge.debugCurrentFrameEpoch(for: ticket)
+        let afterSubmitted = bridge.submittedFrameCount, afterFrame = bridge.lastFramePositionSeconds
+        let requestedLabel = copiedStamp.flatMap { $0.requestedSeconds }.map { String($0) } ?? "unavailable"
+        let copiedLabel = copiedStamp.flatMap { $0.sampleSeconds }.map { String($0) } ?? "unavailable"
+        print("CPPAfterCopySeekBoundary schema=1 copiedObserved=\(copiedObserved) copiedQualified=\(copiedQualified) copiedCallbacks=\(copiedCallbacks) callbackOverflow=\(callbackOverflow) ticketMatches=\(copyState?.ticket == ticket && heldState?.ticket == ticket && after.ticket == ticket) outputMatches=\(copyState?.output == outputID && heldState?.output == outputID && after.output == outputID) entryEpoch=\(copyState.map { String($0.imageEpoch) } ?? "unavailable") heldEpoch=\(heldState.map { String($0.imageEpoch) } ?? "unavailable") afterEpoch=\(after.imageEpoch) heldSeek=\(heldSeek.map { String($0) } ?? "unavailable") heldActive=\(heldState?.activeSeekTicket == heldSeek && heldSeek != nil) afterActive=\(after.activeSeekTicket == heldSeek && heldSeek != nil) creditClearedAtBegin=\(creditClearedAtBegin) currentCreditPresent=\(currentCredit != nil) nativeSeekIssued=\(nativeSeekIssued) enqueuedWhileHeld=\(enqueuedWhileHeld) submittedBefore=\(baselineSubmitted) submittedAfter=\(afterSubmitted) submittedPTSPresent=\(afterFrame != nil) requested=\(requestedLabel) copied=\(copiedLabel) testDirectOutputQueries=0 testDirectCopies=0 scope=after-real-copy-before-enqueue latencyAcceptance=false physicalPixels=unmeasured")
+        XCTAssertTrue(intercepted); XCTAssertTrue(copiedObserved); XCTAssertTrue(copiedQualified)
+        XCTAssertEqual(copiedCallbacks, 1); XCTAssertFalse(callbackOverflow)
+        guard intercepted, copiedQualified, let heldSeek, let copiedState = copyState,
+              let heldState = heldState else {
+            XCTFail("The first actual copied event must qualify the exact original owner"); return
+        }
+        XCTAssertEqual(copiedState.ticket, ticket); XCTAssertEqual(copiedState.output, outputID)
+        XCTAssertTrue(copiedState.coherent); XCTAssertNil(copiedState.activeSeekTicket)
+        XCTAssertEqual(heldState.ticket, ticket); XCTAssertEqual(heldState.output, outputID)
+        XCTAssertEqual(heldState.activeSeekTicket, heldSeek); XCTAssertEqual(heldState.seekSerial, heldSeek)
+        XCTAssertGreaterThan(heldState.imageEpoch, copiedState.imageEpoch)
+        XCTAssertEqual(after.ticket, ticket); XCTAssertEqual(after.output, outputID)
+        XCTAssertEqual(after.activeSeekTicket, heldSeek); XCTAssertEqual(after.seekSerial, heldSeek)
+        XCTAssertTrue(nativeSeekIssued); XCTAssertTrue(creditClearedAtBegin)
+        // RED: the copy belongs to the pre-seek epoch. A matching item/ticket
+        // alone must not let the interrupted render publish into this new epoch.
+        XCTAssertEqual(enqueuedWhileHeld, 0, "A copied pre-seek image must not reach enqueue while its seek is active")
+        XCTAssertEqual(afterSubmitted, baselineSubmitted)
+        XCTAssertNil(afterFrame)
+        XCTAssertNil(currentCredit, "A late epoch snapshot must not credit a copied pre-seek image to the new epoch")
+
+        // Positive recovery is deliberately retained after the RED assertions.
+        bridge.onDebugRenderStamp = nil
+        let nativeFinished = await waitForPresentation { nativeCompletion.result != nil }
+        XCTAssertTrue(nativeFinished); XCTAssertEqual(nativeCompletion.result, true)
+        guard nativeFinished, nativeCompletion.result == true else {
+            XCTFail("The real same-item 0.75 seek must complete before releasing CPP"); return
+        }
+        let beforeRecovery = bridge.submittedFrameCount
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0.75, durationSeconds: 30, isPlaying: false))
+        bridge.completeSeek(heldSeek)
+        XCTAssertTrue(bridge.activate(ticket))
+        let recovered = await waitForPresentation {
+            bridge.updatePlayback(positionSeconds: 0.75, durationSeconds: 30, isPlaying: false)
+            guard let copied = bridge.lastCopiedFramePositionSeconds,
+                  let submitted = bridge.lastFramePositionSeconds else { return false }
+            return bridge.submittedFrameCount > beforeRecovery && bridge.debugCurrentFrameEpoch(for: ticket) != nil
+                && bridge.displayLayer.isReadyForDisplay && copied <= 0.75 + 0.000_01 && submitted <= 0.75 + 0.000_01
+                && abs(copied - 0.75) <= 1.0 / 24 + 0.000_01
+                && abs(submitted - 0.75) <= 1.0 / 24 + 0.000_01
+        }
+        XCTAssertTrue(recovered, "Matching completion must still submit a real paused target in the current epoch")
+        XCTAssertTrue(resource.item === item); XCTAssertTrue(resource.output === output)
+        XCTAssertTrue(resource.isAttached); XCTAssertTrue(resource.isBorrowed); XCTAssertFalse(resource.isRetired)
+        XCTAssertEqual(item.outputs.count, 1)
+        #else
+        XCTFail("After-copy seek contracts require existing DEBUG render stamps")
+        #endif
+    }
+
     private func waitForPresentation(_ condition: () -> Bool) async -> Bool {
         let deadline = ProcessInfo.processInfo.systemUptime + 4
         while !condition(), ProcessInfo.processInfo.systemUptime < deadline {
