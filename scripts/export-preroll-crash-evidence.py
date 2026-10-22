@@ -7,6 +7,7 @@ The deadline is a checked work budget; filesystem and output calls are not inter
 """
 
 import argparse
+from datetime import datetime
 import hashlib
 import importlib.util
 import json
@@ -179,17 +180,61 @@ def _nodes(tests, expected_udid):
     return found
 
 
-def _bindings(log, expected_udid, parser):
+def _known_aq_duplicate(payload, validated):
+    # Only the first fully validated payload per allowlisted case is eligible.
+    # No JSON prefix is decoded or accepted as a new binding.
+    for original, pid, source_line in validated.values():
+        if not payload.startswith(original):
+            continue
+        suffix = payload[len(original):]
+        match = re.fullmatch(
+            rb"(?P<stamp>[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}"
+            rb"\.[0-9]{6}\+0000) OfflineTikTokPlayer\[(?P<pid>[1-9][0-9]{0,19}):"
+            rb"(?P<tid>[1-9][0-9]{0,19})\] \[AQ\] {8}LoudnessManager\.mm:1215 {2}"
+            rb"IsHardwareSupported: no plist loaded, returning false", suffix)
+        if match is None or int(match["pid"]) != pid or int(match["tid"]) > (1 << 64) - 1:
+            continue
+        try:
+            datetime.strptime(match["stamp"].decode("ascii"), "%Y-%m-%d %H:%M:%S.%f%z")
+        except ValueError:
+            continue
+        return source_line
+    return None
+
+
+def _input_failure(output, stage, raw, failure, native_log_line=None):
+    if output is not None:
+        output.metadata("collection-input-failure", stage=stage, reason=failure.reason,
+                        inputBytes=len(raw), inputSHA256=hashlib.sha256(raw).hexdigest(),
+                        nativeLogLine=native_log_line)
+
+
+def _bindings(log, expected_udid, parser, output=None):
     expected = {value: key for key, value in CASE_NAMES.items()}
     seen = {key: [] for key in CASE_NAMES}
     host_count = 0
-    for line in log.splitlines():
+    validated = {}  # At most two exact first payloads, each already bounded to 8192 bytes.
+    recovered = 0
+    first_recovery = None
+    for line_number, line in enumerate(log.splitlines(), 1):
         if not line.startswith(b"NativeRuntimeHost "):
             continue
         host_count += 1
         if host_count > 1024 or len(line) > 8192:
             raise Unavailable("host-receipt-limit")
-        record = _json(line[len(b"NativeRuntimeHost "):])
+        payload = line[len(b"NativeRuntimeHost "):]
+        try:
+            record = _json(payload)
+        except Unavailable as failure:
+            source_line = (_known_aq_duplicate(payload, validated)
+                           if failure.reason == "invalid-json" else None)
+            if source_line is not None:
+                recovered += 1
+                if first_recovery is None:
+                    first_recovery = (line_number, source_line, hashlib.sha256(payload).hexdigest())
+                continue  # This duplicate contributes no binding or attribution facts.
+            _input_failure(output, "native-host-receipt-json", payload, failure, line_number)
+            raise
         if type(record) is not dict:
             raise Unavailable("host-receipt-shape")
         name = record.get("testName")
@@ -220,6 +265,12 @@ def _bindings(log, expected_udid, parser):
         if seen[case_id] and seen[case_id][0][0] != identity:
             raise Unavailable("inconsistent-host-binding")
         seen[case_id].append((identity, binding))
+        validated.setdefault(case_id, (payload, record["pid"], line_number))
+    if recovered and output is not None:
+        output.metadata("host-receipt-recovery", count=recovered,
+                        rule="exact-prior-payload-plus-same-pid-known-aq",
+                        firstNativeLogLine=first_recovery[0],
+                        priorNativeLogLine=first_recovery[1], firstInputSHA256=first_recovery[2])
     return {case_id: values[0][1] for case_id, values in seen.items() if values}
 
 
@@ -434,8 +485,13 @@ def collect(root, expected_udid, export_succeeded, output, *, parser=None, expor
     bundle = exporter.exact_bundle(native)
     tests_raw = _read_fixed(native / "xcresult-tests.json", native, JSON_BYTES)
     native_log = _read_fixed(native / "xcodebuild-test.log", native, LOG_BYTES)
-    tests = _nodes(_json(tests_raw), expected_udid)
-    bindings = _bindings(native_log, expected_udid, parser)
+    try:
+        tests_document = _json(tests_raw)
+    except Unavailable as failure:
+        _input_failure(output, "xcresult-tests-json", tests_raw, failure)
+        raise
+    tests = _nodes(tests_document, expected_udid)
+    bindings = _bindings(native_log, expected_udid, parser, output=output)
     owner = {"child": None, "cleanup_ok": True}
     work = Path(tempfile.mkdtemp(prefix="preroll-crash-", dir=native)).resolve(strict=True)
     case_roots = []

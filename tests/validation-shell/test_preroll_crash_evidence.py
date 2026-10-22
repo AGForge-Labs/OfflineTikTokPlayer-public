@@ -236,6 +236,101 @@ class PrototypeTests(unittest.TestCase):
         with self.assertRaises(self.c.Unavailable):
             self.c._bindings(self.log([missing, self.host(1)]), UDID, self.p)
 
+    def aq_suffix(self, pid=101):
+        return ("2026-10-22 02:19:37.123456+0000 OfflineTikTokPlayer[%d:321] [AQ]"
+                "        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false"
+                % pid).encode("ascii")
+
+    def test_06a_exact_prior_receipt_with_known_same_pid_aq_is_discarded(self):
+        payload = json.dumps(self.host(0)).encode()
+        duplicate = b"NativeRuntimeHost " + payload + self.aq_suffix() + b"\n"
+        log = self.log([self.host(0)]) + duplicate + self.log([self.host(1)])
+        stream = io.BytesIO(); output = self.c.Output(stream)
+        result = self.c._bindings(log, UDID, self.p, output=output)
+        self.assertEqual(set(result), set(self.ids))
+        self.assertEqual((result[self.ids[0]].pid, result[self.ids[1]].pid), (101, 102))
+        self.assertEqual(result[self.ids[0]].case_start_utc, START)
+        rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event"], "host-receipt-recovery")
+        self.assertEqual((rows[0]["count"], rows[0]["firstNativeLogLine"],
+                          rows[0]["priorNativeLogLine"]), (1, 3, 2))
+        self.assertEqual(rows[0]["firstInputSHA256"],
+                         hashlib.sha256(payload + self.aq_suffix()).hexdigest())
+        self.assertFalse(rows[0]["testAcceptance"])
+        self.assertNotIn(b"LoudnessManager", stream.getvalue())
+
+    def test_06b_suffix_recovery_rejects_first_conflicting_and_unrecognized_receipts(self):
+        payload = json.dumps(self.host(0)).encode()
+        line = b"NativeRuntimeHost " + payload
+        suffix = self.aq_suffix()
+        changed = self.host(0); changed["pid"] = 404
+        changed_nonce = self.host(0); changed_nonce["moduleNonce"] = NONCES[1]
+        changed_start = self.host(0); changed_start["caseStartUTC"] = (START + timedelta(seconds=1)).isoformat()
+        bad_lines = [
+            line + b" arbitrary suffix", line + b"{}", line + b" " + suffix,
+            line + self.aq_suffix(102), line + suffix + b"{}", line + suffix + b" trailing",
+            line + suffix.replace(b"[AQ]", b"[Fig]"),
+            line + suffix.replace(b"mm:1215", b"mm:1216"),
+            line + suffix.replace(b"2026-10-22", b"2026-13-22"),
+            line + suffix.replace(b"+0000", b"+0100"), line + b"\xff",
+            b"NativeRuntimeHost " + json.dumps(changed).encode() + self.aq_suffix(404),
+            b"NativeRuntimeHost " + json.dumps(changed_nonce).encode() + suffix,
+            b"NativeRuntimeHost " + json.dumps(changed_start).encode() + suffix,
+            b"NativeRuntimeHost " + json.dumps(self.host(0), separators=(",", ":")).encode() + suffix,
+        ]
+        for bad in bad_lines:
+            with self.subTest(input=hashlib.sha256(bad).hexdigest()[:8]):
+                stream = io.BytesIO()
+                with self.assertRaises(self.c.Unavailable) as failure:
+                    self.c._bindings(self.log([self.host(0)]) + bad + b"\n" + self.log([self.host(1)]),
+                                     UDID, self.p, output=self.c.Output(stream))
+                self.assertEqual(failure.exception.reason, "invalid-json")
+                metadata = json.loads(stream.getvalue())
+                self.assertEqual(metadata["stage"], "native-host-receipt-json")
+                self.assertEqual(metadata["nativeLogLine"], 3)
+                self.assertEqual(metadata["inputSHA256"],
+                                 hashlib.sha256(bad[len(b"NativeRuntimeHost "):]).hexdigest())
+        # A later clean receipt cannot retroactively validate the first malformed one.
+        with self.assertRaises(self.c.Unavailable) as failure:
+            self.c._bindings(line + suffix + b"\n" + self.log(), UDID, self.p)
+        self.assertEqual(failure.exception.reason, "invalid-json")
+
+    def test_06c_recovered_duplicates_still_obey_original_host_caps(self):
+        line = b"NativeRuntimeHost " + json.dumps(self.host(0)).encode()
+        for log in [self.log() + (line + self.aq_suffix() + b"\n") * 1023,
+                    self.log() + line + self.aq_suffix() + b"x" * 8193 + b"\n"]:
+            with self.subTest(bytes=len(log)), self.assertRaises(self.c.Unavailable) as failure:
+                self.c._bindings(log, UDID, self.p)
+            self.assertEqual(failure.exception.reason, "host-receipt-limit")
+
+    def test_06d_fake_export_recovery_and_early_json_failure_provenance(self):
+        line = b"NativeRuntimeHost " + json.dumps(self.host(0)).encode()
+        log = self.log([self.host(0)]) + line + self.aq_suffix() + b"\n" + self.log([self.host(1)])
+        calls, runner = self.fake_xcode()
+        stream = io.BytesIO()
+        with self.repository(log) as (root, _):
+            records = self.c.collect(root, UDID, True, self.c.Output(stream),
+                                     parser=self.p, exporter=self.e, run_child=runner)
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(json.loads(record)["availability"] == "available" for record in records))
+        metadata = [json.loads(row) for row in stream.getvalue().splitlines()]
+        self.assertEqual(sum(row["event"] == "host-receipt-recovery" for row in metadata), 1)
+        self.assertTrue(any(row["event"] == "collection-provenance" for row in metadata))
+        calls.clear(); stream = io.BytesIO()
+        with self.repository() as (root, native):
+            (native / "xcresult-tests.json").write_bytes(b"{")
+            with self.assertRaises(self.c.Unavailable) as failure:
+                self.c.collect(root, UDID, True, self.c.Output(stream),
+                               parser=self.p, exporter=self.e, run_child=runner)
+        self.assertEqual(failure.exception.reason, "invalid-json")
+        self.assertEqual(calls, [])
+        metadata = json.loads(stream.getvalue())
+        self.assertEqual(metadata["stage"], "xcresult-tests-json")
+        self.assertIsNone(metadata["nativeLogLine"])
+        self.assertEqual(metadata["inputSHA256"], hashlib.sha256(b"{").hexdigest())
+        self.popen_guard.assert_not_called()
+
     def test_07_exact_returned_nodes_and_destination_are_required(self):
         found = self.c._nodes(self.nodes(), UDID)
         self.assertEqual(tuple(sorted(found)), tuple(sorted(self.ids)))

@@ -1648,6 +1648,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 XCTAssertNil(startup.pollSummary)
                 startup.pollSummary = ProductionSelectionPollSummary()
                 print("ProductionSelectionPollScope schema=1 enabled=true clockHandoff=true phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only existingTimingSitesEnabled=true capture=unchanged publication=after-cleanup")
+                startup.availabilityClockTrace = handoffTrace
                 startup.enableEarlyNativePulls(baseRequest: service.debugInitialVideoReadyState.generation)
                 service.onDebugCPPNativePullStamp = { [weak startup] value in startup?.recordEarlyNativePull(value) }
                 service.onDebugAlignedVideoEnqueue = { [weak remainingWitness] value in remainingWitness?.record(value) }
@@ -3872,11 +3873,32 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let service = fixture.service(buffer: buffer, continuousAudio: audio)
         var screen: SelectionVideoScreen?
         var originalError: Error?
+        #if DEBUG
+        func recordBodyError(_ error: Error, boundary: String) {
+            func boundedLabel(_ text: String) -> String {
+                let bytes = text.utf8.prefix(192).map { byte in
+                    (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                        || byte == 46 || byte == 95 ? byte : 95
+                }
+                return String(bytes: bytes, encoding: .ascii) ?? "unavailable"
+            }
+            let isTimeout: Bool
+            if let local = error as? SelectionVideoTestFailure, case .timeout = local { isTimeout = true }
+            else { isTimeout = false }
+            let native = error as NSError
+            print("NaturalFixtureBodyError schema=1 boundary=\(boundary) intendedTimeout=\(isTimeout) concreteType=\(boundedLabel(String(reflecting: type(of: error)))) nsDomain=\(boundedLabel(native.domain)) nsCode=\(native.code) originalBinding=retained message=omitted userInfo=omitted playbackAcceptance=false")
+        }
+        #endif
         do {
             let created = try SelectionVideoScreen(service: service)
             screen = created
             try await body(fixture, audio, service, created)
-        } catch { originalError = error }
+        } catch {
+            originalError = error
+            #if DEBUG
+            recordBodyError(error, boundary: "body-catch")
+            #endif
+        }
         service.pause(); audio.graph.engine.stop(); screen?.close()
         #if DEBUG
         let preparation = ProductionSelectionShutdown()
@@ -3893,7 +3915,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #else
         fixture.remove()
         #endif
-        if let originalError { throw originalError }
+        if let originalError {
+            #if DEBUG
+            recordBodyError(originalError, boundary: "before-rethrow")
+            #endif
+            throw originalError
+        }
     }
 
     #if DEBUG
@@ -4295,6 +4322,7 @@ private final class ProductionVideoStartupTrace {
     private var badPhase = false
     #if DEBUG
     var remainingLatencyWitness: RemainingLatencyWitness?
+    weak var availabilityClockTrace: NativeClockHandoffTrace?
     func recordRemainingLatencyPoll(entryNs: UInt64?, state: ProductionSelectionState, service: PlaybackService) {
         guard let remainingLatencyWitness, let entryNs, lastPolls.indices.contains(phase),
               let poll = lastPolls[phase] else { return }
@@ -4463,6 +4491,18 @@ private final class ProductionVideoStartupTrace {
         renderSlots[index] = stamp
         if stamp.render.ticket == nil || !stamp.render.ownershipUnchanged || !stamp.presentationMatches {
             if renderOwnershipFailures < Int.max { renderOwnershipFailures += 1 } else { overflow = true }
+        }
+        if stamp.render.stage == .hasNewTrue, let trace = availabilityClockTrace {
+            let slot = earlyPullPhases.indices.contains(phase) ? earlyPullPhases[phase] : nil
+            let source = slot?.rows.last {
+                $0.pull.stage == .availability && $0.pull.returnNs <= stamp.render.entryNs
+            }
+            let covered = slot.map { slot in
+                slot.capacityDropped == 0 && slot.qualityFailures == 0
+                    && slot.anchorNs.map { stamp.render.entryNs >= $0
+                        && stamp.render.entryNs - $0 <= earlyPullWindowNs } == true
+            } == true && source.map { earlySourceQualified($0) } == true
+            trace.recordFirstAvailability(phase: phase, point: stamp, source: source, covered: covered)
         }
     }
     private func dumpRenderRows() {
@@ -6366,12 +6406,90 @@ private final class NativeClockHandoffTrace {
         var handoff: PlaybackService.DebugVideoRateHandoff?
         var read: PlaybackService.DebugVideoPositionRead?
     }
+    private struct AvailabilitySlot {
+        var before: PlaybackService.DebugVideoPositionRead?, after: PlaybackService.DebugVideoPositionRead?
+        var beforeCount: UInt64 = 0, afterCount: UInt64 = 0
+        var beforeOrdinal: UInt64 = 0, afterOrdinal: UInt64 = 0, boundaryCount: UInt64 = 0
+        var point: PlaybackService.DebugVideoRenderStamp?
+        var source: PlaybackService.DebugCPPNativePullStamp?
+        var sourceCovered = false
+    }
     private let enabled: Bool, baseRequest: Int
     private var slots = Array(repeating: Slot(), count: 6)
     private var orphans: UInt64 = 0, reads: UInt64 = 0
     private var overflow = false
+    private var availabilitySlots: [AvailabilitySlot] = []
+    private var availabilityOrphans: UInt64 = 0, availabilityOverflow = false
     init(enabled: Bool, baseRequest: Int) {
         self.enabled = enabled; self.baseRequest = baseRequest
+        if enabled {
+            availabilitySlots = Array(repeating: AvailabilitySlot(), count: 3)
+            print("NativeClockAvailabilityScope schema=1 enabled=true phases=3 retainedReadsCapacity=6 nativeBoundaryCapacity=3 firstRenderPointCapacity=3 selection=last-existing-read-before-point-and-first-existing-read-after-point noAdditionalGetters=true newClockSites=0 outputIdentity=CPP-boundary-only timebaseIdentity=unavailable imageEpoch=unavailable jointSnapshot=false nativeTimeAndRateAtomic=false missingOrChangedOwnerIsUnqualified=true publication=after-cleanup playbackAcceptance=unchanged")
+        }
+    }
+    private func incrementAvailability(_ value: inout UInt64) {
+        if value == .max { availabilityOverflow = true } else { value += 1 }
+    }
+    func recordFirstAvailability(phase: Int, point: PlaybackService.DebugVideoRenderStamp,
+        source: PlaybackService.DebugCPPNativePullStamp?, covered: Bool) {
+        guard enabled, availabilitySlots.indices.contains(phase) else {
+            incrementAvailability(&availabilityOrphans); return
+        }
+        incrementAvailability(&availabilitySlots[phase].boundaryCount)
+        // Preserve the first true point, even if its ownership/coverage is invalid. Never repair it later.
+        guard availabilitySlots[phase].point == nil else { return }
+        availabilitySlots[phase].point = point
+        availabilitySlots[phase].source = source
+        availabilitySlots[phase].sourceCovered = covered
+    }
+    private func availabilityOwnerJoined(_ read: PlaybackService.DebugVideoPositionRead,
+        source: PlaybackService.DebugCPPNativePullStamp) -> Bool {
+        let p = source.pull
+        return read.kind == .itemTimebase && read.request == source.request && read.returnGeneration == source.request
+            && read.item == source.sourceItem && read.observedItemMatches && read.presentationUnchanged
+            && read.presentationRequest == source.request && read.returnPresentationRequest == source.request
+            && read.presentationTicket == p.ticket && read.returnPresentationTicket == p.ticket
+            && read.entrySeekState == read.returnSeekState && read.entrySeekState.serial == p.nativeSeekTicket
+            && read.entrySeekState.activeTicket == nil && read.entryNs > 0 && read.returnNs >= read.entryNs
+    }
+    private func dumpAvailabilityClocks() {
+        for (phase, slot) in availabilitySlots.enumerated() {
+            let boundaryQualified: Bool
+            if let s = slot.source, let point = slot.point {
+                let p = s.pull, r = point.render
+                boundaryQualified = slot.sourceCovered && s.request == baseRequest + phase + 1
+                    && s.generation == s.request && point.presentationRequest == s.request && point.generation == s.request
+                    && p.stage == .availability && r.stage == .hasNewTrue && p.returnNs <= r.entryNs
+                    && p.ticket != nil && p.ticket == r.ticket && p.returnRevision == r.presentationRevision
+                    && r.ownershipUnchanged && point.presentationMatches
+            } else { boundaryQualified = false }
+            let beforeJoined = slot.before.flatMap { read in slot.source.map { availabilityOwnerJoined(read, source: $0) } } ?? false
+            let afterJoined = slot.after.flatMap { read in slot.source.map { availabilityOwnerJoined(read, source: $0) } } ?? false
+            let beforeNonoverlap = slot.before.flatMap { read in slot.source.map { read.returnNs <= $0.pull.entryNs } } ?? false
+            let afterNonoverlap = slot.after.flatMap { read in slot.source.map { read.entryNs >= $0.pull.returnNs } } ?? false
+            let valuesAvailable = [slot.before, slot.after].allSatisfy { read in
+                read?.rawItemTimebasePosition?.isFinite == true && read?.itemTimebaseEffectiveRate?.isFinite == true
+            }
+            let qualified = boundaryQualified && beforeJoined && afterJoined && beforeNonoverlap && afterNonoverlap && valuesAvailable
+            let selectionIntegrity = (slot.before == nil ? slot.beforeCount == 0 : slot.beforeCount > 0 && slot.beforeOrdinal == slot.beforeCount)
+                && (slot.after == nil ? slot.afterCount == 0 : slot.afterCount > 0 && slot.afterOrdinal == 1)
+                && ((slot.point != nil) == (slot.boundaryCount > 0))
+            print("NativeClockAvailabilitySummary schema=1 phase=\(phase) request=\(baseRequest + phase + 1) readsBeforePoint=\(slot.beforeCount) readsAfterPoint=\(slot.afterCount) truePointsObserved=\(slot.boundaryCount) beforeAvailable=\(slot.before != nil) afterAvailable=\(slot.after != nil) boundaryQualified=\(boundaryQualified) beforeOwnerJoined=\(beforeJoined) afterOwnerJoined=\(afterJoined) beforeNonoverlap=\(beforeNonoverlap) afterNonoverlap=\(afterNonoverlap) nativeValuesAvailable=\(valuesAvailable) sequentialBracketQualified=\(qualified) selectionIntegrity=\(selectionIntegrity) orphans=\(availabilityOrphans) overflow=\(availabilityOverflow) jointSnapshot=false timebaseIdentity=unavailable clockOutputObserved=false imageEpoch=unavailable clock=DispatchTime")
+            if let s = slot.source, let point = slot.point {
+                let p = s.pull
+                print("NativeClockAvailabilityBoundary schema=1 phase=\(phase) request=\(s.request) generation=\(s.generation) item=\(s.sourceItem) ticketRevision=\(p.ticket.map { String($0.debugGeneration) } ?? "unknown") output=\(p.output) seekSerial=\(p.nativeSeekTicket) sourceSeekSerial=\(p.sourceNativeSeekTicket.map { String($0) } ?? "unknown") activeSeek=\(p.activeSeekTicket.map { String($0) } ?? "none") nativeEntryNs=\(p.entryNs) nativeReturnNs=\(p.returnNs) firstTruePointNs=\(point.render.entryNs) sourceCovered=\(slot.sourceCovered) ownerUnchanged=\(p.ownerUnchanged) entryOwnerCoherent=\(p.entryOwnerCoherent) boundaryQualified=\(boundaryQualified) imageEpoch=unavailable clock=DispatchTime")
+            }
+            for (role, read, ordinal, joined, nonoverlap) in [(0, slot.before, slot.beforeOrdinal, beforeJoined, beforeNonoverlap), (1, slot.after, slot.afterOrdinal, afterJoined, afterNonoverlap)] {
+                guard let read else {
+                    print("NativeClockAvailabilityRead schema=1 phase=\(phase) role=\(role) available=false jointSnapshot=false")
+                    continue
+                }
+                print("NativeClockAvailabilityRead schema=1 phase=\(phase) role=\(role) available=true readOrdinal=\(ordinal) kind=\(read.kind.rawValue) request=\(read.request) returnGeneration=\(read.returnGeneration) item=\(read.item) entryNs=\(read.entryNs) returnNs=\(read.returnNs) position=\(read.position) rawPosition=\(read.rawItemTimebasePosition.map { String($0) } ?? "unavailable") effectiveRate=\(read.itemTimebaseEffectiveRate.map { String($0) } ?? "unavailable") presentationRequest=\(read.presentationRequest.map { String($0) } ?? "unknown") returnPresentationRequest=\(read.returnPresentationRequest.map { String($0) } ?? "unknown") ticketRevision=\(read.presentationTicket.map { String($0.debugGeneration) } ?? "unknown") returnTicketRevision=\(read.returnPresentationTicket.map { String($0.debugGeneration) } ?? "unknown") entrySeekSerial=\(read.entrySeekState.serial) returnSeekSerial=\(read.returnSeekState.serial) entryActiveSeek=\(read.entrySeekState.activeTicket.map { String($0) } ?? "none") returnActiveSeek=\(read.returnSeekState.activeTicket.map { String($0) } ?? "none") observedItemMatches=\(read.observedItemMatches) presentationUnchanged=\(read.presentationUnchanged) ownerJoined=\(joined) nonoverlap=\(nonoverlap) outputFromBoundary=\(slot.source.map { String(describing: $0.pull.output) } ?? "unavailable") clockOutputObserved=false timebaseIdentity=unavailable imageEpoch=unavailable jointSnapshot=false nativeTimeAndRateAtomic=false clock=DispatchTime")
+            }
+            // Assert recorder integrity only. Missing, overlapping or changed-owner observations remain unqualified data.
+            XCTAssertTrue(selectionIntegrity)
+        }
+        XCTAssertEqual(availabilityOrphans, 0); XCTAssertFalse(availabilityOverflow)
     }
     private func increment(_ value: inout UInt64) {
         if value == .max { overflow = true } else { value += 1 }
@@ -6389,6 +6507,19 @@ private final class NativeClockHandoffTrace {
         increment(&reads)
         let phase = value.request - baseRequest - 1
         guard (0..<3).contains(phase) else { increment(&orphans); return }
+        if enabled {
+            if availabilitySlots[phase].point == nil {
+                incrementAvailability(&availabilitySlots[phase].beforeCount)
+                availabilitySlots[phase].before = value
+                availabilitySlots[phase].beforeOrdinal = availabilitySlots[phase].beforeCount
+            } else {
+                incrementAvailability(&availabilitySlots[phase].afterCount)
+                if availabilitySlots[phase].after == nil {
+                    availabilitySlots[phase].after = value
+                    availabilitySlots[phase].afterOrdinal = availabilitySlots[phase].afterCount
+                }
+            }
+        }
         for index in (phase * 2)..<(phase * 2 + 2) {
             guard slots[index].read == nil, let handoff = slots[index].handoff,
                   value.entryNs >= handoff.returnNs else { continue }
@@ -6440,6 +6571,7 @@ private final class NativeClockHandoffTrace {
             print("NativeClockFollowingRead schema=2 phase=\(phase) cause=\(handoff.cause.rawValue) request=\(read.request) item=\(read.item) entryNs=\(read.entryNs) returnNs=\(read.returnNs) position=\(read.position) rawPosition=\(read.rawItemTimebasePosition.map { String($0) } ?? "unavailable") effectiveRate=\(read.itemTimebaseEffectiveRate.map { String($0) } ?? "unavailable") seekSerial=\(read.entrySeekState.serial) activeSeek=\(read.entrySeekState.activeTicket.map { String($0) } ?? "none") joined=\(joined) clock=DispatchTime")
             XCTAssertTrue(joined, "The first following read must retain the exact handoff owner")
         }
+        dumpAvailabilityClocks()
     }
 }
 
