@@ -26,6 +26,8 @@ final class PlaybackBuffer {
     let debugSuppressesPlayerRendering: Bool
     let debugNativeGeometry: Bool?
     var debugPreviousNeedsRewind: Bool? { previous?.needsRewind }
+    enum DebugAdvanceRoute: Int { case previousReplacement = 0, queuedAdvance = 1 }
+    var onDebugAdvanceBranch: (@MainActor (DebugAdvanceRoute, String, ObjectIdentifier) -> Void)?
     #endif
     var retainedItems: [AVPlayerItem] {
         var ids = Set<ObjectIdentifier>()
@@ -270,6 +272,9 @@ final class PlaybackBuffer {
         defer { retireReleased(oldResources) }
         if !hasPrepared(mediaID), let prepared = previous, prepared.mediaID == mediaID, prepared.item.status != .failed,
            prepared.isLocal || allowRemote {
+            #if DEBUG
+            onDebugAdvanceBranch?(.previousReplacement, prepared.mediaID, ObjectIdentifier(prepared.item))
+            #endif
             player.pause()
             previous = nil
             replace(with: prepared.item, mediaID: mediaID, isLocal: prepared.isLocal,
@@ -279,6 +284,9 @@ final class PlaybackBuffer {
         guard let prepared = next, prepared.mediaID == mediaID, prepared.item.status != .failed,
               prepared.isLocal || allowRemote,
               player.currentItem === prepared.item || player.items().dropFirst().first === prepared.item else { return nil }
+        #if DEBUG
+        onDebugAdvanceBranch?(.queuedAdvance, prepared.mediaID, ObjectIdentifier(prepared.item))
+        #endif
         retainPrevious(before: prepared); next = loopReserve; loopReserve = nil; active = prepared
         if player.currentItem !== prepared.item { player.advanceToNextItem() }
         updateEndAction()

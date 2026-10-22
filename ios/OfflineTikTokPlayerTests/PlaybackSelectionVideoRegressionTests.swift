@@ -655,6 +655,40 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testPreviousQueueLeadOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [false, true].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PreviousQueueLeadArm schema=1 armID=\(armID) order=off-then-on ordinal=\(ordinal) queuedPreviousLead=\(enabled) traceVideoSeeks=false otherInstrumentation=unset itemResourceOutput=retained-rewound adoptionRoute=queued-advance fixedSetupLeadMs=250 acceptance=unchanged")
+            defer { print("PreviousQueueLeadArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                                                       queuedPreviousLead: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Previous queue lead comparison requires DEBUG")
+        #endif
+    }
+
+    func testPreviousQueueLeadOnThenOff() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [true, false].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PreviousQueueLeadArm schema=1 armID=\(armID) order=on-then-off ordinal=\(ordinal) queuedPreviousLead=\(enabled) traceVideoSeeks=false otherInstrumentation=unset itemResourceOutput=retained-rewound adoptionRoute=queued-advance fixedSetupLeadMs=250 acceptance=unchanged")
+            defer { print("PreviousQueueLeadArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                                                       queuedPreviousLead: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Previous queue lead comparison requires DEBUG")
+        #endif
+    }
+
     func testNativeClockHandoffOffThenOn() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -2070,13 +2104,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 freshPreviousBundle: Bool? = nil,
                                                 suppressNativePlayerRendering: Bool? = nil,
                                                 nativeVideoGeometry: Bool? = nil,
-                                                traceFirstSourceFailure: Bool? = nil) async throws {
+                                                traceFirstSourceFailure: Bool? = nil,
+                                                queuedPreviousLead: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
         if let enabled = traceFirstSourceFailure {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, traceNativeRefill == enabled,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
-                  traceClockHandoff == nil, freshPreviousBundle == nil,
+                  traceClockHandoff == nil, freshPreviousBundle == nil, queuedPreviousLead == nil,
                   suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
                   acceptedPCMOriginBenchmarkMode == nil else {
                 XCTFail("First-failure control requires its matched native bundle and otherwise unset default benchmark")
@@ -2087,7 +2122,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil,
                   !auditSavedAAfterCleanup, traceClockHandoff == nil,
-                  freshPreviousBundle == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  freshPreviousBundle == nil, queuedPreviousLead == nil, acceptedPCMOriginBenchmarkMode == nil,
                   !(suppressNativePlayerRendering != nil && nativeVideoGeometry != nil) else {
                 XCTFail("Suppression control requires the otherwise unset production benchmark")
                 throw SelectionVideoTestFailure.timeout
@@ -2129,7 +2164,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         let previousBundleControl: SelectionPreviousBundleControl?
-        if let fresh = freshPreviousBundle {
+        if let enabled = queuedPreviousLead {
+            guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
+                  traceClockHandoff == nil, freshPreviousBundle == nil,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, acceptedPCMOriginBenchmarkMode == nil else {
+                XCTFail("Previous queue lead requires the otherwise unset default benchmark")
+                throw SelectionVideoTestFailure.timeout
+            }
+            previousBundleControl = try await SelectionPreviousBundleControl(fresh: false, queuedLead: enabled,
+                aID: fixture.aID, bID: fixture.bID,
+                aURL: XCTUnwrap(fixture.savedURLs[fixture.aID]),
+                bURL: XCTUnwrap(fixture.savedURLs[fixture.bID]))
+        } else if let fresh = freshPreviousBundle {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
                   traceClockHandoff == nil, acceptedPCMOriginBenchmarkMode == nil else {
@@ -2144,7 +2192,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 bURL: XCTUnwrap(fixture.savedURLs[fixture.bID]))
         } else { previousBundleControl = nil }
         #else
-        if freshPreviousBundle != nil {
+        if freshPreviousBundle != nil || queuedPreviousLead != nil {
             XCTFail("Previous-bundle control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
         }
@@ -2200,7 +2248,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
-        if suppressionControl != nil || traceFirstSourceFailure != nil {
+        if suppressionControl != nil || traceFirstSourceFailure != nil || queuedPreviousLead != nil {
             XCTAssertTrue(service.debugUsesCurrentCustomFrameForReadiness)
         }
         let remainingWitness = traceClockHandoff == true
@@ -2329,8 +2377,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     guard await waitUntil(timeout: 3, {
                         control.canReplacePrevious(service: service, audio: audio, screen: screen)
                     }) else { throw SelectionPreviousBundleControl.Failure.qualification(20) }
+                    control.beginQueuedLead(audio: audio, tap: tap, quantum: service.audioRenderQuantumFrames)
                     try control.choosePrevious(service: service, audio: audio, screen: screen)
-                    try await Task.sleep(for: .milliseconds(250))
+                    if queuedPreviousLead != nil { try await control.waitQueuedLead() }
+                    else { try await Task.sleep(for: .milliseconds(250)) }
                 }
                 qualification = {
                     try control.qualifyBeforeCommand(phase: phase, service: service, audio: audio, screen: screen)
@@ -2356,11 +2406,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 switch phase {
                 case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
                 case 1: service.next()
-                default: service.previous()
+                default:
+                    #if DEBUG
+                    try previousBundleControl?.stageAtPreviousCommand(service: service, audio: audio, screen: screen)
+                    #endif
+                    service.previous()
+                    #if DEBUG
+                    try previousBundleControl?.qualifyQueuedCommandReturn(service: service, audio: audio)
+                    #endif
                 }
             }
             measurements.append(measurement)
             #if DEBUG
+            if phase == 2 { previousBundleControl?.completeQueuedLeadReadback(last: measurement.last) }
             try suppressionControl?.qualify(phase: phase, stage: 1, service: service, audio: audio)
             #endif
             if phase == 2 {
@@ -2401,6 +2459,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         } catch { previousBundleBodyError = error }
         #if DEBUG
+        // A failed choose/stage/sleep must also stop its optional short probe.
+        previousBundleControl?.finishQueuedLead(audio: audio)
         if let control = previousBundleControl, previousBundleBodyError == nil {
             do {
                 // The original returned eight-second tap and sampler have stopped.
@@ -2408,7 +2468,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 // for the original timed first-frame or PCM acceptance checks.
                 try control.qualifyReturnedA(service: service, audio: audio, stage: 8)
                 await assertMovingVisibleVideo(service, screen: screen, identity: .a,
-                    label: "previous-bundle-\(control.fresh ? "fresh" : "retained")-returned-A")
+                    label: control.returnedCaptureLabel)
                 try control.qualifyReturnedA(service: service, audio: audio, stage: 9)
             } catch { previousBundleBodyError = error }
         }
@@ -2954,7 +3014,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         fixture: SelectionVideoFixture, audio: ContinuousAudioPlayer, tap: ProductionSelectionOutputTap,
         seeks: ProductionSelectionSeekRecorder, startup: ProductionVideoStartupTrace, phase: Int, id: String, frequency: Double,
         prepared: Bool, preparedBefore: Bool, preCommandQualification: (() throws -> Void)? = nil,
-        command: () -> Void) async throws -> ProductionSelectionMeasurement {
+        command: () throws -> Void) async throws -> ProductionSelectionMeasurement {
         let first = tap.begin()
         if prepared { try? await Task.sleep(for: .milliseconds(120)) }
         // Nil preserves the original path. Qualification may query SDK ownership,
@@ -2969,7 +3029,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         startup.remainingLatencyWitness?.beginPhase(phase, commandNs: DispatchTime.now().uptimeNanoseconds)
         #endif
-        command()
+        try command()
         let commandReturned = ProductionSelectionOutputTap.hostSeconds()
         #if DEBUG
         let replayToneAfterCleanup = acceptedPCMOriginBenchmarkMode != nil
@@ -4217,6 +4277,134 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertNotEqual(service.audioSnapshot.token, bToken)
         assertSelection(service, fixture: fixture, id: fixture.aID)
         await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "returned-A")
+    }
+
+    func testReturnedForwardVideoReusesItsPreparedNativeItemAndOutput() async throws {
+        #if DEBUG
+        let buffer = PlaybackBuffer()
+        let tap = ProductionSelectionOutputTap()
+        let seeks = ProductionSelectionSeekRecorder()
+        let startup = ProductionVideoStartupTrace(serviceTracing: false)
+        var forwardMeasurement: ProductionSelectionMeasurement?
+        var reuseReceipt: String?, recoveryReceipt: String?
+        defer {
+            if let reuseReceipt { print(reuseReceipt) }
+            if let recoveryReceipt { print(recoveryReceipt) }
+            print("ReturnedForwardVideoLatencyScope schema=1 commandOrdinal=4 phase=1 measured=\(forwardMeasurement != nil) measurementHelper=original toneEndLimitMs=100 readinessLimitMs=250 alignmentLimitMs=80 captureDuringMeasurement=false serviceObservers=false fullThreePhaseBenchmark=false")
+            if let forwardMeasurement { assertProductionSelection(forwardMeasurement, tap: tap) }
+            seeks.assertUnused()
+            let validity = tap.validity()
+            XCTAssertEqual(validity.invalidTimestamps, 0); XCTAssertEqual(validity.droppedFrames, 0)
+            XCTAssertLessThanOrEqual(tap.count, 12 * 48_000)
+        }
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            let originalSources = (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+            let originalBytes = audio.renderer.retainedPCMMemoryBytes
+            // Configure the graph before first playback, with recording disabled until command four.
+            audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { value, time in
+                tap.append(value, time: time)
+            }
+            defer {
+                tap.stop(); service.pause()
+                audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
+                audio.graph.engine.stop()
+            }
+            service.isInteractingWithFeed = true
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await self.require({ service.queue.currentID == fixture.aID
+                && self.explicitInitialReadySourceSettled(service, screen: screen)
+                && service.preparedAudioCount == 2 && buffer.hasPrepared(fixture.bID) },
+                "Real ready A and prepared B must precede the forward-cache reuse control")
+            let aToken = try XCTUnwrap(audio.entry(for: fixture.aID)).token
+            let bToken = try XCTUnwrap(audio.entry(for: fixture.bID)).token
+            XCTAssertGreaterThan(aToken, 0); XCTAssertGreaterThan(bToken, 0)
+            XCTAssertNotEqual(aToken, bToken); XCTAssertEqual(service.queue.repeatMode, .off)
+            XCTAssertEqual(service.audioSnapshot.token, aToken)
+
+            service.next()
+            try await self.require({ service.queue.currentID == fixture.bID
+                && service.audioSnapshot.token == bToken
+                && self.explicitInitialReadySourceSettled(service, screen: screen) },
+                "The original prepared B must become the real selected source")
+            try await self.requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
+            self.assertSelection(service, fixture: fixture, id: fixture.bID)
+            await self.assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "forward-cache-original-B")
+
+            // Weak witnesses must not prolong the resource whose cache ownership is under test.
+            weak var originalBItem: AVPlayerItem?
+            weak var originalBResource: ContinuousPictureInPicture.PreparedVideoResource?
+            weak var originalBOutput: AVPlayerItemVideoOutput?
+            do {
+                let item = try XCTUnwrap(service.player.currentItem)
+                let resource = try XCTUnwrap(buffer.resource(for: item))
+                let output = try XCTUnwrap(resource.output)
+                XCTAssertTrue(resource.item === item && resource.isAttached && !resource.isRetired && resource.isBorrowed)
+                XCTAssertTrue(item.outputs.contains { $0 === output })
+                originalBItem = item; originalBResource = resource; originalBOutput = output
+            }
+            let baseline = service.audioSnapshot
+            XCTAssertEqual(baseline.token, bToken); XCTAssertFalse(baseline.ended)
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
+
+            service.previous()
+            try await self.require({ service.queue.currentID == fixture.aID
+                && service.audioSnapshot.token == aToken
+                && self.explicitInitialReadySourceSettled(service, screen: screen) },
+                "Previous must return to actual A before checking its intended forward cache")
+            try await self.requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            self.assertSelection(service, fixture: fixture, id: fixture.aID)
+            await self.assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "forward-cache-returned-A")
+            XCTAssertNil(service.previousID); XCTAssertEqual(service.nextID, fixture.bID)
+            XCTAssertEqual(service.queue.repeatMode, .off)
+            try await self.require({ buffer.hasPrepared(fixture.bID) },
+                "Logical Next B must be prepared within the unchanged setup deadline")
+            let nextB = try XCTUnwrap(service.player.items().dropFirst().first)
+            let nextResource = try XCTUnwrap(buffer.resource(for: nextB))
+            let nextOutput = try XCTUnwrap(nextResource.output)
+            XCTAssertTrue(nextResource.isAttached && !nextResource.isRetired && !nextResource.isBorrowed)
+            XCTAssertTrue(nextB.outputs.contains { $0 === nextOutput })
+            XCTAssertEqual(audio.entry(for: fixture.bID)?.token, bToken)
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
+            let sameItem = nextB === originalBItem
+            let sameResource = nextResource === originalBResource
+            let sameOutput = nextOutput === originalBOutput
+            reuseReceipt = "ReturnedForwardVideoReuse schema=1 originalItemAlive=\(originalBItem != nil) originalResourceAlive=\(originalBResource != nil) originalOutputAlive=\(originalBOutput != nil) sameItem=\(sameItem) sameResource=\(sameResource) sameOutput=\(sameOutput) originalToken=\(bToken) preparedToken=\(audio.entry(for: fixture.bID)?.token ?? 0) retainedItems=\(buffer.retainedItemCount) latencyAcceptance=false"
+            // These are the intended RED assertions. Continue through real B recovery on failure.
+            XCTAssertTrue(sameItem, "Returning to first A must retain its intended Next B AVPlayerItem")
+            XCTAssertTrue(sameResource, "The retained forward B must reuse its prepared video resource")
+            XCTAssertTrue(sameOutput, "The retained forward B must reuse its actual attached video output")
+
+            XCTAssertEqual(tap.count, 0, "The preinstalled tap must retain no earlier selection or capture samples")
+            let preparedBefore = buffer.hasPrepared(fixture.bID) && service.preparedAudioCount == 2
+                && audio.entry(for: fixture.bID)?.token == bToken
+            forwardMeasurement = try await self.measureProductionSelection(service, screen: screen, fixture: fixture,
+                audio: audio, tap: tap, seeks: seeks, startup: startup, phase: 1, id: fixture.bID,
+                frequency: 880, prepared: true, preparedBefore: preparedBefore) {
+                service.next()
+            }
+            try await self.require({ service.queue.currentID == fixture.bID
+                && service.audioSnapshot.token == bToken
+                && self.explicitInitialReadySourceSettled(service, screen: screen) },
+                "Next must recover actual B with the original retained PCM token")
+            try await self.requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
+            XCTAssertTrue(service.player.currentItem === nextB)
+            XCTAssertTrue(buffer.resource(for: nextB) === nextResource)
+            XCTAssertTrue(nextResource.output === nextOutput && nextResource.isBorrowed)
+            self.assertSelection(service, fixture: fixture, id: fixture.bID)
+            await self.assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "forward-cache-recovered-B")
+            let final = service.audioSnapshot
+            XCTAssertEqual(final.token, bToken); XCTAssertFalse(final.ended)
+            XCTAssertEqual(final.underrunFrames, baseline.underrunFrames)
+            XCTAssertEqual(service.preparedAudioCount, 2)
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
+            XCTAssertEqual(originalBytes, 6_912_000)
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, originalBytes)
+            XCTAssertEqual((0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }, originalSources)
+            recoveryReceipt = "ReturnedForwardVideoRecovery schema=1 token=\(final.token) visit=\(final.visit) underrunDelta=\(final.underrunFrames - baseline.underrunFrames) queuedItemAdopted=\(service.player.currentItem === nextB) resourceBorrowed=\(nextResource.isBorrowed) retainedItems=\(buffer.retainedItemCount) movingPixels=asserted-after-return latencyAcceptance=false physicalOutput=unverified"
+        }
+        #else
+        XCTFail("Forward-cache ownership qualification requires DEBUG state")
+        #endif
     }
 
     #if DEBUG
@@ -6310,6 +6498,8 @@ private final class PreparedRenderingSuppressionControl {
 private final class SelectionPreviousBundleControl {
     enum Failure: Error { case qualification(Int) }
     let fresh: Bool
+    let queuedLead: Bool?
+    private let queueCaptureID: String?
     let buffer = PlaybackBuffer()
     private let aID: String, bID: String, aURL: URL, bURL: URL
     private let candidate: AVPlayerItem
@@ -6328,6 +6518,43 @@ private final class SelectionPreviousBundleControl {
     private var returnedVisit: Int64?
     private var oldDetachedBeforeInstall = false
     private var chosePrevious = false
+    private var queuedStaged = false
+    private var queueStageAttempted = false
+    private var queuedBSelection: ContinuousPCMRenderer.Snapshot?
+    private var queuedStorage: [ObjectIdentifier] = []
+    private var queuedMemoryBytes: Int?
+    private struct Availability {
+        let ordinal: Int, begin: Double, end: Double, available: Bool
+    }
+    private struct QueueStage {
+        let begin: Double, returned: Double, qualified: Double
+        let accepted: Bool, exactQueue: Bool
+    }
+    private struct QueueCommandReturn {
+        let begin: Double, end: Double, selectedExactItemResourceOutput: Bool, queuedAConsumed: Bool
+        let nextRole: Int, previousRole: Int
+    }
+    private var availability: [Availability] = []
+    private var queueStage: QueueStage?
+    private var queueCommandReturn: QueueCommandReturn?
+    private var queueCommandArmed = false
+    private var advanceBranchCount = 0
+    private var advanceBranchOverflow = false
+    private var advanceBranchKind: Int?
+    private var advanceBranchItemMatches = false
+    private var advanceBranchUnarmed = false
+    private struct LeadEndpoint {
+        let entry: UInt64, returned: UInt64, audio: ContinuousPCMRenderer.Snapshot
+    }
+    private weak var leadTap: ProductionSelectionOutputTap?
+    private var leadTapFirst: Int?, leadTapEndpointIndex: Int?, leadTapReadbackEnd: Int?
+    private var leadReadbackRepeated = false
+    private var leadStartHost: Double?, leadEndHost: Double?
+    private var leadStart: LeadEndpoint?, leadEnd: LeadEndpoint?
+    private var leadProbe: ProductionRendererProbe?, leadResult: ProductionRendererProbe.Result?
+    private var leadBeginUptime: Double?, leadDeadlineUptime: Double?, leadWakeUptime: Double?
+    private var leadBeforeSleepUptime: Double?
+    private var leadQuantum = 0
     private struct Row {
         let stage: Int, publishedUnionItems: Int
         let candidateDetached: Bool, originalResourceAlive: Bool
@@ -6338,8 +6565,9 @@ private final class SelectionPreviousBundleControl {
     private var overflow = false
     private let metadataBegin: Double, metadataEnd: Double
 
-    init(fresh: Bool, aID: String, bID: String, aURL: URL, bURL: URL) async throws {
-        self.fresh = fresh; self.aID = aID; self.bID = bID
+    init(fresh: Bool, queuedLead: Bool? = nil, aID: String, bID: String, aURL: URL, bURL: URL) async throws {
+        self.fresh = fresh; self.queuedLead = queuedLead; self.aID = aID; self.bID = bID
+        queueCaptureID = queuedLead.map { _ in UUID().uuidString.lowercased() }
         self.aURL = aURL.standardizedFileURL; self.bURL = bURL.standardizedFileURL
         let item = AVPlayerItem(url: aURL)
         item.preferredForwardBufferDuration = 8
@@ -6348,13 +6576,71 @@ private final class SelectionPreviousBundleControl {
         candidate = item; preparation = plan
         metadataBegin = begin; metadataEnd = ProcessInfo.processInfo.systemUptime
         rows.reserveCapacity(12)
+        if queuedLead != nil { availability.reserveCapacity(2); queuedStorage.reserveCapacity(3) }
+        try check(queuedLead == nil || !fresh, 60)
         try check(candidate.outputs.isEmpty && candidate.videoComposition == nil, 1)
         try check((candidate.asset as? AVURLAsset)?.url.standardizedFileURL == self.aURL, 2)
         try append(stage: 0)
+        if queuedLead != nil {
+            buffer.onDebugAdvanceBranch = { [weak self] route, id, item in
+                self?.recordAdvanceBranch(route, mediaID: id, item: item)
+            }
+        }
     }
 
     private func check(_ valid: Bool, _ code: Int) throws {
         guard valid else { throw Failure.qualification(code) }
+    }
+    func beginQueuedLead(audio: ContinuousAudioPlayer, tap: ProductionSelectionOutputTap, quantum: Int) {
+        guard queuedLead != nil else { return }
+        let begin = ProcessInfo.processInfo.systemUptime
+        leadBeginUptime = begin; leadDeadlineUptime = begin + 0.250
+        leadTap = tap; leadTapFirst = tap.begin(); leadQuantum = quantum
+        leadStartHost = ProductionSelectionOutputTap.hostSeconds()
+        let entry = DispatchTime.now().uptimeNanoseconds
+        let sample = audio.renderer.snapshot
+        let returned = DispatchTime.now().uptimeNanoseconds
+        leadStart = LeadEndpoint(entry: entry, returned: returned, audio: sample)
+        leadProbe = ProductionRendererProbe(renderer: audio.renderer)
+    }
+
+    func waitQueuedLead() async throws {
+        guard queuedLead != nil, let deadline = leadDeadlineUptime else { throw Failure.qualification(70) }
+        let before = ProcessInfo.processInfo.systemUptime
+        leadBeforeSleepUptime = before
+        // Staging must fit inside the same common budget. Never add 250 ms after
+        // ON staging, extend this deadline, or wait for additional probe samples.
+        try check(before < deadline, 71)
+        try await Task.sleep(for: .seconds(deadline - before))
+        leadWakeUptime = ProcessInfo.processInfo.systemUptime
+    }
+
+    func finishQueuedLead(audio: ContinuousAudioPlayer) {
+        guard queuedLead != nil, let probe = leadProbe else { return }
+        leadProbe = nil
+        leadResult = probe.stop()
+        let entry = DispatchTime.now().uptimeNanoseconds
+        let sample = audio.renderer.snapshot
+        let returned = DispatchTime.now().uptimeNanoseconds
+        leadEnd = LeadEndpoint(entry: entry, returned: returned, audio: sample)
+        leadEndHost = ProductionSelectionOutputTap.hostSeconds()
+        // Preserve the original tap's enabled state across its timed command.
+        // count is only the endpoint into the same fixed 12-second PCM storage.
+        leadTapEndpointIndex = leadTap?.count
+    }
+
+    func completeQueuedLeadReadback(last: Int) {
+        guard queuedLead != nil else { return }
+        // The ordinary measured phase has already returned; retain its existing
+        // callback endpoint only. No extra capture, wait, query or PCM is added.
+        guard leadTapReadbackEnd == nil else { leadReadbackRepeated = true; return }
+        leadTapReadbackEnd = last
+    }
+    var returnedCaptureLabel: String {
+        if let queuedLead, let queueCaptureID {
+            return "previous-queue-lead-\(queuedLead ? "on" : "off")-\(queueCaptureID)-returned-A"
+        }
+        return "previous-bundle-\(fresh ? "fresh" : "retained")-returned-A"
     }
     private func append(stage: Int) throws {
         // This is explicitly a published-boundary union, not a count of SDK-held
@@ -6387,6 +6673,10 @@ private final class SelectionPreviousBundleControl {
     }
     private func oldPreviousMatches() -> Bool {
         guard let old = originalA, let resource = originalResource, let output = resource.output else { return false }
+        if queuedLead != nil {
+            let position = old.currentTime().seconds
+            guard old.status == .readyToPlay && position.isFinite && abs(position) < 0.005 else { return false }
+        }
         return old !== candidate && itemURLMatches(old, aURL)
             && buffer.previousMediaID == aID && buffer.debugPreviousNeedsRewind == false
             && buffer.resource(for: old) === resource && resource.item === old
@@ -6404,11 +6694,124 @@ private final class SelectionPreviousBundleControl {
             && resource.isAttached && resource.isBorrowed && !resource.isRetired
             && ObjectIdentifier(output) == preparedBOutput && item.outputs.contains { $0 === output }
             && audio.entry(for: aID)?.token == aToken && aToken > 0 && aToken != bToken
-            && queue.count == 1 && queue.first === item && buffer.nextMediaID == nil
-            && !buffer.hasPrepared(aID) && !buffer.hasLoopReserve
+            && (queuedLead == nil
+                ? (queue.count == 1 && queue.first === item && buffer.nextMediaID == nil && !buffer.hasPrepared(aID))
+                : queuedBLayoutMatches(queue, current: item))
+            && !buffer.hasLoopReserve
             && state.readyGeneration == state.generation && state.audioVisit == sample.visit
             && state.syncingVideoGeneration == nil && screen.customVideoLayer?.isReadyForDisplay == true
             && (!requireSnapshot || (state.generation == bGeneration && sample.visit == bVisit))
+            && (queuedLead == nil || (item.outputs.count == 1 && item.outputs.first === output
+                && queuedStorageMatches(audio, sample: sample, requireSnapshot: requireSnapshot)))
+    }
+
+    private func queuedBLayoutMatches(_ items: [AVPlayerItem], current: AVPlayerItem) -> Bool {
+        if queuedStaged {
+            return items.count == 2 && items.first === current && items.last === originalA
+                && buffer.nextMediaID == aID && buffer.hasPrepared(aID)
+        }
+        return items.count == 1 && items.first === current && buffer.nextMediaID == nil && !buffer.hasPrepared(aID)
+    }
+
+    private func recordAdvanceBranch(_ route: PlaybackBuffer.DebugAdvanceRoute,
+                                     mediaID: String, item: ObjectIdentifier) {
+        guard mediaID == aID else { return }
+        guard advanceBranchCount == 0 else { advanceBranchOverflow = true; return }
+        advanceBranchCount = 1
+        advanceBranchKind = route.rawValue
+        advanceBranchItemMatches = originalA.map { ObjectIdentifier($0) == item } == true
+        advanceBranchUnarmed = !queueCommandArmed
+    }
+
+    private func queuedStorageMatches(_ audio: ContinuousAudioPlayer, sample: ContinuousPCMRenderer.Snapshot,
+                                      requireSnapshot: Bool) -> Bool {
+        guard queuedStorage.count == 3, queuedMemoryBytes == 6_912_000,
+              audio.renderer.retainedPCMMemoryBytes == queuedMemoryBytes,
+              queuedStorage == (0..<3).map({ ObjectIdentifier(audio.renderer.source(at: $0)) }) else { return false }
+        guard requireSnapshot else { return true }
+        guard let baseline = queuedBSelection else { return false }
+        return sample.token == baseline.token && sample.visit == baseline.visit
+            && sample.selectionVersion == baseline.selectionVersion && sample.frame >= baseline.frame
+            && sample.underrunFrames == baseline.underrunFrames
+    }
+
+    private func observeAvailability(_ ordinal: Int) throws {
+        guard queuedLead != nil, availability.count == ordinal, ordinal < 2,
+              let old = originalA, let resource = originalResource, let output = resource.output,
+              resource.item === old, resource === chosenResource, resource.isAttached,
+              !resource.isRetired, !resource.isBorrowed, ObjectIdentifier(output) == originalOutput,
+              old.outputs.count == 1, old.outputs.first === output else { throw Failure.qualification(61) }
+        let begin = ProcessInfo.processInfo.systemUptime
+        let available = output.hasNewPixelBuffer(forItemTime: .zero)
+        let end = ProcessInfo.processInfo.systemUptime
+        availability.append(Availability(ordinal: ordinal, begin: begin, end: end, available: available))
+    }
+
+    private func stageRetainedPrevious(service: PlaybackService, audio: ContinuousAudioPlayer,
+                                       screen: SelectionVideoScreen) throws {
+        // This entire OFF call is inside the original command origin. No print or
+        // XCTest assertion occurs here; refusal throws before issuing Previous.
+        guard queuedLead != nil, !queueStageAttempted, chosePrevious,
+              let old = originalA, let resource = originalResource,
+              preparedB != nil, bOwnerMatches(service, audio: audio, screen: screen, requireSnapshot: true),
+              oldPreviousMatches(), candidateIsMetadataOnly() else { throw Failure.qualification(62) }
+        queueStageAttempted = true
+        let begin = ProcessInfo.processInfo.systemUptime
+        let accepted = buffer.stage(.init(mediaID: aID, item: old, isLocal: true, videoResource: resource),
+            after: bID, ifEligible: { [self] in
+                bOwnerMatches(service, audio: audio, screen: screen, requireSnapshot: true)
+                    && oldPreviousMatches() && !queuedStaged
+            })
+        let returned = ProcessInfo.processInfo.systemUptime
+        queuedStaged = accepted
+        let exactQueue = accepted && bOwnerMatches(service, audio: audio, screen: screen, requireSnapshot: true)
+            && oldPreviousMatches() && old.outputs.count == 1
+            && resource === chosenResource && resource.output.map(ObjectIdentifier.init) == chosenOutput
+        let qualified = ProcessInfo.processInfo.systemUptime
+        queueStage = QueueStage(begin: begin, returned: returned, qualified: qualified,
+                                accepted: accepted, exactQueue: exactQueue)
+        try check(exactQueue, 63)
+    }
+
+    func stageAtPreviousCommand(service: PlaybackService, audio: ContinuousAudioPlayer,
+                                screen: SelectionVideoScreen) throws {
+        guard let queuedLead else { return }
+        guard availability.count == 2 else { throw Failure.qualification(64) }
+        if !queuedLead { try stageRetainedPrevious(service: service, audio: audio, screen: screen) }
+        else {
+            // Recheck after the original baseline/origin reads. Staging or a warmer
+            // must never silently change the queued route before this command.
+            try check(queuedStaged && queueStage?.exactQueue == true
+                && bOwnerMatches(service, audio: audio, screen: screen, requireSnapshot: true)
+                && oldPreviousMatches(), 65)
+        }
+        try check(advanceBranchCount == 0 && !advanceBranchOverflow, 69)
+        queueCommandArmed = true
+    }
+
+    func qualifyQueuedCommandReturn(service: PlaybackService, audio: ContinuousAudioPlayer) throws {
+        guard queuedLead != nil else { return }
+        defer { queueCommandArmed = false }
+        let begin = ProcessInfo.processInfo.systemUptime
+        guard queueCommandReturn == nil, let old = originalA, let resource = originalResource,
+              let output = originalVideoOutput else { throw Failure.qualification(67) }
+        // Synchronous item/adoption outcome only: real PCM acknowledgement, CPP
+        // readiness, borrowed state and pixels remain the original later oracles.
+        let exact = service.player === buffer.player && service.player.currentItem === old
+            && service.queue.currentID == aID && service.current?.id == aID && audio.selectedID == aID
+            && buffer.resource(for: old) === resource && resource === chosenResource
+            && resource.item === old && resource.isAttached && !resource.isRetired
+            && resource.output === output && old.outputs.count == 1 && old.outputs.first === output
+        let postNext = buffer.nextMediaID, postPrevious = buffer.previousMediaID
+        let consumed = postNext != aID && !buffer.hasPrepared(aID)
+        func role(_ id: String?) -> Int { id == nil ? 0 : (id == aID ? 1 : (id == bID ? 2 : 3)) }
+        let end = ProcessInfo.processInfo.systemUptime
+        queueCommandReturn = QueueCommandReturn(begin: begin, end: end,
+            selectedExactItemResourceOutput: exact, queuedAConsumed: consumed,
+            nextRole: role(postNext), previousRole: role(postPrevious))
+        try check(exact && consumed && advanceBranchCount == 1 && !advanceBranchOverflow
+            && advanceBranchKind == PlaybackBuffer.DebugAdvanceRoute.queuedAdvance.rawValue
+            && advanceBranchItemMatches && !advanceBranchUnarmed, 68)
     }
 
     func canReplacePrevious(service: PlaybackService, audio: ContinuousAudioPlayer,
@@ -6422,6 +6825,7 @@ private final class SelectionPreviousBundleControl {
         try check(canReplacePrevious(service: service, audio: audio, screen: screen), 21)
         bVisit = audio.renderer.snapshot.visit
         bGeneration = service.debugInitialVideoReadyState.generation
+        if queuedLead != nil { queuedBSelection = audio.renderer.snapshot }
         try append(stage: 4)
         if fresh {
             // The only strong old references are scoped to this verification block;
@@ -6457,6 +6861,10 @@ private final class SelectionPreviousBundleControl {
         }
         chosePrevious = true
         try append(stage: 5)
+        if let queuedLead {
+            try observeAvailability(0)
+            if queuedLead { try stageRetainedPrevious(service: service, audio: audio, screen: screen) }
+        }
     }
 
     func qualifyBeforeCommand(phase: Int, service: PlaybackService, audio: ContinuousAudioPlayer,
@@ -6489,7 +6897,9 @@ private final class SelectionPreviousBundleControl {
                 && resource.isAttached && !resource.isBorrowed && !resource.isRetired
                 && ObjectIdentifier(output) == chosenOutput && item.outputs.contains { $0 === output }
                 && (fresh ? oldDetachedBeforeInstall : (oldPreviousMatches() && candidateIsMetadataOnly())), 34)
+            if queuedLead != nil { try observeAvailability(1) }
             try append(stage: 6)
+            finishQueuedLead(audio: audio)
         default: throw Failure.qualification(35)
         }
     }
@@ -6515,6 +6925,10 @@ private final class SelectionPreviousBundleControl {
             originalVideoOutput = output
             preparedB = queued; preparedBResource = queuedResource
             preparedBOutput = ObjectIdentifier(queuedOutput)
+            if queuedLead != nil {
+                queuedStorage = (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+                queuedMemoryBytes = audio.renderer.retainedPCMMemoryBytes
+            }
             try append(stage: 2)
         } else if phase == 2 {
             try qualifyReturnedA(service: service, audio: audio, stage: 7)
@@ -6535,10 +6949,142 @@ private final class SelectionPreviousBundleControl {
             && (fresh ? oldDetachedBeforeInstall : candidateIsMetadataOnly()), 51)
         if let returnedVisit { try check(sample.visit == returnedVisit, 52) }
         else { returnedVisit = sample.visit }
+        if queuedLead != nil {
+            try check(queuedStaged && queueStage?.exactQueue == true && item === originalA
+                && resource === originalResource && output === originalVideoOutput
+                && queueCommandReturn?.selectedExactItemResourceOutput == true
+                && queueCommandReturn?.queuedAConsumed == true
+                && queuedStorageMatches(audio, sample: sample, requireSnapshot: false), 66)
+        }
         try append(stage: stage)
     }
 
+    private func dumpQueuedLead() {
+        guard let queuedLead else { return }
+        guard let begin = leadBeginUptime, let deadline = leadDeadlineUptime,
+              let beforeSleep = leadBeforeSleepUptime, let wake = leadWakeUptime,
+              let start = leadStart, let end = leadEnd, let result = leadResult,
+              let startHost = leadStartHost, let endHost = leadEndHost,
+              let tap = leadTap, let first = leadTapFirst, let endpointIndex = leadTapEndpointIndex,
+              let readbackEnd = leadTapReadbackEnd else {
+            print("PreviousQueueLeadWindow schema=2 queuedPreviousLead=\(queuedLead) available=false beginUptime=\(leadBeginUptime.map { String($0) } ?? "unavailable") deadlineUptime=\(leadDeadlineUptime.map { String($0) } ?? "unavailable") beforeSleepUptime=\(leadBeforeSleepUptime.map { String($0) } ?? "unavailable") wakeUptime=\(leadWakeUptime.map { String($0) } ?? "unavailable") startEndpointPresent=\(leadStart != nil) endEndpointPresent=\(leadEnd != nil) probeResultPresent=\(leadResult != nil) leadStartHost=\(leadStartHost.map { String($0) } ?? "unavailable") leadEndHost=\(leadEndHost.map { String($0) } ?? "unavailable") tapFirstIndex=\(leadTapFirst.map { String($0) } ?? "unavailable") tapEndpointIndex=\(leadTapEndpointIndex.map { String($0) } ?? "unavailable") tapReadbackEnd=\(leadTapReadbackEnd.map { String($0) } ?? "unavailable") scope=whole-precommand-B-lead publication=after-cleanup")
+            XCTFail("The queued-Previous B lead must have complete bounded evidence")
+            return
+        }
+        guard start.entry <= start.returned, start.returned <= end.entry, end.entry <= end.returned,
+              result.samples.allSatisfy({ $0.begin >= start.returned && $0.end >= $0.begin && $0.end <= end.entry }) else {
+            XCTFail("Lead endpoint/probe clock ordering is invalid"); return
+        }
+        let recorded = tap.samples(from: first, to: readbackEnd)
+        let validity = tap.validity()
+        guard recorded.rate.isFinite, recorded.rate > 0, recorded.values.count == recorded.hosts.count,
+              startHost.isFinite, endHost.isFinite, startHost < endHost,
+              first >= 0, first <= endpointIndex, endpointIndex <= readbackEnd, readbackEnd <= tap.count,
+              recorded.values.count == readbackEnd - first, !recorded.values.isEmpty,
+              recorded.values.allSatisfy({ $0.isFinite }), recorded.hosts.allSatisfy({ $0.isFinite }),
+              !leadReadbackRepeated, validity.invalidTimestamps == 0, validity.droppedFrames == 0 else {
+            print("PreviousQueueLeadTapReadback schema=2 queuedPreviousLead=\(queuedLead) available=false reasonCode=1 tapFirstIndex=\(first) tapEndpointIndex=\(endpointIndex) tapReadbackEnd=\(readbackEnd) rawFrames=\(recorded.values.count) rawHosts=\(recorded.hosts.count) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) repeatedReadback=\(leadReadbackRepeated) publication=after-cleanup")
+            XCTFail("The whole B lead tap recording is unavailable"); return
+        }
+        let samples = result.samples
+        let wall = Double(end.returned - start.returned) / 1_000_000_000
+        let pcm = Double(end.audio.frame - start.audio.frame) / 48_000
+        let tolerance = 2 * Double(max(1, leadQuantum)) / 48_000 + 0.005
+        let acquisition = ([start, end].map { Double($0.returned - $0.entry) / 1_000_000_000 }
+            + samples.map { Double($0.end - $0.begin) / 1_000_000_000 }).max() ?? .infinity
+        let innerGaps = zip(samples, samples.dropFirst()).map { before, after in Double(after.end - before.end) / 1_000_000_000 }
+        let edgeGaps = [samples.first.map { Double($0.end - start.returned) / 1_000_000_000 } ?? .infinity,
+                       samples.last.map { Double(end.returned - $0.end) / 1_000_000_000 } ?? .infinity]
+        let maximumGap = (innerGaps + edgeGaps).max() ?? .infinity
+        let represented = samples.first.flatMap { first in samples.last.map { Double($0.end - first.end) / 1_000_000_000 } } ?? -1
+        let skew = zip(samples, samples.dropFirst()).map { before, after in
+            abs(Double(after.audio.frame - before.audio.frame) / 48_000 - Double(after.end - before.end) / 1_000_000_000)
+        }.max() ?? .infinity
+        print("PreviousQueueLeadWindow schema=2 queuedPreviousLead=\(queuedLead) available=true beginUptime=\(begin) deadlineUptime=\(deadline) beforeSleepUptime=\(beforeSleep) wakeUptime=\(wake) stageDwellBudgetMs=250 wakeOvershootMs=\((wake - deadline) * 1000) endpointStartEntryNs=\(start.entry) endpointStartReturnNs=\(start.returned) endpointEndEntryNs=\(end.entry) endpointEndReturnNs=\(end.returned) fullLeadWallSeconds=\(wall) pcmSeconds=\(pcm) toleranceMs=\(tolerance * 1000) samples=\(samples.count) representedSeconds=\(represented) maximumGapMs=\(maximumGap * 1000) maximumAcquisitionMs=\(acquisition * 1000) maximumSkewMs=\(skew * 1000) dropped=\(result.dropped) acquisitionOutstanding=\(result.acquisitionOutstanding) firstToken=\(start.audio.token) finalToken=\(end.audio.token) firstVisit=\(start.audio.visit) finalVisit=\(end.audio.visit) firstSelectionVersion=\(start.audio.selectionVersion) finalSelectionVersion=\(end.audio.selectionVersion) firstFrame=\(start.audio.frame) finalFrame=\(end.audio.frame) firstUnderruns=\(start.audio.underrunFrames) finalUnderruns=\(end.audio.underrunFrames) scope=common-250ms-deadline-plus-original-120ms-lead-and-returned-query-spans noExtensionForSamples=true tapProof=separate-host-domain-row physicalOutputProof=false publication=after-cleanup")
+        for sample in samples.prefix(8) {
+            print("PreviousQueueLeadRenderSample schema=1 queuedPreviousLead=\(queuedLead) beginNs=\(sample.begin) endNs=\(sample.end) token=\(sample.audio.token) visit=\(sample.audio.visit) selectionVersion=\(sample.audio.selectionVersion) frame=\(sample.audio.frame) ended=\(sample.audio.ended) underrunFrames=\(sample.audio.underrunFrames)")
+        }
+        XCTAssertLessThan(beforeSleep, deadline); XCTAssertGreaterThanOrEqual(wake, deadline)
+        XCTAssertGreaterThanOrEqual(wall, 0.25); XCTAssertGreaterThan(leadQuantum, 0)
+        XCTAssertGreaterThanOrEqual(samples.count, 2); XCTAssertLessThanOrEqual(samples.count, 8)
+        XCTAssertGreaterThan(represented, 0.15); XCTAssertLessThanOrEqual(maximumGap, 0.25)
+        XCTAssertLessThanOrEqual(acquisition, 0.005); XCTAssertEqual(result.dropped, 0)
+        XCTAssertFalse(result.acquisitionOutstanding)
+        XCTAssertEqual(start.audio.token, bToken); XCTAssertEqual(start.audio.visit, bVisit)
+        XCTAssertEqual(end.audio.token, start.audio.token); XCTAssertEqual(end.audio.visit, start.audio.visit)
+        XCTAssertEqual(end.audio.selectionVersion, start.audio.selectionVersion)
+        XCTAssertFalse(start.audio.ended); XCTAssertFalse(end.audio.ended)
+        XCTAssertEqual(start.audio.underrunFrames, 0); XCTAssertEqual(end.audio.underrunFrames, 0)
+        XCTAssertTrue(samples.allSatisfy { $0.audio.token == bToken && $0.audio.visit == start.audio.visit
+            && $0.audio.selectionVersion == start.audio.selectionVersion && !$0.audio.ended
+            && $0.audio.underrunFrames == 0 && $0.audio.frame >= start.audio.frame && $0.audio.frame <= end.audio.frame })
+        XCTAssertTrue(zip(samples, samples.dropFirst()).allSatisfy { before, after in after.audio.frame >= before.audio.frame })
+        XCTAssertGreaterThan(pcm, 0.15); XCTAssertEqual(pcm, wall, accuracy: tolerance)
+        XCTAssertLessThanOrEqual(skew, tolerance)
+        // Host-time selection is a readback of synthetic measurement frames, not
+        // media trimming. Whole callback buffers are allowed at both raw edges.
+        let sampleSeconds = 1 / recorded.rate
+        let rawFirstHost = recorded.hosts[0], rawLastHost = recorded.hosts[recorded.hosts.count - 1]
+        let ordered = zip(recorded.hosts, recorded.hosts.dropFirst()).allSatisfy { before, after in after > before }
+        let gridErrorFrames = recorded.hosts.enumerated().reduce(0.0) { maximum, value in
+            max(maximum, abs((value.element - rawFirstHost) * recorded.rate - Double(value.offset)))
+        }
+        let rawHole = ProductionSelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
+        let covered = rawFirstHost <= startHost && rawLastHost + sampleSeconds >= endHost
+        print("PreviousQueueLeadTapReadback schema=2 queuedPreviousLead=\(queuedLead) available=true rawCoverage=\(covered) ordered=\(ordered) rawFrameGridError=\(gridErrorFrames) rawMaximumHoleSeconds=\(rawHole) tapFirstIndex=\(first) tapEndpointIndex=\(endpointIndex) tapReadbackEnd=\(readbackEnd) rawFrames=\(recorded.values.count) rate=\(recorded.rate) rawFirstHost=\(rawFirstHost) rawLastHost=\(rawLastHost) rawEndHostExclusive=\(rawLastHost + sampleSeconds) leadStartHost=\(startHost) leadEndHost=\(endHost) hostIntervalSeconds=\(endHost - startHost) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) readbackSource=existing-phase2-measurement-last extraWaits=0 extraCaptures=0 hostToDispatchArithmetic=false runtimeSourceFrameJoin=false publication=after-cleanup")
+        guard ordered, covered, gridErrorFrames <= 0.5, rawHole <= 0.5 / recorded.rate,
+              let lower = recorded.hosts.firstIndex(where: { $0 >= startHost }) else {
+            XCTFail("Existing phase-2 tap callbacks do not qualify full host-domain B lead coverage"); return
+        }
+        let upper = recorded.hosts.firstIndex(where: { $0 >= endHost }) ?? recorded.hosts.count
+        guard lower < upper else { XCTFail("No complete host-domain B lead interval is available"); return }
+        let selectedValues = Array(recorded.values[lower..<upper])
+        let selectedHosts = Array(recorded.hosts[lower..<upper])
+        let selectedFirst = selectedHosts[0], selectedLast = selectedHosts[selectedHosts.count - 1]
+        let firstOffsetFrames = (selectedFirst - startHost) * recorded.rate
+        let endOvershootFrames = (selectedLast + sampleSeconds - endHost) * recorded.rate
+        let expectedFrames = (endHost - startHost) * recorded.rate
+        let countErrorFrames = abs(Double(selectedValues.count) - expectedFrames)
+        let tone = ProductionSelectionOutputTap.toneBlocks(selectedValues, rate: recorded.rate, frequency: 880)
+        let quiet = ProductionSelectionOutputTap.quietRun(selectedValues, rate: recorded.rate)
+        let hole = ProductionSelectionOutputTap.maximumTimelineHole(selectedHosts, rate: recorded.rate)
+        print("PreviousQueueLeadTapSelection schema=2 queuedPreviousLead=\(queuedLead) available=true firstIndex=\(first + lower) endIndex=\(first + upper) frames=\(selectedValues.count) expectedHostFrames=\(expectedFrames) countErrorFrames=\(countErrorFrames) firstHost=\(selectedFirst) lastHost=\(selectedLast) endHostExclusive=\(selectedLast + sampleSeconds) firstOffsetFrames=\(firstOffsetFrames) endOvershootFrames=\(endOvershootFrames) correctToneBlocks=\(tone.correct) totalToneBlocks=\(tone.total) quietSeconds=\(quiet) maximumTimelineHoleSeconds=\(hole) selection=actual-tap-hosts-in-fixed-lead-interval sourceMediaTrim=false physicalOutputProof=false runtimeSourceFrameJoin=false publication=after-cleanup")
+        XCTAssertTrue(selectedHosts.allSatisfy { $0 >= startHost && $0 < endHost })
+        XCTAssertGreaterThanOrEqual(firstOffsetFrames, 0); XCTAssertLessThanOrEqual(firstOffsetFrames, 1)
+        XCTAssertGreaterThanOrEqual(endOvershootFrames, 0); XCTAssertLessThanOrEqual(endOvershootFrames, 1)
+        XCTAssertLessThanOrEqual(countErrorFrames, 1)
+        XCTAssertGreaterThan(Double(selectedValues.count) / recorded.rate, 0.15)
+        XCTAssertEqual(quiet, 0); XCTAssertGreaterThan(tone.total, 0); XCTAssertEqual(tone.correct, tone.total)
+        XCTAssertLessThanOrEqual(hole, 0.5 / recorded.rate)
+    }
+
     func dump(setupCompleted: Bool) {
+        if let queuedLead {
+            buffer.onDebugAdvanceBranch = nil
+            dumpQueuedLead()
+            print("PreviousQueueLeadScope schema=1 queuedPreviousLead=\(queuedLead) captureID=\(queueCaptureID ?? "unavailable") captureLabel=\(returnedCaptureLabel) setupCompleted=\(setupCompleted) fixedSetupLeadMs=250 existingPreparedLeadMs=120 staging=\(queuedLead ? "before-fixed-lead" : "inside-original-command") adoptionRoute=actual-queued-branch-required sameRetainedItemResourceOutput=true extraPlayers=0 copiesBeforePrevious=0 availabilityReads=\(availability.count) availabilityCapacity=2 stageAttempts=\(queueStageAttempted ? 1 : 0) stageAccepted=\(queueStage?.accepted == true) exactQueuedBA=\(queueStage?.exactQueue == true) readScope=no-copy-hasNew-at-zero sdkReadSideEffects=unverified publication=after-owned-cleanup nilMode=unchanged relativeBenefit=not-decoder-proof acceptance=unchanged")
+            print("PreviousQueueLeadBranch schema=1 queuedPreviousLead=\(queuedLead) count=\(advanceBranchCount) capacity=1 overflow=\(advanceBranchOverflow) routeCode=\(advanceBranchKind.map { String($0) } ?? "unavailable") itemMatches=\(advanceBranchItemMatches) unarmed=\(advanceBranchUnarmed) observedBoundary=after-existing-branch-guard-before-mutation sdkReturnOutcome=separate callbackGetters=0 callbackClocks=0 callbackPrinting=0")
+            for value in availability {
+                print("PreviousQueueLeadAvailability schema=1 queuedPreviousLead=\(queuedLead) ordinal=\(value.ordinal) beginUptime=\(value.begin) returnUptime=\(value.end) durationMs=\((value.end - value.begin) * 1000) available=\(value.available) negativeMeaning=inconclusive consumed=false itemResourceOutput=retained-rewound")
+            }
+            if let value = queueStage {
+                print("PreviousQueueLeadStage schema=1 queuedPreviousLead=\(queuedLead) beginUptime=\(value.begin) returnUptime=\(value.returned) qualifiedUptime=\(value.qualified) stageMs=\((value.returned - value.begin) * 1000) postQualificationMs=\((value.qualified - value.returned) * 1000) accepted=\(value.accepted) exactQueuedBA=\(value.exactQueue) withinMeasuredCommand=\(!queuedLead) stageQualificationCost=included-no-observer printsDuringCommand=0")
+            }
+            if let value = queueCommandReturn {
+                print("PreviousQueueLeadCommandReturn schema=1 queuedPreviousLead=\(queuedLead) beginUptime=\(value.begin) returnUptime=\(value.end) durationMs=\((value.end - value.begin) * 1000) selectedExactItemResourceOutput=\(value.selectedExactItemResourceOutput) queuedAConsumed=\(value.queuedAConsumed) nextRole=\(value.nextRole) previousRole=\(value.previousRole) roleCodes=absent0-A1-B2-other3 withinMeasuredCommand=true previousSlotReconciledByService=true actualPCMAndCPPProof=original-later-oracles")
+            }
+            XCTAssertLessThanOrEqual(availability.count, 2)
+            if setupCompleted {
+                XCTAssertEqual(availability.map(\.ordinal), [0, 1]); XCTAssertTrue(queueStageAttempted)
+                XCTAssertTrue(queuedStaged); XCTAssertEqual(queueStage?.accepted, true)
+                XCTAssertEqual(queueStage?.exactQueue, true)
+                XCTAssertEqual(queueCommandReturn?.selectedExactItemResourceOutput, true)
+                XCTAssertEqual(queueCommandReturn?.queuedAConsumed, true)
+                XCTAssertEqual(advanceBranchCount, 1); XCTAssertFalse(advanceBranchOverflow)
+                XCTAssertEqual(advanceBranchKind, PlaybackBuffer.DebugAdvanceRoute.queuedAdvance.rawValue)
+                XCTAssertTrue(advanceBranchItemMatches); XCTAssertFalse(advanceBranchUnarmed)
+            }
+        }
         print("PreviousBundleScope schema=1 fresh=\(fresh) setupCompleted=\(setupCompleted) metadataJoined=true metadataMs=\((metadataEnd - metadataBegin) * 1000) extraPlayers=0 customTasks=0 traceVideoSeeks=false fixedSetupLeadMs=250 existingPreparedLeadMs=120 aToken=\(aToken) bToken=\(bToken) bVisit=\(bVisit.map { String($0) } ?? "unavailable") bGeneration=\(bGeneration.map { String($0) } ?? "unavailable") returnedVisit=\(returnedVisit.map { String($0) } ?? "unavailable") rows=\(rows.count) capacity=12 overflow=\(overflow) ownershipScope=published-buffer-union-held-candidate sdkInternalQuiescence=unverified unobservedInflightItems=unknown maximumObservedItems=\(rows.map(\.publishedUnionItems).max() ?? 0) compositorScope=returned-A-after-original-PCM-tail treatment=bundle-history-not-individual-component originalAcceptance=unchanged")
         for row in rows {
             print("PreviousBundleBoundary schema=1 fresh=\(fresh) stage=\(row.stage) publishedUnionItems=\(row.publishedUnionItems) candidateDetached=\(row.candidateDetached) originalResourceAlive=\(row.originalResourceAlive) originalRetired=\(row.originalRetired) originalAttached=\(row.originalAttached) originalBorrowed=\(row.originalBorrowed) oldDetachedBeforeInstall=\(row.oldDetachedBeforeInstall)")
