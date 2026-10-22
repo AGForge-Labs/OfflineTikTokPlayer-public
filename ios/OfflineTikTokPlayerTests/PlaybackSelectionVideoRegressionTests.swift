@@ -6990,8 +6990,15 @@ private final class SelectionPreviousBundleControl {
         let wall = Double(end.returned - start.returned) / 1_000_000_000
         let pcm = Double(end.audio.frame - start.audio.frame) / 48_000
         let tolerance = 2 * Double(max(1, leadQuantum)) / 48_000 + 0.005
-        let acquisition = ([start, end].map { Double($0.returned - $0.entry) / 1_000_000_000 }
-            + samples.map { Double($0.end - $0.begin) / 1_000_000_000 }).max() ?? .infinity
+        let endpointAcquisitions: [Double] = [start, end].map { endpoint in
+            let span: UInt64 = endpoint.returned - endpoint.entry
+            return Double(span) / 1_000_000_000.0
+        }
+        let probeAcquisitions: [Double] = samples.map { sample in
+            let span: UInt64 = sample.end - sample.begin
+            return Double(span) / 1_000_000_000.0
+        }
+        let acquisition: Double = (endpointAcquisitions + probeAcquisitions).max() ?? Double.infinity
         let innerGaps = zip(samples, samples.dropFirst()).map { before, after in Double(after.end - before.end) / 1_000_000_000 }
         let edgeGaps = [samples.first.map { Double($0.end - start.returned) / 1_000_000_000 } ?? .infinity,
                        samples.last.map { Double(end.returned - $0.end) / 1_000_000_000 } ?? .infinity]
