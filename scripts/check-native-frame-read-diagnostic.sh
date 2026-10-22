@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=e54c38c552d4d2b22fce1168ce1616a434d7645d
-expected_ios_tree=3477441bd9483a892df085f2d7254a1c2db5ce6f
+expected_code_source=3963020281e0cd01ef90cba65e2dfd29c47478be
+expected_ios_tree=d4b49364d7c3fde9a17a9785a9990e5399be7d37
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
@@ -17,6 +17,7 @@ cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn
   OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testAbandonTimelineRequiresMatchingOwnerAndPreservesReentrantPresentation
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels
+  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testIdentitySourceNeedsNoCompositionAndPreservesEveryDecodedVideoFrame
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -49,9 +50,10 @@ expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn',
     'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testAbandonTimelineRequiresMatchingOwnerAndPreservesReentrantPresentation',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels'}
-if len(expected) != 8 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly eight startup/ownership/pixel/cleanup diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels',
+    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testIdentitySourceNeedsNoCompositionAndPreservesEveryDecodedVideoFrame'}
+if len(expected) != 9 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly nine geometry/startup/ownership/pixel/cleanup diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -60,7 +62,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=8 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=9 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -161,10 +163,11 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=8 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=9 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Default then Issued must be qualified by actual order and runtime PID/module nonce.
 # Clock-handoff controls compare existing OFF/ON instrumentation; no full acceptance follows.
 # A separate prepared A/B/A test retains actual moving compositor-pixel proof.
+# The geometry test is an expected baseline RED; all nine must still pass for evidence success.
 # The real error-cleanup regression runs last to preserve that original order.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
