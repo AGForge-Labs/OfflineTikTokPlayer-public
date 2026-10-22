@@ -331,6 +331,19 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var syncingVideoSeek: UInt64?
     @ObservationIgnored private var audioLoadingID: String?
     @ObservationIgnored private var pendingAudioSeek: (seek: PlaybackTimeline.Seek, version: Int)?
+    private struct PausedExplicitVisitOwnership: Equatable, Sendable {
+        let request: Int
+        let mediaID: String
+        let token: Int
+        let selectionVersion: Int
+        let visit: Int64
+        let target: Double
+        var item: ObjectIdentifier?
+        var ticket: ContinuousPictureInPicture.PresentationTicket?
+        var nativeSeek: UInt64?
+        var completedEpoch: UInt64?
+    }
+    @ObservationIgnored private var pausedExplicitVisitOwnership: PausedExplicitVisitOwnership?
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
     var videoFramePositionSeconds: Double? { continuousPiP.lastFramePositionSeconds }
     var copiedVideoFramePositionSeconds: Double? { continuousPiP.lastCopiedFramePositionSeconds }
@@ -565,6 +578,7 @@ final class PlaybackService: NSObject {
     func debugStopPreparation(_ completion: @escaping @Sendable () -> Void) {
         generation += 1; warmRevision += 1
         pendingInitialClockBinding = nil; statusHandledGeneration = nil
+        pausedExplicitVisitOwnership = nil
         observedItem = nil; itemObservation = nil; readyGeneration = nil
         let tasks = [loadTask, warmTask, audioCheckTask, audioPollTask, stallTask].compactMap { $0 }
         loadTask = nil; warmTask = nil; audioCheckTask = nil; audioPollTask = nil; stallTask = nil
@@ -617,13 +631,22 @@ final class PlaybackService: NSObject {
     func seek(_ seconds: Double) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
+        pausedExplicitVisitOwnership = nil
         transferInitialClockBinding(retainActivation: false)
         explicitVideoSeekGeneration = generation
         pendingInitialZeroStart = nil
         initialZeroVisitOwnership = nil
+        let pausedVisitBaseline = !intent.canPlay && continuousAudio.isSelected ? continuousAudio.snapshot : nil
         if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
            let version = continuousAudio.seek(seek.target) {
             pendingAudioSeek = (seek, version)
+            if !intent.canPlay, let id = continuousAudio.selectedID, queue.currentID == id,
+               let entry = continuousAudio.entry(for: id), entry.token > 0,
+               let baseline = pausedVisitBaseline, baseline.visit >= 0, baseline.visit < Int64.max {
+                pausedExplicitVisitOwnership = PausedExplicitVisitOwnership(request: generation,
+                    mediaID: id, token: entry.token, selectionVersion: version,
+                    visit: baseline.visit + 1, target: seek.target)
+            }
             recordDiagnostic(.seekRequested)
             if !intent.canPlay {
                 _ = clock.completeSeek(seek, actualPosition: seek.target)
@@ -668,6 +691,7 @@ final class PlaybackService: NSObject {
         defer { continuousPiP.endReadinessUpdates() }
         pendingAudioSeek = nil; completePiPSkip()
         pendingInitialClockBinding = nil; statusHandledGeneration = nil
+        pausedExplicitVisitOwnership = nil
         pendingInitialZeroStart = nil
         initialZeroVisitOwnership = nil
         if !audioAlreadySelected { audioLoadingID = queue.currentID }
@@ -1190,6 +1214,58 @@ final class PlaybackService: NSObject {
         return currentVideoPresentation(for: item, request: owner.request) == ticket
     }
 
+    private func ownsPausedExplicitVisit(_ owner: PausedExplicitVisitOwnership, item: AVPlayerItem) -> Bool {
+        generation == owner.request && explicitVideoSeekGeneration == owner.request
+            && !intent.canPlay && videoAllowed && audioLoadingID == nil && observedItem === item
+            && continuousAudio.isSelected && queue.currentID == owner.mediaID
+            && continuousAudio.selectedID == owner.mediaID
+            && continuousAudio.entry(for: owner.mediaID)?.token == owner.token
+            && videoPresentation?.request == owner.request
+            && (owner.item == nil || owner.item == ObjectIdentifier(item))
+            && (owner.ticket == nil || owner.ticket == videoPresentation?.ticket)
+    }
+
+    // Bind only an actual paused native issue to the exact explicit PCM command.
+    // The existing decision supplied this snapshot; no additional SDK read is made.
+    private func bindPausedExplicitVisit(for item: AVPlayerItem, request: Int, position: Double,
+        nativeSeek: UInt64, sample: ContinuousPCMRenderer.Snapshot,
+        selectionPending: Bool) -> PausedExplicitVisitOwnership? {
+        guard var owner = pausedExplicitVisitOwnership, owner.request == request, owner.nativeSeek == nil,
+              ownsPausedExplicitVisit(owner, item: item), let presentation = videoPresentation,
+              presentation.request == request, position.isFinite,
+              abs(position - owner.target) <= 1.0 / 48_000 else { return nil }
+        let acknowledged = !selectionPending && sample.token == owner.token
+            && sample.visit == owner.visit && sample.selectionVersion == owner.selectionVersion
+        let awaiting = selectionPending && sample.visit == owner.visit - 1
+        guard awaiting || acknowledged else { return nil }
+        owner.item = ObjectIdentifier(item); owner.ticket = presentation.ticket
+        owner.nativeSeek = nativeSeek
+        pausedExplicitVisitOwnership = owner
+        return owner
+    }
+
+    // Consume before adoption side effects. Only a completed exact command with
+    // an existing current frame may keep its epoch across its delayed PCM ACK.
+    private func consumePausedExplicitVisit(_ sample: ContinuousPCMRenderer.Snapshot,
+        entry: ContinuousAudioPlayer.Entry) -> Bool {
+        let owner = pausedExplicitVisitOwnership
+        pausedExplicitVisitOwnership = nil
+        guard let owner, let item = observedItem, let ticket = owner.ticket,
+              let nativeSeek = owner.nativeSeek, let epoch = owner.completedEpoch,
+              ownsPausedExplicitVisit(owner, item: item),
+              syncingVideoGeneration == nil, syncingVideoSeek == nil,
+              entry.id == owner.mediaID, entry.token == owner.token,
+              sample.token == owner.token, sample.visit == owner.visit,
+              sample.selectionVersion == owner.selectionVersion, !sample.ended,
+              !continuousAudio.isSelectionPending(in: sample), sample.frame >= 0,
+              abs(Double(sample.frame) / 48_000 - owner.target) <= 1.0 / 48_000,
+              let receipt = continuousPiP.currentFrameReceipt(for: ticket),
+              receipt.seekSerial == nativeSeek, receipt.imageEpoch == epoch,
+              let position = continuousPiP.lastFramePositionSeconds, position.isFinite,
+              abs(position - owner.target) < 0.080 else { return false }
+        return true
+    }
+
     private func currentVideoPresentation(for item: AVPlayerItem, request: Int)
         -> ContinuousPictureInPicture.PresentationTicket? {
         guard generation == request, let presentation = videoPresentation, presentation.request == request,
@@ -1416,8 +1492,9 @@ final class PlaybackService: NSObject {
                 #endif
                 let changedSource = sample.token != audioToken
                 let ownedInitialVisit = consumeInitialZeroVisit(sample, entry: entry, changedSource: changedSource)
+                let ownedPausedExplicitVisit = consumePausedExplicitVisit(sample, entry: entry)
                 audioVisit = sample.visit; audioToken = sample.token
-                if !ownedInitialVisit { continuousPiP.flushForSeek() }
+                if !ownedInitialVisit && !ownedPausedExplicitVisit { continuousPiP.flushForSeek() }
                 continuousAudio.adoptRendered(id: entry.id)
                 if changedSource, entry.id != queue.currentID {
                     var following = queue
@@ -1427,7 +1504,7 @@ final class PlaybackService: NSObject {
                     queue = following
                     let video = buffer.advance(to: entry.id)
                     loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
-                } else if !ownedInitialVisit {
+                } else if !ownedInitialVisit && !ownedPausedExplicitVisit {
                     #if DEBUG
                     synchronizeVideoToAudio(force: true, reason: .sourceVisit)
                     #else
@@ -1725,6 +1802,9 @@ final class PlaybackService: NSObject {
         let initialBindingAtIssue = pendingInitialClockBinding.flatMap {
             $0.issued && $0.nativeSeek == videoSeek ? $0 : nil
         }
+        let pausedExplicitAtIssue = force ? bindPausedExplicitVisit(for: item, request: request,
+            position: position, nativeSeek: videoSeek, sample: visit,
+            selectionPending: initialSelectionPending) : nil
         #if DEBUG
         if let observer = onDebugVideoSeekStamp {
             observer(DebugVideoSeekStamp(reason: reason, request: request, generation: generation,
@@ -1841,7 +1921,17 @@ final class PlaybackService: NSObject {
                     #endif
                 }
                 if initialBindingAtIssue == nil, ownsPresentation(), self.pendingInitialClockBinding == nil {
-                    _ = self.continuousPiP.activate(ticket)
+                    let activated = self.continuousPiP.activate(ticket)
+                    if activated, ownsPresentation(), var owner = pausedExplicitAtIssue,
+                       self.pausedExplicitVisitOwnership == owner,
+                       self.ownsPausedExplicitVisit(owner, item: item),
+                       owner.ticket == ticket, owner.nativeSeek == videoSeek,
+                       let epoch = self.continuousPiP.frameReadinessEpoch(for: ticket) {
+                        // Completion need not have a frame yet. The delayed ACK
+                        // must still find a current receipt in this exact epoch.
+                        owner.completedEpoch = epoch
+                        self.pausedExplicitVisitOwnership = owner
+                    }
                 }
             }
         }

@@ -714,10 +714,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         for (ordinal, enabled) in [false, true].enumerated() {
             let armID = UUID().uuidString.lowercased()
             var helperReturned = false
-            print("PreviousQueueLeadArm schema=1 armID=\(armID) order=off-then-on ordinal=\(ordinal) queuedPreviousLead=\(enabled) traceVideoSeeks=false otherInstrumentation=unset itemResourceOutput=retained-rewound adoptionRoute=queued-advance fixedSetupLeadMs=250 acceptance=unchanged")
+            print("PreviousQueueLeadArm schema=2 armID=\(armID) order=off-then-on ordinal=\(ordinal) queuedPreviousLead=\(enabled) traceVideoSeeks=true traceClockHandoff=true tracingAcrossLeadModes=constant otherAlternatives=unset itemResourceOutput=retained-rewound adoptionRoute=queued-advance fixedSetupLeadMs=250 acceptance=unchanged")
             defer { print("PreviousQueueLeadArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
-            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
-                                                       queuedPreviousLead: enabled)
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                                                       traceClockHandoff: true, queuedPreviousLead: enabled)
             helperReturned = true
         }
         #else
@@ -731,10 +731,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         for (ordinal, enabled) in [true, false].enumerated() {
             let armID = UUID().uuidString.lowercased()
             var helperReturned = false
-            print("PreviousQueueLeadArm schema=1 armID=\(armID) order=on-then-off ordinal=\(ordinal) queuedPreviousLead=\(enabled) traceVideoSeeks=false otherInstrumentation=unset itemResourceOutput=retained-rewound adoptionRoute=queued-advance fixedSetupLeadMs=250 acceptance=unchanged")
+            print("PreviousQueueLeadArm schema=2 armID=\(armID) order=on-then-off ordinal=\(ordinal) queuedPreviousLead=\(enabled) traceVideoSeeks=true traceClockHandoff=true tracingAcrossLeadModes=constant otherAlternatives=unset itemResourceOutput=retained-rewound adoptionRoute=queued-advance fixedSetupLeadMs=250 acceptance=unchanged")
             defer { print("PreviousQueueLeadArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
-            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
-                                                       queuedPreviousLead: enabled)
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                                                       traceClockHandoff: true, queuedPreviousLead: enabled)
             helperReturned = true
         }
         #else
@@ -2300,12 +2300,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         let previousBundleControl: SelectionPreviousBundleControl?
         if let enabled = queuedPreviousLead {
-            guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
+            guard traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
-                  traceClockHandoff == nil, freshPreviousBundle == nil,
+                  traceClockHandoff == true, freshPreviousBundle == nil,
                   suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
-                  traceFirstSourceFailure == nil, acceptedPCMOriginBenchmarkMode == nil else {
-                XCTFail("Previous queue lead requires the otherwise unset default benchmark")
+                  traceFirstSourceFailure == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  traceReturnedAProducerBoundary == nil, sourceOutputBenchmarkMode == nil else {
+                XCTFail("Previous queue lead requires constant native-clock tracing and otherwise unset alternatives")
                 throw SelectionVideoTestFailure.timeout
             }
             previousBundleControl = try await SelectionPreviousBundleControl(fresh: false, queuedLead: enabled,
@@ -4275,6 +4276,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             var starts = 0, overflow = false, qualified = false
             var readyAtReturn: Bool?, loadingAtReturn: Bool?, pendingAtReturn: Bool?
             var transferred = false, userSeekIssued = false
+            var pausedSourceVisitIssues = 0, pausedSourceVisitOverflow = false
+            var observePausedSourceVisits = true
             var startedItem: ObjectIdentifier?
             var readyAccepts = 0
             @MainActor func transfer(_ service: PlaybackService) {
@@ -4303,6 +4306,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             service.onDebugVideoSeekStamp = { [weak service] value in
                 if value.request == request, let service { diagnostic?.record(service, kind: 0, seek: value) }
+                if beforeInitialStart, observePausedSourceVisits, userSeekIssued,
+                   value.request == request, value.reason == .sourceVisit, value.force, !value.canPlay,
+                   let pausedTarget, abs(value.requestedPosition - pausedTarget) <= 1.0 / 48_000 {
+                    if pausedSourceVisitIssues < 8 { pausedSourceVisitIssues += 1 }
+                    else { pausedSourceVisitOverflow = true }
+                }
                 if value.request == request, value.reason == .userPausedSeek {
                     userSeekIssued = true
                 }
@@ -4382,6 +4391,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(held.selectionVersion, paused.selectionVersion); XCTAssertEqual(held.frame, paused.frame)
             XCTAssertEqual(held.underrunFrames, 0)
             diagnostic?.phase = 3; diagnostic?.record(service, kind: 3)
+            if beforeInitialStart {
+                XCTAssertEqual(pausedSourceVisitIssues, 0,
+                    "The exact paused explicit target must survive its delayed PCM acknowledgement without a second source-visit seek")
+                XCTAssertFalse(pausedSourceVisitOverflow)
+            }
+            observePausedSourceVisits = false // Later explicit Play owns its genuine corrections.
             service.play()
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
             diagnostic?.phase = 4; diagnostic?.record(service, kind: 3)
