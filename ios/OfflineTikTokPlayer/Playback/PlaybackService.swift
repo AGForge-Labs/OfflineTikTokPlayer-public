@@ -196,7 +196,7 @@ final class PlaybackService: NSObject {
         let frame = continuousPiP.debugAlignedPollState
         return DebugAlignedVideoPollState(frame: frame, generation: generation, request: videoPresentation?.request,
             presentationMatches: videoPresentation?.ticket == frame.ticket,
-            observedItemMatches: observedItem.map { ObjectIdentifier($0) } == frame.ticket?.item)
+            observedItemMatches: observedItem.map { ObjectIdentifier($0) } == frame.ticket?.debugItemIdentity)
     }
     struct DebugAlignedVideoEnqueue: Sendable {
         let frame: ContinuousPictureInPicture.DebugAlignedEnqueueStamp
@@ -212,7 +212,7 @@ final class PlaybackService: NSObject {
                 observer(DebugAlignedVideoEnqueue(frame: stamp, generation: self.generation,
                     request: self.videoPresentation?.request,
                     presentationMatches: self.videoPresentation?.ticket == stamp.ticket,
-                    observedItemMatches: self.observedItem.map { ObjectIdentifier($0) } == stamp.ticket?.item,
+                    observedItemMatches: self.observedItem.map { ObjectIdentifier($0) } == stamp.ticket?.debugItemIdentity,
                     audioToken: self.audioToken, audioVisit: self.audioVisit))
             }
         }

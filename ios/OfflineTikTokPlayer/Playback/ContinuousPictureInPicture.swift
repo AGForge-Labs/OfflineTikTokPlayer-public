@@ -12,6 +12,10 @@ final class ContinuousPictureInPicture: NSObject {
     struct PresentationTicket: Equatable, Sendable {
         fileprivate let generation: Int
         fileprivate let item: ObjectIdentifier
+        #if DEBUG
+        var debugItemIdentity: ObjectIdentifier { item }
+        var debugGeneration: Int { generation }
+        #endif
     }
     /// One output per retained item. Retirement is explicit; no SDK work runs in deinit.
     @MainActor final class PreparedVideoResource {
