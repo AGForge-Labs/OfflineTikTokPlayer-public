@@ -4,6 +4,7 @@ import UIKit
 import AVFoundation
 import AudioToolbox
 import CoreMedia
+import CoreFoundation
 import CoreVideo
 import PlayerCore
 @testable import OfflineTikTokPlayer
@@ -45,9 +46,34 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testDefaultProductionRenderAccountingEnabled() async throws {
         #if DEBUG
-        try await runProductionSelectionBenchmark(traceVideoSeeks: false, renderAccounting: true)
+        try await runProductionSelectionBenchmark(traceVideoSeeks: false, renderAccounting: true,
+            auditSavedAAfterCleanup: true)
         #else
         XCTFail("Render accounting diagnostic requires DEBUG")
+        #endif
+    }
+
+    func testDefaultFrameMonitorReadTimingUntracedThenTraced() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for enabled in [false, true] {
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                                                       traceDefaultFrameMonitor: enabled)
+        }
+        #else
+        XCTFail("Default-monitor timing diagnostic requires DEBUG")
+        #endif
+    }
+
+    func testDefaultFrameMonitorReadTimingTracedThenUntraced() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for enabled in [true, false] {
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                                                       traceDefaultFrameMonitor: enabled)
+        }
+        #else
+        XCTFail("Default-monitor timing diagnostic requires DEBUG")
         #endif
     }
 
@@ -781,13 +807,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     private func runProductionSelectionBenchmark(traceVideoSeeks: Bool, frameMonitorAlternative: Bool? = nil,
                                                 recordHost: Bool = true, traceNativeRefill: Bool = false,
-                                                renderAccounting: Bool? = nil) async throws {
+                                                renderAccounting: Bool? = nil, traceDefaultFrameMonitor: Bool? = nil,
+                                                auditSavedAAfterCleanup: Bool = false) async throws {
         if recordHost { try recordRuntimeHost() }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             return
         }
         let fixture = try await SelectionVideoFixture()
+        #if DEBUG
+        // Freeze the exact Saved A URL before measured playback; no extra decode here.
+        let fullSourceAReferenceURL = auditSavedAAfterCleanup ? fixture.savedURLs[fixture.aID] : nil
+        #endif
         var mayRemoveFixture = true
         defer { if mayRemoveFixture { fixture.remove() } }
         var references: [(samples: [Float], frequency: Double)] = []
@@ -819,6 +850,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        let monitorReadTrace = traceDefaultFrameMonitor.map { DefaultFrameMonitorReadTrace(enabled: $0) }
+        if let enabled = traceDefaultFrameMonitor {
+            XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
+            XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
+            print("DefaultFrameMonitorReadScope schema=1 enabled=\(enabled) defaultMonitor=true videoSeekTrace=false nativeRefillTrace=false renderAccounting=false maximumRequests=3 stages=4 maximumRetainedRecords=24 wholeTickCoverage=false releaseBehaviorChange=false playbackAcceptance=unchanged")
+            if enabled {
+                service.onDebugFrameMonitorReadBatch = { [weak monitorReadTrace] value in monitorReadTrace?.record(value) }
+            }
+        }
         var monitorRows: [(phase: Int, selectedID: String?, expectedID: String?, outputs: Int, preparedIdentity: Bool)] = []
         var monitorOverflow = false
         var monitorPhase = -1
@@ -842,6 +882,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugVideoRenderStamp = { [weak startup] stamp in startup?.recordRender(stamp) }
         }
         defer {
+            if traceDefaultFrameMonitor != nil { service.onDebugFrameMonitorReadBatch = nil }
             if frameMonitorAlternative != nil { service.debugAfterFirstFrameMonitorStart = nil }
             if traceVideoSeeks {
                 service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil
@@ -877,6 +918,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 audio: audio, tap: tap, seeks: seeks, startup: startup, phase: phase, id: id,
                 frequency: frequency, prepared: prepared, preparedBefore: preparedBefore) {
                 #if DEBUG
+                monitorReadTrace?.beginPhase(phase)
                 if frameMonitorAlternative != nil {
                     monitorPhase = phase
                     monitorExpectedID = id
@@ -928,6 +970,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         mayRemoveFixture = cleanupReturned && decoderAck == true && preparationAck == true
         print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
         #if DEBUG
+        if traceDefaultFrameMonitor != nil { service.onDebugFrameMonitorReadBatch = nil }
+        monitorReadTrace?.dumpAndAssert()
         nativeTrace?.dumpAfterCleanup()
         #endif
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
@@ -1039,7 +1083,332 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             seeks.assertUnused()
         }
         startup.dumpAndAssert()
+        #if DEBUG
+        if auditSavedAAfterCleanup {
+            // All original acceptance checks above execute before this optional audit.
+            guard renderAccounting == true, !traceVideoSeeks, !traceNativeRefill,
+                  frameMonitorAlternative == nil, traceDefaultFrameMonitor == nil else {
+                XCTFail("The post-cleanup reference belongs only to its isolated accounting diagnostic")
+                return
+            }
+            let originalCleanupAcknowledged = mayRemoveFixture
+            guard originalCleanupAcknowledged, !audio.graph.engine.isRunning else {
+                mayRemoveFixture = false
+                Self.targetedFixtureOwnershipLost = true
+                fixture.restorePreferences()
+                print("FullSourceAReference schema=2 status=skipped cleanupAcknowledged=\(originalCleanupAcknowledged) interpretation=unavailable fixtureRetained=true")
+                XCTFail("Original cleanup and engine stop must be established before the reference reader")
+                return // Never create another reader after an uncertain original close.
+            }
+            // A cancellation, metadata/layout/coverage failure or incomplete reader keeps
+            // this exact fixture. The existing defer may delete it only after success.
+            mayRemoveFixture = false
+            do {
+                let saved = try XCTUnwrap(fullSourceAReferenceURL)
+                guard fixture.savedURLs[fixture.aID] == saved else {
+                    throw FullSourceReferenceFailure.quality("Saved A URL changed")
+                }
+                let audit = try await auditFullSavedAReference(saved)
+                audit.dump()
+                mayRemoveFixture = true
+            } catch {
+                Self.targetedFixtureOwnershipLost = true
+                fixture.restorePreferences()
+                print("FullSourceAReference schema=2 status=failed interpretation=unavailable fixtureRetained=true reason=\(String(describing: error))")
+                XCTFail("Full Saved A reference quality failed; retain this fixture: \(error)")
+            }
+        }
+        #endif
     }
+
+    #if DEBUG
+    private enum FullSourceReferenceFailure: Error {
+        case quality(String)
+    }
+
+    private struct FullSourceReferenceRun {
+        let firstFrame: Int64, endFrame: Int64
+        var frames: Int64 { endFrame - firstFrame }
+    }
+
+    /// Two retained ranges per kind, regardless of how many actual runs occur.
+    private struct FullSourceReferenceRuns {
+        var count: UInt64 = 0
+        var first: FullSourceReferenceRun?, longest: FullSourceReferenceRun?
+        var overflow = false
+        mutating func append(_ run: FullSourceReferenceRun) {
+            let next = count.addingReportingOverflow(1)
+            count = next.overflow ? .max : next.partialValue
+            overflow = overflow || next.overflow
+            if first == nil { first = run }
+            if longest == nil || run.frames > longest!.frames { longest = run }
+        }
+        func dump(_ kind: String) {
+            for (role, range) in [("first", first), ("longest", longest)] {
+                guard let range else { continue }
+                print("FullSourceAReferenceRange schema=2 kind=\(kind) role=\(role) firstFrame=\(range.firstFrame) endFrame=\(range.endFrame) frames=\(range.frames) editedStartSeconds=\(Double(range.firstFrame) / 48_000) editedEndSeconds=\(Double(range.endFrame) / 48_000) endFrameExclusive=true")
+            }
+        }
+    }
+
+    private struct FullSourceReferenceTrim {
+        let buffer: Int
+        let rawStart: Int64, rawFrames: Int64
+        let startTrim: Int64, endTrim: Int64
+        let outputStart: Int64, outputFrames: Int64
+        var trimmedFrames: Int64 { startTrim + endTrim }
+    }
+
+    private struct FullSourceReferenceAudit {
+        var frames: Int64 = 0
+        var rawFrames: Int64 = 0
+        var buffers = 0, fullyTrimmedBuffers = 0
+        var startTrimAttachments = 0, endTrimAttachments = 0, speedAttachments = 0
+        var startTrimFrames: Int64 = 0, endTrimFrames: Int64 = 0
+        var trimEvents = 0
+        var firstTrim: FullSourceReferenceTrim?, maximumTrim: FullSourceReferenceTrim?
+        var stereoZeroFrames: Int64 = 0
+        var quietWindows: Int64 = 0
+        var stereoRuns = FullSourceReferenceRuns()
+        var quietRuns = FullSourceReferenceRuns()
+        private var stereoStart: Int64?
+        private var quietStart: Int64?, quietEnd: Int64?
+        // A sliding 480-frame window on edited presentation PCM only.
+        private var squares = [Double](repeating: 0, count: 480)
+        private var squareIndex = 0, windowFrames = 0
+        private var squareSum = 0.0
+
+        mutating func recordBuffer(_ trim: FullSourceReferenceTrim,
+            startPresent: Bool, endPresent: Bool, speedPresent: Bool) {
+            // The reader loop bounds every scalar count and frame sum.
+            buffers += 1; rawFrames += trim.rawFrames
+            if startPresent { startTrimAttachments += 1 }
+            if endPresent { endTrimAttachments += 1 }
+            if speedPresent { speedAttachments += 1 }
+            startTrimFrames += trim.startTrim; endTrimFrames += trim.endTrim
+            if trim.outputFrames == 0 { fullyTrimmedBuffers += 1 }
+            if trim.trimmedFrames > 0 {
+                trimEvents += 1
+                if firstTrim == nil { firstTrim = trim }
+                if maximumTrim == nil || trim.trimmedFrames > maximumTrim!.trimmedFrames {
+                    maximumTrim = trim
+                }
+            }
+        }
+
+        mutating func consume(left: Float, right: Float) throws {
+            let mono = (left + right) * 0.5
+            guard left.isFinite, right.isFinite, mono.isFinite else {
+                throw FullSourceReferenceFailure.quality("Nonfinite presented reference PCM")
+            }
+            let frame = frames
+            if left == 0 && right == 0 {
+                stereoZeroFrames += 1
+                if stereoStart == nil { stereoStart = frame }
+            } else if let start = stereoStart {
+                stereoRuns.append(FullSourceReferenceRun(firstFrame: start, endFrame: frame))
+                stereoStart = nil
+            }
+            let square = Double(mono) * Double(mono)
+            squareSum += square - squares[squareIndex]
+            squares[squareIndex] = square
+            squareIndex = (squareIndex + 1) % 480
+            windowFrames = min(480, windowFrames + 1)
+            if windowFrames == 480 {
+                // Same 0.01 RMS amplitude threshold; no silence-absence assertion.
+                if max(0, squareSum) < 480 * 0.01 * 0.01 {
+                    quietWindows += 1
+                    if quietStart == nil { quietStart = frame - 479 }
+                    quietEnd = frame + 1
+                } else if let start = quietStart, let end = quietEnd {
+                    quietRuns.append(FullSourceReferenceRun(firstFrame: start, endFrame: end))
+                    quietStart = nil; quietEnd = nil
+                }
+            }
+            frames += 1
+        }
+
+        mutating func finish() {
+            if let start = stereoStart {
+                stereoRuns.append(FullSourceReferenceRun(firstFrame: start, endFrame: frames))
+                stereoStart = nil
+            }
+            if let start = quietStart, let end = quietEnd {
+                quietRuns.append(FullSourceReferenceRun(firstFrame: start, endFrame: end))
+                quietStart = nil; quietEnd = nil
+            }
+        }
+
+        func dump() {
+            print("FullSourceAReference schema=2 status=completed source=exact-runtime-Saved-A placement=after-original-acceptance-and-cleanup coverage=edited-presentation sampleRate=48000 channels=2 floatBits=32 payloadCapacityBytes=2097152 rawFrameBudget=1964288 sampleBufferBudget=8192 rawFrames=\(rawFrames) presentedFrames=\(frames) expectedPresentedFrames=1440000 startTrimAttachmentCount=\(startTrimAttachments) endTrimAttachmentCount=\(endTrimAttachments) speedAttachmentCount=\(speedAttachments) speedMultiplier=1 startTrimmedFrames=\(startTrimFrames) endTrimmedFrames=\(endTrimFrames) trimEvents=\(trimEvents) fullyTrimmedBuffers=\(fullyTrimmedBuffers) editedStartFrame=0 editedEndFrame=\(frames) buffers=\(buffers) outputPTSGaps=0 outputPTSOverlaps=0 editRangeCovered=true readerCompleted=true finiteRawPCM=true finitePresentedMono=true stereoZeroFrames=\(stereoZeroFrames) stereoZeroRuns=\(stereoRuns.count) quietWindowFrames=480 quietRMSAmplitude=0.01 quietWindowStrideFrames=1 quietWindows=\(quietWindows) quietWindowUnionRuns=\(quietRuns.count) retainedRangeCapacity=4 retainedTrimCapacity=2 overflow=\(stereoRuns.overflow || quietRuns.overflow) trimSource=explicit-attachments runtimeFrameJoin=false bitstreamSilenceProven=false playbackAcceptance=unchanged")
+            for (role, trim) in [("first", firstTrim), ("maximum-excluded-frames", maximumTrim)] {
+                guard let trim else { continue }
+                print("FullSourceAReferenceTrim schema=2 role=\(role) buffer=\(trim.buffer) rawStartFrame=\(trim.rawStart) rawFrames=\(trim.rawFrames) startTrimFrames=\(trim.startTrim) endTrimFrames=\(trim.endTrim) outputStartFrame=\(trim.outputStart) outputFrames=\(trim.outputFrames) metadataExplained=true")
+            }
+            stereoRuns.dump("exact-stereo-zero")
+            quietRuns.dump("quiet-window-union")
+        }
+    }
+
+    /// An edited-presentation reference decode, separate from runtime decoder
+    /// state. Explicit metadata only; no inferred trim or mixer-frame join.
+    private func auditFullSavedAReference(_ savedURL: URL) async throws -> FullSourceReferenceAudit {
+        try Task.checkCancellation()
+        let asset = AVURLAsset(url: savedURL)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard tracks.count == 1, let track = tracks.first else {
+            throw FullSourceReferenceFailure.quality("Expected one fixture audio track")
+        }
+        let editedRange = try await track.load(.timeRange)
+        let assetDuration = try await asset.load(.duration)
+        func exactFrame(_ time: CMTime) throws -> Int64 {
+            guard time.isNumeric, time.epoch == 0 else {
+                throw FullSourceReferenceFailure.quality("Invalid reference timeline")
+            }
+            let scaled = CMTimeConvertScale(time, timescale: 48_000, method: .default)
+            guard scaled.isNumeric, scaled.epoch == 0, CMTimeCompare(time, scaled) == 0 else {
+                throw FullSourceReferenceFailure.quality("Reference timeline is off the 48 kHz frame grid")
+            }
+            return scaled.value
+        }
+        func declaredTrim(_ sample: CMSampleBuffer, key: CFString) throws -> (frames: Int64, present: Bool) {
+            guard let value = CMGetAttachment(sample, key: key, attachmentModeOut: nil) else {
+                return (0, false) // Only absence uses the documented no-trim default.
+            }
+            guard CFGetTypeID(value) == CFDictionaryGetTypeID() else {
+                throw FullSourceReferenceFailure.quality("Present trim attachment is not a CMTime dictionary")
+            }
+            let time = CMTimeMakeFromDictionary(value as! CFDictionary)
+            let frames = try exactFrame(time)
+            guard frames >= 0 else {
+                throw FullSourceReferenceFailure.quality("Negative declared trim duration")
+            }
+            return (frames, true)
+        }
+        func validateSpeed(_ sample: CMSampleBuffer) throws -> Bool {
+            guard let value = CMGetAttachment(sample,
+                key: kCMSampleBufferAttachmentKey_SpeedMultiplier, attachmentModeOut: nil) else {
+                return false // Only absence uses the documented 1.0 default.
+            }
+            guard CFGetTypeID(value) == CFNumberGetTypeID() else {
+                throw FullSourceReferenceFailure.quality("Present speed attachment is not a CFNumber")
+            }
+            var speed = 0.0
+            guard CFNumberGetValue(value as! CFNumber, .doubleType, &speed),
+                  speed.isFinite, speed == 1 else {
+                throw FullSourceReferenceFailure.quality("Malformed or unsupported non-unit speed")
+            }
+            return true
+        }
+        let editedStart = try exactFrame(editedRange.start)
+        let editedEnd = try exactFrame(CMTimeRangeGetEnd(editedRange))
+        let assetEnd = try exactFrame(assetDuration)
+        guard editedStart == 0, editedEnd == assetEnd, assetEnd == 30 * 48_000 else {
+            throw FullSourceReferenceFailure.quality("Full 30-second edited audio range is not established")
+        }
+        try Task.checkCancellation()
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: 2, AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true, AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ])
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else {
+            throw FullSourceReferenceFailure.quality("Reference output cannot be added")
+        }
+        reader.add(output) // Full source: intentionally do not set reader.timeRange.
+        defer { reader.cancelReading() }
+        guard reader.startReading() else {
+            throw reader.error ?? FullSourceReferenceFailure.quality("Reference reader did not start")
+        }
+        let payloadBytes = 2 * 1_024 * 1_024
+        let maximumRawFrames: Int64 = assetEnd + Int64(2 * (payloadBytes / 8))
+        let maximumBuffers = 8_192
+        let payload = UnsafeMutablePointer<Float>.allocate(capacity: payloadBytes / MemoryLayout<Float>.size)
+        payload.initialize(repeating: 0, count: payloadBytes / MemoryLayout<Float>.size)
+        defer {
+            payload.deinitialize(count: payloadBytes / MemoryLayout<Float>.size)
+            payload.deallocate()
+        }
+        var audit = FullSourceReferenceAudit()
+        while let sample = output.copyNextSampleBuffer() {
+            try Task.checkCancellation()
+            guard audit.buffers < maximumBuffers,
+                  let description = CMSampleBufferGetFormatDescription(sample),
+                  let format = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee,
+                  format.mFormatID == kAudioFormatLinearPCM, format.mSampleRate == 48_000,
+                  format.mChannelsPerFrame == 2, format.mBitsPerChannel == 32,
+                  format.mBytesPerFrame == 8, format.mBytesPerPacket == 8, format.mFramesPerPacket == 1,
+                  format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+                  format.mFormatFlags & kAudioFormatFlagIsPacked != 0,
+                  format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0,
+                  format.mFormatFlags & kAudioFormatFlagIsBigEndian == 0 else {
+                throw FullSourceReferenceFailure.quality("Reference buffer budget or PCM layout failed")
+            }
+            let count = CMSampleBufferGetNumSamples(sample)
+            guard count > 0, count <= payloadBytes / 8,
+                  audit.rawFrames <= maximumRawFrames - Int64(count),
+                  let block = CMSampleBufferGetDataBuffer(sample),
+                  CMBlockBufferGetDataLength(block) == count * 8 else {
+                throw FullSourceReferenceFailure.quality("Reference raw-frame/payload budget or frame count failed")
+            }
+            let startTrim = try declaredTrim(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
+            let endTrim = try declaredTrim(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd)
+            let speedPresent = try validateSpeed(sample)
+            let rawCount = Int64(count)
+            // Check each operand before subtraction: malformed large metadata
+            // cannot overflow arithmetic or silently discard the payload.
+            guard startTrim.frames <= rawCount, endTrim.frames <= rawCount - startTrim.frames else {
+                throw FullSourceReferenceFailure.quality("Declared trims exceed raw PCM frame count")
+            }
+            let presentedCount = rawCount - startTrim.frames - endTrim.frames
+            let rawStart = try exactFrame(CMSampleBufferGetPresentationTimeStamp(sample))
+            let rawDuration = try exactFrame(CMSampleBufferGetDuration(sample))
+            let outputStart = try exactFrame(CMSampleBufferGetOutputPresentationTimeStamp(sample))
+            let outputDuration = try exactFrame(CMSampleBufferGetOutputDuration(sample))
+            let explainedStart = rawStart.addingReportingOverflow(startTrim.frames)
+            // Support only the explicit trim mapping at unit speed. This also
+            // requires any negative raw priming PTS to be fully explained.
+            guard !explainedStart.overflow, explainedStart.partialValue == outputStart,
+                  rawDuration == rawCount, outputDuration == presentedCount,
+                  outputStart == audit.frames, outputStart >= 0,
+                  outputStart <= editedEnd - presentedCount else {
+                throw FullSourceReferenceFailure.quality("Unexplained timing edit, output PTS gap/overlap or incomplete trim mapping")
+            }
+            guard CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: count * 8,
+                destination: UnsafeMutableRawPointer(payload)) == kCMBlockBufferNoErr else {
+                throw FullSourceReferenceFailure.quality("Reference payload copy failed")
+            }
+            let firstPresented = Int(startTrim.frames)
+            let endPresented = count - Int(endTrim.frames)
+            for frame in 0..<count {
+                let left = payload[frame * 2], right = payload[frame * 2 + 1]
+                guard left.isFinite, right.isFinite else {
+                    throw FullSourceReferenceFailure.quality("Nonfinite raw reference PCM")
+                }
+                if frame >= firstPresented, frame < endPresented {
+                    try audit.consume(left: left, right: right)
+                }
+            }
+            audit.recordBuffer(FullSourceReferenceTrim(buffer: audit.buffers, rawStart: rawStart,
+                rawFrames: rawCount, startTrim: startTrim.frames, endTrim: endTrim.frames,
+                outputStart: outputStart, outputFrames: presentedCount),
+                startPresent: startTrim.present, endPresent: endTrim.present, speedPresent: speedPresent)
+        }
+        try Task.checkCancellation()
+        guard reader.status == .completed, reader.error == nil, audit.frames == editedEnd,
+              audit.rawFrames - audit.startTrimFrames - audit.endTrimFrames == audit.frames else {
+            throw reader.error ?? FullSourceReferenceFailure.quality("Reference reader or full edited-presentation coverage incomplete")
+        }
+        audit.finish()
+        guard !audit.stereoRuns.overflow, !audit.quietRuns.overflow else {
+            throw FullSourceReferenceFailure.quality("Reference range counter overflow")
+        }
+        return audit
+    }
+    #endif
 
     private func productionSelectionState(_ service: PlaybackService, fixture: SelectionVideoFixture,
         audio: ContinuousAudioPlayer, id: String) -> ProductionSelectionState {
@@ -3053,6 +3422,113 @@ private final class ProductionVideoStartupTrace {
         #endif
     }
 }
+
+#if DEBUG
+/// No native queries or per-call logging. Fixed first+maximum per stage/request.
+@MainActor
+private final class DefaultFrameMonitorReadTrace {
+    private struct Record {
+        let owner: PlaybackService.DebugFrameMonitorReadBatch
+        let read: PlaybackFrameMonitor.DebugReadStamp
+        var span: UInt64 { read.returnNs >= read.entryNs ? read.returnNs - read.entryNs : 0 }
+    }
+    private struct Stage {
+        var calls: UInt64 = 0
+        var first: Record?, maximum: Record?
+    }
+    private struct Request {
+        let phase: Int, request: Int
+        let epoch: UInt64
+        let item: ObjectIdentifier, output: ObjectIdentifier
+        var batches: UInt64 = 0, invalidMappings: UInt64 = 0, accepted: UInt64 = 0
+        var stages = [Stage](repeating: Stage(), count: 4)
+    }
+    let enabled: Bool
+    private var phase = -1
+    private var requests: [Request] = []
+    private var overflow = false
+    private var qualityFailures: UInt64 = 0
+    init(enabled: Bool) { self.enabled = enabled; requests.reserveCapacity(3) }
+    func beginPhase(_ value: Int) { phase = value }
+    private func increment(_ value: inout UInt64) {
+        if value == UInt64.max { overflow = true } else { value += 1 }
+    }
+    func record(_ owner: PlaybackService.DebugFrameMonitorReadBatch) {
+        guard enabled, (0..<3).contains(phase) else { increment(&qualityFailures); return }
+        let reads = owner.reads
+        guard !reads.epochOverflowed else { overflow = true; return }
+        let index: Int
+        if let found = requests.firstIndex(where: { $0.request == owner.request }) { index = found }
+        else {
+            guard requests.count < 3, !requests.contains(where: { $0.phase == phase }) else {
+                overflow = true; return
+            }
+            requests.append(Request(phase: phase, request: owner.request, epoch: reads.epoch,
+                                    item: reads.item, output: reads.output))
+            index = requests.count - 1
+        }
+        let initial = requests[index]
+        guard initial.phase == phase, initial.epoch == reads.epoch,
+              initial.item == reads.item, initial.output == reads.output else {
+            increment(&qualityFailures) // Reject mixed/restarted owners; never merge their spans.
+            return
+        }
+        if owner.request != owner.generation || !owner.sourceItemMatches || !owner.observedItemMatches
+            || !owner.presentationMatches || !owner.selectedMatchesQueue
+            || reads.ownerAfterReadiness == reads.readinessAccepted
+            || (reads.fallback != nil) != !reads.mappedTime.isValid {
+            increment(&qualityFailures)
+        }
+        // Copy one tiny aggregate; native owners are represented only by identifiers.
+        var request = requests[index]
+        increment(&request.batches)
+        if !reads.mappedTime.isValid { increment(&request.invalidMappings) }
+        if reads.readinessAccepted { increment(&request.accepted) }
+        let values = [Optional(reads.mapping), reads.fallback, Optional(reads.availability), Optional(reads.layer)]
+        for value in values.compactMap({ $0 }) {
+            if !value.ownerCoherent || value.returnNs < value.entryNs { increment(&qualityFailures) }
+            let index = value.stage.rawValue
+            var stage = request.stages[index]
+            increment(&stage.calls)
+            let record = Record(owner: owner, read: value)
+            if stage.first == nil { stage.first = record }
+            if stage.maximum == nil || record.span > stage.maximum!.span { stage.maximum = record }
+            request.stages[index] = stage
+        }
+        requests[index] = request
+    }
+    func dumpAndAssert() {
+        let retained = requests.reduce(0) { sum, request in
+            sum + request.stages.reduce(0) { $0 + ($1.first == nil ? 0 : 1) + ($1.maximum == nil ? 0 : 1) }
+        }
+        print("DefaultFrameMonitorReadSummary schema=1 enabled=\(enabled) requests=\(requests.count) maximumRequests=3 stages=4 retainedRecords=\(retained) capacityRecords=24 overflow=\(overflow) qualityFailures=\(qualityFailures) wholeTickCoverage=false nativeEntryGuardsCovered=false")
+        XCTAssertFalse(overflow); XCTAssertEqual(qualityFailures, 0); XCTAssertLessThanOrEqual(retained, 24)
+        if !enabled {
+            XCTAssertTrue(requests.isEmpty, "Nil observer must not synthesize zero-valued native read evidence")
+            return
+        }
+        XCTAssertEqual(requests.count, 3)
+        XCTAssertEqual(Set(requests.map(\.phase)), Set(0..<3))
+        for request in requests {
+            XCTAssertGreaterThan(request.batches, 0)
+            XCTAssertGreaterThan(request.accepted, 0, "Each selected request needs an actual accepted monitor tick")
+            for kind in PlaybackFrameMonitor.DebugReadStage.allCases {
+                let stage = request.stages[kind.rawValue]
+                let expected = kind == .fallback ? request.invalidMappings : request.batches
+                XCTAssertEqual(stage.calls, expected, "Missing or duplicate read observations fail quality")
+                print("DefaultFrameMonitorReadCount schema=1 phase=\(request.phase) request=\(request.request) stage=\(kind.rawValue) calls=\(stage.calls) batches=\(request.batches) invalidMappings=\(request.invalidMappings) accepted=\(request.accepted) absentFallbackIsZero=\(kind == .fallback && stage.calls == 0)")
+                for (role, value) in [("first", stage.first), ("maximum", stage.maximum)] {
+                    guard let value else { continue }
+                    let owner = value.owner, reads = owner.reads
+                    let mapped = reads.mappedTime.isNumeric ? String(reads.mappedTime.seconds) : "nonnumeric"
+                    let chosen = reads.chosenTime.isNumeric ? String(reads.chosenTime.seconds) : "nonnumeric"
+                    print("DefaultFrameMonitorRead schema=1 phase=\(request.phase) request=\(request.request) role=\(role) stage=\(kind.rawValue) epoch=\(reads.epoch) entryNs=\(value.read.entryNs) returnNs=\(value.read.returnNs) spanNs=\(value.span) operationOwnerCoherent=\(value.read.ownerCoherent) sourceItemMatches=\(owner.sourceItemMatches) observedItemMatches=\(owner.observedItemMatches) presentationMatches=\(owner.presentationMatches) selectedMatchesQueue=\(owner.selectedMatchesQueue) generation=\(owner.generation) cachedAudioToken=\(owner.cachedAudioToken) cachedAudioVisit=\(owner.cachedAudioVisit) mappedValid=\(reads.mappedTime.isValid) mappedNumeric=\(reads.mappedTime.isNumeric) mappedSeconds=\(mapped) chosenValid=\(reads.chosenTime.isValid) chosenNumeric=\(reads.chosenTime.isNumeric) chosenSeconds=\(chosen) fallbackTaken=\(reads.fallback != nil) decoded=\(reads.decoded) layerReady=\(reads.layerReady) readinessAccepted=\(reads.readinessAccepted) expectedTerminalCancellation=\(reads.readinessAccepted) ownerAfterReadiness=\(reads.ownerAfterReadiness) displayTimestamp=\(reads.displayTimestamp) targetTimestamp=\(reads.targetTimestamp) wholeTickCoverage=false")
+                }
+            }
+        }
+    }
+}
+#endif
 
 private struct ProductionSelectionState {
     let audio: ContinuousPCMRenderer.Snapshot

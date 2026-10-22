@@ -35,6 +35,18 @@ final class PlaybackService: NSObject {
     #if DEBUG
     @ObservationIgnored var debugUsesCurrentCustomFrameForReadiness = false
     // One synchronous notification per start, no retained event history or SDK reads.
+    struct DebugFrameMonitorReadBatch {
+        let request: Int, generation: Int
+        let sourceItemMatches: Bool, observedItemMatches: Bool, presentationMatches: Bool
+        let selectedMatchesQueue: Bool
+        let cachedAudioToken: Int, cachedAudioVisit: Int64
+        let reads: PlaybackFrameMonitor.DebugReadBatch
+    }
+    @ObservationIgnored var onDebugFrameMonitorReadBatch: ((DebugFrameMonitorReadBatch) -> Void)? {
+        didSet {
+            if onDebugFrameMonitorReadBatch == nil { frameMonitor.onDebugReadBatch = nil }
+        }
+    }
     @ObservationIgnored var debugAfterFirstFrameMonitorStart: ((AVPlayerItem) -> Void)?
     enum DebugInitialLoadPhase: Int, Sendable {
         case idle = 0, savedLookup = 1, cachedLookupAndResolution = 2, localResolved = 3
@@ -808,6 +820,22 @@ final class PlaybackService: NSObject {
             #endif
         }
         #if DEBUG
+        if let observer = onDebugFrameMonitorReadBatch {
+            let expectedItem = ObjectIdentifier(playerItem)
+            let expected = videoPresentation
+            frameMonitor.onDebugReadBatch = { [weak self] reads in
+                guard let self else { return }
+                observer(DebugFrameMonitorReadBatch(request: request, generation: self.generation,
+                    sourceItemMatches: reads.item == expectedItem,
+                    observedItemMatches: self.observedItem.map { ObjectIdentifier($0) == expectedItem } ?? false,
+                    presentationMatches: expected != nil && expected?.request == request
+                        && self.videoPresentation?.request == expected?.request
+                        && self.videoPresentation?.ticket == expected?.ticket,
+                    selectedMatchesQueue: self.continuousAudio.selectedID != nil
+                        && self.continuousAudio.selectedID == self.queue.currentID,
+                    cachedAudioToken: self.audioToken, cachedAudioVisit: self.audioVisit, reads: reads))
+            }
+        }
         if debugUsesCurrentCustomFrameForReadiness {
             // Capture the raw ticket: audio eligibility can still be pending here.
             let expected = videoPresentation
