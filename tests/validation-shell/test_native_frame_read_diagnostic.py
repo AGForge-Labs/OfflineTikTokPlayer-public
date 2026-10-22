@@ -17,7 +17,18 @@ WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
 CASES = (
     "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionDefaultReadinessRequiresTheSelectedCPPOutput",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSeekAfterVisibleReadinessRequiresFreshCPPImageBeforeReadyReturns",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff",
     "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame",
+    "OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource",
+    "OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks",
+    "OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testSupersededCurrentFrameMonitorCannotCompleteItsReplacement",
+    "OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testSuspendedPausedImageRequiresTwoFreshTicksAfterResume",
 )
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
@@ -179,7 +190,7 @@ exit "$FRAME_READ_TEE_EXIT"
             self.assertEqual(receipt.read_text(), "", result.stdout + result.stderr)
             return result, arguments, "", None
 
-    def test_exact_two_selectors_limits_and_cleanup(self):
+    def test_exact_thirteen_selectors_limits_and_cleanup(self):
         result, arguments, receipt, verified = self.exercise()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
@@ -232,7 +243,7 @@ exit "$FRAME_READ_TEE_EXIT"
         source = SOURCE.read_text(encoding="utf-8")
         declaration = re.search(r"^cases=\((.*?)\)\s*$", source, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(declaration)
-        self.assertEqual(len(CASES), 2)
+        self.assertEqual(len(CASES), 13)
         self.assertEqual(tuple(shlex.split(declaration.group(1))), CASES)
         workflow = WORKFLOW.read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertIn("fetch-depth: 2", workflow)

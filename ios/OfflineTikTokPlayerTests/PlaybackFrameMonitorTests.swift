@@ -3,7 +3,7 @@ import AVFoundation
 import UIKit
 @testable import OfflineTikTokPlayer
 
-/// Actual CPP enqueue proof and native layer readiness; no decoded substitute,
+/// Actual CPP enqueue proof and visible sample-buffer layer readiness; no decoded substitute,
 /// screenshot, fabricated epoch or benchmark-latency allowance is used here.
 @MainActor
 final class PlaybackFrameMonitorTests: XCTestCase {
@@ -22,9 +22,10 @@ final class PlaybackFrameMonitorTests: XCTestCase {
         XCTAssertEqual(presentation.player.rate, 0)
         XCTAssertEqual(presentation.item.outputs.count, 1)
         var completions = 0
-        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
-            presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket)
-        }, onReady: { completions += 1 })
+        monitor.start(item: presentation.item, layer: presentation.layer,
+                      displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+            presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+        }, onReady: { _ in completions += 1 })
         XCTAssertEqual(presentation.item.outputs.count, 1)
         monitor.debugTick(displayTime: 10)
         XCTAssertEqual(completions, 0)
@@ -44,9 +45,10 @@ final class PlaybackFrameMonitorTests: XCTestCase {
         XCTAssertNil(presentation.bridge.debugCurrentFrameEpoch(for: staleTicket))
         XCTAssertNil(presentation.bridge.debugCurrentFrameEpoch(for: current))
         XCTAssertFalse(presentation.bridge.activate(staleTicket))
-        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
-            presentation.bridge.debugCurrentFrameEpoch(for: staleTicket)
-        }, onReady: { completions += 1 })
+        monitor.start(item: presentation.item, layer: presentation.layer,
+                      displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+            presentation.bridge.currentFrameReceipt(for: staleTicket)
+        }, onReady: { _ in completions += 1 })
         monitor.debugTick(displayTime: 11)
         monitor.debugTick(displayTime: 11 + 1.0 / 60)
         XCTAssertEqual(completions, 1, "A stale ticket cannot supply an old image to the new presentation")
@@ -69,9 +71,10 @@ final class PlaybackFrameMonitorTests: XCTestCase {
         let originalEpoch = try XCTUnwrap(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket))
         let originalSubmissions = presentation.bridge.submittedFrameCount
         var completions = 0
-        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
-            presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket)
-        }, onReady: { completions += 1 })
+        monitor.start(item: presentation.item, layer: presentation.layer,
+                      displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+            presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+        }, onReady: { _ in completions += 1 })
         monitor.debugTick(displayTime: 20)
         XCTAssertEqual(completions, 0)
         presentation.bridge.flushForSeek()
@@ -91,6 +94,7 @@ final class PlaybackFrameMonitorTests: XCTestCase {
             presentation.bridge.updatePlayback(positionSeconds: 0.25, durationSeconds: 1.2, isPlaying: false)
             return presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket) != nil
                 && presentation.layer.isReadyForDisplay
+                && presentation.bridge.displayLayer.isReadyForDisplay
         }
         XCTAssertTrue(enqueued)
         guard enqueued else { throw SetupFailure.notReady }
@@ -107,14 +111,121 @@ final class PlaybackFrameMonitorTests: XCTestCase {
 
         // Also exercise nil with no replacement image: it cannot preserve a
         // prior decoded latch or complete the second tick after a flush.
-        monitor.start(item: presentation.item, layer: presentation.layer, decodedFrameEpoch: {
-            presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket)
-        }, onReady: { completions += 1 })
+        monitor.start(item: presentation.item, layer: presentation.layer,
+                      displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+            presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+        }, onReady: { _ in completions += 1 })
         monitor.debugTick(displayTime: 22)
         presentation.bridge.flushForSeek()
         XCTAssertNil(presentation.bridge.debugCurrentFrameEpoch(for: presentation.ticket))
         monitor.debugTick(displayTime: 22 + 1.0 / 60)
         XCTAssertEqual(completions, 1)
+        #else
+        XCTFail("Current custom-frame contracts require DEBUG controls")
+        #endif
+    }
+
+    func testSupersededCurrentFrameMonitorCannotCompleteItsReplacement() async throws {
+        #if DEBUG
+        let presentation = try await makePresentation()
+        defer { presentation.close() }
+        let monitor = PlaybackFrameMonitor()
+        monitor.debugAutomaticallyTicks = false
+        defer { monitor.cancel() }
+        let receipt = try XCTUnwrap(presentation.bridge.currentFrameReceipt(for: presentation.ticket))
+        XCTAssertTrue(presentation.bridge.displayLayer.isReadyForDisplay)
+        let submissions = presentation.bridge.submittedFrameCount
+        var oldCompletions = 0, newCompletions = 0, replacements = 0
+        // Replace the request from its real cached proof callback. The old tick
+        // must not arm, cancel or complete the new request after this returns.
+        monitor.start(item: presentation.item, layer: presentation.layer,
+                      displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+            if replacements == 0 {
+                replacements += 1
+                monitor.start(item: presentation.item, layer: presentation.layer,
+                              displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+                    presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+                }, onReady: { accepted in
+                    XCTAssertEqual(accepted, receipt)
+                    newCompletions += 1
+                })
+            }
+            return presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+        }, onReady: { _ in oldCompletions += 1 })
+        monitor.debugTick(displayTime: 30)
+        XCTAssertEqual(replacements, 1)
+        XCTAssertEqual(oldCompletions, 0); XCTAssertEqual(newCompletions, 0)
+        monitor.debugTick(displayTime: 30 + 1.0 / 60)
+        XCTAssertEqual(newCompletions, 0, "Replacement needs its own first display tick")
+        monitor.debugTick(displayTime: 30 + 2.0 / 60)
+        XCTAssertEqual(oldCompletions, 0); XCTAssertEqual(newCompletions, 1)
+        XCTAssertEqual(presentation.item.outputs.count, 1)
+        XCTAssertEqual(presentation.bridge.submittedFrameCount, submissions)
+        XCTAssertEqual(presentation.bridge.currentFrameReceipt(for: presentation.ticket), receipt)
+
+        var postCancelReplacements = 0, cancelledCompletions = 0, replacementCompletions = 0
+        monitor.start(item: presentation.item, layer: presentation.layer,
+                      displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+            // Actual cancellation has happened. Starting and cancelling a newer
+            // request leaves request=nil again, but must still revoke this completion.
+            if !monitor.debugHasActiveRequest, postCancelReplacements == 0 {
+                postCancelReplacements += 1
+                monitor.start(item: presentation.item, layer: presentation.layer,
+                              displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+                    presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+                }, onReady: { _ in replacementCompletions += 1 })
+                monitor.cancel()
+            }
+            return presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+        }, onReady: { _ in cancelledCompletions += 1 })
+        monitor.debugTick(displayTime: 31)
+        monitor.debugTick(displayTime: 31 + 1.0 / 60)
+        XCTAssertEqual(postCancelReplacements, 1)
+        XCTAssertEqual(cancelledCompletions, 0)
+        XCTAssertEqual(replacementCompletions, 0)
+        XCTAssertFalse(monitor.debugHasActiveRequest)
+        XCTAssertEqual(presentation.item.outputs.count, 1)
+        XCTAssertEqual(presentation.bridge.submittedFrameCount, submissions)
+        XCTAssertEqual(presentation.bridge.currentFrameReceipt(for: presentation.ticket), receipt)
+        #else
+        XCTFail("Current custom-frame contracts require DEBUG controls")
+        #endif
+    }
+
+    func testSuspendedPausedImageRequiresTwoFreshTicksAfterResume() async throws {
+        #if DEBUG
+        let presentation = try await makePresentation()
+        defer { presentation.close() }
+        let monitor = PlaybackFrameMonitor()
+        monitor.debugAutomaticallyTicks = false
+        defer { monitor.cancel() }
+        let receipt = try XCTUnwrap(presentation.bridge.currentFrameReceipt(for: presentation.ticket))
+        let submissions = presentation.bridge.submittedFrameCount
+        var completions = 0
+        monitor.start(item: presentation.item, layer: presentation.layer,
+                      displayLayer: presentation.bridge.displayLayer, currentFrameReceipt: {
+            presentation.bridge.currentFrameReceipt(for: presentation.ticket)
+        }, onReady: { accepted in
+            XCTAssertEqual(accepted, receipt)
+            completions += 1
+        })
+        monitor.debugTick(displayTime: 40)
+        XCTAssertEqual(completions, 0)
+        presentation.bridge.suspendFrameFeed()
+        XCTAssertNil(presentation.bridge.currentFrameReceipt(for: presentation.ticket))
+        XCTAssertTrue(monitor.invalidateCurrentFrameReadiness())
+        // Resume before the next tick: a transient ineligibility must still
+        // discard the old display tick without discarding an unflushed image.
+        presentation.bridge.resumeFrameFeed()
+        XCTAssertEqual(presentation.bridge.currentFrameReceipt(for: presentation.ticket), receipt)
+        XCTAssertTrue(presentation.bridge.displayLayer.isReadyForDisplay)
+        monitor.debugTick(displayTime: 40 + 1.0 / 60)
+        XCTAssertEqual(completions, 0)
+        monitor.debugTick(displayTime: 40 + 2.0 / 60)
+        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(presentation.player.rate, 0)
+        XCTAssertEqual(presentation.item.outputs.count, 1)
+        XCTAssertEqual(presentation.bridge.submittedFrameCount, submissions)
         #else
         XCTFail("Current custom-frame contracts require DEBUG controls")
         #endif
@@ -140,6 +251,7 @@ final class PlaybackFrameMonitorTests: XCTestCase {
         }
         func close() {
             player.pause(); bridge.invalidate(); player.replaceCurrentItem(with: nil)
+            bridge.displayLayer.removeFromSuperlayer(); layer.removeFromSuperlayer()
             resource.retire(); window.isHidden = true; window.rootViewController = nil
             previousKeyWindow?.makeKey()
         }
@@ -165,6 +277,8 @@ final class PlaybackFrameMonitorTests: XCTestCase {
         let layer = AVPlayerLayer(player: player)
         layer.frame = window.bounds
         controller.view.layer.addSublayer(layer)
+        bridge.displayLayer.frame = layer.bounds
+        layer.addSublayer(bridge.displayLayer)
         window.makeKeyAndVisible()
         controller.view.layoutIfNeeded()
         let result = Presentation(item: item, resource: resource, bridge: bridge, ticket: ticket,
@@ -180,7 +294,7 @@ final class PlaybackFrameMonitorTests: XCTestCase {
             let actualImage = await waitUntil {
                 bridge.updatePlayback(positionSeconds: 0, durationSeconds: 1.2, isPlaying: false)
                 #if DEBUG
-                return bridge.debugCurrentFrameEpoch(for: ticket) != nil
+                return bridge.debugCurrentFrameEpoch(for: ticket) != nil && bridge.displayLayer.isReadyForDisplay
                 #else
                 return false
                 #endif

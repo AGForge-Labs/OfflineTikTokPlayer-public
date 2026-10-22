@@ -17,6 +17,65 @@ final class ContinuousPictureInPicture: NSObject {
         var debugGeneration: Int { generation }
         #endif
     }
+    /// Cached credit for one accepted image, bound to the pull's original owner.
+    /// Reading this value never asks AVFoundation for another frame.
+    struct CurrentFrameReceipt: Equatable, Sendable {
+        let ticket: PresentationTicket
+        let output: ObjectIdentifier
+        let imageEpoch: UInt64
+        let seekSerial: UInt64
+    }
+    private var imageEpoch: UInt64 = 0
+    private var imageEpochSaturated = false
+    private var submittedReceipt: CurrentFrameReceipt?
+    private var readinessMutationDepth = 0
+    private var readinessUpdatePending = false
+    /// Invalidation is immediate. Stable delivery is coalesced across nested CPP
+    /// and service mutations, so a callback cannot adopt a half-installed source.
+    var onCurrentFrameInvalidated: (() -> Void)?
+    var onCurrentFrameStateChanged: (() -> Void)?
+
+    func beginReadinessUpdates() { readinessMutationDepth += 1 }
+    func endReadinessUpdates() {
+        precondition(readinessMutationDepth > 0)
+        readinessMutationDepth -= 1
+        guard readinessMutationDepth == 0, readinessUpdatePending else { return }
+        readinessUpdatePending = false
+        onCurrentFrameStateChanged?()
+    }
+    @discardableResult
+    private func invalidateCurrentFrameProof() -> UInt64 {
+        submittedReceipt = nil
+        if imageEpoch == .max { imageEpochSaturated = true }
+        else { imageEpoch += 1 }
+        lastEnqueuedTime = .invalid
+        lastFramePositionSeconds = nil
+        lastCopiedFramePositionSeconds = nil
+        readinessUpdatePending = true
+        let invalidatedEpoch = imageEpoch
+        onCurrentFrameInvalidated?()
+        return invalidatedEpoch
+    }
+    private func invalidateFrameEligibility() {
+        readinessUpdatePending = true
+        onCurrentFrameInvalidated?()
+    }
+    func frameReadinessEpoch(for ticket: PresentationTicket) -> UInt64? {
+        guard owns(ticket), !imageEpochSaturated else { return nil }
+        return imageEpoch
+    }
+    func currentFrameReceipt(for ticket: PresentationTicket) -> CurrentFrameReceipt? {
+        guard let receipt = submittedReceipt, receipt.ticket == ticket,
+              ownsFramePull(receipt) else { return nil }
+        return receipt
+    }
+    private func ownsFramePull(_ receipt: CurrentFrameReceipt) -> Bool {
+        owns(receipt.ticket) && presentationActive && frameFeedEnabled
+            && installedTimeline == receipt.ticket && activeSeekTicket == nil
+            && !imageEpochSaturated && imageEpoch == receipt.imageEpoch
+            && seekTicket == receipt.seekSerial
+            && videoOutput.map(ObjectIdentifier.init) == receipt.output
+    }
     /// One output per retained item. Retirement is explicit; no SDK work runs in deinit.
     @MainActor final class PreparedVideoResource {
         private(set) weak var item: AVPlayerItem?
@@ -167,18 +226,10 @@ final class ContinuousPictureInPicture: NSObject {
         return result
     }
     // Cached proof only: no output pull or SDK query is performed by its getter.
-    private var debugImageEpoch: UInt64 = 0
-    private var debugImageEpochSaturated = false
-    private var debugEnqueuedImageEpoch: UInt64?
+    private var debugImageEpoch: UInt64 { imageEpoch }
+    private var debugImageEpochSaturated: Bool { imageEpochSaturated }
     func debugCurrentFrameEpoch(for ticket: PresentationTicket) -> UInt64? {
-        guard owns(ticket), !debugImageEpochSaturated,
-              debugEnqueuedImageEpoch == debugImageEpoch else { return nil }
-        return debugImageEpoch
-    }
-    private func debugInvalidateCurrentFrameProof() {
-        debugEnqueuedImageEpoch = nil
-        if debugImageEpoch == UInt64.max { debugImageEpochSaturated = true }
-        else { debugImageEpoch += 1 }
+        currentFrameReceipt(for: ticket)?.imageEpoch
     }
     struct DebugAlignedPollState: Sendable {
         let ticket: PresentationTicket?, output: ObjectIdentifier?
@@ -403,6 +454,8 @@ final class ContinuousPictureInPicture: NSObject {
     @discardableResult
     func setCurrentItem(_ item: AVPlayerItem?, preparedVideo: PreparedVideoResource? = nil) -> PresentationTicket? {
         guard !invalidated else { return nil }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
         presentationRevision &+= 1
         installedTimeline = nil
         presentationActive = false
@@ -410,6 +463,8 @@ final class ContinuousPictureInPicture: NSObject {
         stopFrameTimer()
         let adoptionRevision = presentationRevision
         let ticket = item.map { PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0)) }
+        invalidateCurrentFrameProof()
+        guard !invalidated, presentationRevision == adoptionRevision else { return nil }
         if currentItem === item, currentResource?.isRetired != true,
            preparedVideo == nil || preparedVideo === currentResource {
             // A new service request for the same item needs its own timeline,
@@ -430,13 +485,8 @@ final class ContinuousPictureInPicture: NSObject {
         orientationPrepared = false
         format = nil
         hasReportedFrameFailure = false
-        #if DEBUG
-        debugInvalidateCurrentFrameProof()
-        #endif
-        displayLayer.flushAndRemoveImage()
-        lastEnqueuedTime = .invalid
-        lastFramePositionSeconds = nil
-        lastCopiedFramePositionSeconds = nil
+        flushForSeek()
+        guard !invalidated, presentationRevision == adoptionRevision else { return nil }
         guard let item else { stopFrameTimer(); return nil }
         if let preparedVideo, preparedVideo.borrow(for: item), let output = preparedVideo.output {
             guard !invalidated, presentationRevision == adoptionRevision, currentItem === item else {
@@ -489,12 +539,15 @@ final class ContinuousPictureInPicture: NSObject {
     func installTimeline(_ ticket: PresentationTicket, positionSeconds: Double,
                          durationSeconds: Double, isPlaying: Bool) -> Bool {
         guard owns(ticket) else { return false }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
+        let seek = seekTicket, activeSeek = activeSeekTicket
         presentationActive = false
         installedTimeline = nil
         stopFrameTimer()
         applyPlayback(positionSeconds: positionSeconds, durationSeconds: durationSeconds,
                       isPlaying: isPlaying, forceAnchor: true)
-        guard owns(ticket) else { return false }
+        guard owns(ticket), seekTicket == seek, activeSeekTicket == activeSeek else { return false }
         installedTimeline = ticket
         return true
     }
@@ -502,8 +555,12 @@ final class ContinuousPictureInPicture: NSObject {
     @discardableResult
     func activate(_ ticket: PresentationTicket) -> Bool {
         guard owns(ticket), installedTimeline == ticket, activeSeekTicket == nil else { return false }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
         presentationActive = true
+        readinessUpdatePending = true
         renderFrame()
+        guard owns(ticket), installedTimeline == ticket, presentationActive else { return false }
         if frameFeedEnabled && playbackState.read().isPlaying { startFrameTimer() }
         return true
     }
@@ -559,6 +616,10 @@ final class ContinuousPictureInPicture: NSObject {
     private func applyPlayback(positionSeconds: Double, durationSeconds: Double, isPlaying: Bool,
                                forceAnchor: Bool) {
         guard !invalidated else { return }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
+        let revision = presentationRevision
+        let seek = seekTicket, activeSeek = activeSeekTicket
         let position = positionSeconds.isFinite ? max(0, positionSeconds) : 0
         let duration = durationSeconds.isFinite ? max(0, durationSeconds) : 0
         let previous = playbackState.read()
@@ -567,6 +628,8 @@ final class ContinuousPictureInPicture: NSObject {
             let current = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
             if forceAnchor || !current.isFinite || abs(current - position) > 0.08 {
                 flushForSeek()
+                guard !invalidated, presentationRevision == revision,
+                      seekTicket == seek, activeSeekTicket == activeSeek else { return }
                 CMTimebaseSetTime(timebase, time: CMTime(seconds: position, preferredTimescale: 60_000))
             } else if previous.isPlaying != isPlaying || !isPlaying {
                 CMTimebaseSetTime(timebase, time: CMTime(seconds: position, preferredTimescale: 60_000))
@@ -583,43 +646,57 @@ final class ContinuousPictureInPicture: NSObject {
 
     /// A seek starts a new frame epoch, including the image held by a paused timebase.
     func flushForSeek() {
-        #if DEBUG
-        debugInvalidateCurrentFrameProof()
-        #endif
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
+        let revision = presentationRevision
+        let epoch = invalidateCurrentFrameProof()
+        guard !invalidated, imageEpoch == epoch, presentationRevision == revision else { return }
         displayLayer.flushAndRemoveImage()
-        lastEnqueuedTime = .invalid
-        lastFramePositionSeconds = nil
-        lastCopiedFramePositionSeconds = nil
+        guard !invalidated, imageEpoch == epoch, presentationRevision == revision else { return }
         hasReportedFrameFailure = false
     }
 
     /// Stop pulls before native seeking can make its target available. Acquiring it
     /// before completion and then flushing would consume a paused one-shot frame.
     func beginSeek() -> UInt64 {
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
         seekTicket &+= 1
-        activeSeekTicket = seekTicket
+        let ticket = seekTicket
+        activeSeekTicket = ticket
         #if DEBUG
         debugTraceRender(.seekBegin) { flushForSeek() }
         #else
         flushForSeek()
         #endif
-        return seekTicket
+        return ticket
     }
 
     func completeSeek(_ ticket: UInt64) {
         guard activeSeekTicket == ticket else { return }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
         activeSeekTicket = nil
+        readinessUpdatePending = true
     }
 
     /// Call when video is intentionally disabled, even if audio remains active.
     func suspendFrameFeed() {
+        guard frameFeedEnabled else { return }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
         frameFeedEnabled = false
         stopFrameTimer()
+        invalidateFrameEligibility()
     }
 
     func resumeFrameFeed() {
         guard !invalidated else { return }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
+        let wasSuspended = !frameFeedEnabled
         frameFeedEnabled = true
+        if wasSuspended { readinessUpdatePending = true }
         renderFrame()
         if playbackState.read().isPlaying && currentItem != nil { startFrameTimer() }
     }
@@ -627,9 +704,12 @@ final class ContinuousPictureInPicture: NSObject {
     /// Release on the control thread. No audio session or audio renderer is touched.
     func invalidate() {
         guard !invalidated else { return }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
         invalidated = true
         presentationActive = false
         installedTimeline = nil
+        invalidateCurrentFrameProof()
         #if DEBUG
         onFrameAcquisition = nil
         onDebugRenderStamp = nil
@@ -646,9 +726,6 @@ final class ContinuousPictureInPicture: NSObject {
         releaseCurrentResource()
         videoOutput = nil
         currentItem = nil
-        #if DEBUG
-        debugInvalidateCurrentFrameProof()
-        #endif
         displayLayer.flushAndRemoveImage()
         displayLayer.controlTimebase = nil
         timebase = nil
@@ -658,6 +735,8 @@ final class ContinuousPictureInPicture: NSObject {
         onRestoreUI = nil
         onStateChanged = nil
         onEvent = nil
+        onCurrentFrameInvalidated = nil
+        onCurrentFrameStateChanged = nil
     }
 
     private func startFrameTimer() {
@@ -678,6 +757,8 @@ final class ContinuousPictureInPicture: NSObject {
 
     private func renderFrame() {
         guard !invalidated, frameFeedEnabled, let videoOutput, let timebase else { return }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
         #if DEBUG
         let debugEnqueueTicket = currentItem.map {
             PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0))
@@ -694,30 +775,45 @@ final class ContinuousPictureInPicture: NSObject {
             return
         }
         guard presentationActive else { return }
+        guard let item = currentItem, !imageEpochSaturated else { return }
+        let pullReceipt = CurrentFrameReceipt(
+            ticket: PresentationTicket(generation: presentationRevision, item: ObjectIdentifier(item)),
+            output: ObjectIdentifier(videoOutput), imageEpoch: imageEpoch, seekSerial: seekTicket)
+        guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
         debugTraceRender(.attempt, sourceTicket: debugSourceTicket)
         #endif
-        if displayLayer.status == .failed {
-            #if DEBUG
-            debugEnqueuedImageEpoch = nil
-            #endif
-            if !hasReportedFrameFailure {
-                onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)
-                hasReportedFrameFailure = true
+        guard ownsFramePull(pullReceipt) else { return }
+        let layerFailed = displayLayer.status == .failed
+        guard ownsFramePull(pullReceipt) else { return }
+        if layerFailed {
+            // Discard credit before any observer or SDK flush can reenter.
+            let shouldReport = !hasReportedFrameFailure
+            let errorCode = shouldReport ? (displayLayer.error as NSError?)?.code : nil
+            guard ownsFramePull(pullReceipt) else { return }
+            let recoveryEpoch = pullReceipt.imageEpoch.addingReportingOverflow(1)
+            flushForSeek()
+            guard !recoveryEpoch.overflow, !imageEpochSaturated,
+                  imageEpoch == recoveryEpoch.partialValue, seekTicket == pullReceipt.seekSerial,
+                  activeSeekTicket == nil, owns(pullReceipt.ticket),
+                  videoOutput === self.videoOutput else { return }
+            // This recovery flush must not rearm the already-reported failure
+            // on every other pull. A later explicit seek/source flush may retry.
+            hasReportedFrameFailure = true
+            if shouldReport {
+                onEvent?(.frameFailed, errorCode)
             }
-            #if DEBUG
-            debugInvalidateCurrentFrameProof()
-            #endif
-            displayLayer.flushAndRemoveImage()
-            lastEnqueuedTime = .invalid
+            return // The next pull must capture the new image epoch.
         }
         // Respect platform backpressure. No app-owned pixel-buffer queue or decoded-frame history.
         guard displayLayer.isReadyForMoreMediaData else { return }
+        guard ownsFramePull(pullReceipt) else { return }
         let requestedTime = CMTimebaseGetTime(timebase)
         guard requestedTime.isNumeric else { return }
         #if DEBUG
         if let item = currentItem { onFrameAcquisition?(item, requestedTime) }
         #endif
+        guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
         let hasNew = debugNativePull(.availability, sourceTicket: debugEnqueueTicket,
             sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
@@ -728,6 +824,7 @@ final class ContinuousPictureInPicture: NSObject {
         #else
         guard videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
         #endif
+        guard ownsFramePull(pullReceipt) else { return }
         var displayTime = CMTime.invalid
         #if DEBUG
         let copied = debugNativePull(.copy, sourceTicket: debugEnqueueTicket,
@@ -740,11 +837,13 @@ final class ContinuousPictureInPicture: NSObject {
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
         #endif
+        guard ownsFramePull(pullReceipt) else { return }
         if !displayTime.isNumeric { displayTime = requestedTime }
         lastCopiedFramePositionSeconds = CMTimeGetSeconds(displayTime)
         #if DEBUG
         debugTraceRender(.copied, requested: requestedTime, sample: displayTime, sourceTicket: debugSourceTicket)
         #endif
+        guard ownsFramePull(pullReceipt) else { return }
         // A stopped clock cannot advance to a future sample. Do not let an output
         // replay from before a backwards seek pin this epoch ahead of its target.
         // Past samples remain valid for sources with long or variable frame durations.
@@ -764,6 +863,7 @@ final class ContinuousPictureInPicture: NSObject {
             let status = CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
                                                                       imageBuffer: pixel,
                                                                       formatDescriptionOut: &createdFormat)
+            guard ownsFramePull(pullReceipt) else { return }
             guard status == noErr, let createdFormat else { reportFrameFailure(status); return }
             format = createdFormat
             formatWidth = width
@@ -779,11 +879,12 @@ final class ContinuousPictureInPicture: NSObject {
                                                               formatDescription: format,
                                                               sampleTiming: &timing,
                                                               sampleBufferOut: &sample)
+        guard ownsFramePull(pullReceipt) else { return }
         guard status == noErr, let sample else { reportFrameFailure(status); return }
         #if DEBUG
-        let debugEnqueueEpoch = debugImageEpoch
         let debugAlignedBeforeEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #endif
+        guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
         debugNativePull(.enqueue, sourceTicket: debugEnqueueTicket,
             sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
@@ -794,14 +895,15 @@ final class ContinuousPictureInPicture: NSObject {
         #else
         displayLayer.enqueue(sample)
         #endif
+        guard ownsFramePull(pullReceipt) else { return }
         lastEnqueuedTime = displayTime
         lastFramePositionSeconds = CMTimeGetSeconds(displayTime)
         submittedFrameCount &+= 1
-        #if DEBUG
-        if let debugEnqueueTicket, owns(debugEnqueueTicket),
-           !debugImageEpochSaturated, debugImageEpoch == debugEnqueueEpoch {
-            debugEnqueuedImageEpoch = debugEnqueueEpoch
+        if submittedReceipt != pullReceipt {
+            submittedReceipt = pullReceipt
+            readinessUpdatePending = true
         }
+        #if DEBUG
         debugObserveAlignedEnqueue(debugAlignedContext, afterCopy: debugAlignedAfterCopy,
             beforeEnqueue: debugAlignedBeforeEnqueue, afterEnqueue: debugAlignedAfterEnqueue,
             enqueuedNs: debugAlignedEnqueuedNs, requested: requestedTime, sample: displayTime)

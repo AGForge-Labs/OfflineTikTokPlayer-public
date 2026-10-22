@@ -761,6 +761,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
 
             var experimentOwnersStable: (@MainActor () -> Bool)?
+            var capabilityQueryCount = 0, capabilityCopyCount = 0
             let helperProbe = prerollOwner.map { _ in ProductionRendererProbe(renderer: audio.renderer) }
             defer {
                 if let helperProbe {
@@ -770,17 +771,39 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
             }
             if let prerollOwner {
-                experimentOwnersStable = try await self.transferPreparedNextForPreroll(prerollOwner,
+                let transfer = try await self.transferPreparedNextForPreroll(prerollOwner,
                     fixture: fixture, audio: audio, service: service, buffer: buffer, a: currentA, b: queuedB,
                     resource: resource, output: output, checkpoint: checkpointAudio, nextToken: nextToken,
                     originalSources: originalSources)
+                experimentOwnersStable = transfer.ownersStable
                 guard ownsPreparedB(), experimentOwnersStable?() == true else {
                     print("PreparedNextPrerollProbe schema=1 token=\(prerollOwner.token) queryCount=0 copyCount=0 setupValid=false ownerStable=false latencyEvidence=false compositorPixels=unmeasured")
                     XCTFail("Exact restored B and finalized callback owners must be valid after the transfer await, before availability")
                     throw SelectionVideoTestFailure.timeout
                 }
+                switch transfer.outcome {
+                case .refusedRestored:
+                    XCTAssertFalse(transfer.consumingProbeAuthorized)
+                    XCTAssertFalse(prerollOwner.issuedPreroll)
+                    XCTAssertEqual(prerollOwner.callback?.snapshot.count, 0)
+                    XCTAssertEqual(capabilityQueryCount, 0); XCTAssertEqual(capabilityCopyCount, 0)
+                    guard !transfer.consumingProbeAuthorized, !prerollOwner.issuedPreroll,
+                          prerollOwner.callback?.snapshot.count == 0,
+                          capabilityQueryCount == 0, capabilityCopyCount == 0 else {
+                        XCTFail("An ownership refusal must never authorize preroll or a consuming output probe")
+                        throw SelectionVideoTestFailure.timeout
+                    }
+                    print("PreparedNextPrerollProbe schema=2 token=\(prerollOwner.token) requestedTreatment=\(prerollOwner.enabled) actualIssued=\(prerollOwner.issuedPreroll) outcome=refusedRestored queryCount=\(capabilityQueryCount) copyCount=\(capabilityCopyCount) ownerStable=true consumingProbeAuthorized=false capabilitySuccess=false latencyEvidence=false compositorPixels=unmeasured")
+                    return
+                case .qualifiedCapability:
+                    guard transfer.consumingProbeAuthorized else {
+                        XCTFail("Only a qualified accepted setup may authorize the existing consuming probe")
+                        throw SelectionVideoTestFailure.timeout
+                    }
+                }
             }
 
+            capabilityQueryCount += 1
             let queryEntry = DispatchTime.now().uptimeNanoseconds
             let reportedAvailable = output.hasNewPixelBuffer(forItemTime: .zero)
             let queryReturn = DispatchTime.now().uptimeNanoseconds
@@ -790,6 +813,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 return
             }
             var returnedPTS = CMTime.invalid
+            capabilityCopyCount += 1
             let copyEntry = DispatchTime.now().uptimeNanoseconds
             var pixel = output.copyPixelBuffer(forItemTime: .zero, itemTimeForDisplay: &returnedPTS)
             let copyReturn = DispatchTime.now().uptimeNanoseconds
@@ -912,9 +936,25 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let nativeAttachProbeCalibrated = OPDebugCalibrateNativeAttachProbe()
         XCTAssertTrue(nativeAttachProbeCalibrated, "The native observer must preserve the original exception as a classified failure without unwinding Swift")
         guard nativeAttachProbeCalibrated else { throw SelectionVideoTestFailure.timeout }
-        print("PrerollAsyncArmBoundary schema=3 token=\(owner.token) phase=entry separateTask=false nativeAttach=classified-failure originalGuards=unchanged")
+        print("PrerollAsyncArmBoundary schema=4 token=\(owner.token) phase=entry separateTask=false nativeAttach=typed-ownership-outcome APlaybackResourceTimingGuards=unchanged capabilityExpectation=qualified-or-refusal")
         try await runPreparedNextVideoFirstFrameCapabilityBeforeSelection(prerollOwner: owner)
-        print("PrerollAsyncArmBoundary schema=3 token=\(owner.token) phase=return separateTask=false nativeAttach=classified-failure originalGuards=unchanged")
+        print("PrerollAsyncArmBoundary schema=4 token=\(owner.token) phase=return separateTask=false nativeAttach=typed-ownership-outcome APlaybackResourceTimingGuards=unchanged capabilityExpectation=qualified-or-refusal")
+    }
+
+    private enum PreparedNextPrerollTransferOutcome {
+        case refusedRestored
+        case qualifiedCapability
+    }
+
+    @MainActor private struct PreparedNextPrerollTransfer {
+        let outcome: PreparedNextPrerollTransferOutcome
+        let ownersStable: @MainActor () -> Bool
+        var consumingProbeAuthorized: Bool {
+            switch outcome {
+            case .refusedRestored: return false
+            case .qualifiedCapability: return true
+            }
+        }
     }
 
     @MainActor private final class PreparedNextPrerollOwner {
@@ -942,7 +982,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         buffer: PlaybackBuffer, a: AVPlayerItem, b: AVPlayerItem,
         resource: ContinuousPictureInPicture.PreparedVideoResource, output: AVPlayerItemVideoOutput,
         checkpoint: ContinuousPCMRenderer.Snapshot, nextToken: Int,
-        originalSources: [ObjectIdentifier]) async throws -> (@MainActor () -> Bool) {
+        originalSources: [ObjectIdentifier]) async throws -> PreparedNextPrerollTransfer {
         let aAsset = a.asset, bAsset = b.asset, composition = b.videoComposition
         let originalPlayer = service.player, aRate = originalPlayer.rate
         var lastFrame = checkpoint.frame
@@ -1078,14 +1118,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 afterQueued: false, afterHelper: false) { buffer.player.remove(b) }
         }
         var attached: UInt64 = 0
-        var attachmentAccepted = false
+        var attachmentAccepted = false, attachmentAttempted = false
+        var attachmentOutcome = OPDebugNativeAttachmentOutcome.observationUnavailable
         if valid {
             valid = boundary("attach-same-B", beforeQueued: false, beforeHelper: false,
                 afterQueued: false, afterHelper: true, afterSDKAuthorized: { attachmentAccepted }) {
                     attached = DispatchTime.now().uptimeNanoseconds
-                    attachmentAccepted = OPDebugObservePlayerAttachment(created, item: b, token: owner.token)
+                    attachmentAttempted = true
+                    attachmentOutcome = OPDebugClassifyPlayerAttachment(created, item: b, token: owner.token)
+                    attachmentAccepted = attachmentOutcome == .accepted
                 }
         }
+        let ownershipRejected = attachmentAttempted && attachmentOutcome == .ownershipRejected
         valid = valid && attachmentAccepted
         let deadline = attached + 1_000_000_000
         let callback = PreparedNextPrerollCallback(token: owner.token, deadline: deadline)
@@ -1093,6 +1137,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         owner.callback = callback
         let setupReturn = DispatchTime.now().uptimeNanoseconds
         valid = valid && attached > 0 && setupReturn - setupEntry <= 250_000_000
+        let refusalSetupValid = ownershipRejected && attached > 0 && setupReturn - setupEntry <= 250_000_000
         // Both arms observe readiness and dwell to the SAME fixed deadline. ON's
         // completion never shortens it; readiness never extends it.
         while valid, DispatchTime.now().uptimeNanoseconds < deadline {
@@ -1216,6 +1261,33 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTFail("The exact original queue could not be restored; retain owners without further SDK queries")
             throw SelectionVideoTestFailure.timeout
         }
+        if ownershipRejected {
+            // Refusal changes the platform-capability expectation, never A's
+            // observation window. Restore first; observe only the original A/B
+            // owners until the SAME attachment-based deadline, without reset.
+            var refusalObservationValid = refusalSetupValid && owner.cleanupAcknowledged && restored
+                && !issued && !owner.issuedPreroll && callback.snapshot.count == 0 && owns(true, false)
+            while refusalObservationValid, DispatchTime.now().uptimeNanoseconds < deadline {
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now < deadline else { break }
+                do { try await Task.sleep(nanoseconds: min(10_000_000, deadline - now)) }
+                catch { refusalObservationValid = false }
+                refusalObservationValid = owns(true, false) && refusalObservationValid
+                    && !issued && !owner.issuedPreroll && callback.snapshot.count == 0
+            }
+            let refusalObservationReturned = DispatchTime.now().uptimeNanoseconds
+            let refusalObservationDelay = refusalObservationReturned > deadline
+                ? refusalObservationReturned - deadline : 0
+            refusalObservationValid = owns(true, false) && refusalObservationValid
+                && refusalObservationReturned >= deadline && refusalObservationDelay <= 50_000_000
+                && !issued && !owner.issuedPreroll && callback.snapshot.count == 0
+            print("PreparedNextPrerollRefusalObservation schema=1 token=\(owner.token) requestedTreatment=\(owner.enabled) actualIssued=\(issued) fixedDeadlineNs=\(deadline) returnNs=\(refusalObservationReturned) delayNs=\(refusalObservationDelay) maximumObserverDelayNs=50000000 observedThroughOriginalDeadline=\(refusalObservationReturned >= deadline) qualified=\(refusalObservationValid) nativeOutcome=ownershipRejected capabilitySuccess=false consumingProbeAuthorized=false latencyEvidence=false")
+            XCTAssertTrue(refusalObservationValid, "An exact native ownership refusal must preserve restored A/B owners and zero preroll through the original fixed observation deadline")
+            guard refusalObservationValid else {
+                retainUnresolvedCleanup("refusal-observation-unqualified")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
         print("PreparedNextPrerollArm schema=1 token=\(owner.token) order=\(owner.order) ordinal=\(owner.ordinal) enabled=\(owner.enabled) setupEntryNs=\(setupEntry) setupReturnNs=\(setupReturn) attachedNs=\(attached) fixedDeadlineNs=\(deadline) dwellReturnNs=\(dwellReturned) dwellDelayNs=\(dwellDelay) detachDelayNs=\(detachDelay) maximumObserverDelayNs=50000000 readyNs=\(readyNs.map { String($0) } ?? "missing") issued=\(issued) callbackCountCappedAtTwo=\(native.count) callbackResult=\(native.finished.map { String($0) } ?? "missing") callbackNativeNs=\(native.time.map { String($0) } ?? "missing") callbackObservedNs=\(observedCallbackNs.map { String($0) } ?? "missing") cancelEntryNs=\(cancelEntry) cancelReturnNs=\(cancelReturn) detachEntryNs=\(detachEntry) detachReturnNs=\(detachReturn) cleanupReturnNs=\(cleanupReturned) helperDetached=\(detached) cleanupAcknowledged=\(owner.cleanupAcknowledged) restored=\(restored) helperRate=\(created.rate) helperMuted=\(created.isMuted) latencyEvidence=false compositorPixels=unmeasured")
         if owner.cleanupAcknowledged {
             owner.helper = nil; owner.item = nil; owner.resource = nil; owner.fixture = nil
@@ -1223,9 +1295,16 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             Self.unresolvedPreparedPrerollOwner = owner
             Self.targetedFixtureOwnershipLost = true
         }
+        if ownershipRejected {
+            print("PreparedNextPrerollOutcome schema=1 token=\(owner.token) requestedTreatment=\(owner.enabled) actualIssued=\(issued) outcome=refusedRestored cleanupAcknowledged=\(owner.cleanupAcknowledged) restored=\(restored) capabilitySuccess=false consumingProbeAuthorized=false latencyEvidence=false")
+            return PreparedNextPrerollTransfer(outcome: .refusedRestored, ownersStable: { @MainActor in
+                owns(true, false) && !owner.issuedPreroll && callback.snapshot.count == 0
+            })
+        }
         XCTAssertTrue(valid, "Matched helper setup, readiness, timely native result, ownership, cleanup and reinsertion must all be valid before the sole output probe")
         guard valid else { throw SelectionVideoTestFailure.timeout }
-        return { @MainActor in owns(true, false) }
+        print("PreparedNextPrerollOutcome schema=1 token=\(owner.token) requestedTreatment=\(owner.enabled) actualIssued=\(issued) outcome=qualifiedCapability cleanupAcknowledged=\(owner.cleanupAcknowledged) restored=\(restored) consumingProbeAuthorized=true compositorPixels=unmeasured latencyEvidence=false")
+        return PreparedNextPrerollTransfer(outcome: .qualifiedCapability, ownersStable: { @MainActor in owns(true, false) })
     }
 
     private func assertPreparedNextPrerollContinuity(_ result: ProductionRendererProbe.Result,
@@ -1420,6 +1499,65 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #else
         XCTFail("Production-default readiness contract requires existing DEBUG test hooks")
+        #endif
+    }
+
+    func testSeekAfterVisibleReadinessRequiresFreshCPPImageBeforeReadyReturns() async throws {
+        #if DEBUG
+        let scheduler = SelectionVideoSeekScheduler()
+        defer { scheduler.release() }
+        try await withOwnedNaturalFixture(seekVideo: scheduler.seek) { fixture, audio, service, screen in
+            service.isInteractingWithFeed = true
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio,
+                screen: screen, id: fixture.aID)
+            service.pause()
+            try await require({ !service.wantsToPlay && !service.audioEngineRunning && service.player.rate == 0
+                && service.debugInitialVideoReadyState.syncingVideoGeneration == nil && service.isVideoReady },
+                "A real current image and the ready latch must settle before the independent seek")
+            let item = try XCTUnwrap(service.player.currentItem)
+            let displayLayer = try XCTUnwrap(screen.customVideoLayer)
+            let request = service.debugInitialVideoReadyState.generation
+            let submitted = service.submittedVideoFrameCount
+            let blocked = service.videoFrameAcquisitionBlockedCount
+            XCTAssertTrue(displayLayer.isReadyForDisplay)
+            XCTAssertGreaterThan(submitted, 0)
+            XCTAssertEqual(item.outputs.count, 1)
+
+            service.seek(0.4)
+            XCTAssertFalse(service.isVideoReady,
+                "A ready latch must clear synchronously when the visible image is flushed")
+            XCTAssertNil(service.videoFramePositionSeconds)
+            XCTAssertNil(service.copiedVideoFramePositionSeconds)
+            try await require({ scheduler.isHoldingCompletion && scheduler.nativeFinished == true
+                && service.videoFrameAcquisitionBlockedCount >= blocked + 2 },
+                "The actual native seek must finish while two real pulls encounter the held completion")
+            XCTAssertEqual(service.submittedVideoFrameCount, submitted)
+            XCTAssertNil(service.videoFramePositionSeconds)
+            XCTAssertNil(service.copiedVideoFramePositionSeconds)
+            XCTAssertFalse(service.isVideoReady)
+            XCTAssertFalse(displayLayer.isReadyForDisplay)
+            XCTAssertEqual(service.debugInitialVideoReadyState.generation, request)
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertFalse(service.wantsToPlay); XCTAssertFalse(service.audioEngineRunning)
+            print("ServiceReadinessAfterSeek schema=1 request=\(request) nativeFinished=\(scheduler.nativeFinished == true) completionHeld=\(scheduler.isHoldingCompletion) blockedDelta=\(service.videoFrameAcquisitionBlockedCount - blocked) submittedBefore=\(submitted) submittedNow=\(service.submittedVideoFrameCount) serviceReady=\(service.isVideoReady) customReady=\(displayLayer.isReadyForDisplay) target=0.4 timingAcceptance=false")
+
+            scheduler.release()
+            await assertPausedCustomFrame(service, screen: screen, requested: 0.4, after: submitted,
+                label: "ready-latch-recovered-A-0.4")
+            try await require({ service.isVideoReady && displayLayer.isReadyForDisplay },
+                "Only the fresh actual CPP target may requalify service readiness")
+            _ = await assertVisibleFrame(service, screen: screen, identity: .a,
+                label: "ready-latch-recovered-A-0.4")
+            assertPausedCustomFrameState(service, screen: screen, requested: 0.4, after: submitted,
+                label: "ready-latch-recovered-A-0.4-captured")
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertEqual(service.debugInitialVideoReadyState.generation, request)
+            XCTAssertEqual(item.outputs.count, 1)
+            XCTAssertFalse(service.wantsToPlay); XCTAssertFalse(service.audioEngineRunning)
+        }
+        #else
+        XCTFail("Service readiness seek ordering requires the existing DEBUG ownership state")
         #endif
     }
 
@@ -1826,7 +1964,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #endif
         #if DEBUG
-        let monitorBuffer = previousBundleControl?.buffer ?? frameMonitorAlternative.map { _ in PlaybackBuffer() }
+        // Read-timing ON/OFF remains an explicit comparison of the legacy native
+        // monitor. Installing an observer must never choose a rendering path.
+        let observedFrameMode = frameMonitorAlternative ?? traceDefaultFrameMonitor.map { _ in false }
+        let monitorBuffer = previousBundleControl?.buffer ?? observedFrameMode.map { _ in PlaybackBuffer() }
         #else
         let monitorBuffer = frameMonitorAlternative.map { _ in PlaybackBuffer() }
         #endif
@@ -1874,8 +2015,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let enabled = traceDefaultFrameMonitor {
             XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
-            print("DefaultFrameMonitorReadScope schema=1 enabled=\(enabled) defaultMonitor=true videoSeekTrace=false nativeRefillTrace=false renderAccounting=false maximumRequests=3 stages=4 maximumRetainedRecords=24 wholeTickCoverage=false releaseBehaviorChange=false playbackAcceptance=unchanged")
-            print("CPPNativePullScope schema=1 enabled=\(enabled) stages=3 maximumRequests=3 maximumRetainedRecords=18 legacySeekTrace=false defaultMonitor=true phaseBinding=monitor-start-request-item nilObserverClocks=false releaseBehaviorChange=false playbackAcceptance=unchanged")
+            service.debugUsesCurrentCustomFrameForReadiness = false
+            XCTAssertFalse(service.debugUsesCurrentCustomFrameForReadiness)
+            print("DefaultFrameMonitorReadScope schema=2 enabled=\(enabled) defaultMonitor=false legacyMonitorExplicit=true videoSeekTrace=false nativeRefillTrace=false renderAccounting=false maximumRequests=3 stages=4 maximumRetainedRecords=24 wholeTickCoverage=false releaseBehaviorChange=false playbackAcceptance=unchanged")
+            print("CPPNativePullScope schema=2 enabled=\(enabled) stages=3 maximumRequests=3 maximumRetainedRecords=18 legacySeekTrace=false defaultMonitor=false legacyMonitorExplicit=true phaseBinding=monitor-start-request-item nilObserverClocks=false releaseBehaviorChange=false playbackAcceptance=unchanged")
             if enabled {
                 service.onDebugFrameMonitorReadBatch = { [weak monitorReadTrace, weak cppNativePullTrace] value in
                     monitorReadTrace?.record(value); cppNativePullTrace?.recordMonitor(value)
@@ -1887,7 +2030,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var monitorOverflow = false
         var monitorPhase = -1
         var monitorExpectedID: String?
-        if let alternative = frameMonitorAlternative {
+        if let alternative = observedFrameMode {
             service.debugUsesCurrentCustomFrameForReadiness = alternative
             service.debugAfterFirstFrameMonitorStart = { [weak service] item in
                 guard monitorRows.count < 8 else { monitorOverflow = true; return }
@@ -1915,7 +2058,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if traceDefaultFrameMonitor != nil {
                 service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
             }
-            if frameMonitorAlternative != nil { service.debugAfterFirstFrameMonitorStart = nil }
+            if observedFrameMode != nil { service.debugAfterFirstFrameMonitorStart = nil }
             if traceVideoSeeks {
                 service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil
                 service.onDebugVideoRenderStamp = nil
@@ -1976,7 +2119,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     let commandNs = monitorReadTrace.beginPhase(phase)
                     cppNativePullTrace?.beginPhase(phase, commandNs: commandNs)
                 }
-                if frameMonitorAlternative != nil {
+                if observedFrameMode != nil {
                     monitorPhase = phase
                     monitorExpectedID = id
                 }
@@ -2085,7 +2228,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             throw previousBundleBodyError
         }
         #if DEBUG
-        if let alternative = frameMonitorAlternative {
+        if let alternative = observedFrameMode {
             print("FrameMonitorBenchmarkOutputs schema=1 alternative=\(alternative) rows=\(monitorRows.count) capacity=8 overflow=\(monitorOverflow) originalGuardsRetained=true physicalPixels=unmeasured")
             XCTAssertGreaterThanOrEqual(monitorRows.count, 3)
             XCTAssertLessThanOrEqual(monitorRows.count, 8)
@@ -4112,6 +4255,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     /// Cleanup runs on normal return and on a retained original error. File removal
     /// requires both existing acknowledgements; failure retains only this fixture.
     private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, buffer: PlaybackBuffer? = nil, recordHost: Bool = true,
+        seekVideo: PlaybackService.SeekVideo? = nil,
         additionalCleanupAcknowledged: @MainActor () -> Bool = { @MainActor in true }, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
         PlaybackService, SelectionVideoScreen) async throws -> Void) async throws {
         if recordHost { try recordRuntimeHost() }
@@ -4126,7 +4270,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #else
         let audio = ContinuousAudioPlayer()
         #endif
-        let service = fixture.service(buffer: buffer, continuousAudio: audio)
+        let service = fixture.service(buffer: buffer, continuousAudio: audio, seekVideo: seekVideo)
         var screen: SelectionVideoScreen?
         var originalError: Error?
         #if DEBUG

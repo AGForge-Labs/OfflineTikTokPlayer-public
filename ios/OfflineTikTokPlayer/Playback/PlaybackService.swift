@@ -33,7 +33,8 @@ final class PlaybackService: NSObject {
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     #if DEBUG
-    @ObservationIgnored var debugUsesCurrentCustomFrameForReadiness = false
+    // Explicit false is the retained native-layer/second-output diagnostic control.
+    @ObservationIgnored var debugUsesCurrentCustomFrameForReadiness = true
     enum DebugVideoPositionReadKind: Int { case legacyCurrentTime = 0, itemTimebase = 1 }
     struct DebugVideoPositionRead {
         let kind: DebugVideoPositionReadKind
@@ -322,6 +323,18 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var warmRevision = 0
     @ObservationIgnored private weak var observedItem: AVPlayerItem?
     @ObservationIgnored private var videoPresentation: (request: Int, ticket: ContinuousPictureInPicture.PresentationTicket)?
+    private struct FrameMonitorOwner: Equatable {
+        let request: Int
+        let ticket: ContinuousPictureInPicture.PresentationTicket
+    }
+    @ObservationIgnored private var frameMonitorOwner: FrameMonitorOwner?
+    private var usesCurrentCustomFrameForReadiness: Bool {
+        #if DEBUG
+        return debugUsesCurrentCustomFrameForReadiness
+        #else
+        return true
+        #endif
+    }
     @ObservationIgnored private var pendingInitialZeroStart: (request: Int, ticket: ContinuousPictureInPicture.PresentationTicket)?
     private struct InitialZeroVisitOwnership {
         let request: Int
@@ -447,6 +460,8 @@ final class PlaybackService: NSObject {
         }
         continuousPiP.onStateChanged = { [weak self] _, _, _ in self?.samplePiPState() }
         continuousPiP.onEvent = { [weak self] event, code in self?.handlePiPEvent(event, code: code) }
+        continuousPiP.onCurrentFrameInvalidated = { [weak self] in self?.invalidateVideoReadiness() }
+        continuousPiP.onCurrentFrameStateChanged = { [weak self] in self?.ensureCurrentFrameMonitor() }
         configureAudio(); installObservers(); installRemoteControls()
         audioPollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -496,6 +511,8 @@ final class PlaybackService: NSObject {
         persist(); updateNowPlaying()
     }
     func pause() {
+        continuousPiP.beginReadinessUpdates()
+        defer { continuousPiP.endReadinessUpdates() }
         intent.pause()
         recordDiagnostic(.pauseRequested)
         continuousAudio.suspend()
@@ -559,6 +576,8 @@ final class PlaybackService: NSObject {
     func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
+        continuousPiP.beginReadinessUpdates()
+        defer { continuousPiP.endReadinessUpdates() }
         explicitVideoSeekGeneration = generation
         pendingInitialZeroStart = nil
         initialZeroVisitOwnership = nil
@@ -605,6 +624,8 @@ final class PlaybackService: NSObject {
 
     private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil,
                              audioAlreadySelected: Bool = false) {
+        continuousPiP.beginReadinessUpdates()
+        defer { continuousPiP.endReadinessUpdates() }
         pendingAudioSeek = nil; completePiPSkip()
         pendingInitialZeroStart = nil
         initialZeroVisitOwnership = nil
@@ -625,6 +646,7 @@ final class PlaybackService: NSObject {
         recordPlaybackEvent("loadRequested")
         cancelStallRecovery()
         loadTask?.cancel(); itemObservation = nil; frameMonitor.cancel(); observedItem = nil; readyGeneration = nil
+        frameMonitorOwner = nil
         videoPresentation = nil
         audioCheckTask?.cancel(); hasAudioTrack = nil
         isVideoReady = false
@@ -761,6 +783,8 @@ final class PlaybackService: NSObject {
     }
 
     private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
+        continuousPiP.beginReadinessUpdates()
+        defer { continuousPiP.endReadinessUpdates() }
         observedItem = playerItem
         #if DEBUG
         if let observer = onDebugCPPNativePullStamp {
@@ -818,6 +842,8 @@ final class PlaybackService: NSObject {
                               self.readyGeneration != request else { return }
                     }
                     #endif
+                    self.continuousPiP.beginReadinessUpdates()
+                    defer { self.continuousPiP.endReadinessUpdates() }
                     #if DEBUG
                     self.debugTraceVideoStartup(.readyAccepted, request: request) {}
                     #endif
@@ -897,17 +923,35 @@ final class PlaybackService: NSObject {
     }
 
     private func monitorFirstFrame(_ playerItem: AVPlayerItem, request: Int) {
+        if usesCurrentCustomFrameForReadiness {
+            guard generation == request, observedItem === playerItem,
+                  let expected = videoPresentation, expected.request == request,
+                  continuousPiP.frameReadinessEpoch(for: expected.ticket) != nil,
+                  !continuousPiP.isFrameFeedSuspended else { return }
+            let owner = FrameMonitorOwner(request: request, ticket: expected.ticket)
+            guard frameMonitorOwner != owner else { return }
+            frameMonitorOwner = owner
+            frameMonitor.start(item: playerItem, layer: surface.playerLayer,
+                displayLayer: continuousPiP.displayLayer, currentFrameReceipt: { [weak self, weak playerItem] in
+                    guard let self, let playerItem, self.ownsFrameMonitor(owner, item: playerItem) else { return nil }
+                    return self.continuousPiP.currentFrameReceipt(for: owner.ticket)
+                }, onReady: { [weak self, weak playerItem] receipt in
+                    guard let self, let playerItem, self.ownsFrameMonitor(owner, item: playerItem) else { return }
+                    let selected = self.player.currentItem === playerItem
+                    guard selected, self.ownsFrameMonitor(owner, item: playerItem),
+                          self.continuousPiP.currentFrameReceipt(for: owner.ticket) == receipt else { return }
+                    self.completeVideoReadiness(request: request)
+                })
+            guard ownsFrameMonitor(owner, item: playerItem) else { return }
+            #if DEBUG
+            debugAfterFirstFrameMonitorStart?(playerItem)
+            #endif
+            return
+        }
+        frameMonitorOwner = nil
         let completion: () -> Void = { [weak self, weak playerItem] in
             guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
-            #if DEBUG
-            self.debugTraceVideoStartup(.firstFrameEvent, request: request) {
-                self.isVideoReady = true
-                self.recordPlaybackEvent("firstFrame")
-            }
-            #else
-            self.isVideoReady = true
-            self.recordPlaybackEvent("firstFrame")
-            #endif
+            self.completeVideoReadiness(request: request)
         }
         #if DEBUG
         if let observer = onDebugFrameMonitorReadBatch {
@@ -926,24 +970,47 @@ final class PlaybackService: NSObject {
                     cachedAudioToken: self.audioToken, cachedAudioVisit: self.audioVisit, reads: reads))
             }
         }
-        if debugUsesCurrentCustomFrameForReadiness {
-            // Capture the raw ticket: audio eligibility can still be pending here.
-            let expected = videoPresentation
-            frameMonitor.start(item: playerItem, layer: surface.playerLayer, decodedFrameEpoch: { [weak self, weak playerItem] in
-                guard let self, let playerItem, let expected,
-                      expected.request == request, self.generation == request,
-                      self.observedItem === playerItem,
-                      self.videoPresentation?.request == request,
-                      self.videoPresentation?.ticket == expected.ticket else { return nil }
-                return self.continuousPiP.debugCurrentFrameEpoch(for: expected.ticket)
-            }, onReady: completion)
-        } else {
-            frameMonitor.start(item: playerItem, layer: surface.playerLayer, onReady: completion)
-        }
+        frameMonitor.start(item: playerItem, layer: surface.playerLayer, onReady: completion)
         debugAfterFirstFrameMonitorStart?(playerItem)
         #else
         frameMonitor.start(item: playerItem, layer: surface.playerLayer, onReady: completion)
         #endif
+    }
+
+    private func ownsFrameMonitor(_ owner: FrameMonitorOwner, item: AVPlayerItem) -> Bool {
+        generation == owner.request && observedItem === item && frameMonitorOwner == owner
+            && videoPresentation?.request == owner.request && videoPresentation?.ticket == owner.ticket
+    }
+
+    private func completeVideoReadiness(request: Int) {
+        #if DEBUG
+        debugTraceVideoStartup(.firstFrameEvent, request: request) {
+            isVideoReady = true
+            recordPlaybackEvent("firstFrame")
+        }
+        #else
+        isVideoReady = true
+        recordPlaybackEvent("firstFrame")
+        #endif
+    }
+
+    private func invalidateVideoReadiness() {
+        guard usesCurrentCustomFrameForReadiness else { return }
+        let request = generation, expectedOwner = frameMonitorOwner, expectedItem = observedItem
+        isVideoReady = false
+        guard generation == request, frameMonitorOwner == expectedOwner, observedItem === expectedItem else { return }
+        if let owner = frameMonitorOwner, let item = observedItem,
+           ownsFrameMonitor(owner, item: item),
+           continuousPiP.frameReadinessEpoch(for: owner.ticket) != nil,
+           frameMonitor.invalidateCurrentFrameReadiness() { return }
+        frameMonitorOwner = nil
+        frameMonitor.cancel()
+    }
+
+    private func ensureCurrentFrameMonitor() {
+        guard usesCurrentCustomFrameForReadiness, let item = observedItem else { return }
+        // Called only after the outer CPP/service mutation has installed its owner.
+        monitorFirstFrame(item, request: generation)
     }
 
     private var initialZeroStartOwnsPendingReady: Bool {
@@ -1128,6 +1195,8 @@ final class PlaybackService: NSObject {
     }
 
     private func sampleContinuousAudio(handleEnd: Bool = true) {
+        continuousPiP.beginReadinessUpdates()
+        defer { continuousPiP.endReadinessUpdates() }
         continuousAudio.settlePausedState()
         guard audioLoadingID == nil else { return }
         let sample = continuousAudio.snapshot
@@ -1317,6 +1386,8 @@ final class PlaybackService: NSObject {
     }
 
     private func synchronizeVideoToAudio(force: Bool = false) {
+        continuousPiP.beginReadinessUpdates()
+        defer { continuousPiP.endReadinessUpdates() }
         #if DEBUG
         let reason = debugVideoSeekReason
         #endif
@@ -1399,6 +1470,8 @@ final class PlaybackService: NSObject {
         seekVideo(player, CMTime(seconds: position, preferredTimescale: 48_000)) { [weak self, weak item] finished in
             Task { @MainActor in
                 guard let self else { return }
+                self.continuousPiP.beginReadinessUpdates()
+                defer { self.continuousPiP.endReadinessUpdates() }
                 defer { self.continuousPiP.completeSeek(videoSeek) }
                 guard self.syncingVideoGeneration == request else { return }
                 self.syncingVideoGeneration = nil
@@ -1552,6 +1625,8 @@ final class PlaybackService: NSObject {
     }
 
     private func applyPresentation(_ actions: PlaybackPresentationPolicy.Actions) {
+        continuousPiP.beginReadinessUpdates()
+        defer { continuousPiP.endReadinessUpdates() }
         surface.isHidden = audioOnly
         pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }

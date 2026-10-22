@@ -2,13 +2,24 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=c3e044b315a004fa67fd7ad9b6c9411b633fd634
-expected_ios_tree=afe0e79b1190c108472abcf2eb21d4c7f1969846
+expected_code_source=PENDING
+expected_ios_tree=PENDING
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionDefaultReadinessRequiresTheSelectedCPPOutput
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSeekAfterVisibleReadinessRequiresFreshCPPImageBeforeReadyReturns
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff
   OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame
+  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource
+  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks
+  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testSupersededCurrentFrameMonitorCannotCompleteItsReplacement
+  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testSuspendedPausedImageRequiresTwoFreshTicksAfterResume
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -35,9 +46,20 @@ evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionDefaultReadinessRequiresTheSelectedCPPOutput',
-    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame'}
-if len(expected) != 2 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly two diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSeekAfterVisibleReadinessRequiresFreshCPPImageBeforeReadyReturns',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff',
+    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame',
+    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource',
+    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks',
+    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testSupersededCurrentFrameMonitorCannotCompleteItsReplacement',
+    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testSuspendedPausedImageRequiresTwoFreshTicksAfterResume'}
+if len(expected) != 13 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly thirteen diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -46,7 +68,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=2 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=13 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -97,7 +119,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=2 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=13 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Invoke the single filtered native attempt.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
