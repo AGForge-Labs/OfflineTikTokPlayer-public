@@ -2,25 +2,21 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=e41ae537ee3f24c5ceb88a0f6aa72137631dc139
-expected_ios_tree=4759cbac0e79bfe4d564e8b14a8964ac09e838f9
+expected_code_source=232a28faddc5426e6cd027c873fa4a41583eca05
+expected_ios_tree=a86e14ad92f0fc731439083a5c0221732eb38ded
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRefusesConflictsAndHonorsSavedEligibility
-  OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRevalidatesLiveLocalityBeforeCommit
-  OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRevalidatesOwnerAfterNativeInsertionEligibility
-  OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousToNextPreservesExactPreparationAndPlayerPolicy
+  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback
+  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetNativeMinimumFrameDurationCompositionPreservesEveryImage
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOnThenOff
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedForwardVideoReusesItsPreparedNativeItemAndOutput
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -46,20 +42,16 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.NativeMediaTests/testPromotingPreviousRefusesConflictsAndHonorsSavedEligibility',
-    'OfflineTikTokPlayerTests.NativeMediaTests/testPromotingPreviousRevalidatesLiveLocalityBeforeCommit',
-    'OfflineTikTokPlayerTests.NativeMediaTests/testPromotingPreviousRevalidatesOwnerAfterNativeInsertionEligibility',
-    'OfflineTikTokPlayerTests.NativeMediaTests/testPromotingPreviousToNextPreservesExactPreparationAndPlayerPolicy',
+    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback',
+    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testImportedPositiveOffsetNativeMinimumFrameDurationCompositionPreservesEveryImage',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOnThenOff',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedForwardVideoReusesItsPreparedNativeItemAndOutput'}
-if len(expected) != 12 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly twelve promotion and playback identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
+if len(expected) != 8 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly eight composition, native-clock and playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -68,7 +60,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=12 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=8 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -169,13 +161,12 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=12 expectedUI=0 expectedCore=105 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# Preserve original default, completion ownership, actual ABA and cleanup guards.
-# Same retained A is staged in the same player early versus inside command.
-# Both controls change adoption route; no decoder-only causal attribution.
-# Four native promotion contracts require exact transfer, refusal, live locality
-# and owner revalidation. They do not replace the eight playback controls.
-# All earlier cases remain in full source; full acceptance remains mandatory.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=8 expectedUI=0 expectedCore=105 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# This exact subset retains the default composition RED without an exemption.
+# Default and startup-traced benchmarks keep their distinct original callbacks.
+# There is no promotion prefix. Actual XCTest start/result records determine
+# execution history; selected-list order is not a matched-history guarantee.
+# All other cases remain in full source; full acceptance remains mandatory.
 # Every selected case and both native/tee exits must pass without exemptions.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
