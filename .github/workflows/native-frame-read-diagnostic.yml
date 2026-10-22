@@ -1,0 +1,53 @@
+name: Native default frame read diagnostic
+on:
+  push:
+    branches: [diagnostic/native-reader-isolation]
+    paths: ['.github/workflows/native-frame-read-diagnostic.yml', 'scripts/check-native-frame-read-diagnostic.sh', 'tests/validation-shell/test_native_frame_read_diagnostic.py']
+permissions:
+  contents: read
+jobs:
+  native-frame-read-diagnostic:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Require the exact committed app and tests before diagnostic work
+        id: source_pin
+        run: |
+          mkdir -p artifacts/native
+          bash scripts/check-native-frame-read-diagnostic.sh --verify-source
+      - name: Preserve portable launcher evidence bootstrap and export guards
+        id: harness
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        run: |
+          python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_native_test_evidence.py
+          python3 tests/validation-shell/test_simulator_boot_preflight.py
+          python3 tests/validation-shell/test_simulator_destination_resolution.py
+          python3 tests/validation-shell/test_native_xcresult_export.py
+          python3 tests/validation-shell/test_native_frame_read_diagnostic.py
+      - name: Resolve within sixty seconds and boot within four minutes
+        id: simulator_boot
+        if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
+        run: |
+          simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
+          printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
+      - name: Run only the two ordered native read diagnostics and the cleanup audit
+        id: native
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
+        env:
+          SIMULATOR_DESTINATION: platform=iOS Simulator,id=${{ steps.simulator_boot.outputs.simulator_id }}
+        run: bash scripts/check-native-frame-read-diagnostic.sh
+      - name: Export bounded raw structured records after an actual attempt
+        id: xcresult_export
+        if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
+        run: python3 scripts/export-native-xcresult.py
+      - name: Independently require the three exact identities and zero native exit
+        id: evidence
+        if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
+        run: bash scripts/check-native-frame-read-diagnostic.sh --verify-results
