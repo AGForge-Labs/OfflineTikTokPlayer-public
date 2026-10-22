@@ -149,6 +149,19 @@ def capture(udid, temporary, request, identifier):
         acknowledge(temporary, identifier, code)
 
 
+def capture_lifecycle(event, reason, started, deadline, lifetime, observed):
+    # Fixed numeric fields only. Failure to write diagnostics must not replace
+    # the helper's original exit/interrupt or prevent request processing.
+    payload = {"schema": 1, "eventCode": event, "reasonCode": reason,
+               "startUptime": started, "deadlineUptime": deadline,
+               "effectiveLifetimeSeconds": lifetime, "observedUptime": observed,
+               "elapsedSeconds": max(0, observed - started)}
+    try:
+        print("SimulatorCaptureLifecycle " + json.dumps(payload, sort_keys=True), flush=True)
+    except OSError:
+        pass
+
+
 def main():
     global DEADLINE
     parser = argparse.ArgumentParser(description=__doc__)
@@ -169,36 +182,47 @@ def main():
         arguments.udid = str(uuid.UUID(arguments.udid)).upper()
     except ValueError:
         parser.error("--udid must be a Simulator UUID")
-    deadline = time.monotonic() + min(2400, arguments.lifetime)
+    started = time.monotonic()
+    lifetime = min(2400, arguments.lifetime)
+    deadline = started + lifetime
     DEADLINE = deadline
-    target = None
-    next_lookup = 0.0
-    while time.monotonic() < deadline:
-        if target is None:
-            if time.monotonic() < next_lookup:
-                time.sleep(0.1)
+    capture_lifecycle(0, 0, started, deadline, lifetime, started)
+    reason = 2  # Uncaught Python exception; default signal behavior is unchanged.
+    try:
+        target = None
+        next_lookup = 0.0
+        while time.monotonic() < deadline:
+            if target is None:
+                if time.monotonic() < next_lookup:
+                    time.sleep(0.1)
+                    continue
+                next_lookup = time.monotonic() + 3
+                try:
+                    target = locate(arguments.udid)
+                except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+                    target = None
                 continue
-            next_lookup = time.monotonic() + 3
+            udid, temporary = target
             try:
-                target = locate(arguments.udid)
-            except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+                if not temporary.is_dir():
+                    target = None
+                    continue
+                for request in temporary.glob(PREFIX + "*.request.json"):
+                    if time.monotonic() >= deadline:
+                        break
+                    match = REQUEST.fullmatch(request.name)
+                    if match:
+                        capture(udid, temporary, request, match.group(1))
+            except OSError:
                 target = None
-            continue
-        udid, temporary = target
-        try:
-            if not temporary.is_dir():
-                target = None
-                continue
-            for request in temporary.glob(PREFIX + "*.request.json"):
-                if time.monotonic() >= deadline:
-                    break
-                match = REQUEST.fullmatch(request.name)
-                if match:
-                    capture(udid, temporary, request, match.group(1))
-        except OSError:
-            target = None
-        time.sleep(0.1)
-    return 0
+            time.sleep(0.1)
+        reason = 1  # The existing loop reached its deadline.
+        return 0
+    except KeyboardInterrupt:
+        reason = 3
+        raise
+    finally:
+        capture_lifecycle(1, reason, started, deadline, lifetime, time.monotonic())
 
 
 if __name__ == "__main__":

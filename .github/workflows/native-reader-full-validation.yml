@@ -2,7 +2,7 @@ name: Native reader full validation
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh', 'scripts/ensure-simulator-booted.py', 'tests/validation-shell/test_simulator_boot_preflight.py', 'scripts/test-apple-buffer.sh', 'scripts/generate-apple-buffer-resources.py', 'tests/validation-shell/test_apple_buffer_projection.py', 'scripts/capture-simulator-test-frames.py', 'tests/validation-shell/test_simulator_destination_resolution.py', 'scripts/export-native-xcresult.py', 'tests/validation-shell/test_native_xcresult_export.py', 'scripts/preroll-crash-excerpt.py', 'scripts/export-preroll-crash-evidence.py', 'tests/validation-shell/test_preroll_crash_evidence.py']
+    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh', 'scripts/check-ios.sh', 'scripts/run-owned-xcodebuild.py', 'tests/validation-shell/test_check_ios_shell.py', 'tests/validation-shell/test_owned_xcodebuild_deadline.py', 'scripts/ensure-simulator-booted.py', 'tests/validation-shell/test_simulator_boot_preflight.py', 'scripts/test-apple-buffer.sh', 'scripts/generate-apple-buffer-resources.py', 'tests/validation-shell/test_apple_buffer_projection.py', 'scripts/capture-simulator-test-frames.py', 'tests/validation-shell/test_simulator_destination_resolution.py', 'scripts/export-native-xcresult.py', 'tests/validation-shell/test_native_xcresult_export.py', 'scripts/preroll-crash-excerpt.py', 'scripts/export-preroll-crash-evidence.py', 'tests/validation-shell/test_preroll_crash_evidence.py']
 permissions:
   contents: read
 concurrency:
@@ -12,7 +12,7 @@ jobs:
   native-reader-full-validation:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -28,6 +28,7 @@ jobs:
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 tests/validation-shell/test_check_ios_shell.py
+          python3 tests/validation-shell/test_owned_xcodebuild_deadline.py
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_simulator_boot_preflight.py
           python3 tests/validation-shell/test_apple_buffer_projection.py

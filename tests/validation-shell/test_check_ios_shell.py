@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class NativeLauncherTests(unittest.TestCase):
     def exercise(self, arguments=(), status=0, expansion_error=False, preflight_failure=False,
-                 driver_status=0, driver_remark=True, successful_output=None):
+                 driver_status=0, driver_remark=True, successful_output=None, tee_status=0):
         with tempfile.TemporaryDirectory(prefix="offline-ios-shell-") as directory:
             root = Path(directory)
             (root / "scripts").mkdir()
@@ -34,16 +34,35 @@ class NativeLauncherTests(unittest.TestCase):
 done
 : "${LAUNCHER_TEST_UNBOUND_VALUE}"
 '''
-                launcher = launcher.replace("xcodebuild -project", injection + "xcodebuild -project", 1)
+                anchor = "python3 scripts/run-owned-xcodebuild.py --phase full-test -- xcodebuild -project"
+                self.assertEqual(launcher.count(anchor), 1)
+                launcher = launcher.replace(anchor, injection + anchor, 1)
             (root / "scripts/check-ios.sh").write_text(launcher)
             for script in ("test-core.sh", "test-apple-buffer.sh"):
                 code = status if preflight_failure and script == "test-core.sh" else 0
                 (root / "scripts" / script).write_text(f"#!/bin/bash\nexit {code}\n")
             python = root / "bin/python3"
             python.write_text("""#!/bin/bash
+if [ "$1" = scripts/run-owned-xcodebuild.py ]; then
+  phase="$3"
+  printf '%s\\n' "$@" > "$LAUNCHER_TEST_ROOT/owned-$phase.args"
+  shift 4
+  case "$phase" in
+    driver) phase_code=3; deadline=60 ;;
+    full-test) phase_code=4; deadline=1320 ;;
+    *) exit 92 ;;
+  esac
+  "$@"
+  owned_status=$?
+  timed_out=false
+  if [ "$owned_status" -eq 124 ]; then timed_out=true; fi
+  printf 'OwnedXcodebuildCommand {"schema":1,"event":"complete","phase":%s,"deadlineSeconds":%s,"timedOut":%s,"wrapperExit":%s}\\n' "$phase_code" "$deadline" "$timed_out" "$owned_status"
+  exit "$owned_status"
+fi
 case "$*" in
+  *verify-native-test-log.py*) printf '%s\\n' "$@" > "$LAUNCHER_TEST_ROOT/verifier.args" ;;
   *--resolve-destination*) printf '%s\\n' '00000000-0000-0000-0000-000000000001' ;;
-  *--udid*) echo $$ > "$LAUNCHER_TEST_ROOT/helper.pid"; exec sleep 60 ;;
+  *--udid*) printf '%s\\n' "$@" > "$LAUNCHER_TEST_ROOT/capture.args"; echo $$ > "$LAUNCHER_TEST_ROOT/helper.pid"; exec sleep 60 ;;
   *) exit 0 ;;
 esac
 """)
@@ -72,9 +91,16 @@ fi
 exit "$LAUNCHER_TEST_DRIVER_STATUS"
 ''')
             xcrun.chmod(0o755)
+            tee = root / "bin/tee"
+            tee.write_text('''#!/bin/bash
+cat > "$1"
+cat "$1"
+exit "$LAUNCHER_TEST_TEE_STATUS"
+''')
+            tee.chmod(0o755)
             environment = dict(os.environ, PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
                 LAUNCHER_TEST_ROOT=str(root), LAUNCHER_TEST_STATUS=str(status),
-                LAUNCHER_TEST_DRIVER_STATUS=str(driver_status),
+                LAUNCHER_TEST_DRIVER_STATUS=str(driver_status), LAUNCHER_TEST_TEE_STATUS=str(tee_status),
                 LAUNCHER_TEST_DRIVER_REMARK="1" if driver_remark else "0",
                 SWIFTC_MAXIMUM_DETERMINISM="")
             environment.pop("LAUNCHER_TEST_UNBOUND_VALUE", None)
@@ -82,12 +108,17 @@ exit "$LAUNCHER_TEST_DRIVER_STATUS"
                 env=environment, text=True, capture_output=True, timeout=10)
             actual = (root / "xcode.args").read_text().splitlines() if (root / "xcode.args").exists() else []
             pid_file = root / "helper.pid"
+            driver_command = ["swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-"]
+            self.assertEqual((root / "owned-driver.args").read_text().splitlines(),
+                ["scripts/run-owned-xcodebuild.py", "--phase", "driver", "--", "xcrun"] + driver_command)
             if driver_status != 0 or not driver_remark:
                 self.assertEqual(result.returncode, driver_status or 1, result.stdout + result.stderr)
                 self.assertEqual((root / "driver.args").read_text().splitlines(),
                     ["swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-"])
                 plan = (root / "artifacts/native/swift-driver-plan.log").read_text()
                 self.assertEqual("SWIFTC_MAXIMUM_DETERMINISM overriding -j" in plan, driver_remark)
+                self.assertIn(plan, result.stdout, "Driver failure evidence must be printed before exit")
+                self.assertIn('"phase":3,"deadlineSeconds":60', plan)
                 if driver_status == 0:
                     self.assertIn("did not confirm its one-job override", result.stderr)
                 self.assertFalse(pid_file.exists(), "A rejected driver preflight must prevent helper launch")
@@ -112,13 +143,24 @@ exit "$LAUNCHER_TEST_DRIVER_STATUS"
                     os.kill(pid, signal.SIGTERM)
                     self.fail("The launcher left its screenshot helper running")
             self.assertTrue(pid_file.exists(), "The isolated screenshot helper must actually start")
-            self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+            self.assertEqual(result.returncode, status or tee_status, result.stdout + result.stderr)
             if successful_output is not None:
                 self.assertIn(successful_output, result.stdout)
             if expansion_error:
                 self.assertIn("unbound variable", result.stderr)
                 self.assertEqual(actual, [], "An earlier error must prevent the native launch")
                 return actual
+            self.assertEqual((root / "capture.args").read_text().splitlines(),
+                ["scripts/capture-simulator-test-frames.py", "--udid",
+                 "00000000-0000-0000-0000-000000000001", "--lifetime", "1800"])
+            self.assertEqual((root / "owned-full-test.args").read_text().splitlines(),
+                ["scripts/run-owned-xcodebuild.py", "--phase", "full-test", "--", "xcodebuild"] + actual)
+            self.assertIn('"phase":4,"deadlineSeconds":1320', evidence_log.read_text())
+            self.assertEqual((root / "verifier.args").exists(), status == 0 and tee_status == 0,
+                             "The strict verifier runs only after both command and tee succeed")
+            self.assertEqual(actual[-1], "test")
+            for limit in ("-default-test-execution-time-allowance", "-maximum-test-execution-time-allowance"):
+                self.assertEqual(actual[actual.index(limit) + 1], "120")
             self.assertIn("CODE_SIGNING_ALLOWED=NO", actual)
             self.assertIn("SWIFTC_MAXIMUM_DETERMINISM=1", actual)
             self.assertIn("SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO", actual)
@@ -162,6 +204,21 @@ exit "$LAUNCHER_TEST_DRIVER_STATUS"
 
     def test_driver_plan_without_override_remark_fails_closed(self):
         self.exercise(driver_remark=False)
+
+
+    def test_owned_timeout_cannot_be_masked_by_full_passing_case_output(self):
+        from test_native_test_evidence import case_line, current_manifest
+        output = "\n".join([case_line(identity) for identity in current_manifest()] + ["** TEST SUCCEEDED **"]) + "\n"
+        self.exercise(status=124, successful_output=output)
+
+    def test_native_status_wins_over_tee_failure(self):
+        self.exercise(status=65, tee_status=17)
+
+    def test_tee_failure_is_not_an_accepted_native_run(self):
+        self.exercise(tee_status=17)
+
+    def test_driver_timeout_receipt_is_visible_before_failure(self):
+        self.exercise(driver_status=124)
 
 
 if __name__ == "__main__":

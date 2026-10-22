@@ -11,7 +11,9 @@ import subprocess
 import sys
 import time
 
-PHASES = {"build": (0, 720), "case-01": (1, 300), "case-02": (2, 300), "driver": (3, 60)}
+PHASES = {"build": (0, 720), "case-01": (1, 300), "case-02": (2, 300), "driver": (3, 60),
+          "full-test": (4, 1320)}
+MAX_SESSION_SECONDS = max(seconds for _, seconds in PHASES.values())
 DRIVER_COMMAND = ("xcrun", "swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-")
 
 
@@ -23,7 +25,7 @@ def session(control, result, seconds, argv):
     # Caught handlers reset to defaults when the real child execs. Guardian stays
     # alive until supervisor cleanup, reserving the session leader PID/PGID even
     # if xcodebuild exits while descendants still hold the stdout/tee pipe open.
-    if os.getpgid(0) != os.getpid() or os.getsid(0) != os.getpid() or not 0 < seconds <= 720: return 125
+    if os.getpgid(0) != os.getpid() or os.getsid(0) != os.getpid() or not 0 < seconds <= MAX_SESSION_SECONDS: return 125
     for signum in (signal.SIGINT, signal.SIGTERM): signal.signal(signum, lambda *_: None)
     if not select.select([control], [], [], seconds + 3)[0] or os.read(control, 1) != b"G": return 125
     # Parent holds its write end until cleanup. EOF detects SIGKILL/crash; a
@@ -162,14 +164,15 @@ def main():
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     phase, seconds = PHASES[args.phase]
-    mode = "build-for-testing" if phase == 0 else "test-without-building"
+    mode = "build-for-testing" if phase == 0 else "test" if phase == 4 else "test-without-building"
     if os.name != "posix": parser.error("Only fixed POSIX SDK phases are supported")
     if phase == 3:
         if tuple(command) != DRIVER_COMMAND: parser.error("Only the exact read-only Swift driver probe is supported")
     else:
         if not command or command[0] != "xcodebuild" or command.count(mode) != 1:
             parser.error("Only the fixed POSIX xcodebuild phase is supported")
-        if any(value in command for value in ({"build-for-testing", "test-without-building", "test", "archive"} - {mode})):
+        if any(value in command for value in ({"build-for-testing", "test-without-building", "test", "archive", "build", "clean", "analyze",
+                                                "install", "installhdrs", "installsrc", "docbuild"} - {mode})):
             parser.error("Mixed or unsupported xcodebuild action")
     executable = shutil.which(command[0])
     if executable is None:

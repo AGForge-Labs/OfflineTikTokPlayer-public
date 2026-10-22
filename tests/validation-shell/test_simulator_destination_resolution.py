@@ -116,5 +116,80 @@ class SimulatorDestinationResolutionTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), IDENTIFIER + "\n")
 
 
+    def lifecycle_rows(self, output):
+        prefix = "SimulatorCaptureLifecycle "
+        rows = []
+        for line in output.getvalue().splitlines():
+            self.assertTrue(line.startswith(prefix))
+            row = json.loads(line[len(prefix):])
+            self.assertEqual(set(row), {"schema", "eventCode", "reasonCode", "startUptime",
+                "deadlineUptime", "effectiveLifetimeSeconds", "observedUptime", "elapsedSeconds"})
+            self.assertTrue(all(type(value) in (int, float) for value in row.values()))
+            self.assertEqual(row["schema"], 1)
+            rows.append(row)
+        self.assertNotIn(IDENTIFIER, output.getvalue())
+        self.assertNotIn("PRIVATE", output.getvalue())
+        return rows
+
+    def test_capture_lifecycle_deadline_and_cap_require_no_discovery(self):
+        for requested, effective in [(1800, 1800), (999999, 2400)]:
+            with self.subTest(requested=requested):
+                output = io.StringIO()
+                with patch.object(sys, "argv", ["capture-simulator-test-frames.py",
+                        "--udid", IDENTIFIER, "--lifetime", str(requested)]), \
+                     patch.object(self.module.time, "monotonic",
+                                  side_effect=[1000.0, 1000.0 + effective, 1000.0 + effective]), \
+                     patch.object(self.module.time, "sleep", side_effect=AssertionError("no wait")), \
+                     patch.object(self.module, "locate", side_effect=AssertionError("no discovery")) as locate, \
+                     patch.object(self.module.subprocess, "run", side_effect=AssertionError("no SDK")) as run, \
+                     contextlib.redirect_stdout(output):
+                    self.assertEqual(self.module.main(), 0)
+                rows = self.lifecycle_rows(output)
+                self.assertEqual(len(rows), 2)
+                self.assertEqual([(row["eventCode"], row["reasonCode"]) for row in rows], [(0, 0), (1, 1)])
+                self.assertEqual([row["effectiveLifetimeSeconds"] for row in rows], [effective, effective])
+                self.assertEqual([row["startUptime"] for row in rows], [1000.0, 1000.0])
+                self.assertEqual([row["deadlineUptime"] for row in rows], [1000.0 + effective] * 2)
+                self.assertEqual([row["elapsedSeconds"] for row in rows], [0, effective])
+                self.assertEqual(self.module.DEADLINE, 1000.0 + effective)
+                locate.assert_not_called(); run.assert_not_called()
+
+    def test_capture_start_precedes_discovery_and_exit_does_not_hide_python_failure(self):
+        for failure, reason in [(KeyboardInterrupt(), 3), (RuntimeError("PRIVATE"), 2)]:
+            with self.subTest(reason=reason):
+                output = io.StringIO()
+                def lookup(_):
+                    rows = self.lifecycle_rows(output)
+                    self.assertEqual([(row["eventCode"], row["reasonCode"]) for row in rows], [(0, 0)])
+                    raise failure
+                with patch.object(sys, "argv", ["capture-simulator-test-frames.py",
+                        "--udid", IDENTIFIER, "--lifetime", "1800"]), \
+                     patch.object(self.module.time, "monotonic",
+                                  side_effect=[1000.0, 1000.0, 1000.0, 1000.0, 1001.0]), \
+                     patch.object(self.module.time, "sleep", side_effect=AssertionError("no wait")), \
+                     patch.object(self.module, "locate", side_effect=lookup) as locate, \
+                     patch.object(self.module.subprocess, "run", side_effect=AssertionError("no SDK")) as run, \
+                     contextlib.redirect_stdout(output):
+                    with self.assertRaises(type(failure)) as raised:
+                        self.module.main()
+                self.assertIs(raised.exception, failure)
+                rows = self.lifecycle_rows(output)
+                self.assertEqual([(row["eventCode"], row["reasonCode"]) for row in rows], [(0, 0), (1, reason)])
+                self.assertEqual(rows[-1]["elapsedSeconds"], 1)
+                locate.assert_called_once_with(IDENTIFIER); run.assert_not_called()
+
+    def test_lifecycle_write_failure_does_not_replace_keyboard_interrupt(self):
+        failure = KeyboardInterrupt()
+        with patch.object(sys, "argv", ["capture-simulator-test-frames.py", "--udid", IDENTIFIER]), \
+             patch.object(self.module.time, "monotonic",
+                          side_effect=[1000.0, 1000.0, 1000.0, 1000.0, 1001.0]), \
+             patch.object(self.module, "locate", side_effect=failure), \
+             patch.object(self.module.subprocess, "run", side_effect=AssertionError("no SDK")) as run, \
+             patch("builtins.print", side_effect=BrokenPipeError):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.module.main()
+        self.assertIs(raised.exception, failure)
+        run.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

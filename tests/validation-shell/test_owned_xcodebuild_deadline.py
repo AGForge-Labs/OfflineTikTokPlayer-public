@@ -212,4 +212,68 @@ class OwnedXcodebuildDeadlineTests(unittest.TestCase):
                     unrelated.terminate(); unrelated.wait(timeout=3)
 
 
+    def test_full_test_cli_uses_only_the_fixed_combined_action_and_budget(self):
+        expected = {"build": (0, 720), "case-01": (1, 300), "case-02": (2, 300),
+                    "driver": (3, 60), "full-test": (4, 1320)}
+        self.assertEqual(self.module.PHASES, expected)
+        command = ["xcodebuild", "-project", "owned.xcodeproj", "-jobs", "1", "test"]
+        with mock.patch.object(sys, "argv", [str(SCRIPT), "--phase", "full-test", "--"] + command), \
+             mock.patch.object(self.module.shutil, "which", return_value="/owned/xcodebuild"), \
+             mock.patch.object(self.module.signal, "signal"), \
+             mock.patch.object(self.module, "run_owned", return_value={"wrapperExit": 65}) as run:
+            self.assertEqual(self.module.main(), 65)
+        self.assertEqual(run.call_args.args[:3], (["/owned/xcodebuild"] + command[1:], 1320, 4))
+        self.assertIsNone(run.call_args.kwargs["stdin"])
+        wrong = (["xcodebuild", "build-for-testing"], ["xcodebuild", "test-without-building"],
+                 ["xcodebuild", "test", "archive"], ["xcodebuild", "test", "build"],
+                 ["xcodebuild", "clean", "test"], ["xcodebuild", "test", "test"],
+                 ["xcrun", "test"], ["xcodebuild"])
+        for arguments in wrong:
+            with self.subTest(arguments=arguments), \
+                 mock.patch.object(sys, "argv", [str(SCRIPT), "--phase", "full-test", "--"] + arguments), \
+                 mock.patch.object(self.module.shutil, "which") as lookup, \
+                 mock.patch.object(self.module, "run_owned") as run:
+                with self.assertRaises(SystemExit) as failure: self.module.main()
+                self.assertEqual(failure.exception.code, 2)
+                lookup.assert_not_called(); run.assert_not_called()
+
+    def test_guardian_admits_the_full_window_but_rejects_any_larger_window(self):
+        # No child, signal or real wait: prove the guardian reaches its control
+        # gate at the configured maximum rather than silently rejecting >720s.
+        for seconds, admitted in ((1320, True), (1321, False)):
+            with self.subTest(seconds=seconds), \
+                 mock.patch.object(self.module.os, "getpid", return_value=101), \
+                 mock.patch.object(self.module.os, "getpgid", return_value=101), \
+                 mock.patch.object(self.module.os, "getsid", return_value=101), \
+                 mock.patch.object(self.module.signal, "signal"), \
+                 mock.patch.object(self.module.select, "select", return_value=([], [], [])) as wait, \
+                 mock.patch.object(self.module.os, "read") as read, \
+                 mock.patch.object(self.module.os, "killpg") as kill, \
+                 mock.patch.object(self.module.subprocess, "Popen") as child:
+                self.assertEqual(self.module.session(10, 11, seconds, ["never-launch"]), 125)
+                if admitted: wait.assert_called_once_with([10], [], [], 1323)
+                else: wait.assert_not_called()
+                read.assert_not_called(); kill.assert_not_called(); child.assert_not_called()
+
+    def test_full_phase_timeout_cleans_real_children_without_signaling_other_sessions(self):
+        # Internal two-second control exercises phase4 cleanup; the public CLI
+        # remains fixed at 1320s and no SDK executable is run by this unit.
+        payload, descendant, ready = self.payload(True)
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(20)"], start_new_session=True)
+        try:
+            with mock.patch.object(self.module.os, "killpg", wraps=os.killpg) as signals:
+                report = self.module.run_owned([sys.executable, "-c", payload], 2, 4, grace_seconds=.05)
+            self.assertTrue(ready.exists(), "The real surrogate must start before the timeout")
+            self.assertEqual(report["phase"], 4); self.assertEqual(report["deadlineSeconds"], 2)
+            self.assertEqual(report["wrapperExit"], 124); self.assertTrue(report["timedOut"])
+            self.assertIsNone(report["childReturnCode"]); self.assertTrue(report["groupVerified"])
+            self.assertTrue(report["leaderReaped"]); self.assertTrue(report["termSent"]); self.assertTrue(report["killSent"])
+            self.assertFalse(self.active(int(descendant.read_text()))); self.assertFalse(self.active(report["pid"]))
+            self.assertIsNone(unrelated.poll()); self.assertTrue(signals.call_args_list)
+            self.assertTrue(all(call.args[0] == report["pid"] and call.args[0] != unrelated.pid
+                                for call in signals.call_args_list))
+        finally:
+            unrelated.terminate(); unrelated.wait(timeout=3)
+
+
 if __name__ == "__main__": unittest.main()

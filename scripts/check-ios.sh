@@ -25,8 +25,13 @@ else
 fi
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode 26 or later on macOS is required.' >&2; exit 2; }
 # Print the selected driver's plan only; no compilation is executed by this probe.
-printf '' | xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/swift-driver-plan.log 2>&1
+set +e
+printf '' | python3 scripts/run-owned-xcodebuild.py --phase driver -- xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/swift-driver-plan.log 2>&1
+driver_status=("${PIPESTATUS[@]}")
+set -e
 cat artifacts/native/swift-driver-plan.log
+if [ "${driver_status[0]}" -ne 0 ]; then exit "${driver_status[0]}"; fi
+if [ "${driver_status[1]}" -ne 0 ]; then exit "${driver_status[1]}"; fi
 grep -Fq 'SWIFTC_MAXIMUM_DETERMINISM overriding -j' artifacts/native/swift-driver-plan.log || {
   printf '%s\n' 'The selected Swift driver did not confirm its one-job override.' >&2
   exit 1
@@ -38,7 +43,7 @@ destination="${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro 
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
 # Native window tests request real compositor pixels through their own app tmp.
 # Pin the test and capture to the same existing Simulator; one helper, no extra app launch.
-python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 &
+python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1800 &
 capture_pid=$!
 cleanup_capture() {
   local cleanup_status=$?
@@ -51,13 +56,18 @@ cleanup_capture() {
   exit "$cleanup_status"
 }
 trap cleanup_capture EXIT
-xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+set +e
+python3 scripts/run-owned-xcodebuild.py --phase full-test -- xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
   -destination "platform=iOS Simulator,id=$simulator_id" \
   -derivedDataPath artifacts/DerivedData -resultBundlePath "artifacts/native/Tests-$(date +%Y%m%d-%H%M%S).xcresult" \
   -jobs 1 -parallel-testing-enabled NO \
   -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
   "$@" SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
   CODE_SIGNING_ALLOWED=NO test 2>&1 | tee "$native_log"
+native_status=("${PIPESTATUS[@]}")
+set -e
+if [ "${native_status[0]}" -ne 0 ]; then exit "${native_status[0]}"; fi
+if [ "${native_status[1]}" -ne 0 ]; then exit "${native_status[1]}"; fi
 if [ "$validation_mode" = selection-only ]; then
   python3 scripts/verify-native-test-log.py --log "$native_log" --selection-only
 else

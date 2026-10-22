@@ -121,28 +121,66 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery() async throws {
         #if DEBUG
+        var setupReceipt: String?
+        defer { if let setupReceipt { print(setupReceipt) } }
         try await withOwnedNaturalFixture { fixture, audio, service, screen in
+            let setupDeadline = ProcessInfo.processInfo.systemUptime + 3
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
             let item = try XCTUnwrap(service.player.currentItem)
             let timebase = try XCTUnwrap(item.timebase)
+            let setupState = service.debugInitialVideoReadyState
+            let setupOwner = service.debugAlignedVideoPollState
+            let setupSample = audio.renderer.snapshot
             var reads: [PlaybackService.DebugVideoPositionRead] = []
             var seeks: [PlaybackService.DebugVideoSeekStamp] = []
             var overflow = false
-            service.onDebugVideoPositionRead = { value in
-                if reads.count < 8 { reads.append(value) } else { overflow = true }
-            }
-            service.onDebugVideoSeekStamp = { value in
-                if seeks.count < 8 { seeks.append(value) } else { overflow = true }
-            }
             defer { service.onDebugVideoPositionRead = nil; service.onDebugVideoSeekStamp = nil }
 
             // Keep the real PCM engine running and the playback intent unchanged.
             // This isolated control deliberately withholds MainActor polling for
             // one fixed 200 ms sleep; no CPU spin or benchmark budget is changed.
             service.player.pause()
+            let pauseReturnNativeRate = CMTimebaseGetEffectiveRate(timebase)
+            var qualificationRate: Double?, qualificationOwner = false, qualifiedWithinDeadline = false
+            let stoppedSetup = await waitUntil(timeout: max(0, setupDeadline - ProcessInfo.processInfo.systemUptime)) {
+                qualifiedWithinDeadline = ProcessInfo.processInfo.systemUptime < setupDeadline
+                guard qualifiedWithinDeadline else { return false }
+                guard service.player.currentItem === item, let currentTimebase = item.timebase,
+                      currentTimebase === timebase else { qualificationOwner = false; return false }
+                qualificationRate = CMTimebaseGetEffectiveRate(currentTimebase)
+                let state = service.debugInitialVideoReadyState, owner = service.debugAlignedVideoPollState
+                let sample = audio.renderer.snapshot
+                qualificationOwner = state.generation == setupState.generation
+                    && state.readyGeneration == state.generation && state.syncingVideoGeneration == nil
+                    && owner.generation == setupOwner.generation && owner.request == setupOwner.request
+                    && setupOwner.frame.ticket != nil && owner.frame.ticket == setupOwner.frame.ticket
+                    && setupOwner.frame.output != nil && owner.frame.output == setupOwner.frame.output
+                    && owner.presentationMatches && owner.observedItemMatches && owner.frame.coherent
+                    && owner.frame.activeSeekTicket == nil && owner.frame.seekSerial == setupOwner.frame.seekSerial
+                    && service.queue.currentID == fixture.aID && audio.selectedID == fixture.aID
+                    && audio.entry(for: fixture.aID)?.token == sample.token && sample.token == setupSample.token
+                    && sample.visit == setupSample.visit && sample.selectionVersion == setupSample.selectionVersion
+                    && !sample.ended && !audio.isSelectionPending(in: sample)
+                    && service.wantsToPlay && service.audioEngineRunning && !service.isLoading && !service.audioOnly
+                qualifiedWithinDeadline = ProcessInfo.processInfo.systemUptime < setupDeadline
+                return qualificationOwner && qualificationRate == 0 && qualifiedWithinDeadline
+            }
+            setupReceipt = "StoppedNativeClockSetup schema=1 qualified=\(stoppedSetup) ownerMatches=\(qualificationOwner) withinDeadline=\(qualifiedWithinDeadline) pauseReturnEffectiveRate=\(pauseReturnNativeRate) qualificationEffectiveRate=\(qualificationRate.map { String($0) } ?? "missing") request=\(setupState.generation) token=\(setupSample.token) visit=\(setupSample.visit) selectionVersion=\(setupSample.selectionVersion) setupBudgetMs=3000 boundedMainActorHoldMs=200 latencyAcceptance=false"
+            XCTAssertTrue(stoppedSetup, "The exact current owner must settle to a real stopped native clock within the original setup deadline")
+            guard stoppedSetup else { throw SelectionVideoTestFailure.timeout }
             let initialNativeRate = CMTimebaseGetEffectiveRate(timebase)
+            if let receipt = setupReceipt { setupReceipt = receipt + " preHoldEffectiveRate=\(initialNativeRate)" }
             XCTAssertEqual(initialNativeRate, 0)
+            guard initialNativeRate == 0 else { throw SelectionVideoTestFailure.timeout }
+            // Automatic polls during setup are not the isolated measured read.
+            // Install the original bounded observers only after setup qualifies.
+            service.onDebugVideoPositionRead = { value in
+                if reads.count < 8 { reads.append(value) } else { overflow = true }
+            }
+            service.onDebugVideoSeekStamp = { value in
+                if seeks.count < 8 { seeks.append(value) } else { overflow = true }
+            }
             let before = audio.renderer.snapshot
             holdMainActorForStoppedNativeClockControl()
             let after = audio.renderer.snapshot
@@ -545,6 +583,44 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testDefaultProductionRenderAccountingBaseline() async throws {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false, renderAccounting: false)
+    }
+
+    func testProductionRenderDemandAccountingOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [false, true].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("ProductionRenderDemandAccountingArm schema=2 armID=\(armID) order=off-then-on ordinal=\(ordinal) enabled=\(enabled) actualClockHandoffMode=unset noActiveClockObservers=true clockObserverScope=optional-handoff-diagnostics explicitFalseEquivalence=unproven traceVideoSeeks=false defaultMonitor=true fullSavedAAuditRequested=\(enabled) offFullAuditSupported=false design=ordered-fresh-fixture-not-causal-proof noRecurrence=inconclusive acceptance=unchanged")
+            defer {
+                print("ProductionRenderDemandAccountingArmEnd schema=2 armID=\(armID) order=off-then-on ordinal=\(ordinal) enabled=\(enabled) helperReturned=\(helperReturned) xctestOutcome=external fullApplicationAcceptance=not-inferred")
+            }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                renderAccounting: enabled, auditSavedAAfterCleanup: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Production render-demand accounting controls require DEBUG")
+        #endif
+    }
+
+    func testProductionRenderDemandAccountingOnThenOff() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [true, false].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("ProductionRenderDemandAccountingArm schema=2 armID=\(armID) order=on-then-off ordinal=\(ordinal) enabled=\(enabled) actualClockHandoffMode=unset noActiveClockObservers=true clockObserverScope=optional-handoff-diagnostics explicitFalseEquivalence=unproven traceVideoSeeks=false defaultMonitor=true fullSavedAAuditRequested=\(enabled) offFullAuditSupported=false design=ordered-fresh-fixture-not-causal-proof noRecurrence=inconclusive acceptance=unchanged")
+            defer {
+                print("ProductionRenderDemandAccountingArmEnd schema=2 armID=\(armID) order=on-then-off ordinal=\(ordinal) enabled=\(enabled) helperReturned=\(helperReturned) xctestOutcome=external fullApplicationAcceptance=not-inferred")
+            }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                renderAccounting: enabled, auditSavedAAfterCleanup: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Production render-demand accounting controls require DEBUG")
+        #endif
     }
 
     func testDefaultProductionRenderAccountingEnabled() async throws {
@@ -3956,12 +4032,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let completion = NaturalCompletionSeekHold(minimumTarget: farTarget,
             maximumTarget: SelectionVideoFixture.duration)
         var stage = 0
-        var decisionReceipt: String?, recoveryReceipt: String?
+        var decisionReceipt: String?, recoveryReceipt: String?, startupReceipt: String?
         defer {
             completion.release()
             print("NaturalSeekCompletionSummary schema=1 stage=\(stage) intercepted=\(completion.intercepted) nativeCallbacks=\(completion.nativeCallbacks) nativeFinished=\(completion.nativeFinished.map { String($0) } ?? "missing") forwarded=\(completion.forwarded) rejectedCommands=\(completion.rejectedCommands) overflow=\(completion.overflow) cleanupAcknowledged=\(completion.cleanupAcknowledged) latencyAcceptance=false physicalOutput=unverified")
             if let decisionReceipt { print(decisionReceipt) }
             if let recoveryReceipt { print(recoveryReceipt) }
+            if let startupReceipt { print(startupReceipt) }
             completion.dumpCommandTrace()
         }
         let buffer = PlaybackBuffer()
@@ -3969,10 +4046,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             seekVideo: { player, time, callback in completion.seek(player, time, callback) },
             additionalCleanupAcknowledged: { completion.cleanupAcknowledged }) { fixture, audio, service, screen in
             service.isInteractingWithFeed = false
+            service.debugInitialLoadPhaseEnabled = true
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            var startupPolls = 0, startupPollCountSaturated = false
+            var lastAReady: Bool?, lastPreparedAudioCount: Int?, lastBPrepared: Bool?
             let prepared = await waitUntil(timeout: 3) {
-                self.explicitInitialReadySourceSettled(service, screen: screen)
-                    && service.preparedAudioCount == 2 && buffer.hasPrepared(fixture.bID)
+                if startupPolls < Int.max { startupPolls += 1 } else { startupPollCountSaturated = true }
+                lastAReady = nil; lastPreparedAudioCount = nil; lastBPrepared = nil
+                let aReady = self.explicitInitialReadySourceSettled(service, screen: screen)
+                lastAReady = aReady
+                guard aReady else { return false }
+                let preparedAudioCount = service.preparedAudioCount
+                lastPreparedAudioCount = preparedAudioCount
+                guard preparedAudioCount == 2 else { return false }
+                let bPrepared = buffer.hasPrepared(fixture.bID)
+                lastBPrepared = bPrepared
+                return bPrepared
+            }
+            if !prepared {
+                let ready = service.debugInitialVideoReadyState, load = service.debugInitialLoadPhaseState
+                startupReceipt = "NaturalSeekCompletionStartup schema=1 stage=0 prepared=false polls=\(startupPolls) pollCountSaturated=\(startupPollCountSaturated) aReady=\(lastAReady.map { String($0) } ?? "unknown") preparedAudioCount=\(lastPreparedAudioCount.map { String($0) } ?? "unknown") bPrepared=\(lastBPrepared.map { String($0) } ?? "unknown") predicateScope=last-short-circuit-poll loadEnabled=\(load.enabled) loadRequest=\(load.request) loadGeneration=\(load.generation) loadPhase=\(load.phase.rawValue) readyGeneration=\(ready.readyGeneration.map { String($0) } ?? "unknown") generation=\(ready.generation) cachedAudioVisit=\(ready.audioVisit) syncingGeneration=\(ready.syncingVideoGeneration.map { String($0) } ?? "unknown") phaseScope=after-window-not-joint setupBudgetMs=3000 latencyAcceptance=false playbackAcceptance=false"
             }
             XCTAssertTrue(prepared, "Real ready A and both complete Saved sources must precede the completion control")
             guard prepared else { throw SelectionVideoTestFailure.timeout }
