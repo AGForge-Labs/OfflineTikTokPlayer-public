@@ -34,6 +34,20 @@ final class PlaybackService: NSObject {
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     #if DEBUG
     @ObservationIgnored var debugUsesCurrentCustomFrameForReadiness = false
+    enum DebugVideoPositionReadKind: Int { case legacyCurrentTime = 0, itemTimebase = 1 }
+    struct DebugVideoPositionRead {
+        let kind: DebugVideoPositionReadKind
+        let item: ObjectIdentifier
+        let request: Int, returnGeneration: Int
+        let entryNs: UInt64, returnNs: UInt64
+        let position: Double
+        let observedItemMatches: Bool, presentationUnchanged: Bool
+    }
+    @ObservationIgnored var onDebugVideoPositionReadAttempt: (@MainActor (DebugVideoPositionReadKind, ObjectIdentifier) -> Void)?
+    @ObservationIgnored var onDebugVideoPositionRead: (@MainActor (DebugVideoPositionRead) -> Void)?
+    @ObservationIgnored var onDebugPeriodicCurrentItemReadAttempt: (@MainActor (ObjectIdentifier) -> Void)?
+    func debugSynchronizeVideoToAudio(force: Bool = false) { synchronizeVideoToAudio(force: force) }
+    func debugSampleNativeVideoClock() { sampleNativeVideoClock() }
     struct DebugCPPNativePullStamp {
         let request: Int, generation: Int
         let sourceItem: ObjectIdentifier
@@ -385,16 +399,7 @@ final class PlaybackService: NSObject {
             }
         }
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600), queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, let item = self.observedItem, self.player.currentItem === item else { return }
-                guard !self.continuousAudio.isSelected else { return }
-                // Read the current item now: an already queued callback can belong to the old item.
-                self.clock.sample(position: item.currentTime().seconds)
-                if self.firstProgressGeneration != self.generation, item.currentTime().seconds >= 0.05 {
-                    self.firstProgressGeneration = self.generation; self.recordPlaybackEvent("clock50ms")
-                }
-                if Date().timeIntervalSince(self.lastBookmark) > 5 { self.persist(); self.updateNowPlaying() }
-            }
+            MainActor.assumeIsolated { self?.sampleNativeVideoClock() }
         }
     }
 
@@ -1154,6 +1159,44 @@ final class PlaybackService: NSObject {
     }
     #endif
 
+    private func sampleNativeVideoClock() {
+        guard let item = observedItem else { return }
+        #if DEBUG
+        onDebugPeriodicCurrentItemReadAttempt?(ObjectIdentifier(item))
+        #endif
+        guard player.currentItem === item else { return }
+        guard !continuousAudio.isSelected else { return }
+        // Read the current item now: an already queued callback can belong to the old item.
+        clock.sample(position: item.currentTime().seconds)
+        if firstProgressGeneration != generation, item.currentTime().seconds >= 0.05 {
+            firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
+        }
+        if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
+    }
+
+    private func readOrdinaryVideoPosition(_ item: AVPlayerItem) -> Double {
+        @MainActor func read() -> Double { item.currentTime().seconds }
+        #if DEBUG
+        let kind: DebugVideoPositionReadKind = .legacyCurrentTime
+        let observer = onDebugVideoPositionRead
+        let request = generation, presentation = videoPresentation
+        onDebugVideoPositionReadAttempt?(kind, ObjectIdentifier(item))
+        if let observer {
+            let entered = DispatchTime.now().uptimeNanoseconds
+            let position = read()
+            let returned = DispatchTime.now().uptimeNanoseconds
+            observer(DebugVideoPositionRead(kind: kind, item: ObjectIdentifier(item),
+                request: request, returnGeneration: generation, entryNs: entered, returnNs: returned,
+                position: position, observedItemMatches: observedItem === item,
+                presentationUnchanged: presentation != nil
+                    && presentation?.request == videoPresentation?.request
+                    && presentation?.ticket == videoPresentation?.ticket))
+            return position
+        }
+        #endif
+        return read()
+    }
+
     private func synchronizeVideoToAudio(force: Bool = false) {
         #if DEBUG
         let reason = debugVideoSeekReason
@@ -1178,14 +1221,14 @@ final class PlaybackService: NSObject {
             #if DEBUG
             if self.onDebugVideoSeekStamp != nil {
                 ordinaryDriftReadEntryNs = DispatchTime.now().uptimeNanoseconds
-                sampledPosition = item.currentTime().seconds
+                sampledPosition = self.readOrdinaryVideoPosition(item)
                 ordinaryDriftReadReturnNs = DispatchTime.now().uptimeNanoseconds
             } else {
-                sampledPosition = item.currentTime().seconds
+                sampledPosition = self.readOrdinaryVideoPosition(item)
             }
             ordinaryDriftVideoPositionSeconds = sampledPosition
             #else
-            sampledPosition = item.currentTime().seconds
+            sampledPosition = self.readOrdinaryVideoPosition(item)
             #endif
             // Revalidate the SDK-owned queue before taking the fresh audio goal.
             // No SDK item/position query follows that goal in this decision.

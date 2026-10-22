@@ -34,6 +34,256 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let data = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
         print("NativeRuntimeHost " + String(decoding: data, as: UTF8.self))
     }
+    func testOrdinaryVideoDriftUsesItemTimebaseAndPreservesForcedOwnership() async throws {
+        #if DEBUG
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            try await require({ buffer.hasPrepared(fixture.bID) }, "Real B must be staged before the owner-reentry control")
+            service.pause()
+            try await require({ service.player.rate == 0 && !service.audioEngineRunning
+                && service.debugInitialVideoReadyState.syncingVideoGeneration == nil }, "A must settle paused")
+            let item = try XCTUnwrap(service.player.currentItem)
+            let itemID = ObjectIdentifier(item)
+            var reads: [PlaybackService.DebugVideoPositionRead] = []
+            var attempts: [PlaybackService.DebugVideoPositionReadKind] = []
+            var seeks: [PlaybackService.DebugVideoSeekStamp] = []
+            var overflow = false
+            defer {
+                service.onDebugVideoPositionReadAttempt = nil; service.onDebugVideoPositionRead = nil
+                service.onDebugVideoSeekStamp = nil
+            }
+            service.onDebugVideoSeekStamp = { stamp in
+                if seeks.count < 16 { seeks.append(stamp) } else { overflow = true }
+            }
+            service.onDebugVideoPositionReadAttempt = { kind, raw in
+                XCTAssertEqual(raw, itemID)
+                if attempts.count < 4 { attempts.append(kind) } else { overflow = true }
+            }
+            service.onDebugVideoPositionRead = { read in
+                if reads.count < 4 { reads.append(read) } else { overflow = true }
+            }
+            service.debugSynchronizeVideoToAudio()
+            service.onDebugVideoPositionReadAttempt = nil; service.onDebugVideoPositionRead = nil
+            // Synchronous assertions cannot accidentally count a later automatic poll.
+            XCTAssertEqual(attempts, [.itemTimebase], "Ordinary service drift must use the real item's timebase")
+            XCTAssertEqual(reads.count, 1)
+            if let read = reads.first {
+                XCTAssertEqual(read.kind, .itemTimebase); XCTAssertEqual(read.item, itemID)
+                XCTAssertEqual(read.request, read.returnGeneration)
+                XCTAssertTrue(read.observedItemMatches); XCTAssertTrue(read.presentationUnchanged)
+                XCTAssertGreaterThanOrEqual(read.returnNs, read.entryNs); XCTAssertTrue(read.position.isFinite)
+                print("NativePositionSourceContract kind=\(read.kind.rawValue) request=\(read.request) item=\(read.item) entryNs=\(read.entryNs) returnNs=\(read.returnNs) position=\(read.position)")
+            }
+
+            try await require({ service.debugInitialVideoReadyState.syncingVideoGeneration == nil },
+                              "Any ordinary correction must finish before the independent forced control")
+            let submitted = service.submittedVideoFrameCount
+            var forcedReads = 0
+            service.onDebugVideoPositionReadAttempt = { _, _ in forcedReads += 1 }
+            service.seek(0.65)
+            service.onDebugVideoPositionReadAttempt = nil
+            XCTAssertEqual(forcedReads, 0, "A forced paused seek must bypass both ordinary position APIs")
+            XCTAssertTrue(seeks.contains { $0.force && $0.reason == .userPausedSeek
+                && abs($0.requestedPosition - 0.65) < 0.5 / 48_000 })
+            try await require({
+                service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                    && abs(service.player.currentTime().seconds - 0.65) < 0.04
+                    && service.submittedVideoFrameCount > submitted
+                    && service.videoFramePositionSeconds.map { abs($0 - 0.65) < 0.08 } == true
+            }, "The forced command must complete a real paused native seek and submit its target")
+            XCTAssertFalse(service.wantsToPlay); XCTAssertFalse(service.audioEngineRunning)
+
+            let oldRequest = service.debugInitialVideoReadyState.generation
+            var changedOwner = false
+            let seekStart = seeks.count
+            service.onDebugVideoPositionReadAttempt = { _, raw in
+                guard !changedOwner else { return }
+                XCTAssertEqual(raw, itemID); changedOwner = true
+                service.start(playlistIDs: [fixture.playlist], at: fixture.bID)
+            }
+            service.debugSynchronizeVideoToAudio()
+            service.onDebugVideoPositionReadAttempt = nil
+            XCTAssertTrue(changedOwner)
+            XCTAssertGreaterThan(service.debugInitialVideoReadyState.generation, oldRequest)
+            XCTAssertFalse(seeks.dropFirst(seekStart).contains { $0.request == oldRequest },
+                           "A source changed at the actual read boundary must reject the old correction")
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
+            XCTAssertFalse(overflow); XCTAssertLessThanOrEqual(reads.count, 4); XCTAssertLessThanOrEqual(seeks.count, 16)
+        }
+        #else
+        XCTFail("Native position contracts require DEBUG seams")
+        #endif
+    }
+
+    func testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership() async throws {
+        #if DEBUG
+        try await withOwnedNaturalFixture { fixture, audio, service, screen in
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            service.pause()
+            try await require({ service.player.rate == 0 && !service.audioEngineRunning
+                && service.debugInitialVideoReadyState.syncingVideoGeneration == nil }, "A must settle paused")
+            let item = try XCTUnwrap(service.player.currentItem)
+            let native = item.currentTime().seconds
+            XCTAssertTrue(native.isFinite && native >= 0 && native < 30)
+            let sentinel = native < 15 ? 25.0 : 1.0
+            XCTAssertGreaterThan(abs(sentinel - native), 1)
+            let raw = ObjectIdentifier(item)
+            var attempts = 0
+            defer { service.onDebugPeriodicCurrentItemReadAttempt = nil }
+            service.clock.reset(position: sentinel, duration: 30)
+            service.onDebugPeriodicCurrentItemReadAttempt = { observed in XCTAssertEqual(observed, raw); attempts += 1 }
+            service.debugSampleNativeVideoClock()
+            service.onDebugPeriodicCurrentItemReadAttempt = nil
+            XCTAssertEqual(attempts, 0, "PCM-selected periodic callbacks must not query native ownership")
+            XCTAssertEqual(service.clock.position, sentinel)
+
+            // Retain the exact native item while removing only PCM ownership.
+            audio.clearSelection()
+            attempts = 0
+            service.clock.reset(position: sentinel, duration: 30)
+            service.onDebugPeriodicCurrentItemReadAttempt = { observed in XCTAssertEqual(observed, raw); attempts += 1 }
+            service.debugSampleNativeVideoClock()
+            service.onDebugPeriodicCurrentItemReadAttempt = nil
+            XCTAssertEqual(attempts, 1)
+            XCTAssertEqual(service.clock.position, native, accuracy: 0.005,
+                           "The non-PCM path must still sample the real paused item")
+
+            var selectedInRead = false
+            attempts = 0
+            service.clock.reset(position: sentinel, duration: 30)
+            service.onDebugPeriodicCurrentItemReadAttempt = { observed in
+                XCTAssertEqual(observed, raw); attempts += 1
+                selectedInRead = audio.select(id: fixture.aID, position: native)
+            }
+            service.debugSampleNativeVideoClock()
+            service.onDebugPeriodicCurrentItemReadAttempt = nil
+            XCTAssertEqual(attempts, 1); XCTAssertTrue(selectedInRead); XCTAssertTrue(audio.isSelected)
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertEqual(service.clock.position, sentinel,
+                           "The retained late PCM guard must reject selection changed by SDK reentry")
+            print("PeriodicNativeClockContract pcmReads=0 legacyReads=1 reentrantReads=\(attempts) sameNativeItem=\(service.player.currentItem === item)")
+        }
+        #else
+        XCTFail("Periodic clock contracts require DEBUG seams")
+        #endif
+    }
+
+    func testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion() async throws {
+        #if DEBUG
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            try await require({ buffer.hasPrepared(fixture.bID) }, "Real B must be staged for A-B-A calibration")
+            service.pause()
+            try await require({ service.player.rate == 0 && !service.audioEngineRunning
+                && service.debugInitialVideoReadyState.syncingVideoGeneration == nil }, "Calibration A must settle paused")
+            let firstA = try XCTUnwrap(service.player.currentItem)
+            let firstRequest = service.debugInitialVideoReadyState.generation
+            for target in [0.65, 0.25] {
+                service.seek(target)
+                try await require({
+                    service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                        && abs(service.player.currentTime().seconds - target) < 0.04
+                        && service.videoFramePositionSeconds.map { abs($0 - target) < 0.08 } == true
+                }, "Each actual paused forward/backwards native seek must complete")
+                try sampleItemTimebaseContract(service, item: firstA, label: "paused-A-\(target)", paused: true)
+            }
+            let frame = service.audioSnapshot.frame
+            let pausedNative = firstA.currentTime().seconds
+            XCTAssertTrue(pausedNative.isFinite)
+            service.play()
+            try await require({
+                guard service.player.currentItem === firstA, service.player.rate > 0,
+                      let timebase = firstA.timebase else { return false }
+                let time = CMTimebaseGetTime(timebase)
+                return service.audioSnapshot.frame >= frame + 2_400
+                    && service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                    && time.isNumeric && time.seconds.isFinite && time.seconds >= pausedNative + 0.025
+            }, "Both real PCM and the native item clock must advance before the playing bracket")
+            try sampleItemTimebaseContract(service, item: firstA, label: "playing-A", paused: false)
+
+            service.next()
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
+            try await require({ buffer.previousMediaID == fixture.aID }, "The original A item must be retained")
+            service.pause()
+            try await require({ service.player.rate == 0 && !service.audioEngineRunning
+                && service.debugInitialVideoReadyState.syncingVideoGeneration == nil }, "B must settle paused")
+            let b = try XCTUnwrap(service.player.currentItem)
+            XCTAssertFalse(b === firstA)
+            try sampleItemTimebaseContract(service, item: b, label: "paused-B", paused: true)
+            service.previous()
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            service.pause()
+            try await require({ service.player.rate == 0 && !service.audioEngineRunning
+                && service.debugInitialVideoReadyState.syncingVideoGeneration == nil }, "Returned A must settle paused")
+            let returnedA = try XCTUnwrap(service.player.currentItem)
+            XCTAssertTrue(returnedA === firstA, "Calibration must cover actual item reinsertion, not a replacement A")
+            XCTAssertGreaterThan(service.debugInitialVideoReadyState.generation, firstRequest)
+            try sampleItemTimebaseContract(service, item: returnedA, label: "reinserted-A", paused: true)
+        }
+        #else
+        XCTFail("Real item timebase calibration requires DEBUG ownership seams")
+        #endif
+    }
+
+    #if DEBUG
+    private func requireNativeClockContractOwner(_ service: PlaybackService, fixture: SelectionVideoFixture,
+        audio: ContinuousAudioPlayer, screen: SelectionVideoScreen, id: String) async throws {
+        try await require({
+            let owner = service.debugInitialVideoReadyState
+            guard let frame = service.videoFramePositionSeconds, let copied = service.copiedVideoFramePositionSeconds,
+                  let expected = audio.entry(for: id), service.player.currentItem?.status == .readyToPlay else { return false }
+            return service.queue.currentID == id && audio.selectedID == id
+                && service.audioSnapshot.token == expected.token && !service.audioSnapshot.ended
+                && owner.readyGeneration == owner.generation && owner.syncingVideoGeneration == nil
+                && service.isVideoReady && !service.isLoading && service.submittedVideoFrameCount > 0
+                && frame.isFinite && copied.isFinite && frame >= 0 && copied >= 0
+                && abs(frame - service.videoRequestedPositionSeconds) <= 0.080 && abs(copied - frame) <= 0.080
+                && screen.customVideoLayer?.isReadyForDisplay == true
+        }, "An exact real selected item, rendered source, and aligned custom frame must qualify the clock contract")
+        assertSelection(service, fixture: fixture, id: id)
+    }
+
+    private func sampleItemTimebaseContract(_ service: PlaybackService, item: AVPlayerItem,
+        label: String, paused: Bool) throws {
+        let owner = service.debugInitialVideoReadyState
+        XCTAssertTrue(service.player.currentItem === item)
+        XCTAssertNil(owner.syncingVideoGeneration)
+        if !paused { XCTAssertGreaterThan(service.player.rate, 0) }
+        let lookupEntry = DispatchTime.now().uptimeNanoseconds
+        let timebase = try XCTUnwrap(item.timebase, "A ready real current item must expose a timebase")
+        let lookupReturn = DispatchTime.now().uptimeNanoseconds
+        let readEntry = DispatchTime.now().uptimeNanoseconds
+        let before = CMTimebaseGetTime(timebase)
+        let readReturn = DispatchTime.now().uptimeNanoseconds
+        let nativeEntry = DispatchTime.now().uptimeNanoseconds
+        let native = item.currentTime()
+        let nativeReturn = DispatchTime.now().uptimeNanoseconds
+        let after = CMTimebaseGetTime(timebase)
+        let finalOwner = service.debugInitialVideoReadyState
+        XCTAssertTrue(service.player.currentItem === item)
+        XCTAssertEqual(finalOwner.generation, owner.generation); XCTAssertNil(finalOwner.syncingVideoGeneration)
+        if !paused { XCTAssertGreaterThan(service.player.rate, 0) }
+        XCTAssertTrue(before.isNumeric && native.isNumeric && after.isNumeric)
+        XCTAssertEqual(before.epoch, native.epoch); XCTAssertEqual(after.epoch, native.epoch)
+        let low = min(before.seconds, after.seconds), high = max(before.seconds, after.seconds)
+        XCTAssertTrue(low.isFinite && high.isFinite && native.seconds.isFinite)
+        XCTAssertGreaterThanOrEqual(after.seconds, before.seconds - 0.005)
+        XCTAssertGreaterThanOrEqual(native.seconds, low - 0.005)
+        XCTAssertLessThanOrEqual(native.seconds, high + 0.005)
+        if paused {
+            XCTAssertEqual(service.player.rate, 0)
+            XCTAssertEqual(native.seconds, before.seconds, accuracy: 0.005)
+            XCTAssertEqual(native.seconds, after.seconds, accuracy: 0.005)
+        }
+        print("NativeItemTimebaseCalibration schema=1 label=\(label) request=\(owner.generation) item=\(ObjectIdentifier(item)) paused=\(paused) before=\(before.seconds) native=\(native.seconds) after=\(after.seconds) bracketMs=\((high - low) * 1000) toleranceMs=5 lookupSpanNs=\(lookupReturn - lookupEntry) timebaseReadSpanNs=\(readReturn - readEntry) nativeReadSpanNs=\(nativeReturn - nativeEntry) performanceAcceptance=false")
+    }
+    #endif
+
     /// Real mixer output and actual custom-layer submission, without screenshot or SDK-position probes.
     /// This is selected-frame readiness evidence, not compositor pixels or physical speaker output.
     func testProductionSelectionLatencyAndStreamingContinuityWithoutCapture() async throws {
@@ -897,6 +1147,75 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(run.firstFrame, ordinal * 960); XCTAssertEqual(run.frames, 480)
         }
         XCTAssertNil(overflow.run(at: 4))
+        #if DEBUG
+        // Same classifier/window alignment as the live loop. These pure controls
+        // prove captured-tail interpretation, not a real SDK scheduling failure.
+        func recording(_ frequency: (Int) -> Double?) -> ProductionSelectionOutputTap.Recording {
+            let values = (0..<5_760).map { frame -> Float in
+                guard let hz = frequency(frame) else { return 0 }
+                return Float(0.2 * sin(2 * Double.pi * hz * Double(frame) / 48_000))
+            }
+            return .init(values: values, hosts: (0..<5_760).map { 100 + Double($0) / 48_000 }, rate: 48_000)
+        }
+        let changed = recording { $0 < 3_840 ? 440 : 880 }
+        let replay = ProductionSelectionOutputTap.replayTone(changed, origin: 100.019, frequency: 880,
+            firstIndex: 0, onlineNextCursor: 480, expectedFrames: changed.values.count)
+        XCTAssertTrue(replay.available); XCTAssertGreaterThan(replay.targetWindows, 0)
+        XCTAssertGreaterThan(replay.alternateWindows, 0)
+        XCTAssertGreaterThanOrEqual(replay.firstTargetIndex, 480)
+        XCTAssertTrue(replay.targetWasUnsearched)
+        let visited = ProductionSelectionOutputTap.replayTone(changed, origin: 100.019, frequency: 880,
+            firstIndex: 0, onlineNextCursor: replay.firstTargetIndex + 480, expectedFrames: changed.values.count)
+        XCTAssertFalse(visited.targetWasUnsearched)
+        XCTAssertEqual(visited.firstTargetIndex, replay.firstTargetIndex)
+        XCTAssertEqual(visited.firstTarget?.start, replay.firstTarget?.start)
+        let alternate = recording { _ in 440 }
+        let other = ProductionSelectionOutputTap.replayTone(alternate, origin: 100.019, frequency: 880,
+            firstIndex: 0, onlineNextCursor: 480, expectedFrames: alternate.values.count)
+        XCTAssertTrue(other.available); XCTAssertEqual(other.targetWindows, 0)
+        XCTAssertGreaterThan(other.alternateWindows, 0); XCTAssertNil(other.firstTarget)
+        let quietRecording = recording { _ in nil }
+        let missing = ProductionSelectionOutputTap.replayTone(quietRecording, origin: 100.019, frequency: 880,
+            firstIndex: 0, onlineNextCursor: 480, expectedFrames: quietRecording.values.count)
+        XCTAssertTrue(missing.available); XCTAssertNil(missing.firstTarget); XCTAssertNil(missing.firstAlternate)
+        XCTAssertEqual(missing.targetWindows, 0); XCTAssertEqual(missing.alternateWindows, 0)
+        let truncated = ProductionSelectionOutputTap.replayTone(changed, origin: 100.019, frequency: 880,
+            firstIndex: 0, onlineNextCursor: 480, expectedFrames: changed.values.count + 1)
+        XCTAssertFalse(truncated.available)
+        // Pure bookkeeping controls, using supplied monotonic values rather
+        // than a claimed SDK latency or a fabricated readiness observation.
+        let poll = ProductionSelectionPollSummary()
+        poll.setDeadline(phase: 0, uptime: 1)
+        poll.bodyEntered(phase: 0, at: 10)
+        poll.stageEntered(phase: 0, stage: .toneScan, at: 12)
+        poll.stageReturned(phase: 0, stage: .toneScan, at: 20)
+        poll.stageEntered(phase: 0, stage: .stateCapture, at: 22)
+        poll.stageReturned(phase: 0, stage: .stateCapture, at: 60)
+        poll.stageEntered(phase: 0, stage: .readinessEvaluation, at: 62)
+        poll.stageReturned(phase: 0, stage: .readinessEvaluation, at: 70, layerReadyPredicateEvaluated: true)
+        poll.bodyReturned(phase: 0, at: 80)
+        poll.bodyEntered(phase: 0, at: 180)
+        poll.stageEntered(phase: 0, stage: .toneScan, at: 182)
+        poll.stageReturned(phase: 0, stage: .toneScan, at: 190)
+        poll.stageEntered(phase: 0, stage: .stateCapture, at: 192)
+        poll.stageReturned(phase: 0, stage: .stateCapture, at: 200)
+        poll.stageEntered(phase: 0, stage: .readinessEvaluation, at: 202)
+        poll.stageReturned(phase: 0, stage: .readinessEvaluation, at: 210)
+        poll.bodyReturned(phase: 0, at: 220)
+        poll.loopExited(phase: 0, at: 230, nextCursor: 960)
+        let completed = try XCTUnwrap(poll.snapshot(phase: 0))
+        XCTAssertEqual(completed.entered, 2); XCTAssertEqual(completed.returned, 2)
+        XCTAssertEqual(completed.state.first?.begin, 22); XCTAssertEqual(completed.state.worst?.duration, 38)
+        XCTAssertEqual(completed.largestGap?.begin, 80); XCTAssertEqual(completed.largestGap?.end, 180)
+        XCTAssertFalse(completed.bodyOpen); XCTAssertFalse(completed.stageOpen)
+        XCTAssertEqual(completed.readiness.first?.layerReadyPredicateEvaluated, true)
+        poll.bodyEntered(phase: 1, at: 300)
+        poll.stageEntered(phase: 1, stage: .stateCapture, at: 310)
+        let open = try XCTUnwrap(poll.snapshot(phase: 1))
+        XCTAssertTrue(open.bodyOpen); XCTAssertTrue(open.stageOpen)
+        XCTAssertEqual(open.lastEntry, 300); XCTAssertEqual(open.stageEntry, 310)
+        XCTAssertEqual(open.stageReturn, 0); XCTAssertEqual(open.returned, 0)
+        #endif
     }
 
     private func runProductionSelectionBenchmark(traceVideoSeeks: Bool, frameMonitorAlternative: Bool? = nil,
@@ -946,6 +1265,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let tap = ProductionSelectionOutputTap()
         let seeks = ProductionSelectionSeekRecorder()
         let startup = ProductionVideoStartupTrace(serviceTracing: traceVideoSeeks)
+        #if DEBUG
+        if acceptedPCMOrigin != nil {
+            startup.pollSummary = ProductionSelectionPollSummary()
+            print("ProductionSelectionPollScope schema=1 enabled=true originMode=\(acceptedPCMOrigin == true) phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only capture=unchanged publication=after-cleanup")
+        }
+        #endif
         let monitorBuffer = frameMonitorAlternative.map { _ in PlaybackBuffer() }
         let service: PlaybackService
         if traceVideoSeeks {
@@ -954,6 +1279,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        let nativePositionReadTrace = acceptedPCMOriginBenchmarkMode.map {
+            NativePositionReadDurationTrace(originEnabled: $0, baseRequest: service.debugInitialVideoReadyState.generation)
+        }
+        if let nativePositionReadTrace {
+            XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
+            XCTAssertNil(traceDefaultFrameMonitor); XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
+            print("NativePositionReadScope schema=1 originEnabled=\(acceptedPCMOriginBenchmarkMode == true) readTimingEnabled=true phases=3 capacityRecords=6 kind0=currentTime kind1=freshItemTimebaseAndGetTime legacySeekTracing=false playbackAcceptance=unchanged")
+            service.onDebugVideoPositionRead = { [weak nativePositionReadTrace] value in nativePositionReadTrace?.record(value) }
+        }
         let monitorReadTrace = traceDefaultFrameMonitor.map { DefaultFrameMonitorReadTrace(enabled: $0) }
         let cppNativePullTrace = traceDefaultFrameMonitor.map { CPPNativePullDurationTrace(enabled: $0) }
         if let enabled = traceDefaultFrameMonitor {
@@ -991,6 +1325,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugVideoRenderStamp = { [weak startup] stamp in startup?.recordRender(stamp) }
         }
         defer {
+            if nativePositionReadTrace != nil { service.onDebugVideoPositionRead = nil }
             if traceDefaultFrameMonitor != nil {
                 service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
             }
@@ -1098,6 +1433,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if traceDefaultFrameMonitor != nil {
             service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
         }
+        if nativePositionReadTrace != nil { service.onDebugVideoPositionRead = nil }
+        nativePositionReadTrace?.dumpAndAssert()
         monitorReadTrace?.dumpAndAssert()
         cppNativePullTrace?.dumpAndAssert()
         nativeTrace?.dumpAfterCleanup()
@@ -1217,6 +1554,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         startup.dumpAndAssert()
         #if DEBUG
+        startup.pollSummary?.dumpAndAssert()
         if auditSavedAAfterCleanup {
             // All original acceptance checks above execute before this optional audit.
             guard renderAccounting == true, !traceVideoSeeks, !traceNativeRefill,
@@ -1572,14 +1910,27 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let origin = ProductionSelectionOutputTap.hostSeconds()
         command()
         let commandReturned = ProductionSelectionOutputTap.hostSeconds()
+        #if DEBUG
+        let replayToneAfterCleanup = acceptedPCMOriginBenchmarkMode != nil
+        #else
+        let replayToneAfterCleanup = false
+        #endif
         var cursor = first
         var outgoing: ProductionSelectionOutputTap.Tone?
         var tone: ProductionSelectionOutputTap.Tone?
         var displayReady: Double?
         var ready: Double?
         let deadline = ProcessInfo.processInfo.systemUptime + (prepared ? 1 : 5)
+        #if DEBUG
+        let pollSummary = startup.pollSummary
+        pollSummary?.setDeadline(phase: phase, uptime: deadline)
+        #endif
         var pollUptime = ProcessInfo.processInfo.systemUptime
         while pollUptime < deadline {
+            #if DEBUG
+            pollSummary?.bodyEntered(phase: phase, at: DispatchTime.now().uptimeNanoseconds)
+            pollSummary?.stageEntered(phase: phase, stage: .toneScan, at: DispatchTime.now().uptimeNanoseconds)
+            #endif
             while tone == nil, let window = tap.window(at: cursor) {
                 cursor += max(1, Int(window.rate * 0.01))
                 if prepared, outgoing == nil, window.end <= origin,
@@ -1591,8 +1942,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     tone = .init(start: window.start, end: window.end)
                 }
             }
+            #if DEBUG
+            pollSummary?.stageReturned(phase: phase, stage: .toneScan, at: DispatchTime.now().uptimeNanoseconds)
+            pollSummary?.stageEntered(phase: phase, stage: .stateCapture, at: DispatchTime.now().uptimeNanoseconds)
+            #endif
             let state = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+            #if DEBUG
+            pollSummary?.stageReturned(phase: phase, stage: .stateCapture, at: DispatchTime.now().uptimeNanoseconds)
+            #endif
             startup.beginPoll()
+            #if DEBUG
+            pollSummary?.stageEntered(phase: phase, stage: .readinessEvaluation, at: DispatchTime.now().uptimeNanoseconds)
+            #endif
             if ready == nil, state.selected, state.audio.visit > before.visit,
                state.submitted > submitted, startup.observeLayerReady(screen.customVideoLayer?.isReadyForDisplay == true),
                let frame = state.frame, let copied = state.copied,
@@ -1603,17 +1964,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     ready = ProductionSelectionOutputTap.hostSeconds()
                 }
             }
+            #if DEBUG
+            pollSummary?.stageReturned(phase: phase, stage: .readinessEvaluation,
+                at: DispatchTime.now().uptimeNanoseconds, layerReadyPredicateEvaluated: startup.didEvaluateLayerReady)
+            #endif
             startup.recordPoll(uptime: pollUptime, readyLatched: ready != nil,
                 state: state, beforeVisit: before.visit, beforeSubmitted: submitted)
+            #if DEBUG
+            pollSummary?.bodyReturned(phase: phase, at: DispatchTime.now().uptimeNanoseconds)
+            #endif
             if tone != nil && ready != nil { break }
             try? await Task.sleep(for: .milliseconds(5))
             pollUptime = ProcessInfo.processInfo.systemUptime
         }
+        #if DEBUG
+        pollSummary?.loopExited(phase: phase, at: DispatchTime.now().uptimeNanoseconds, nextCursor: cursor)
+        #endif
         let last = tap.stop()
         let finalState = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
         startup.finishPhase(state: finalState, beforeVisit: before.visit, beforeSubmitted: submitted)
         return ProductionSelectionMeasurement(phase: phase, prepared: prepared, preparedBefore: preparedBefore,
             frequency: frequency, first: first, last: last, origin: origin,
+            onlineNextCursor: cursor,
+            replayToneAfterCleanup: replayToneAfterCleanup,
             commandReturnHostSeconds: commandReturned, outgoing: outgoing, tone: tone,
             displayReady: displayReady, ready: ready, before: before,
             expectedTokenBefore: expectedTokenBefore, beforeSubmitted: submitted,
@@ -1624,6 +1997,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let recorded = tap.samples(from: value.first, to: value.last)
         let quiet = ProductionSelectionOutputTap.quietRun(recorded.values, rate: recorded.rate)
         let hole = ProductionSelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
+        #if DEBUG
+        if value.replayToneAfterCleanup {
+        let replay = ProductionSelectionOutputTap.replayTone(recorded, origin: value.origin,
+            frequency: value.frequency, firstIndex: value.first, onlineNextCursor: value.onlineNextCursor,
+            expectedFrames: value.last - value.first)
+        print("ProductionSelectionOfflineTone schema=1 phase=\(value.phase) prepared=\(value.prepared) inputValid=\(replay.inputValid) available=\(replay.available) recordedFrames=\(recorded.values.count) rate=\(recorded.rate) firstIndex=\(value.first) lastIndex=\(value.last) onlineNextCursor=\(value.onlineNextCursor) onlineTargetFound=\(value.tone != nil) windows=\(replay.windows) eligibleWindows=\(replay.eligibleWindows) unsearchedEligibleWindows=\(replay.unsearchedEligibleWindows) targetWindows=\(replay.targetWindows) alternateWindows=\(replay.alternateWindows) firstTargetIndex=\(replay.firstTargetIndex) firstTargetStartMs=\(replay.firstTarget.map { String(($0.start - value.origin) * 1000) } ?? "missing") firstTargetEndMs=\(replay.firstTarget.map { String(($0.end - value.origin) * 1000) } ?? "missing") firstAlternateStartMs=\(replay.firstAlternate.map { String(($0.start - value.origin) * 1000) } ?? "missing") firstAlternateEndMs=\(replay.firstAlternate.map { String(($0.end - value.origin) * 1000) } ?? "missing") targetWasUnsearched=\(replay.targetWasUnsearched) replayedVisitedMatchDespiteOnlineMissing=\(value.tone == nil && replay.firstTarget != nil && !replay.targetWasUnsearched) firstRecordedHostSeconds=\(recorded.hosts.first.map { String($0) } ?? "missing") lastRecordedEndHostSeconds=\(recorded.hosts.last.map { String($0 + 1 / max(1, recorded.rate)) } ?? "missing") maximumHoleMs=\(hole * 1000) scratchCapacityFrames=960 scope=retained-measurement-only classifiedAfterCleanup=true availableToPollAt100ms=unmeasured playbackAcceptance=unchanged")
+        }
+        #endif
         let toneMs = value.tone.map { ($0.end - value.origin) * 1_000 }
         let readyMs = value.ready.map { ($0 - value.origin) * 1_000 }
         let state = value.state
@@ -3481,6 +3862,8 @@ private final class ProductionVideoStartupTrace {
     private var finalMasks = [UInt16?](repeating: nil, count: 3)
     private var badPhase = false
     #if DEBUG
+    var pollSummary: ProductionSelectionPollSummary?
+    var didEvaluateLayerReady: Bool { layerReady != nil } // Cached optional-chain predicate result; no second SDK getter.
     private enum Event {
         case startup(Int, PlaybackService.DebugVideoStartupStamp)
         case seek(Int, UInt64, PlaybackService.DebugVideoSeekStamp)
@@ -3918,6 +4301,119 @@ private final class DefaultFrameMonitorReadTrace {
 }
 #endif
 
+#if DEBUG
+/// Main-actor-only fixed scalar observation. Nil configuration reads no clock.
+/// First/worst completed spans include entry-marker work and any synchronous
+/// reentrancy; they exclude the return-marker update and are not exclusive SDK cost.
+@MainActor
+private final class ProductionSelectionPollSummary {
+    enum Stage: Int { case toneScan = 1, stateCapture = 2, readinessEvaluation = 3 }
+    struct Span {
+        let poll: UInt64, begin: UInt64, end: UInt64
+        var layerReadyPredicateEvaluated = false
+        var duration: UInt64 { end - begin }
+    }
+    struct Pair {
+        var first: Span?, worst: Span?
+        mutating func accept(_ span: Span) {
+            if first == nil { first = span }
+            if worst == nil || span.duration > worst!.duration { worst = span }
+        }
+    }
+    struct Phase {
+        var entered: UInt64 = 0, returned: UInt64 = 0
+        var lastEntry: UInt64 = 0, lastReturn: UInt64 = 0
+        var stageEntry: UInt64 = 0, stageReturn: UInt64 = 0
+        var stageCode = 0, bodyOpen = false, stageOpen = false
+        var deadlineUptime = 0.0
+        var loopExit: UInt64 = 0, nextCursor = 0
+        var tone = Pair(), state = Pair(), readiness = Pair()
+        var largestGap: Span?
+    }
+    private var phases = [Phase](repeating: Phase(), count: 3)
+    private var invalid = false, overflowed = false
+
+    func snapshot(phase: Int) -> Phase? { phases.indices.contains(phase) ? phases[phase] : nil }
+    func setDeadline(phase: Int, uptime: Double) {
+        guard phases.indices.contains(phase), uptime.isFinite else { invalid = true; return }
+        phases[phase].deadlineUptime = uptime
+    }
+    func bodyEntered(phase: Int, at now: UInt64) {
+        guard phases.indices.contains(phase) else { invalid = true; return }
+        var value = phases[phase]
+        if value.bodyOpen || value.stageOpen { invalid = true }
+        value.entered = increment(value.entered)
+        if value.returned > 0 {
+            if now < value.lastReturn { invalid = true }
+            else {
+                let gap = Span(poll: value.entered, begin: value.lastReturn, end: now)
+                if value.largestGap == nil || gap.duration > value.largestGap!.duration { value.largestGap = gap }
+            }
+        }
+        value.lastEntry = now; value.bodyOpen = true
+        phases[phase] = value
+    }
+    func stageEntered(phase: Int, stage: Stage, at now: UInt64) {
+        guard phases.indices.contains(phase) else { invalid = true; return }
+        var value = phases[phase]
+        if !value.bodyOpen || value.stageOpen || now < value.lastEntry { invalid = true }
+        value.stageCode = stage.rawValue; value.stageEntry = now; value.stageReturn = 0; value.stageOpen = true
+        phases[phase] = value
+    }
+    func stageReturned(phase: Int, stage: Stage, at now: UInt64, layerReadyPredicateEvaluated: Bool = false) {
+        guard phases.indices.contains(phase) else { invalid = true; return }
+        var value = phases[phase]
+        guard value.bodyOpen, value.stageOpen, value.stageCode == stage.rawValue,
+              now >= value.stageEntry else { invalid = true; return }
+        let span = Span(poll: value.entered, begin: value.stageEntry, end: now,
+                        layerReadyPredicateEvaluated: layerReadyPredicateEvaluated)
+        switch stage {
+        case .toneScan: value.tone.accept(span)
+        case .stateCapture: value.state.accept(span)
+        case .readinessEvaluation: value.readiness.accept(span)
+        }
+        value.stageReturn = now; value.stageOpen = false
+        phases[phase] = value
+    }
+    func bodyReturned(phase: Int, at now: UInt64) {
+        guard phases.indices.contains(phase) else { invalid = true; return }
+        var value = phases[phase]
+        guard value.bodyOpen, !value.stageOpen, now >= value.lastEntry else { invalid = true; return }
+        value.returned = increment(value.returned); value.lastReturn = now; value.bodyOpen = false
+        phases[phase] = value
+    }
+    func loopExited(phase: Int, at now: UInt64, nextCursor: Int) {
+        guard phases.indices.contains(phase), now >= phases[phase].lastEntry,
+              nextCursor >= 0 else { invalid = true; return }
+        phases[phase].loopExit = now; phases[phase].nextCursor = nextCursor
+    }
+    private func increment(_ count: UInt64) -> UInt64 {
+        let result = count.addingReportingOverflow(1)
+        if result.overflow { overflowed = true; return .max }
+        return result.partialValue
+    }
+    func dumpAndAssert() {
+        XCTAssertFalse(invalid); XCTAssertFalse(overflowed)
+        for phase in phases.indices {
+            let value = phases[phase]
+            let trailingAvailable = value.loopExit > 0 && value.returned > 0
+                && !value.bodyOpen && value.loopExit >= value.lastReturn
+            let trailing = trailingAvailable ? value.loopExit - value.lastReturn : 0
+            print("ProductionSelectionPollSummary schema=1 phase=\(phase) entered=\(value.entered) returned=\(value.returned) lastEntryAvailable=\(value.entered > 0) lastEntryNs=\(value.lastEntry) lastBodyReturnNs=\(value.lastReturn) lastStage=\(value.stageCode) lastStageEntryNs=\(value.stageEntry) lastStageReturnNs=\(value.stageReturn) unreturnedBody=\(value.bodyOpen) unreturnedStage=\(value.stageOpen) loopExitNs=\(value.loopExit) trailingGapAvailable=\(trailingAvailable) trailingBodyReturnToLoopExitNs=\(trailing) deadlineSystemUptime=\(value.deadlineUptime) onlineNextCursor=\(value.nextCursor) invalid=\(invalid) overflowed=\(overflowed) firstWorstSpanCapacity=18 largestGapCapacity=3 publication=after-cleanup sdkExclusiveCost=false terminalStateMeasured=false")
+            XCTAssertEqual(value.entered, value.returned)
+            XCTAssertFalse(value.bodyOpen); XCTAssertFalse(value.stageOpen)
+            for (stage, pair) in [(1, value.tone), (2, value.state), (3, value.readiness)] {
+                for (variant, span) in [(0, pair.first), (1, pair.worst)] {
+                    print("ProductionSelectionPollSpan schema=1 phase=\(phase) stage=\(stage) variant=\(variant) available=\(span != nil) poll=\(span?.poll ?? 0) beginNs=\(span?.begin ?? 0) endNs=\(span?.end ?? 0) durationNs=\(span?.duration ?? 0) layerReadyPredicateEvaluated=\(span?.layerReadyPredicateEvaluated ?? false) clock=DispatchTime scope=existing-operation-plus-entry-marker includesSynchronousReentrancy=true playbackAcceptance=unchanged")
+                }
+            }
+            let gap = value.largestGap
+            print("ProductionSelectionPollGap schema=1 phase=\(phase) available=\(gap != nil) nextPoll=\(gap?.poll ?? 0) bodyReturnNs=\(gap?.begin ?? 0) nextEntryNs=\(gap?.end ?? 0) durationNs=\(gap?.duration ?? 0) includes=return-marker-sleep-and-scheduling finalGapWithoutNextEntryNs=\(trailing)")
+        }
+    }
+}
+#endif
+
 private struct ProductionSelectionState {
     let audio: ContinuousPCMRenderer.Snapshot
     let expectedToken: Int
@@ -3947,6 +4443,8 @@ private struct ProductionSelectionMeasurement {
     let first: Int
     let last: Int
     let origin: Double
+    let onlineNextCursor: Int
+    let replayToneAfterCleanup: Bool
     let commandReturnHostSeconds: Double
     let outgoing: ProductionSelectionOutputTap.Tone?
     let tone: ProductionSelectionOutputTap.Tone?
@@ -4199,6 +4697,17 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
 /// The tap is disabled during the first two 8-second renderer-only windows.
 private final class ProductionSelectionOutputTap: @unchecked Sendable {
     struct Tone { let start: Double; let end: Double }
+    #if DEBUG
+    struct ToneReplay {
+        var inputValid = false
+        var windows = 0, eligibleWindows = 0, unsearchedEligibleWindows = 0
+        var targetWindows = 0, alternateWindows = 0
+        var firstTarget: Tone?, firstAlternate: Tone?
+        var firstTargetIndex = -1
+        var targetWasUnsearched = false
+        var available: Bool { inputValid && eligibleWindows > 0 }
+    }
+    #endif
     struct Window { let samples: [Float]; let rate: Double; let start: Double; let end: Double }
     struct Recording { let values: [Float]; let hosts: [Double]; let rate: Double }
     struct Anomaly {
@@ -4435,6 +4944,55 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         }
         return (correct, total)
     }
+
+    #if DEBUG
+    /// Replay the original live 20 ms windows/10 ms cursor, without extending
+    /// capture, reading another source, changing classifications or latching ready.
+    /// One fixed scratch buffer; no PCM or per-window history escapes this call.
+    static func replayTone(_ recording: Recording, origin: Double, frequency: Double,
+                           firstIndex: Int, onlineNextCursor: Int, expectedFrames: Int) -> ToneReplay {
+        var result = ToneReplay()
+        let count = recording.values.count
+        let end = firstIndex.addingReportingOverflow(count)
+        guard recording.rate == 48_000, origin.isFinite, frequency == 440 || frequency == 880,
+              firstIndex >= 0, !end.overflow, end.partialValue <= 576_000,
+              count == expectedFrames, count == recording.hosts.count, count >= 960,
+              onlineNextCursor >= firstIndex, onlineNextCursor <= end.partialValue,
+              recording.values.allSatisfy({ $0.isFinite }), recording.hosts.allSatisfy({ $0.isFinite }),
+              zip(recording.hosts, recording.hosts.dropFirst()).allSatisfy({ pair in pair.0 < pair.1 }) else { return result }
+        result.inputValid = true
+        var scratch = [Float](repeating: 0, count: 960)
+        recording.values.withUnsafeBufferPointer { values in
+            for start in stride(from: 0, through: count - 960, by: 480) {
+                result.windows += 1
+                let last = start + 960
+                let hostEnd = recording.hosts[last - 1] + 1 / recording.rate
+                guard hostEnd >= origin else { continue }
+                result.eligibleWindows += 1
+                let globalIndex = firstIndex + start
+                if globalIndex >= onlineNextCursor { result.unsearchedEligibleWindows += 1 }
+                scratch.withUnsafeMutableBufferPointer {
+                    $0.baseAddress!.update(from: values.baseAddress!.advanced(by: start), count: 960)
+                }
+                if isTone(scratch, rate: recording.rate, frequency: frequency) {
+                    result.targetWindows += 1
+                    if result.firstTarget == nil {
+                        result.firstTarget = Tone(start: recording.hosts[start], end: hostEnd)
+                        result.firstTargetIndex = globalIndex
+                        result.targetWasUnsearched = globalIndex >= onlineNextCursor
+                    }
+                }
+                if isTone(scratch, rate: recording.rate, frequency: frequency == 440 ? 880 : 440) {
+                    result.alternateWindows += 1
+                    if result.firstAlternate == nil {
+                        result.firstAlternate = Tone(start: recording.hosts[start], end: hostEnd)
+                    }
+                }
+            }
+        }
+        return result
+    }
+    #endif
 
     static func quietRun(_ samples: [Float], rate: Double) -> Double {
         let frames = Int(rate * 0.01)
@@ -5102,3 +5660,72 @@ private final class PreparedNextPrerollCallback: @unchecked Sendable {
         return Snapshot(count: count, finished: finished, time: time)
     }
 }
+
+#if DEBUG
+/// Returned ordinary-position reads only; three known fresh-service requests, six value records.
+@MainActor
+private final class NativePositionReadDurationTrace {
+    private struct Phase {
+        let request: Int
+        var item: ObjectIdentifier?
+        var calls: UInt64 = 0, nonfinite: UInt64 = 0
+        var first: PlaybackService.DebugVideoPositionRead?, maximum: PlaybackService.DebugVideoPositionRead?
+    }
+    private let originEnabled: Bool
+    private var phases: [Phase] = []
+    private var observed: UInt64 = 0, orphans: UInt64 = 0, qualityFailures: UInt64 = 0
+    private var overflow = false
+    init(originEnabled: Bool, baseRequest: Int) {
+        self.originEnabled = originEnabled
+        phases.reserveCapacity(3)
+        for phase in 0..<3 {
+            let request = baseRequest.addingReportingOverflow(phase + 1)
+            if request.overflow { overflow = true }
+            phases.append(Phase(request: request.partialValue))
+        }
+    }
+    private func increment(_ value: inout UInt64) {
+        if value == .max { overflow = true } else { value += 1 }
+    }
+    func record(_ value: PlaybackService.DebugVideoPositionRead) {
+        increment(&observed)
+        guard value.request == value.returnGeneration, value.observedItemMatches, value.presentationUnchanged,
+              value.returnNs >= value.entryNs,
+              let index = phases.firstIndex(where: { $0.request == value.request }) else {
+            increment(&orphans); increment(&qualityFailures); return
+        }
+        if (phases[index].item != nil && phases[index].item != value.item)
+            || (phases[index].first != nil && phases[index].first?.kind != value.kind) {
+            increment(&orphans); increment(&qualityFailures); return
+        }
+        phases[index].item = value.item
+        increment(&phases[index].calls)
+        if !value.position.isFinite { increment(&phases[index].nonfinite) }
+        if phases[index].first == nil { phases[index].first = value }
+        let span = value.returnNs - value.entryNs
+        if phases[index].maximum == nil
+            || span > phases[index].maximum!.returnNs - phases[index].maximum!.entryNs {
+            phases[index].maximum = value
+        }
+    }
+    func dumpAndAssert() {
+        let retained = phases.reduce(0) { $0 + ($1.first == nil ? 0 : 1) + ($1.maximum == nil ? 0 : 1) }
+        print("NativePositionReadSummary schema=1 originEnabled=\(originEnabled) readTimingEnabled=true observedReturned=\(observed) orphans=\(orphans) qualityFailures=\(qualityFailures) overflow=\(overflow) phases=3 retainedRecords=\(retained) capacityRecords=6 phaseBinding=fresh-service-request-offset returnedCallsOnly=true unreturnedCalls=unverified orphanIntervals=unavailable clock=DispatchTime")
+        XCTAssertFalse(overflow); XCTAssertEqual(qualityFailures, 0); XCTAssertEqual(orphans, 0)
+        XCTAssertLessThanOrEqual(retained, 6)
+        var accounted = orphans
+        for (phase, value) in phases.enumerated() {
+            let sum = accounted.addingReportingOverflow(value.calls)
+            XCTAssertFalse(sum.overflow); accounted = sum.partialValue
+            XCTAssertEqual(value.first == nil, value.calls == 0)
+            XCTAssertEqual(value.maximum == nil, value.calls == 0)
+            print("NativePositionReadCount schema=1 originEnabled=\(originEnabled) phase=\(phase) request=\(value.request) calls=\(value.calls) nonfinitePositions=\(value.nonfinite) item=\(value.item.map { String(describing: $0) } ?? "unavailable") absentRecords=unavailable")
+            for (role, read) in [("first", value.first), ("maximum", value.maximum)] {
+                guard let read else { continue }
+                print("NativePositionReadDuration schema=1 originEnabled=\(originEnabled) phase=\(phase) request=\(read.request) role=\(role) kind=\(read.kind.rawValue) item=\(read.item) entryNs=\(read.entryNs) returnNs=\(read.returnNs) spanNs=\(read.returnNs - read.entryNs) position=\(read.position) finite=\(read.position.isFinite) returnGeneration=\(read.returnGeneration) observedItemMatches=\(read.observedItemMatches) presentationUnchanged=\(read.presentationUnchanged) decisionOutcome=unjoined clock=DispatchTime")
+            }
+        }
+        XCTAssertEqual(observed, accounted)
+    }
+}
+#endif
