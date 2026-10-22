@@ -2,15 +2,15 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Exact cold-start trace source; paused ownership Release behavior remains reviewed acb67877.
-expected_code_source=e23e6e3fe48ffb057ed0a1c591c61c07e9366f0c
-expected_ios_tree=6010df625cb8ed3504499d2e06d4e3a426a77b8a
+# Exact completed-owner/pending-first-image baseline; Release ownership remains acb67877.
+expected_code_source=3a9d4f5e2e335f26266070204b9eb540b3b12e20
+expected_ios_tree=8c16aa086d985e27f122767f2b3c96fbc9b7000e
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testCompletedPausedExplicitSeekKeepsItsTimelineWhileFirstImageIsPending
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -36,9 +36,9 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace'}
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testCompletedPausedExplicitSeekKeepsItsTimelineWhileFirstImageIsPending'}
 if len(expected) != 1 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly one cold-boundary trace identity must exist in the pinned source')
+    raise SystemExit('Exactly one completed-owner pending-image identity must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
