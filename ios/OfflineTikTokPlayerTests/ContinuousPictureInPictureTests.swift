@@ -257,6 +257,8 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             XCTFail("The media offset must survive actual mapping while the leading decoded image is preserved"); throw TinyVideoFailure.fixture
         }
         let composition = try await assertTinyConservativeFallback(asset)
+        _ = await observeTinyCompositionTiming(composition, track: track,
+            fixtureID: "offset", mode: "default")
         try assertTinyComposition(composition, track: track, end: witness.end)
         let composed = try readTinyVideoFrames(asset, track: track, composition: composition, mode: "composed", fixtureID: "offset")
         try assertTinyFrameParity(native, composed, witness: witness, fixtureID: "offset")
@@ -270,6 +272,46 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         _ = try await assertTinyConservativeFallback(immutable)
         #else
         XCTFail("Offset/composition refusal requires the separate DEBUG native preparation API")
+        #endif
+    }
+
+    func testImportedPositiveOffsetNativeMinimumFrameDurationCompositionPreservesEveryImage() async throws {
+        #if DEBUG
+        let times = [6, 7, 9, 12, 13].map { CMTime(value: Int64($0), timescale: 24) }
+        let end = CMTime(value: 14, timescale: 24)
+        let url = try await makeAsymmetricVideo(transform: .identity, frameCount: times.count,
+            presentationTimes: times, endTime: end)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = AVURLAsset(url: url)
+        let (track, native, _, witness) = try await qualifyTinyImportedVideo(asset, expectedTimes: times,
+            end: end, fixtureID: "offset-native-minimum")
+        let original = try await assertTinyConservativeFallback(asset)
+        try assertTinyComposition(original, track: track, end: witness.end)
+        let observedMinimum = await observeTinyCompositionTiming(original, track: track,
+            fixtureID: "offset-native-minimum", mode: "default-before-copy")
+        let minimum = try XCTUnwrap(observedMinimum,
+            "The native minimum frame duration must load before testing this comparison")
+        guard minimum.isNumeric, minimum.epoch == 0,
+              CMTimeCompare(minimum, .zero) > 0 else {
+            XCTFail("An invalid native minimum cannot supply a guessed composition cadence"); throw TinyVideoFailure.fixture
+        }
+        let originalFrameDuration = original.frameDuration
+        let adjusted = try XCTUnwrap(original.mutableCopy() as? AVMutableVideoComposition)
+        guard adjusted !== original else {
+            XCTFail("The timing control must never mutate the actual default composition"); throw TinyVideoFailure.fixture
+        }
+        adjusted.frameDuration = minimum
+        XCTAssertEqual(tinyRawTime(original.frameDuration), tinyRawTime(originalFrameDuration))
+        XCTAssertEqual(CMTimeCompare(adjusted.frameDuration, minimum), 0)
+        XCTAssertEqual(adjusted.sourceTrackIDForFrameTiming, original.sourceTrackIDForFrameTiming)
+        XCTAssertEqual(adjusted.renderSize, original.renderSize)
+        try assertTinyComposition(adjusted, track: track, end: witness.end)
+        print("TinyVideoCompositionTimingOverride schema=1 fixture=offset-native-minimum defaultFrameDuration=\(tinyRawTime(originalFrameDuration)) nativeMinimum=\(tinyRawTime(minimum)) adjustedFrameDuration=\(tinyRawTime(adjusted.frameDuration)) rawTimeFields=value/scale/flags/epoch onlyMutation=frameDuration copyOfActualDefault=true strictOriginalTargets=true physicalHoldProof=false latencyEvidence=false")
+        let composed = try readTinyVideoFrames(asset, track: track, composition: adjusted,
+            mode: "composed-native-minimum", fixtureID: "offset-native-minimum")
+        try assertTinyFrameParity(native, composed, witness: witness, fixtureID: "offset-native-minimum")
+        #else
+        XCTFail("The native-minimum comparison requires the existing DEBUG fixture qualification API")
         #endif
     }
 
@@ -496,6 +538,19 @@ final class ContinuousPictureInPictureTests: XCTestCase {
               CMTimeCompare(try XCTUnwrap(frames.last).pts, try XCTUnwrap(witness.media.last).outputPTS) == 0 else {
             XCTFail("All five real media images need distinct full pixels, one exact use and the complete final frame")
             throw TinyVideoFailure.fixture
+        }
+    }
+
+    private func observeTinyCompositionTiming(_ composition: AVVideoComposition, track: AVAssetTrack,
+        fixtureID: String, mode: String) async -> CMTime? {
+        let actualFrameDuration = composition.frameDuration
+        do {
+            let nativeMinimum = try await track.load(.minFrameDuration)
+            print("TinyVideoCompositionTimingObserved schema=1 fixture=\(fixtureID) mode=\(mode) actualFrameDuration=\(tinyRawTime(actualFrameDuration)) nativeMinimum=\(tinyRawTime(nativeMinimum)) nativeMinimumLoad=returned rawTimeFields=value/scale/flags/epoch diagnosticOnly=true latencyEvidence=false")
+            return nativeMinimum
+        } catch {
+            print("TinyVideoCompositionTimingObserved schema=1 fixture=\(fixtureID) mode=\(mode) actualFrameDuration=\(tinyRawTime(actualFrameDuration)) nativeMinimumLoad=failed nativeMinimumAvailable=false rawTimeFields=value/scale/flags/epoch diagnosticOnly=true latencyEvidence=false")
+            return nil
         }
     }
 

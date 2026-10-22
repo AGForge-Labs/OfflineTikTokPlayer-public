@@ -16,18 +16,14 @@ SOURCE = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_SOURCE",
 WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
 CASES = (
-    "OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRefusesConflictsAndHonorsSavedEligibility",
-    "OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRevalidatesLiveLocalityBeforeCommit",
-    "OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRevalidatesOwnerAfterNativeInsertionEligibility",
-    "OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousToNextPreservesExactPreparationAndPlayerPolicy",
+    "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback",
+    "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetNativeMinimumFrameDurationCompositionPreservesEveryImage",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff",
     "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOffThenOn",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOnThenOff",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedForwardVideoReusesItsPreparedNativeItemAndOutput",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture",
 )
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
@@ -258,12 +254,12 @@ exit "$FRAME_READ_TEE_EXIT"
             self.assertEqual(receipt.read_text(), "", result.stdout + result.stderr)
             return result, arguments, "", None
 
-    def test_exact_twelve_selectors_limits_and_cleanup(self):
+    def test_exact_eight_selectors_limits_and_cleanup(self):
         result, arguments, receipt, verified = self.exercise()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("expectedNative=12", result.stdout)
+        self.assertIn("expectedNative=8", result.stdout)
         self.assertIn("expectedCore=105", result.stdout)
-        self.assertIn("NativeFrameReadDiagnosticEvidence native=12 ui=0 nativeExit=0 teeExit=0", result.stdout)
+        self.assertIn("NativeFrameReadDiagnosticEvidence native=8 ui=0 nativeExit=0 teeExit=0", result.stdout)
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
         self.assertEqual(receipt, "0\t0\n")
         self.assertEqual([value for value in arguments if value.startswith("-only-testing:")],
@@ -298,7 +294,7 @@ exit "$FRAME_READ_TEE_EXIT"
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(receipt, "0\t0\n")
                 self.assertNotEqual(verified.returncode, 0)
-                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=12", result.stdout)
+                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=8", result.stdout)
 
     def test_failed_preflights_clear_stale_evidence_and_prevent_launch(self):
         for scenario, expected in (("core-failure", 19), ("driver-failure", 31),
@@ -359,7 +355,7 @@ exit "$FRAME_READ_TEE_EXIT"
         source = SOURCE.read_text(encoding="utf-8")
         declaration = re.search(r"^cases=\((.*?)\)\s*$", source, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(declaration)
-        self.assertEqual(len(CASES), 12)
+        self.assertEqual(len(CASES), 8)
         self.assertEqual(tuple(shlex.split(declaration.group(1))), CASES)
         workflow = WORKFLOW.read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertIn("fetch-depth: 2", workflow)

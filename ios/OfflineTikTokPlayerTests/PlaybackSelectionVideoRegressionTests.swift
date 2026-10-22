@@ -322,6 +322,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
                 XCTAssertLessThanOrEqual(probeReads, 1_024)
             }
+            @MainActor
+            func acknowledgedOwner(id: String, request: Int,
+                item: ObjectIdentifier) -> ContinuousPCMRenderer.Snapshot? {
+                guard let currentItem = service.player.currentItem,
+                      ObjectIdentifier(currentItem) == item,
+                      let entry = audio.entry(for: id) else { return nil }
+                let owner = service.debugInitialVideoReadyState
+                let sample = audio.renderer.snapshot
+                guard owner.generation == request, service.queue.currentID == id,
+                      audio.selectedID == id, sample.token == entry.token, sample.visit > 0,
+                      !sample.ended, !audio.isSelectionPending(in: sample) else { return nil }
+                return sample
+            }
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
             try await require({ buffer.hasPrepared(fixture.bID) }, "Real B must be staged for A-B-A calibration")
@@ -352,16 +365,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     && time.isNumeric && time.seconds.isFinite && time.seconds >= pausedNative + 0.025
             }, "Both real PCM and the native item clock must advance before the playing bracket")
             try sampleItemTimebaseContract(service, item: firstA, label: "playing-A", paused: false)
+            let playingAPCM = try XCTUnwrap(acknowledgedOwner(id: fixture.aID,
+                request: firstRequest, item: ObjectIdentifier(firstA)))
             try await samplePlayingNativeClockPair(service, audio: audio, item: firstA,
-                label: "settled-existing-A", into: &playingBrackets)
+                expectedPCM: playingAPCM, label: "settled-existing-A", into: &playingBrackets)
 
             probeRequest = service.debugInitialVideoReadyState.generation + 1
             probeHandoff = nil; probeReads = 0
             service.next()
-            try await require({ probeHandoff != nil }, "B must return its real rate handoff before the isolated probe")
+            var playingBPCM: ContinuousPCMRenderer.Snapshot?
+            try await require({
+                guard let handoff = probeHandoff else { return false }
+                playingBPCM = acknowledgedOwner(id: fixture.bID, request: handoff.request, item: handoff.item)
+                return playingBPCM != nil
+            }, "B must return its real rate handoff and acknowledge its exact selected native/PCM owner before the isolated probe")
             let playingB = try XCTUnwrap(service.player.currentItem)
             try await samplePlayingNativeClockPair(service, audio: audio, item: playingB,
-                label: "selected-B-handoff", handoff: probeHandoff, ordinaryReads: { probeReads }, into: &playingBrackets)
+                expectedPCM: try XCTUnwrap(playingBPCM), label: "selected-B-handoff",
+                handoff: probeHandoff, ordinaryReads: { probeReads }, into: &playingBrackets)
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
             try await require({ buffer.previousMediaID == fixture.aID }, "The original A item must be retained")
             service.pause()
@@ -376,11 +397,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             probeRequest = service.debugInitialVideoReadyState.generation + 1
             probeHandoff = nil; probeReads = 0
             service.previous()
-            try await require({ probeHandoff != nil }, "Returned A must return its real rate handoff before the isolated probe")
+            var returnedAPCM: ContinuousPCMRenderer.Snapshot?
+            try await require({
+                guard let handoff = probeHandoff else { return false }
+                returnedAPCM = acknowledgedOwner(id: fixture.aID, request: handoff.request, item: handoff.item)
+                return returnedAPCM != nil
+            }, "Returned A must return its real rate handoff and acknowledge its exact selected native/PCM owner before the isolated probe")
             let playingReturnedA = try XCTUnwrap(service.player.currentItem)
             XCTAssertTrue(playingReturnedA === firstA)
             try await samplePlayingNativeClockPair(service, audio: audio, item: playingReturnedA,
-                label: "reinserted-A-handoff", handoff: probeHandoff, ordinaryReads: { probeReads }, into: &playingBrackets)
+                expectedPCM: try XCTUnwrap(returnedAPCM), label: "reinserted-A-handoff",
+                handoff: probeHandoff, ordinaryReads: { probeReads }, into: &playingBrackets)
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
             service.pause()
             try await require({ service.player.rate == 0 && !service.audioEngineRunning
@@ -414,7 +441,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     private func samplePlayingNativeClockPair(_ service: PlaybackService, audio: ContinuousAudioPlayer,
-        item: AVPlayerItem, label: String, handoff: PlaybackService.DebugVideoRateHandoff? = nil,
+        item: AVPlayerItem, expectedPCM: ContinuousPCMRenderer.Snapshot,
+        label: String, handoff: PlaybackService.DebugVideoRateHandoff? = nil,
         ordinaryReads: () -> Int = { 0 }, into values: inout [PlayingNativeClockBracket]) async throws {
         for ordinal in 0..<2 {
             if ordinal == 1 { try await Task.sleep(for: .milliseconds(100)) }
@@ -442,6 +470,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 && owner.generation == finalOwner.generation
                 && before.token == after.token && before.visit == after.visit
                 && before.selectionVersion == after.selectionVersion
+                && before.token == expectedPCM.token && before.visit == expectedPCM.visit
+                && before.selectionVersion == expectedPCM.selectionVersion
+                && !audio.isSelectionPending(in: after)
             let end = DispatchTime.now().uptimeNanoseconds
             values.append(PlayingNativeClockBracket(label: label, ordinal: ordinal,
                 item: ObjectIdentifier(item), timebase: ObjectIdentifier(timebase),
@@ -654,8 +685,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         for (ordinal, fresh) in [false, true].enumerated() {
             print("PreviousBundleArm schema=1 order=retained-then-fresh ordinal=\(ordinal) fresh=\(fresh) traceVideoSeeks=false treatment=bundle-history acceptance=unchanged")
+            print("PreviousBundleFullSourceAuditScope schema=1 order=retained-then-fresh ordinal=\(ordinal) fresh=\(fresh) exactSavedA=true placement=after-original-validators-and-acknowledged-cleanup historicalComparator=39826799271 auditAddsFrameworkHistory=true secondArmIncludesPriorAudit=\(ordinal > 0) measuredWindowQueriesAdded=0 runtimeFrameJoin=false acceptance=unchanged")
             try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
-                                                       freshPreviousBundle: fresh)
+                auditSavedAAfterCleanup: true, freshPreviousBundle: fresh)
         }
         #else
         XCTFail("Previous-bundle controls require DEBUG test support")
@@ -2215,7 +2247,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 bURL: XCTUnwrap(fixture.savedURLs[fixture.bID]))
         } else if let fresh = freshPreviousBundle {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
-                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil,
                   traceClockHandoff == nil, acceptedPCMOriginBenchmarkMode == nil else {
                 XCTFail("Previous-bundle control must use the unchanged getter-free default benchmark")
                 throw SelectionVideoTestFailure.timeout
@@ -2293,9 +2325,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if suppressionControl != nil || traceFirstSourceFailure != nil || queuedPreviousLead != nil {
             XCTAssertTrue(service.debugUsesCurrentCustomFrameForReadiness)
         }
-        let remainingWitness = traceClockHandoff == true
+        let remainingWitness = traceClockHandoff == true || acceptedPCMOrigin != nil
             ? RemainingLatencyWitness(baseRequest: service.debugInitialVideoReadyState.generation) : nil
         startup.remainingLatencyWitness = remainingWitness
+        if let enabled = acceptedPCMOrigin {
+            // Same added cached witness in BOTH origin arms; no new SDK getter.
+            service.onDebugAlignedVideoEnqueue = { [weak remainingWitness] value in remainingWitness?.record(value) }
+            print("AcceptedPCMOriginReadinessWitnessBundle schema=1 originEnabled=\(enabled) alignedEnqueue=true customAndFullCompoundPolls=true phases=3 customMask=127 fullMask=511 newSampler=false newSDKQueries=0 existingTimingSitesEnabled=true noIndividualObserverAttribution=true acceptance=unchanged")
+        }
         let handoffTrace = traceClockHandoff.map {
             NativeClockHandoffTrace(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation)
         }
@@ -2369,7 +2406,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 service.onDebugAlignedVideoEnqueue = nil
                 service.onDebugCPPNativePullStamp = nil
             }
-            if nativePositionReadTrace != nil { service.onDebugVideoPositionRead = nil }
+            if nativePositionReadTrace != nil {
+                service.onDebugVideoPositionRead = nil
+                service.onDebugAlignedVideoEnqueue = nil
+            }
             if traceDefaultFrameMonitor != nil {
                 service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
             }
@@ -2561,6 +2601,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugAlignedVideoEnqueue = nil
             service.onDebugCPPNativePullStamp = nil
         }
+        if acceptedPCMOrigin != nil { service.onDebugAlignedVideoEnqueue = nil }
         handoffTrace?.dumpAndAssert()
         remainingWitness?.dumpAndAssert()
         if traceDefaultFrameMonitor != nil {
@@ -2733,9 +2774,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         if auditSavedAAfterCleanup {
             // All original acceptance checks above execute before this optional audit.
-            guard renderAccounting == true, !traceVideoSeeks, !traceNativeRefill,
+            guard (renderAccounting == true || freshPreviousBundle != nil), !traceVideoSeeks, !traceNativeRefill,
                   frameMonitorAlternative == nil, traceDefaultFrameMonitor == nil else {
-                XCTFail("The post-cleanup reference belongs only to its isolated accounting diagnostic")
+                XCTFail("The post-cleanup reference belongs only to its isolated accounting or Previous-bundle diagnostic")
                 return
             }
             let originalCleanupAcknowledged = mayRemoveFixture
@@ -3660,10 +3701,31 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let probe = SelectionInitialReadyOrderingProbe(generation: request)
             service.onDebugInitialVideoReady = { generation in await probe.hold(request: generation) }
             service.onDebugVideoSeekStamp = { stamp in probe.record(stamp) }
+            var acceptedStamp: PlaybackService.DebugVideoStartupStamp?
+            var startStamp: PlaybackService.DebugVideoStartupStamp?
+            var rateStamp: PlaybackService.DebugVideoRateHandoff?
+            var handoffReceiptOverflow = false
+            service.onDebugVideoStartupStamp = { stamp in
+                guard stamp.request == request else { return }
+                if stamp.kind == .readyAccepted {
+                    if acceptedStamp == nil { acceptedStamp = stamp }
+                    else { handoffReceiptOverflow = true }
+                } else if stamp.kind == .setRate || stamp.kind == .playImmediately || stamp.kind == .startSkipped {
+                    if startStamp == nil { startStamp = stamp }
+                    else { handoffReceiptOverflow = true }
+                }
+            }
+            service.onDebugVideoRateHandoff = { stamp in
+                guard stamp.request == request, stamp.cause == .initialReady else { return }
+                if rateStamp == nil { rateStamp = stamp }
+                else { handoffReceiptOverflow = true }
+            }
             defer {
                 probe.release()
                 service.onDebugInitialVideoReady = nil
                 service.onDebugVideoSeekStamp = nil
+                service.onDebugVideoStartupStamp = nil
+                service.onDebugVideoRateHandoff = nil
             }
             let baselineUnderruns = service.audioSnapshot.underrunFrames
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -3705,6 +3767,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(10))
             }
             probe.stopRecording()
+            service.onDebugVideoStartupStamp = nil
+            service.onDebugVideoRateHandoff = nil
             let postReady = service.audioSnapshot
             let submitted = service.submittedVideoFrameCount
             let revealed = await waitUntil(timeout: 5) {
@@ -3733,6 +3797,41 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let wall = observations.first.flatMap { first in observations.last.map { Double($0.end - first.begin) / 1_000_000_000 } } ?? -1
             let pcm = observations.first.flatMap { first in observations.last.map { Double($0.after.frame - first.before.frame) / 48_000 } } ?? -1
             print("InitialReadyNativeClockControl schema=1 request=\(request) heldBeforeFrame=\(held.before.frame) heldAfterFrame=\(held.after.frame) heldNativePosition=\(held.nativePosition) heldAcquisitionMs=\(held.acquisitionSeconds * 1_000) heldSameIdentity=\(held.sameIdentity) heldOffsetErrorMs=\(held.alignmentErrorSeconds * 1_000) observations=\(observations.count) capacity=32 requestedIntervalMs=10 wallSeconds=\(wall) pcmSeconds=\(pcm) maximumGapMs=\((gaps.max() ?? .infinity) * 1_000) revealed=\(revealed) reasons=\(probe.reasons.map { String($0) }.joined(separator: ",")) nativeReadsPerObservation=1 rendererReadsPerObservation=2 latencyAcceptance=false physicalOutput=unverified")
+            let firstClock = observations.first
+            let afterAcceptance = acceptedStamp.map { accepted in
+                firstClock.map { $0.begin >= accepted.returnNs } ?? false
+            } ?? false
+            let afterRate = rateStamp.map { rate in
+                firstClock.map { $0.begin >= rate.returnNs } ?? false
+            } ?? false
+            let rateOwnerJoined = rateStamp.map { rate in
+                rate.request == request && rate.entryGeneration == request && rate.returnGeneration == request
+                    && rate.presentationRequest == request && rate.returnPresentationRequest == request
+                    && rate.presentationTicket != nil && rate.presentationTicket == rate.returnPresentationTicket
+                    && rate.presentationTicket?.debugItemIdentity == rate.item
+                    && rate.entryObservedItemMatches && rate.returnObservedItemMatches && rate.presentationUnchanged
+                    && rate.entrySeekState == rate.returnSeekState && rate.requestedRate == 1
+                    && rate.anchorTime.isNumeric && rate.anchorHostTime.isNumeric
+                    && rate.anchorTime.seconds.isFinite && rate.anchorTime.seconds >= 0
+                    && rate.anchorHostTime.seconds.isFinite && rate.returnNs >= rate.entryNs
+                    && firstClock?.nativeItem == rate.item && firstClock?.sameIdentity == true
+            } ?? false
+            print("InitialReadyHandoffScope schema=1 request=\(request) capacityReady=1 capacityStart=1 capacityRate=1 overflow=\(handoffReceiptOverflow) readyAcceptedAvailable=\(acceptedStamp != nil) startAvailable=\(startStamp != nil) rateAvailable=\(rateStamp != nil) startKind=\(startStamp?.kind.rawValue ?? -1) firstClockAvailable=\(firstClock != nil) firstClockBeginNs=\(firstClock.map { String($0.begin) } ?? "unavailable") firstClockItem=\(firstClock?.nativeItem.map { String(describing: $0) } ?? "unavailable") firstClockAfterAcceptanceReturn=\(afterAcceptance) firstClockAfterRateReturn=\(afterRate) rateOwnerJoined=\(rateOwnerJoined) firstSampleLimitMs=80 addedWaits=0 firstSamplePlacement=original extraSDKQueries=0 newClockSites=0 existingCallbackTimingEnabled=true timebaseIdentity=unavailable nativeClockStartConfirmed=false clock=DispatchTime output=after-observed-window")
+            if let accepted = acceptedStamp {
+                print("InitialReadyAcceptanceReceipt schema=1 request=\(accepted.request) entryGeneration=\(accepted.entryGeneration) returnGeneration=\(accepted.returnGeneration) entryNs=\(accepted.entryNs) returnNs=\(accepted.returnNs) presentationRequest=\(accepted.presentationRequest.map { String($0) } ?? "unavailable") presentationUnchanged=\(accepted.presentationUnchanged) cachedToken=\(accepted.audioToken) cachedVisit=\(accepted.audioVisit) readyGeneration=\(accepted.readyGeneration.map { String($0) } ?? "unavailable") marker=existing-readyAccepted nativeClockApplied=unverified")
+                XCTAssertEqual(accepted.entryGeneration, request); XCTAssertEqual(accepted.returnGeneration, request)
+                XCTAssertGreaterThanOrEqual(accepted.returnNs, accepted.entryNs)
+                XCTAssertTrue(afterAcceptance)
+            }
+            if let start = startStamp {
+                print("InitialReadyStartReceipt schema=1 request=\(start.request) kind=\(start.kind.rawValue) entryNs=\(start.entryNs) returnNs=\(start.returnNs) timelineInstalled=\(start.timelineInstalled) anchorHostSeconds=\(start.anchorHostSeconds.map { String($0) } ?? "unavailable") anchorPosition=\(start.anchorPosition.map { String($0) } ?? "unavailable") presentationUnchanged=\(start.presentationUnchanged) nativeClockApplied=unverified")
+                if start.kind == .setRate { XCTAssertNotNil(rateStamp) }
+            }
+            if let rate = rateStamp {
+                print("InitialReadyRateReceipt schema=1 request=\(rate.request) cause=\(rate.cause.rawValue) item=\(rate.item) entryGeneration=\(rate.entryGeneration) returnGeneration=\(rate.returnGeneration) entryNs=\(rate.entryNs) returnNs=\(rate.returnNs) requestedRate=\(rate.requestedRate) anchorPosition=\(rate.anchorTime.seconds) anchorHostSeconds=\(rate.anchorHostTime.seconds) presentationRequest=\(rate.presentationRequest.map { String($0) } ?? "unavailable") returnPresentationRequest=\(rate.returnPresentationRequest.map { String($0) } ?? "unavailable") ticketRevision=\(rate.presentationTicket.map { String($0.debugGeneration) } ?? "unavailable") returnTicketRevision=\(rate.returnPresentationTicket.map { String($0.debugGeneration) } ?? "unavailable") entrySeekSerial=\(rate.entrySeekState.serial) returnSeekSerial=\(rate.returnSeekState.serial) entryActiveSeek=\(rate.entrySeekState.activeTicket.map { String($0) } ?? "none") returnActiveSeek=\(rate.returnSeekState.activeTicket.map { String($0) } ?? "none") presentationUnchanged=\(rate.presentationUnchanged) entryObservedItemMatches=\(rate.entryObservedItemMatches) returnObservedItemMatches=\(rate.returnObservedItemMatches) sameItemAsFirstClock=\(firstClock?.nativeItem == rate.item) nativeClockApplied=unverified")
+                XCTAssertTrue(afterRate); XCTAssertTrue(rateOwnerJoined)
+            }
+            XCTAssertFalse(handoffReceiptOverflow); XCTAssertNotNil(acceptedStamp); XCTAssertNotNil(startStamp)
             held.dumpBoundaries(request: request, label: "held")
             XCTAssertTrue(revealed, "Ready binding must reveal a fresh selected custom frame with continuing aligned PCM")
             for value in observations {
@@ -3769,6 +3868,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         let before: ContinuousPCMRenderer.Snapshot, after: ContinuousPCMRenderer.Snapshot
         let nativePosition: Double
+        let nativeItem: ObjectIdentifier? // From the original first owner getter, not another SDK read.
         let nativeOwnerUnchanged: Bool
         var acquisitionSeconds: Double { Double(end - begin) / 1_000_000_000 }
         var sameIdentity: Bool {
@@ -3798,7 +3898,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let end = DispatchTime.now().uptimeNanoseconds
         return InitialReadyNativeClockObservation(begin: begin, beforeSnapshotReturnNs: beforeSnapshotReturnNs,
             nativeReturnNs: nativeReturnNs, end: end, before: before, after: after,
-                                                  nativePosition: native, nativeOwnerUnchanged: nativeOwnerUnchanged)
+            nativePosition: native, nativeItem: item.map(ObjectIdentifier.init),
+            nativeOwnerUnchanged: nativeOwnerUnchanged)
     }
     #endif
 
