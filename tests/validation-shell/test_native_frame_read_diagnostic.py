@@ -16,13 +16,12 @@ SOURCE = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_SOURCE",
 WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
 CASES = (
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionRenderAccountingEnabled",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation",
     "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn",
     "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff",
-    "OfflineTikTokPlayerTests/AcceptedPCMOriginTests/testAcceptedPCMOriginCoverageAndExactZeroCalibration",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryVideoDriftUsesItemTimebaseAndPreservesForcedOwnership",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion",
 )
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
@@ -54,13 +53,20 @@ class NativeFrameReadDiagnosticTests(unittest.TestCase):
             for folder in (scripts, tools, native):
                 folder.mkdir(parents=True)
             source = SOURCE.read_text(encoding="utf-8")
-            # Pending review pins cannot authorize real native work. Only this
-            # disposable fake-git fixture substitutes deterministic test pins.
-            source = re.sub(r"^expected_code_source=PENDING$", "expected_code_source=" + "a" * 40,
-                            source, flags=re.MULTILINE)
-            source = re.sub(r"^expected_ios_tree=PENDING$", "expected_ios_tree=" + "b" * 40,
-                            source, flags=re.MULTILINE)
-            tree = re.search(r"^expected_ios_tree=([0-9a-f]{40})$", source, re.MULTILINE).group(1)
+            if scenario == "pending-pins":
+                # Exercise the real rejection guard rather than substituting pins.
+                source = re.sub(r"^expected_code_source=.*$", "expected_code_source=PENDING",
+                                source, flags=re.MULTILINE)
+                source = re.sub(r"^expected_ios_tree=.*$", "expected_ios_tree=PENDING",
+                                source, flags=re.MULTILINE)
+                tree = "b" * 40
+            else:
+                # Only this disposable fake-git fixture substitutes review pins.
+                source = re.sub(r"^expected_code_source=PENDING$", "expected_code_source=" + "a" * 40,
+                                source, flags=re.MULTILINE)
+                source = re.sub(r"^expected_ios_tree=PENDING$", "expected_ios_tree=" + "b" * 40,
+                                source, flags=re.MULTILINE)
+                tree = re.search(r"^expected_ios_tree=([0-9a-f]{40})$", source, re.MULTILINE).group(1)
             launcher = scripts / "check-native-frame-read-diagnostic.sh"
             write(launcher, source)
             shutil.copyfile(ROOT / "scripts/verify-native-test-log.py", scripts / "verify-native-test-log.py")
@@ -177,7 +183,7 @@ exit "$FRAME_READ_TEE_EXIT"
             self.assertEqual(receipt.read_text(), "", result.stdout + result.stderr)
             return result, arguments, "", None
 
-    def test_exact_seven_selectors_limits_and_cleanup(self):
+    def test_exact_six_selectors_limits_and_cleanup(self):
         result, arguments, receipt, verified = self.exercise()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
@@ -214,14 +220,17 @@ exit "$FRAME_READ_TEE_EXIT"
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(receipt, "0\t0\n")
                 self.assertNotEqual(verified.returncode, 0)
-                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=7", result.stdout)
+                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=6", result.stdout)
 
     def test_failed_preflights_clear_stale_evidence_and_prevent_launch(self):
-        for scenario, expected in (("core-failure", 19), ("driver-failure", 31), ("stale-bundle", 2)):
+        for scenario, expected in (("core-failure", 19), ("driver-failure", 31),
+                                   ("stale-bundle", 2), ("pending-pins", 2)):
             with self.subTest(scenario=scenario):
                 result, arguments, _, _ = self.exercise(scenario)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertEqual(arguments, [])
+                if scenario == "pending-pins":
+                    self.assertIn("Final committed source pins required.", result.stderr)
 
     def test_source_inventory_and_workflow_are_dedicated_and_bounded(self):
         source = SOURCE.read_text(encoding="utf-8")

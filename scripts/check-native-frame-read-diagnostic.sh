@@ -2,18 +2,17 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=026b1820ae6a286f9870849f362058183554a8ed
-expected_ios_tree=b303362770f42dee2f882891873389b3a1d1cb36
+expected_code_source=c5a3ee6a5f94d8ac57ce9f137bd78c2678c8d9ea
+expected_ios_tree=5326b32ffd7a193216a8bfb4b0ee1fcd860a4603
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionRenderAccountingEnabled
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff
-  OfflineTikTokPlayerTests/AcceptedPCMOriginTests/testAcceptedPCMOriginCoverageAndExactZeroCalibration
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryVideoDriftUsesItemTimebaseAndPreservesForcedOwnership
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -39,15 +38,14 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionRenderAccountingEnabled',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff',
-    'OfflineTikTokPlayerTests.AcceptedPCMOriginTests/testAcceptedPCMOriginCoverageAndExactZeroCalibration'}
-if len(expected) != 7 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly seven diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryVideoDriftUsesItemTimebaseAndPreservesForcedOwnership',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion'}
+if len(expected) != 6 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly six diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -56,7 +54,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=7 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=6 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -107,7 +105,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=7 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=6 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Invoke the single filtered native attempt.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
