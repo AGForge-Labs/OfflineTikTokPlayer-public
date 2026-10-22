@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=946635e4fa5dd63f2af55717bbab22fea8177f28
-expected_ios_tree=a0edc016d81e4f73904c4527ad227b738a229f2a
+expected_code_source=04b428a92f13b14c00c4dca38ed996c3cecff788
+expected_ios_tree=d527e4f9aa3fa3194704fa31daf4bcd530612595
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
@@ -14,6 +14,7 @@ cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOffThenOn
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOnThenOff
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -43,9 +44,10 @@ expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOnThenOff'}
-if len(expected) != 5 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly five warm-handoff/accounting diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOnThenOff',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn'}
+if len(expected) != 6 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly six warm-handoff/accounting/cleanup diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -54,7 +56,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=5 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=6 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -155,9 +157,10 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=5 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=6 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Default then Issued must be qualified by actual order and runtime PID/module nonce.
 # Accounting cases use the unchanged nil-default workload; no full acceptance follows.
+# The real error-cleanup regression runs last to preserve that original order.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
