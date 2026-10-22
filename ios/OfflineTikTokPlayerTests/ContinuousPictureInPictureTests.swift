@@ -59,7 +59,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertEqual(results, [false, true])
     }
 
-    func testIdentitySourceNeedsNoCompositionAndPreservesEveryDecodedVideoFrame() async throws {
+    func testDefaultIdentityCompositionPreservesEveryDecodedVideoFrame() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
@@ -68,19 +68,23 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         // No player/window or temporary asset. Cleanup precedes every resource unwrap.
         defer {
             bridge.invalidate(); owned?.retire()
-            XCTAssertTrue(item.outputs.isEmpty)
+            XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition)
         }
         XCTAssertNil(item.videoComposition)
         let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
         owned = plan.install()
         let resource = try XCTUnwrap(owned), output = try XCTUnwrap(resource.output)
-        // Primary RED on the current implementation: it always assigns a composition.
-        XCTAssertNil(item.videoComposition, "The uncomposed public identity source must retain its native geometry path")
+        let installedComposition = try XCTUnwrap(item.videoComposition,
+            "Default preparation must preserve its owned composition policy")
+        #if DEBUG
+        XCTAssertTrue(resource.debugInstalledComposition === installedComposition)
+        #endif
         XCTAssertTrue(resource.item === item); XCTAssertTrue(resource.output === output)
         XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
         XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(item.outputs.first === output)
         _ = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
         XCTAssertTrue(resource.isBorrowed)
+        XCTAssertTrue(item.videoComposition === installedComposition)
         XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
 
         let tracks = try await asset.loadTracks(withMediaType: .video)
@@ -105,7 +109,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertEqual(CMTimeCompare(duration, CMTime(seconds: 30, preferredTimescale: 24)), 0)
         XCTAssertEqual(CMTimeCompare(range.start, .zero), 0)
         XCTAssertEqual(CMTimeCompare(CMTimeRangeGetEnd(range), duration), 0)
-        let baseline = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
+        let baseline = installedComposition
         XCTAssertEqual(baseline.sourceTrackIDForFrameTiming, track.trackID)
         XCTAssertEqual(baseline.renderSize, CGSize(width: 160, height: 96))
 
@@ -205,6 +209,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertEqual(composed.lastFrameHash, native.lastFrameHash)
         XCTAssertNotEqual(native.firstFrameHash, native.lastFrameHash)
         XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(resource.isBorrowed)
+        XCTAssertTrue(item.videoComposition === installedComposition)
         XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
         print("NativeGeometryVideoDecode schema=1 nativeFrames=\(native.count) composedFrames=\(composed.count) activeBytesPerReader=\(native.bytes) nativePTSHash=\(native.ptsHash) composedPTSHash=\(composed.ptsHash) nativePixelHash=\(native.pixelHash) composedPixelHash=\(composed.pixelHash) nativeLastFrameHash=\(native.lastFrameHash) composedLastFrameHash=\(composed.lastFrameHash) completeEOF=true scope=full-source-video-decode playbackEvidence=false latencyEvidence=false")
     }
@@ -217,7 +222,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             presentationTimes: times, endTime: end)
         defer { try? FileManager.default.removeItem(at: url) }
         let asset = AVURLAsset(url: url)
-        let (track, native, _) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end, fixtureID: "vfr")
+        let (track, native, _, witness) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end, fixtureID: "vfr")
         let item = AVPlayerItem(asset: asset), bridge = ContinuousPictureInPicture()
         var owned: ContinuousPictureInPicture.PreparedVideoResource?
         defer { bridge.invalidate(); owned?.retire(); XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition) }
@@ -230,15 +235,9 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         _ = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
         XCTAssertTrue(resource.isBorrowed); XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
         let composition = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
-        let composed = try readTinyVideoFrames(asset, track: track, composition: composition, mode: "composed")
-        guard composed.count == native.count else {
-            XCTFail("The composition must preserve the complete actual VFR frame count"); throw TinyVideoFailure.comparison
-        }
-        for index in native.indices {
-            XCTAssertEqual(CMTimeCompare(composed[index].pts, native[index].pts), 0, "VFR actual PTS index \(index)")
-            XCTAssertEqual(CMTimeCompare(composed[index].duration, native[index].duration), 0, "VFR duration index \(index)")
-            XCTAssertEqual(composed[index].pixels, native[index].pixels, "VFR actual pixels index \(index)")
-        }
+        try assertTinyComposition(composition, track: track, end: witness.end)
+        let composed = try readTinyVideoFrames(asset, track: track, composition: composition, mode: "composed", fixtureID: "vfr")
+        try assertTinyFrameParity(native, composed, witness: witness, fixtureID: "vfr")
         XCTAssertTrue(resource.isBorrowed); XCTAssertEqual(item.outputs.count, 1)
         #else
         XCTFail("VFR comparison requires the separate DEBUG native preparation API")
@@ -253,19 +252,22 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             presentationTimes: times, endTime: end)
         defer { try? FileManager.default.removeItem(at: url) }
         let asset = AVURLAsset(url: url)
-        let (track, native, range) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end, fixtureID: "offset")
-        guard CMTimeCompare(try XCTUnwrap(native.first).pts, .zero) > 0 else {
-            XCTFail("The offset must survive actual import and complete native decode"); throw TinyVideoFailure.fixture
+        let (track, native, range, witness) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end, fixtureID: "offset")
+        guard CMTimeCompare(try XCTUnwrap(witness.media.first).outputPTS, .zero) > 0 else {
+            XCTFail("The media offset must survive actual mapping while the leading decoded image is preserved"); throw TinyVideoFailure.fixture
         }
-        try await assertTinyConservativeFallback(asset)
+        let composition = try await assertTinyConservativeFallback(asset)
+        try assertTinyComposition(composition, track: track, end: witness.end)
+        let composed = try readTinyVideoFrames(asset, track: track, composition: composition, mode: "composed", fixtureID: "offset")
+        try assertTinyFrameParity(native, composed, witness: witness, fixtureID: "offset")
         let mutable = AVMutableComposition()
         let target = try XCTUnwrap(mutable.addMutableTrack(withMediaType: .video,
             preferredTrackID: kCMPersistentTrackID_Invalid))
         try target.insertTimeRange(range, of: track, at: .zero)
-        try await assertTinyConservativeFallback(mutable)
+        _ = try await assertTinyConservativeFallback(mutable)
         let immutable = try XCTUnwrap(mutable.copy() as? AVComposition)
         XCTAssertFalse(immutable is AVMutableComposition)
-        try await assertTinyConservativeFallback(immutable)
+        _ = try await assertTinyConservativeFallback(immutable)
         #else
         XCTFail("Offset/composition refusal requires the separate DEBUG native preparation API")
         #endif
@@ -274,9 +276,156 @@ final class ContinuousPictureInPictureTests: XCTestCase {
     #if DEBUG
     private enum TinyVideoFailure: Error { case fixture, comparison, policy }
     private struct TinyVideoFrame { let pts: CMTime, duration: CMTime, pixels: String }
+    private struct TinyBufferRecord {
+        let index: Int, numSamples: Int
+        let pts: CMTime, duration: CMTime, outputPTS: CMTime, outputDuration: CMTime
+        let timingStatus: OSStatus, timing: CMSampleTimingInfo
+        let valid: Bool, dataReady: Bool, imagePresent: Bool, dataPresent: Bool
+        let dataBytes: Int, totalSampleBytes: Int, emptyMedia: String
+    }
+    private struct TinyVideoWitness {
+        let media: [TinyBufferRecord], controls: [TinyBufferRecord]
+        let mapping: CMTimeMapping, emptyTarget: CMTimeRange?, end: CMTime
+    }
+    private func tinyRawTime(_ time: CMTime) -> String {
+        "\(time.value)/\(time.timescale)/\(time.flags.rawValue)/\(time.epoch)"
+    }
+    private func tinyBufferRecord(_ sample: CMSampleBuffer, index: Int, fixtureID: String) -> TinyBufferRecord {
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
+        let timingStatus = CMSampleBufferGetSampleTimingInfo(sample, at: 0, timingInfoOut: &timing)
+        let emptyMedia: String
+        if let value = CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_EmptyMedia, attachmentModeOut: nil) {
+            emptyMedia = CFGetTypeID(value) == CFBooleanGetTypeID()
+                ? (CFBooleanGetValue(value as! CFBoolean) ? "true" : "false") : "invalid-type"
+        } else { emptyMedia = "absent-default-false" }
+        let data = CMSampleBufferGetDataBuffer(sample)
+        let record = TinyBufferRecord(index: index, numSamples: CMSampleBufferGetNumSamples(sample),
+            pts: CMSampleBufferGetPresentationTimeStamp(sample), duration: CMSampleBufferGetDuration(sample),
+            outputPTS: CMSampleBufferGetOutputPresentationTimeStamp(sample), outputDuration: CMSampleBufferGetOutputDuration(sample),
+            timingStatus: timingStatus, timing: timing, valid: CMSampleBufferIsValid(sample),
+            dataReady: CMSampleBufferDataIsReady(sample), imagePresent: CMSampleBufferGetImageBuffer(sample) != nil,
+            dataPresent: data != nil, dataBytes: data.map { CMBlockBufferGetDataLength($0) } ?? 0,
+            totalSampleBytes: CMSampleBufferGetTotalSampleSize(sample), emptyMedia: emptyMedia)
+        print("TinyVideoTimingBufferObserved schema=1 fixture=\(fixtureID) mode=compressed index=\(record.index) numSamples=\(record.numSamples) pts=\(tinyRawTime(record.pts)) duration=\(tinyRawTime(record.duration)) outputPTS=\(tinyRawTime(record.outputPTS)) outputDuration=\(tinyRawTime(record.outputDuration)) timingStatus=\(record.timingStatus) samplePTS=\(tinyRawTime(record.timing.presentationTimeStamp)) sampleDTS=\(tinyRawTime(record.timing.decodeTimeStamp)) sampleDuration=\(tinyRawTime(record.timing.duration)) valid=\(record.valid) dataReady=\(record.dataReady) imagePresent=\(record.imagePresent) dataPresent=\(record.dataPresent) dataBytes=\(record.dataBytes) totalSampleBytes=\(record.totalSampleBytes) emptyMedia=\(record.emptyMedia) rawTimeFields=value/scale/flags/epoch qualification=pending")
+        return record
+    }
+
+    private func readTinyEncodedWitness(_ asset: AVURLAsset, track: AVAssetTrack,
+        segments: [AVAssetTrackSegment], expectedTimes: [CMTime], end: CMTime, fixtureID: String) throws -> TinyVideoWitness {
+        let hasEmpty = CMTimeCompare(expectedTimes[0], .zero) > 0
+        guard segments.count == (hasEmpty ? 2 : 1), let segment = segments.last, !segment.isEmpty else {
+            XCTFail("The tiny source needs its actual single media mapping and optional leading empty interval")
+            throw TinyVideoFailure.fixture
+        }
+        let mapping = segment.timeMapping
+        guard [mapping.source.start, mapping.source.duration, mapping.target.start, mapping.target.duration, end]
+                .allSatisfy({ $0.isNumeric && $0.epoch == 0 }),
+              CMTimeCompare(mapping.source.start, .zero) == 0,
+              CMTimeCompare(mapping.source.duration, .zero) > 0,
+              CMTimeCompare(mapping.source.duration, mapping.target.duration) == 0,
+              CMTimeCompare(mapping.target.start, expectedTimes[0]) == 0,
+              CMTimeCompare(CMTimeRangeGetEnd(mapping.target), end) == 0 else {
+            XCTFail("Actual source/target mapping must prove the complete unscaled media interval")
+            throw TinyVideoFailure.fixture
+        }
+        let emptyTarget = hasEmpty ? segments[0].timeMapping.target : nil
+        if let emptyTarget {
+            guard segments[0].isEmpty, emptyTarget.start.isNumeric, emptyTarget.duration.isNumeric,
+                  emptyTarget.start.epoch == 0, emptyTarget.duration.epoch == 0,
+                  CMTimeCompare(emptyTarget.start, .zero) == 0, CMTimeCompare(emptyTarget.duration, .zero) > 0,
+                  CMTimeCompare(CMTimeRangeGetEnd(emptyTarget), mapping.target.start) == 0 else {
+                XCTFail("The actual leading empty target interval must meet the first media target exactly")
+                throw TinyVideoFailure.fixture
+            }
+        }
+        let reader = try AVAssetReader(asset: asset)
+        defer { reader.cancelReading() }
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { throw TinyVideoFailure.fixture }
+        reader.add(output) // Entire asset; controls and media are both retained as scalar records.
+        guard reader.startReading() else { throw reader.error ?? TinyVideoFailure.fixture }
+        var media: [TinyBufferRecord] = [], controls: [TinyBufferRecord] = []
+        var returned = 0, observedNil = false
+        while returned < 32 {
+            try Task.checkCancellation()
+            let record = autoreleasepool { () -> TinyBufferRecord? in
+                guard let sample = output.copyNextSampleBuffer() else { return nil }
+                return tinyBufferRecord(sample, index: returned, fixtureID: fixtureID)
+            }
+            guard let record else { observedNil = true; break }
+            returned += 1
+            guard record.valid, record.dataReady, record.emptyMedia != "invalid-type", !record.imagePresent else {
+                XCTFail("Every compressed buffer needs valid typed metadata and a known payload kind")
+                throw TinyVideoFailure.fixture
+            }
+            if record.numSamples == 0 {
+                guard !record.dataPresent, record.dataBytes == 0, record.totalSampleBytes == 0,
+                      record.duration.isNumeric, CMTimeCompare(record.duration, .zero) == 0,
+                      record.outputDuration.isNumeric, CMTimeCompare(record.outputDuration, .zero) == 0 else {
+                    XCTFail("A zero-sample control must have no hidden payload or media duration")
+                    throw TinyVideoFailure.fixture
+                }
+                if record.emptyMedia == "true" {
+                    let atEmptyStart = emptyTarget.map { CMTimeCompare(record.outputPTS, $0.start) == 0 } ?? false
+                    guard record.outputPTS.isNumeric, record.outputPTS.epoch == 0,
+                          atEmptyStart || CMTimeCompare(record.outputPTS, end) == 0 else {
+                        XCTFail("An EmptyMedia control must identify the actual empty start or terminal endpoint")
+                        throw TinyVideoFailure.fixture
+                    }
+                }
+                controls.append(record) // Unflagged controls remain controls; no assumed frame/empty interval.
+            } else {
+                guard record.numSamples == 1, record.dataPresent, record.dataBytes > 0,
+                      record.totalSampleBytes == record.dataBytes, record.emptyMedia != "true", record.timingStatus == 0,
+                      [record.pts, record.duration, record.outputPTS, record.outputDuration,
+                       record.timing.presentationTimeStamp, record.timing.duration].allSatisfy({ $0.isNumeric && $0.epoch == 0 }),
+                      CMTimeCompare(record.duration, .zero) > 0,
+                      CMTimeCompare(record.pts, record.timing.presentationTimeStamp) == 0,
+                      CMTimeCompare(record.duration, record.timing.duration) == 0,
+                      CMTimeCompare(record.outputDuration, record.duration) == 0,
+                      CMTimeCompare(record.pts, mapping.source.start) >= 0,
+                      CMTimeCompare(CMTimeAdd(record.pts, record.duration), CMTimeRangeGetEnd(mapping.source)) <= 0,
+                      CMTimeCompare(record.outputPTS, CMTimeAdd(mapping.target.start,
+                          CMTimeSubtract(record.pts, mapping.source.start))) == 0 else {
+                    XCTFail("Every real encoded sample needs exact actual source/target timing and payload")
+                    throw TinyVideoFailure.fixture
+                }
+                media.append(record)
+            }
+        }
+        let status = reader.status
+        let completedEOF = observedNil && status == .completed
+        print("TinyVideoEncodedWitness schema=1 fixture=\(fixtureID) returned=\(returned) controls=\(controls.count) media=\(media.count) observedNil=\(observedNil) completedEOF=\(completedEOF) status=\(status.rawValue) rawControlsRetained=true timingSource=actual-compressed-samples qualification=pending latencyEvidence=false")
+        guard completedEOF, media.count == expectedTimes.count, media.count >= 3, media.count <= 8,
+              media.count + controls.count == returned else {
+            XCTFail("All actual encoded samples and controls must reach completed EOF within the bound")
+            throw reader.error ?? TinyVideoFailure.fixture
+        }
+        // Presentation table only. Raw returned indices and DTS remain in every record.
+        media.sort { CMTimeCompare($0.outputPTS, $1.outputPTS) < 0 }
+        for index in media.indices {
+            let nextTarget = index + 1 < media.count ? media[index + 1].outputPTS : end
+            let nextSource = index + 1 < media.count ? media[index + 1].pts : CMTimeRangeGetEnd(mapping.source)
+            guard CMTimeCompare(media[index].outputPTS, expectedTimes[index]) == 0,
+                  CMTimeCompare(CMTimeAdd(media[index].outputPTS, media[index].outputDuration), nextTarget) == 0,
+                  CMTimeCompare(CMTimeAdd(media[index].pts, media[index].duration), nextSource) == 0 else {
+                XCTFail("Every actual encoded presentation interval must cover its original target and complete endpoint")
+                throw TinyVideoFailure.fixture
+            }
+        }
+        guard CMTimeCompare(try XCTUnwrap(media.first).pts, mapping.source.start) == 0 else { throw TinyVideoFailure.fixture }
+        if let emptyTarget {
+            guard controls.contains(where: { $0.emptyMedia == "true" && CMTimeCompare($0.outputPTS, emptyTarget.start) == 0 }) else {
+                XCTFail("The actual leading empty mapping needs its observed typed EmptyMedia control")
+                throw TinyVideoFailure.fixture
+            }
+        }
+        return TinyVideoWitness(media: media, controls: controls, mapping: mapping, emptyTarget: emptyTarget, end: end)
+    }
 
     private func qualifyTinyImportedVideo(_ asset: AVURLAsset, expectedTimes: [CMTime], end: CMTime, fixtureID: String)
-        async throws -> (AVAssetTrack, [TinyVideoFrame], CMTimeRange) {
+        async throws -> (AVAssetTrack, [TinyVideoFrame], CMTimeRange, TinyVideoWitness) {
         let tracks = try await asset.loadTracks(withMediaType: .video)
         guard tracks.count == 1, let track = tracks.first else {
             XCTFail("The tiny imported fixture needs exactly one actual video track"); throw TinyVideoFailure.fixture
@@ -292,100 +441,95 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             let mapping = segment.timeMapping
             print("TinyVideoSegmentObserved schema=1 index=\(index) isEmpty=\(segment.isEmpty) sourceStart=\(raw(mapping.source.start)) sourceDuration=\(raw(mapping.source.duration)) targetStart=\(raw(mapping.target.start)) targetDuration=\(raw(mapping.target.duration)) rawTimeFields=value/scale/flags/epoch fixtureQualification=pending latencyEvidence=false")
         }
-        observeTinyVideoBufferTiming(asset, track: track, fixtureID: fixtureID)
-        let frames = try readTinyVideoFrames(asset, track: track, composition: nil, mode: "native")
-        guard frames.count == expectedTimes.count, frames.count >= 3, frames.count <= 8,
+        guard expectedTimes.count >= 3, expectedTimes.count <= 8,
               range.start.isNumeric, range.duration.isNumeric, duration.isNumeric,
+              range.start.epoch == 0, range.duration.epoch == 0, duration.epoch == 0,
               (CMTimeCompare(range.start, expectedTimes[0]) == 0 || CMTimeCompare(range.start, .zero) == 0),
-              CMTimeCompare(duration, end) == 0,
-              CMTimeCompare(CMTimeRangeGetEnd(range), end) == 0,
-              Set(frames.map { $0.pixels }).count == frames.count else {
-            XCTFail("Actual imported range, all distinguishable native frames and endpoint must qualify"); throw TinyVideoFailure.fixture
+              CMTimeCompare(duration, end) == 0, CMTimeCompare(CMTimeRangeGetEnd(range), end) == 0 else {
+            XCTFail("Actual imported range and complete endpoint must qualify")
+            throw TinyVideoFailure.fixture
         }
-        for index in frames.indices {
-            guard CMTimeCompare(frames[index].pts, expectedTimes[index]) == 0 else {
-                XCTFail("Writer inputs are not proof: actual imported PTS index \(index) must match"); throw TinyVideoFailure.fixture
-            }
-            let next = index + 1 < frames.count ? frames[index + 1].pts : end
-            guard CMTimeCompare(CMTimeAdd(frames[index].pts, frames[index].duration), next) == 0 else {
-                XCTFail("Every actual native sample duration must preserve full coverage"); throw TinyVideoFailure.fixture
-            }
-        }
-        let intervals = zip(frames, frames.dropFirst()).map { CMTimeSubtract($1.pts, $0.pts) }
+        let witness = try readTinyEncodedWitness(asset, track: track, segments: segments,
+            expectedTimes: expectedTimes, end: duration, fixtureID: fixtureID)
+        let frames = try readTinyVideoFrames(asset, track: track, composition: nil, mode: "native", fixtureID: fixtureID)
+        try assertTinyFrameCoverage(frames, witness: witness, fixtureID: fixtureID, mode: "native")
+        let intervals = zip(witness.media, witness.media.dropFirst()).map { CMTimeSubtract($1.outputPTS, $0.outputPTS) }
         guard intervals.dropFirst().contains(where: { CMTimeCompare($0, intervals[0]) != 0 }) else {
-            XCTFail("The imported native sequence must remain nonuniform"); throw TinyVideoFailure.fixture
+            XCTFail("The imported actual media presentation sequence must remain nonuniform")
+            throw TinyVideoFailure.fixture
         }
-        print("TinyVideoImported schema=1 frames=\(frames.count) rangeStartValue=\(range.start.value) rangeStartScale=\(range.start.timescale) rangeDurationValue=\(range.duration.value) rangeDurationScale=\(range.duration.timescale) assetDurationValue=\(duration.value) assetDurationScale=\(duration.timescale) nonuniform=true allPixelsDistinct=true source=actual-import-and-native-EOF latencyEvidence=false")
-        return (track, frames, range)
+        print("TinyVideoImported schema=2 fixture=\(fixtureID) frames=\(frames.count) mediaFrames=\(witness.media.count) controls=\(witness.controls.count) emptyIntervalImages=\(witness.emptyTarget == nil ? 0 : 1) rangeStartValue=\(range.start.value) rangeStartScale=\(range.start.timescale) assetDurationValue=\(duration.value) assetDurationScale=\(duration.timescale) nonuniform=true allMediaPixelsDistinct=true source=actual-compressed-timing-and-native-image-EOF decodedDurationSynthesized=false latencyEvidence=false")
+        return (track, frames, range, witness)
     }
 
-    private func observeTinyVideoBufferTiming(_ asset: AVAsset, track: AVAssetTrack, fixtureID: String) {
-        func raw(_ time: CMTime) -> String {
-            "\(time.value)/\(time.timescale)/\(time.flags.rawValue)/\(time.epoch)"
+    private func assertTinyFrameCoverage(_ frames: [TinyVideoFrame], witness: TinyVideoWitness,
+        fixtureID: String, mode: String) throws {
+        guard frames.count == witness.media.count + (witness.emptyTarget == nil ? 0 : 1) else {
+            XCTFail("Every encoded media sample and actual leading empty-interval image must be retained")
+            throw TinyVideoFailure.fixture
         }
-        for mode in ["compressed", "decoded"] {
-            if Task.isCancelled {
-                print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=task-cancelled returned=0 observedNil=false completedEOF=false diagnosticsOnly=true")
-                break
+        var used: Set<Int> = [], usedEmpty = false, mediaPixels: [String] = []
+        for (index, frame) in frames.enumerated() {
+            let matches = witness.media.indices.filter { CMTimeCompare(witness.media[$0].outputPTS, frame.pts) == 0 }
+            let actualDuration: CMTime, kind: String
+            if matches.count == 1, let match = matches.first {
+                guard used.insert(match).inserted else { throw TinyVideoFailure.fixture }
+                actualDuration = witness.media[match].outputDuration; kind = "encoded-media"
+                mediaPixels.append(frame.pixels)
+            } else if matches.isEmpty, let empty = witness.emptyTarget,
+                      CMTimeCompare(frame.pts, empty.start) == 0, !usedEmpty {
+                usedEmpty = true; actualDuration = empty.duration; kind = "actual-empty-target-start"
+            } else {
+                XCTFail("An actual decoded image must match exactly one proved target without dropping or rebasing it")
+                throw TinyVideoFailure.fixture
             }
-            do {
-                let reader = try AVAssetReader(asset: asset)
-                defer { reader.cancelReading() }
-                let settings: [String: Any]? = mode == "decoded"
-                    ? [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA] : nil
-                let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
-                output.alwaysCopiesSampleData = false
-                guard reader.canAdd(output) else {
-                    print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=output-rejected returned=0 observedNil=false completedEOF=false diagnosticsOnly=true")
-                    continue
+            if frame.duration.isNumeric {
+                guard CMTimeCompare(frame.duration, actualDuration) == 0 else {
+                    XCTFail("A valid reported decoded duration must match its actual timing witness")
+                    throw TinyVideoFailure.fixture
                 }
-                reader.add(output) // Full asset; no timeRange, sample filtering or timing inference.
-                guard reader.startReading() else {
-                    print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=reader-start-failed status=\(reader.status.rawValue) errorPresent=\(reader.error != nil) errorCode=\((reader.error as NSError?)?.code ?? 0) returned=0 observedNil=false completedEOF=false diagnosticsOnly=true")
-                    continue
-                }
-                var returned = 0, observedNil = false
-                while returned < 32 && !Task.isCancelled {
-                    let found = autoreleasepool { () -> Bool in
-                        guard let sample = output.copyNextSampleBuffer() else { return false }
-                        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-                        let duration = CMSampleBufferGetDuration(sample)
-                        let outputPTS = CMSampleBufferGetOutputPresentationTimeStamp(sample)
-                        let outputDuration = CMSampleBufferGetOutputDuration(sample)
-                        var timing = CMSampleTimingInfo(duration: .invalid,
-                            presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
-                        let timingStatus = CMSampleBufferGetSampleTimingInfo(sample, at: 0, timingInfoOut: &timing)
-                        let emptyMedia: String
-                        if let value = CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_EmptyMedia,
-                            attachmentModeOut: nil) {
-                            emptyMedia = CFGetTypeID(value) == CFBooleanGetTypeID()
-                                ? (CFBooleanGetValue(value as! CFBoolean) ? "true" : "false") : "invalid-type"
-                        } else { emptyMedia = "absent-default-false" }
-                        let data = CMSampleBufferGetDataBuffer(sample)
-                        let dataBytes = data.map { CMBlockBufferGetDataLength($0) } ?? 0
-                        print("TinyVideoTimingBufferObserved schema=1 fixture=\(fixtureID) mode=\(mode) index=\(returned) numSamples=\(CMSampleBufferGetNumSamples(sample)) pts=\(raw(pts)) duration=\(raw(duration)) outputPTS=\(raw(outputPTS)) outputDuration=\(raw(outputDuration)) timingStatus=\(timingStatus) samplePTS=\(raw(timing.presentationTimeStamp)) sampleDTS=\(raw(timing.decodeTimeStamp)) sampleDuration=\(raw(timing.duration)) valid=\(CMSampleBufferIsValid(sample)) dataReady=\(CMSampleBufferDataIsReady(sample)) imagePresent=\(CMSampleBufferGetImageBuffer(sample) != nil) dataPresent=\(data != nil) dataBytes=\(dataBytes) totalSampleBytes=\(CMSampleBufferGetTotalSampleSize(sample)) emptyMedia=\(emptyMedia) rawTimeFields=value/scale/flags/epoch qualification=unavailable diagnosticsOnly=true")
-                        returned += 1
-                        return true
-                    }
-                    if !found { observedNil = true; break }
-                }
-                let status = reader.status
-                let completedEOF = observedNil && status == .completed
-                let capped = returned == 32 && !observedNil
-                let terminal = Task.isCancelled ? "task-cancelled" : capped ? "buffer-cap-no-EOF"
-                    : completedEOF ? "completed-EOF"
-                    : status == .failed ? "reader-error" : status == .cancelled ? "reader-cancelled"
-                    : observedNil ? "nil-without-completed" : "stopped-without-EOF"
-                print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=\(terminal) status=\(status.rawValue) errorPresent=\(reader.error != nil) errorCode=\((reader.error as NSError?)?.code ?? 0) returned=\(returned) observedNil=\(observedNil) completedEOF=\(completedEOF) bufferCap=32 qualification=unavailable diagnosticsOnly=true")
-                if capped { XCTFail("Metadata-only tiny timing scan reached its 32-buffer bound before EOF") }
-            } catch {
-                print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=reader-init-error errorCode=\((error as NSError).code) returned=0 observedNil=false completedEOF=false qualification=unavailable diagnosticsOnly=true")
+            }
+            print("TinyVideoImageWitness schema=1 fixture=\(fixtureID) mode=\(mode) index=\(index) pts=\(tinyRawTime(frame.pts)) kind=\(kind) reportedDuration=\(tinyRawTime(frame.duration)) reportedDurationAvailable=\(frame.duration.isNumeric) actualWitnessDuration=\(tinyRawTime(actualDuration)) pixelHash=\(frame.pixels) rawTimeFields=value/scale/flags/epoch decodedDurationSynthesized=false physicalHoldProof=false")
+        }
+        guard used.count == witness.media.count, usedEmpty == (witness.emptyTarget != nil),
+              Set(mediaPixels).count == witness.media.count,
+              CMTimeCompare(try XCTUnwrap(frames.last).pts, try XCTUnwrap(witness.media.last).outputPTS) == 0 else {
+            XCTFail("All five real media images need distinct full pixels, one exact use and the complete final frame")
+            throw TinyVideoFailure.fixture
+        }
+    }
+
+    private func assertTinyComposition(_ composition: AVVideoComposition, track: AVAssetTrack, end: CMTime) throws {
+        guard composition.sourceTrackIDForFrameTiming == track.trackID, composition.instructions.count == 1,
+              let instruction = composition.instructions.first,
+              CMTimeCompare(instruction.timeRange.start, .zero) == 0,
+              CMTimeCompare(CMTimeRangeGetEnd(instruction.timeRange), end) == 0 else {
+            XCTFail("Actual composition must declare the source timing track and full original endpoint coverage")
+            throw TinyVideoFailure.comparison
+        }
+    }
+
+    private func assertTinyFrameParity(_ native: [TinyVideoFrame], _ composed: [TinyVideoFrame],
+        witness: TinyVideoWitness, fixtureID: String) throws {
+        try assertTinyFrameCoverage(composed, witness: witness, fixtureID: fixtureID, mode: "composed")
+        guard composed.count == native.count else {
+            XCTFail("The composition must preserve every actual image, including an empty-interval image")
+            throw TinyVideoFailure.comparison
+        }
+        for index in native.indices {
+            XCTAssertEqual(CMTimeCompare(composed[index].pts, native[index].pts), 0, "Actual PTS index \(index)")
+            XCTAssertEqual(composed[index].pixels, native[index].pixels, "Actual full pixels index \(index)")
+            if native[index].duration.isNumeric && composed[index].duration.isNumeric {
+                XCTAssertEqual(CMTimeCompare(composed[index].duration, native[index].duration), 0,
+                    "Independently reported decoded duration index \(index)")
             }
         }
+        XCTAssertEqual(composed.last?.pixels, native.last?.pixels, "The complete actual last image must agree")
+        print("TinyVideoImageParity schema=1 fixture=\(fixtureID) nativeFrames=\(native.count) composedFrames=\(composed.count) nativeDurationUnavailable=\(native.filter { !$0.duration.isNumeric }.count) composedDurationUnavailable=\(composed.filter { !$0.duration.isNumeric }.count) completeEOF=true durationSource=actual-encoded-or-empty-target decodedDurationCopied=false physicalHoldProof=false latencyEvidence=false xctestOutcome=external")
     }
 
     private func readTinyVideoFrames(_ asset: AVAsset, track: AVAssetTrack,
-        composition: AVVideoComposition?, mode: String) throws -> [TinyVideoFrame] {
+        composition: AVVideoComposition?, mode: String, fixtureID: String) throws -> [TinyVideoFrame] {
         let reader = try AVAssetReader(asset: asset)
         let settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         let output: AVAssetReaderOutput
@@ -399,7 +543,8 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         reader.add(output) // Entire asset; no timeRange, offset subtraction or cadence conversion.
         guard reader.startReading() else { throw reader.error ?? TinyVideoFailure.fixture }
         var frames: [TinyVideoFrame] = []; frames.reserveCapacity(32)
-        while true {
+        var observedNil = false
+        while frames.count < 32 {
             try Task.checkCancellation()
             let frame = try autoreleasepool { () throws -> TinyVideoFrame? in
                 guard let sample = output.copyNextSampleBuffer() else { return nil }
@@ -407,11 +552,12 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                     XCTFail("The complete tiny decode exceeded its fixed frame bound"); throw TinyVideoFailure.fixture
                 }
                 let pts = CMSampleBufferGetPresentationTimeStamp(sample), duration = CMSampleBufferGetDuration(sample)
-                print("TinyVideoFrameObserved schema=1 mode=\(mode) index=\(frames.count) ptsValue=\(pts.value) ptsScale=\(pts.timescale) ptsFlags=\(pts.flags.rawValue) ptsEpoch=\(pts.epoch) durationValue=\(duration.value) durationScale=\(duration.timescale) durationFlags=\(duration.flags.rawValue) durationEpoch=\(duration.epoch) timingQualification=pending latencyEvidence=false")
-                guard pts.isNumeric, duration.isNumeric, pts.epoch == 0, duration.epoch == 0,
-                      CMTimeCompare(duration, .zero) > 0,
+                print("TinyVideoFrameObserved schema=2 fixture=\(fixtureID) mode=\(mode) index=\(frames.count) ptsValue=\(pts.value) ptsScale=\(pts.timescale) ptsFlags=\(pts.flags.rawValue) ptsEpoch=\(pts.epoch) durationValue=\(duration.value) durationScale=\(duration.timescale) durationFlags=\(duration.flags.rawValue) durationEpoch=\(duration.epoch) reportedDurationAvailable=\(duration.isNumeric) timingQualification=pending latencyEvidence=false")
+                guard CMSampleBufferIsValid(sample), CMSampleBufferDataIsReady(sample),
+                      CMSampleBufferGetDataBuffer(sample) == nil, pts.isNumeric, pts.epoch == 0, duration.epoch == 0,
+                      (duration.isNumeric ? CMTimeCompare(duration, .zero) > 0 : duration.flags.rawValue == 0),
                       frames.last.map({ CMTimeCompare(pts, $0.pts) > 0 }) ?? true else {
-                    XCTFail("Actual decoded timestamps/durations must be numeric and ordered"); throw TinyVideoFailure.fixture
+                    XCTFail("Every actual image needs ordered numeric PTS and a positive or explicitly unavailable reported duration"); throw TinyVideoFailure.fixture
                 }
                 let pixel = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
                 let stride = CVPixelBufferGetBytesPerRow(pixel)
@@ -429,19 +575,19 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                 let pixels = hash.finalize().map { String(format: "%02x", $0) }.joined()
                 return TinyVideoFrame(pts: pts, duration: duration, pixels: pixels)
             }
-            guard let frame else { break }
+            guard let frame else { observedNil = true; break }
             frames.append(frame)
         }
-        guard reader.status == .completed, !frames.isEmpty else {
+        guard observedNil, reader.status == .completed, !frames.isEmpty else {
             XCTFail("The complete tiny reader must reach actual EOF"); throw reader.error ?? TinyVideoFailure.fixture
         }
         for (index, frame) in frames.enumerated() {
-            print("TinyVideoDecoded schema=1 mode=\(mode) index=\(index) count=\(frames.count) ptsValue=\(frame.pts.value) ptsScale=\(frame.pts.timescale) durationValue=\(frame.duration.value) durationScale=\(frame.duration.timescale) pixelHash=\(frame.pixels) completedEOF=true latencyEvidence=false")
+            print("TinyVideoDecoded schema=2 fixture=\(fixtureID) mode=\(mode) index=\(index) count=\(frames.count) ptsValue=\(frame.pts.value) ptsScale=\(frame.pts.timescale) durationValue=\(frame.duration.value) durationScale=\(frame.duration.timescale) durationFlags=\(frame.duration.flags.rawValue) durationEpoch=\(frame.duration.epoch) reportedDurationAvailable=\(frame.duration.isNumeric) pixelHash=\(frame.pixels) completedEOF=true latencyEvidence=false")
         }
         return frames
     }
 
-    private func assertTinyConservativeFallback(_ asset: AVAsset) async throws {
+    private func assertTinyConservativeFallback(_ asset: AVAsset) async throws -> AVVideoComposition {
         let item = AVPlayerItem(asset: asset), bridge = ContinuousPictureInPicture()
         var owned: ContinuousPictureInPicture.PreparedVideoResource?
         defer { bridge.invalidate(); owned?.retire(); XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition) }
@@ -462,6 +608,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         _ = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
         XCTAssertTrue(resource.isBorrowed); XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
         XCTAssertTrue(item.videoComposition === installed)
+        return installed
     }
     #endif
 

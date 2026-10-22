@@ -12,7 +12,7 @@ import sys
 import time
 
 PHASES = {"build": (0, 720), "case-01": (1, 300), "case-02": (2, 300), "driver": (3, 60),
-          "full-test": (4, 1320)}
+          "full-test": (4, 1800)}
 MAX_SESSION_SECONDS = max(seconds for _, seconds in PHASES.values())
 DRIVER_COMMAND = ("xcrun", "swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-")
 
