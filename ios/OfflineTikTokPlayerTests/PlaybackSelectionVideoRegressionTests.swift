@@ -884,11 +884,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     @MainActor @inline(never)
     private func runPreparedNextPrerollArm(_ owner: PreparedNextPrerollOwner) async throws {
         let nativeAttachProbeCalibrated = OPDebugCalibrateNativeAttachProbe()
-        XCTAssertTrue(nativeAttachProbeCalibrated, "The native exception observer must rethrow the original calibration exception")
+        XCTAssertTrue(nativeAttachProbeCalibrated, "The native observer must preserve the original exception as a classified failure without unwinding Swift")
         guard nativeAttachProbeCalibrated else { throw SelectionVideoTestFailure.timeout }
-        print("PrerollAsyncArmBoundary schema=2 token=\(owner.token) phase=entry separateTask=false nativeAttach=observe-rethrow originalGuards=unchanged")
+        print("PrerollAsyncArmBoundary schema=3 token=\(owner.token) phase=entry separateTask=false nativeAttach=classified-failure originalGuards=unchanged")
         try await runPreparedNextVideoFirstFrameCapabilityBeforeSelection(prerollOwner: owner)
-        print("PrerollAsyncArmBoundary schema=2 token=\(owner.token) phase=return separateTask=false nativeAttach=observe-rethrow originalGuards=unchanged")
+        print("PrerollAsyncArmBoundary schema=3 token=\(owner.token) phase=return separateTask=false nativeAttach=classified-failure originalGuards=unchanged")
     }
 
     @MainActor private final class PreparedNextPrerollOwner {
@@ -989,7 +989,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             return result
         }
         @MainActor func boundary(_ operation: String, beforeQueued: Bool, beforeHelper: Bool,
-            afterQueued: Bool, afterHelper: Bool, _ action: @MainActor () -> Void) -> Bool {
+            afterQueued: Bool, afterHelper: Bool,
+            afterSDKAuthorized: @MainActor () -> Bool = { true }, _ action: @MainActor () -> Void) -> Bool {
             #if DEBUG
             let diagnose = claimDiagnosticBoundary(operation)
             if diagnose { diagnosticStage(operation, "pre-owns-entry") }
@@ -1005,6 +1006,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let entry = DispatchTime.now().uptimeNanoseconds
             action()
             let returned = DispatchTime.now().uptimeNanoseconds
+            guard afterSDKAuthorized() else {
+                #if DEBUG
+                if diagnose { diagnosticStage(operation, "classified-failure-no-post-sdk", result: false, cachedNs: returned) }
+                #endif
+                return false
+            }
             #if DEBUG
             if diagnose {
                 diagnosticStage(operation, "action-raw-return", cachedNs: returned)
@@ -1030,6 +1037,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         owner.fixture = fixture; owner.item = b; owner.resource = resource
         owner.cleanupAcknowledged = false
+        @MainActor func retainUnresolvedCleanup(_ stage: String) {
+            owner.cleanupAcknowledged = false
+            Self.unresolvedPreparedPrerollOwner = owner
+            Self.targetedFixtureOwnershipLost = true
+            print("PreparedNextPrerollCleanupFailure schema=1 token=\(owner.token) stage=\(stage) ownerRetained=true fixtureRetained=true sdkQueriesAfterFailure=false consumingProbeAuthorized=false")
+        }
         let created = AVPlayer()
         created.isMuted = true; created.volume = 0
         helper = created; owner.helper = created
@@ -1039,13 +1052,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 afterQueued: false, afterHelper: false) { buffer.player.remove(b) }
         }
         var attached: UInt64 = 0
+        var attachmentAccepted = false
         if valid {
             valid = boundary("attach-same-B", beforeQueued: false, beforeHelper: false,
-                afterQueued: false, afterHelper: true) {
+                afterQueued: false, afterHelper: true, afterSDKAuthorized: { attachmentAccepted }) {
                     attached = DispatchTime.now().uptimeNanoseconds
-                    OPDebugObservePlayerAttachment(created, item: b, token: owner.token)
+                    attachmentAccepted = OPDebugObservePlayerAttachment(created, item: b, token: owner.token)
                 }
         }
+        valid = valid && attachmentAccepted
         let deadline = attached + 1_000_000_000
         let callback = PreparedNextPrerollCallback(token: owner.token, deadline: deadline)
         let callbackToken = owner.token
@@ -1084,22 +1099,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let dwellDelay = dwellReturned > deadline ? dwellReturned - deadline : 0
         // A common 50 ms scheduling/SDK-return quality cap is not extra dwell.
         // Both arms request cleanup at exactly the fixed deadline; no late result qualifies.
-        valid = owns(false, true) && valid && dwellReturned >= deadline
-            && dwellDelay <= 50_000_000 && readyNs != nil
+        if attachmentAccepted {
+            valid = owns(false, true) && valid && dwellReturned >= deadline
+                && dwellDelay <= 50_000_000 && readyNs != nil
+        } else { valid = false }
         // Always clean the exact helper, even after a failed ownership observation.
         #if DEBUG
         diagnosticStage("cleanup-cancel", "entry")
         #endif
         let cancelEntry = DispatchTime.now().uptimeNanoseconds
-        created.cancelPendingPrerolls()
+        let cancelSucceeded = OPDebugCancelPlayerPrerolls(created, token: owner.token)
         let cancelReturn = DispatchTime.now().uptimeNanoseconds
         #if DEBUG
         diagnosticStage("cleanup-cancel", "raw-return", cachedNs: cancelReturn)
         #endif
+        guard cancelSucceeded else {
+            retainUnresolvedCleanup("cancel-rejected")
+            XCTFail("Native cleanup cancellation failed; retain the exact owners without querying the helper")
+            throw SelectionVideoTestFailure.timeout
+        }
         #if DEBUG
         diagnosticStage("cleanup-owner", "entry")
         #endif
-        valid = owns(false, true) && valid
+        if attachmentAccepted { valid = owns(false, true) && valid }
         #if DEBUG
         diagnosticStage("cleanup-owner", "combined-valid-result", result: valid)
         #endif
@@ -1107,13 +1129,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         diagnosticStage("cleanup-detach", "entry")
         #endif
         let detachEntry = DispatchTime.now().uptimeNanoseconds
-        created.replaceCurrentItem(with: nil)
+        let detachSucceeded = cancelSucceeded && OPDebugObservePlayerAttachment(created, item: nil, token: owner.token)
         let detachReturn = DispatchTime.now().uptimeNanoseconds
         #if DEBUG
         diagnosticStage("cleanup-detach", "raw-return", cachedNs: detachReturn)
         #endif
+        guard detachSucceeded else {
+            retainUnresolvedCleanup("detach-rejected")
+            XCTFail("Native cleanup detachment failed; retain the exact owners without querying the helper")
+            throw SelectionVideoTestFailure.timeout
+        }
         let detachDelay = detachReturn > deadline ? detachReturn - deadline : 0
-        let detached = created.currentItem == nil
+        let detached = detachSucceeded && created.currentItem == nil
         valid = owns(false, false) && valid && detachDelay <= 50_000_000
         let cleanupDeadline = cancelEntry + 250_000_000
         while issued, callback.snapshot.count == 0, DispatchTime.now().uptimeNanoseconds < cleanupDeadline {
@@ -1129,7 +1156,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let native = callback.snapshot
         let cleanupReturned = DispatchTime.now().uptimeNanoseconds
         if native.count > 0, observedCallbackNs == nil { observedCallbackNs = cleanupReturned }
-        owner.cleanupAcknowledged = detached && (issued ? native.count == 1 : native.count == 0)
+        owner.cleanupAcknowledged = cancelSucceeded && detached && (issued ? native.count == 1 : native.count == 0)
             && cancelReturn <= cleanupDeadline && detachReturn <= cleanupDeadline
             && cleanupReturned <= cleanupDeadline
         let timelySuccess = issued && native.count == 1 && native.finished == true
@@ -1137,18 +1164,33 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         valid = valid && owner.cleanupAcknowledged && (owner.enabled ? timelySuccess : native.count == 0)
         callbackFinalized = owner.cleanupAcknowledged
         if owner.cleanupAcknowledged { helper = nil; owner.helper = nil }
-        if valid {
+        // Treatment validity stays false after native rejection. Restoration is
+        // independently authorized only by the exact original owners and close.
+        var restorationEligible = owner.cleanupAcknowledged && owns(false, false)
+        var restored = false
+        if restorationEligible {
             var canInsert = false
-            valid = boundary("can-insert-same-B", beforeQueued: false, beforeHelper: false,
-                afterQueued: false, afterHelper: false) {
-                    canInsert = buffer.player.canInsert(b, after: a)
+            restorationEligible = boundary("can-insert-same-B", beforeQueued: false, beforeHelper: false,
+                afterQueued: false, afterHelper: false, afterSDKAuthorized: { canInsert }) {
+                    canInsert = OPDebugCanRestoreQueueItem(buffer.player, item: b, after: a, token: owner.token)
                 } && canInsert
         }
-        if valid {
-            valid = boundary("reinsert-same-B-after-same-A", beforeQueued: false, beforeHelper: false,
-                afterQueued: true, afterHelper: false) { buffer.player.insert(b, after: a) }
+        if restorationEligible {
+            var inserted = false
+            restored = boundary("reinsert-same-B-after-same-A", beforeQueued: false, beforeHelper: false,
+                afterQueued: true, afterHelper: false, afterSDKAuthorized: { inserted }) {
+                    inserted = OPDebugRestoreQueueItem(buffer.player, item: b, after: a, token: owner.token)
+                } && inserted
         }
-        print("PreparedNextPrerollArm schema=1 token=\(owner.token) order=\(owner.order) ordinal=\(owner.ordinal) enabled=\(owner.enabled) setupEntryNs=\(setupEntry) setupReturnNs=\(setupReturn) attachedNs=\(attached) fixedDeadlineNs=\(deadline) dwellReturnNs=\(dwellReturned) dwellDelayNs=\(dwellDelay) detachDelayNs=\(detachDelay) maximumObserverDelayNs=50000000 readyNs=\(readyNs.map { String($0) } ?? "missing") issued=\(issued) callbackCountCappedAtTwo=\(native.count) callbackResult=\(native.finished.map { String($0) } ?? "missing") callbackNativeNs=\(native.time.map { String($0) } ?? "missing") callbackObservedNs=\(observedCallbackNs.map { String($0) } ?? "missing") cancelEntryNs=\(cancelEntry) cancelReturnNs=\(cancelReturn) detachEntryNs=\(detachEntry) detachReturnNs=\(detachReturn) cleanupReturnNs=\(cleanupReturned) helperDetached=\(detached) cleanupAcknowledged=\(owner.cleanupAcknowledged) restored=\(valid) helperRate=\(created.rate) helperMuted=\(created.isMuted) latencyEvidence=false compositorPixels=unmeasured")
+        owner.cleanupAcknowledged = owner.cleanupAcknowledged && restored
+        valid = valid && restored
+        print("PreparedNextPrerollRejectedSetup schema=1 token=\(owner.token) attachmentAccepted=\(attachmentAccepted) restored=\(restored) experimentValid=\(valid) fixedBudgetsUnchanged=true consumingProbeAuthorized=\(valid)")
+        guard restored else {
+            retainUnresolvedCleanup("queue-restoration-unconfirmed")
+            XCTFail("The exact original queue could not be restored; retain owners without further SDK queries")
+            throw SelectionVideoTestFailure.timeout
+        }
+        print("PreparedNextPrerollArm schema=1 token=\(owner.token) order=\(owner.order) ordinal=\(owner.ordinal) enabled=\(owner.enabled) setupEntryNs=\(setupEntry) setupReturnNs=\(setupReturn) attachedNs=\(attached) fixedDeadlineNs=\(deadline) dwellReturnNs=\(dwellReturned) dwellDelayNs=\(dwellDelay) detachDelayNs=\(detachDelay) maximumObserverDelayNs=50000000 readyNs=\(readyNs.map { String($0) } ?? "missing") issued=\(issued) callbackCountCappedAtTwo=\(native.count) callbackResult=\(native.finished.map { String($0) } ?? "missing") callbackNativeNs=\(native.time.map { String($0) } ?? "missing") callbackObservedNs=\(observedCallbackNs.map { String($0) } ?? "missing") cancelEntryNs=\(cancelEntry) cancelReturnNs=\(cancelReturn) detachEntryNs=\(detachEntry) detachReturnNs=\(detachReturn) cleanupReturnNs=\(cleanupReturned) helperDetached=\(detached) cleanupAcknowledged=\(owner.cleanupAcknowledged) restored=\(restored) helperRate=\(created.rate) helperMuted=\(created.isMuted) latencyEvidence=false compositorPixels=unmeasured")
         if owner.cleanupAcknowledged {
             owner.helper = nil; owner.item = nil; owner.resource = nil; owner.fixture = nil
         } else {
@@ -1603,6 +1645,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(traceDefaultFrameMonitor)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
             if enabled {
+                XCTAssertNil(startup.pollSummary)
+                startup.pollSummary = ProductionSelectionPollSummary()
+                print("ProductionSelectionPollScope schema=1 enabled=true clockHandoff=true phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only existingTimingSitesEnabled=true capture=unchanged publication=after-cleanup")
                 startup.enableEarlyNativePulls(baseRequest: service.debugInitialVideoReadyState.generation)
                 service.onDebugCPPNativePullStamp = { [weak startup] value in startup?.recordEarlyNativePull(value) }
                 service.onDebugAlignedVideoEnqueue = { [weak remainingWitness] value in remainingWitness?.record(value) }
@@ -6195,6 +6240,8 @@ private final class RemainingLatencyWitness {
         var commandNs: UInt64 = 0
         var enqueue: PlaybackService.DebugAlignedVideoEnqueue?
         var lastFalse: Poll?, firstTrue: Poll?
+        var lastNotFull: Poll?, firstFull: Poll?
+        var pollsThroughFirstFull: UInt64 = 0
     }
     private let baseRequest: Int
     private var phases = Array(repeating: Phase(), count: 3)
@@ -6227,14 +6274,56 @@ private final class RemainingLatencyWitness {
               entryNs >= phases[phase].commandNs, observedNs >= entryNs else {
             increment(&orphans); return
         }
-        guard phases[phase].firstTrue == nil else { return }
+        guard phases[phase].firstTrue == nil || phases[phase].firstFull == nil else { return }
         let poll = Poll(entryNs: entryNs, observedNs: observedNs, mask: mask, evaluated: evaluated,
             audio: state.audio, requested: state.requested, copied: state.copied,
             submittedPTS: state.frame, submittedCount: state.submitted, owner: owner)
         // Mask127 is exactly the existing custom compound; videoReady/loading
         // remain visible in mask511 and retain their original acceptance guards.
-        if mask & 127 == 127, evaluated == 511 { phases[phase].firstTrue = poll }
-        else { phases[phase].lastFalse = poll }
+        if phases[phase].firstTrue == nil {
+            if mask & 127 == 127, evaluated == 511 { phases[phase].firstTrue = poll }
+            else { phases[phase].lastFalse = poll }
+        }
+        // Independent pair: continue collecting the original full compound after custom127 latches.
+        if phases[phase].firstFull == nil {
+            increment(&phases[phase].pollsThroughFirstFull)
+            if mask == 511, evaluated == 511 { phases[phase].firstFull = poll }
+            else { phases[phase].lastNotFull = poll }
+        }
+    }
+    private func dumpFullPolls(phase: Int, value: Phase) {
+        let full = value.firstFull, previous = value.lastNotFull
+        let covered = full != nil && value.pollsThroughFirstFull > 0
+            && ((previous != nil) == (value.pollsThroughFirstFull > 1))
+        let ordered = full.map { first in
+            previous.map { $0.observedNs <= first.entryNs } ?? (value.pollsThroughFirstFull == 1)
+        } ?? false
+        let afterCustom = full.map { first in
+            value.firstTrue.map { $0.observedNs <= first.observedNs && $0.entryNs <= first.entryNs } ?? false
+        } ?? false
+        print("FullCompoundPollCoverage schema=1 phase=\(phase) commandNs=\(value.commandNs) pairCapacity=2 pollsThroughFirstFull=\(value.pollsThroughFirstFull) lastNotFullAvailable=\(previous != nil) firstFullAvailable=\(full != nil) covered=\(covered) pairOrdered=\(ordered) fullAtOrAfterCustom=\(afterCustom) extraClocks=0 extraSDKQueries=0 clock=DispatchTime publication=after-cleanup")
+        XCTAssertTrue(covered); XCTAssertTrue(ordered); XCTAssertTrue(afterCustom)
+        if let previous { XCTAssertFalse(previous.mask == 511 && previous.evaluated == 511) }
+        if let full { XCTAssertEqual(full.mask, 511); XCTAssertEqual(full.evaluated, 511) }
+        for (variant, poll) in [(0, previous), (1, full)] {
+            guard let poll else {
+                print("FullCompoundPoll schema=1 phase=\(phase) variant=\(variant) available=false qualifyingMask=511 fullAcceptanceMask=511")
+                continue
+            }
+            XCTAssertGreaterThanOrEqual(poll.entryNs, value.commandNs)
+            XCTAssertGreaterThanOrEqual(poll.observedNs, poll.entryNs)
+            let owner = poll.owner, frame = owner.frame
+            let pollOrdinal = variant == 0 && value.pollsThroughFirstFull > 0
+                ? value.pollsThroughFirstFull - 1 : value.pollsThroughFirstFull
+            let joined = value.enqueue.map { enqueue in
+                enqueue.request == owner.request && owner.generation == owner.request
+                    && owner.presentationMatches && owner.observedItemMatches && frame.coherent
+                    && frame.ticket == enqueue.frame.ticket && frame.output == enqueue.frame.output
+                    && frame.seekSerial == enqueue.frame.seekSerial && frame.activeSeekTicket == nil
+                    && frame.imageEpoch == enqueue.frame.imageEpoch && poll.entryNs >= enqueue.frame.enqueuedNs
+            } ?? false
+            print("FullCompoundPoll schema=1 phase=\(phase) variant=\(variant) available=true poll=\(pollOrdinal) commandNs=\(value.commandNs) entryNs=\(poll.entryNs) observedNs=\(poll.observedNs) mask=\(poll.mask) evaluatedMask=\(poll.evaluated) qualifyingMask=511 fullAcceptanceMask=511 request=\(owner.request.map { String($0) } ?? "unknown") generation=\(owner.generation) item=\(frame.ticket.map { String(describing: $0.debugItemIdentity) } ?? "unknown") ticketRevision=\(frame.ticket.map { String($0.debugGeneration) } ?? "unknown") output=\(frame.output.map { String(describing: $0) } ?? "unknown") seekSerial=\(frame.seekSerial) activeSeek=\(frame.activeSeekTicket.map { String($0) } ?? "none") imageEpoch=\(frame.imageEpoch) sameEnqueueEpoch=\(joined) token=\(poll.audio.token) visit=\(poll.audio.visit) audioFrame=\(poll.audio.frame) copiedPTS=\(poll.copied.map { String($0) } ?? "unknown") submittedPTS=\(poll.submittedPTS.map { String($0) } ?? "unknown") requested=\(poll.requested) submittedCount=\(poll.submittedCount) clock=DispatchTime stateOwnerJointCoherence=false")
+        }
     }
     func dumpAndAssert() {
         print("RemainingLatencyWitnessSummary schema=2 phases=3 alignedEnqueues=\(phases.compactMap(\.enqueue).count) pollPairsCapacity=3 uncredited=\(uncredited) orphans=\(orphans) overflow=\(overflow) extraSDKQueries=0 durableFrameProof=false output=after-cleanup")
@@ -6263,6 +6352,7 @@ private final class RemainingLatencyWitness {
                 } ?? false
                 print("AlignedCompoundPoll schema=2 phase=\(phase) variant=\(variant) available=true commandNs=\(value.commandNs) entryNs=\(poll.entryNs) observedNs=\(poll.observedNs) mask=\(poll.mask) evaluatedMask=\(poll.evaluated) qualifyingMask=127 fullAcceptanceMask=511 request=\(owner.request.map { String($0) } ?? "unknown") generation=\(owner.generation) item=\(frame.ticket.map { String(describing: $0.debugItemIdentity) } ?? "unknown") ticketRevision=\(frame.ticket.map { String($0.debugGeneration) } ?? "unknown") output=\(frame.output.map { String(describing: $0) } ?? "unknown") seekSerial=\(frame.seekSerial) activeSeek=\(frame.activeSeekTicket.map { String($0) } ?? "none") imageEpoch=\(frame.imageEpoch) sameEnqueueEpoch=\(joined) token=\(poll.audio.token) visit=\(poll.audio.visit) audioFrame=\(poll.audio.frame) copiedPTS=\(poll.copied.map { String($0) } ?? "unknown") submittedPTS=\(poll.submittedPTS.map { String($0) } ?? "unknown") requested=\(poll.requested) submittedCount=\(poll.submittedCount) clock=DispatchTime stateOwnerJointCoherence=false")
             }
+            dumpFullPolls(phase: phase, value: value)
         }
     }
 }

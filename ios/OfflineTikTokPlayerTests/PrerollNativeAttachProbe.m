@@ -17,10 +17,10 @@ static NSString *OPDebugBoundedExceptionText(NSString *text, NSUInteger limit) {
     return safe;
 }
 
-static BOOL OPDebugAttachReceipt(NSString *phase, uint64_t token, BOOL calibration, NSException *exception) {
-    NSMutableDictionary *record = [@{@"schema": @1, @"operation": @"attach-same-B", @"phase": phase,
+static BOOL OPDebugAttachReceipt(NSString *operation, uint64_t token, BOOL calibration, NSException *exception) {
+    NSMutableDictionary *record = [@{@"schema": @2, @"operation": operation, @"phase": @"classified-exception",
         @"token": @(token), @"pid": @(getpid()), @"calibration": @(calibration),
-        @"swallowsException": @NO, @"stdoutDeliveryAcknowledged": @NO} mutableCopy];
+        @"operationSucceeded": @NO, @"unwindsSwift": @NO, @"stdoutDeliveryAcknowledged": @NO} mutableCopy];
     if (exception) {
         record[@"exceptionName"] = OPDebugBoundedExceptionText(exception.name, 96);
         record[@"exceptionReason"] = OPDebugBoundedExceptionText(exception.reason ?: @"", 384);
@@ -34,24 +34,44 @@ static BOOL OPDebugAttachReceipt(NSString *phase, uint64_t token, BOOL calibrati
     return write(STDERR_FILENO, line.bytes, line.length) == (ssize_t)line.length;
 }
 
-static void OPDebugObserveAttachment(AVPlayer *player, AVPlayerItem *item, uint64_t token,
-                                     BOOL calibration, BOOL *exceptionReceiptWritten) {
+// Every block is created below in Objective-C, never supplied from Swift.
+static BOOL OPDebugObserveOperation(NSString *operation, uint64_t token, BOOL calibration,
+    void (^nativeOperation)(void), NSException **observedException, BOOL *exceptionReceiptWritten) {
     @try {
-        // No Swift closure/frame intervenes between this call and its catch.
-        [player replaceCurrentItemWithPlayerItem:item];
+        nativeOperation();
+        return YES;
     } @catch (NSException *exception) {
-        BOOL written = OPDebugAttachReceipt(@"exception-rethrow", token, calibration, exception);
+        BOOL written = OPDebugAttachReceipt(operation, token, calibration, exception);
+        if (observedException) { *observedException = exception; }
         if (exceptionReceiptWritten) { *exceptionReceiptWritten = written; }
-        @throw;
+        return NO;
     }
 }
 
-void OPDebugObservePlayerAttachment(AVPlayer *player, AVPlayerItem *item, uint64_t token) {
-    OPDebugObserveAttachment(player, item, token, NO, NULL);
+BOOL OPDebugObservePlayerAttachment(AVPlayer *player, AVPlayerItem *item, uint64_t token) {
+    return OPDebugObserveOperation(item ? @"attach-same-B" : @"cleanup-detach", token, NO,
+        ^{ [player replaceCurrentItemWithPlayerItem:item]; }, NULL, NULL);
 }
 
-// Calibrate the same observer's catch, bounded receipt and unchanged exception
-// identity wholly in Objective-C; no exception crosses Swift during calibration.
+BOOL OPDebugCancelPlayerPrerolls(AVPlayer *player, uint64_t token) {
+    return OPDebugObserveOperation(@"cleanup-cancel", token, NO,
+        ^{ [player cancelPendingPrerolls]; }, NULL, NULL);
+}
+
+BOOL OPDebugCanRestoreQueueItem(AVQueuePlayer *player, AVPlayerItem *item, AVPlayerItem *after, uint64_t token) {
+    __block BOOL canInsert = NO;
+    BOOL returned = OPDebugObserveOperation(@"can-insert-same-B", token, NO,
+        ^{ canInsert = [player canInsertItem:item afterItem:after]; }, NULL, NULL);
+    return returned && canInsert;
+}
+
+BOOL OPDebugRestoreQueueItem(AVQueuePlayer *player, AVPlayerItem *item, AVPlayerItem *after, uint64_t token) {
+    return OPDebugObserveOperation(@"reinsert-same-B-after-same-A", token, NO,
+        ^{ [player insertItem:item afterItem:after]; }, NULL, NULL);
+}
+
+// Calibrate classified failure, bounded receipt and original exception identity
+// wholly in Objective-C; no exception crosses Swift.
 @interface OPDebugThrowingAttachmentPlayer : AVPlayer
 @property(nonatomic, strong) NSException *calibrationException;
 @property(nonatomic) NSUInteger attachmentCalls;
@@ -73,14 +93,15 @@ BOOL OPDebugCalibrateNativeAttachProbe(void) {
     player.calibrationException = exception;
     AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:[AVMutableComposition composition]];
     BOOL written = NO;
+    NSException *observed = nil;
+    BOOL succeeded = NO;
     player.armed = YES;
     @try {
-        OPDebugObserveAttachment(player, item, 0, YES, &written);
-    } @catch (NSException *observed) {
-        return observed == exception && player.attachmentCalls == 1 && written;
+        succeeded = OPDebugObserveOperation(@"attach-same-B", 0, YES,
+            ^{ [player replaceCurrentItemWithPlayerItem:item]; }, &observed, &written);
     } @finally {
         player.armed = NO;
         player.calibrationException = nil;
     }
-    return NO;
+    return !succeeded && observed == exception && player.attachmentCalls == 1 && written;
 }
