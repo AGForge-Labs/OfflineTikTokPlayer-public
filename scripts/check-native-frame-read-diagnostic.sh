@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=bbae31de82789d446feaecb29d805f92e4cd6dd2
-expected_ios_tree=39202bc7e291f30a4af790a2af43d46f4a70dd8e
+expected_code_source=503356de331e8078e882ff06f25e11d02c67a9dc
+expected_ios_tree=9a859a7ab2cbe7b77751794653ac2c6c0c1e9f1f
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
@@ -14,6 +14,10 @@ cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -45,9 +49,13 @@ expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery'}
-if len(expected) != 7 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly seven diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff'}
+if len(expected) != 11 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly eleven diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -56,7 +64,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=7 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=11 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -107,7 +115,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=7 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=11 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Invoke the single filtered native attempt.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
