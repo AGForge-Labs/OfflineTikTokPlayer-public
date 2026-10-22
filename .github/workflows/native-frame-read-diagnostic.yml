@@ -1,4 +1,4 @@
-name: Paused timeline repair regressions and baseline validation
+name: Matched native start argument sensitivity validation
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -45,7 +45,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run the paused timeline controls and original benchmark
+      - name: Run only both matched start-argument orders
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
@@ -60,7 +60,7 @@ jobs:
         run: |
           cp artifacts/native/native-frame-read.log artifacts/native/xcodebuild-test.log
           python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
-      - name: Independently require all eight identities and zero native exit
+      - name: Independently require both identities and zero native exit
         id: evidence
         if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
         run: bash scripts/check-native-frame-read-diagnostic.sh --verify-results
