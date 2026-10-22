@@ -1,4 +1,4 @@
-name: Production frame readiness repair checks
+name: Held natural completion command localization
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -45,7 +45,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run ownership readiness continuity and refusal regression checks
+      - name: Run the unchanged real held-completion test with bounded command tracing
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
@@ -60,22 +60,7 @@ jobs:
         run: |
           cp artifacts/native/native-frame-read.log artifacts/native/xcodebuild-test.log
           python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
-      - name: Independently require thirteen exact identities and zero native exit
+      - name: Independently require the exact held-completion identity and zero native exit
         id: evidence
         if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
         run: bash scripts/check-native-frame-read-diagnostic.sh --verify-results
-      - name: Compile the qualified source as an unsigned Release app
-        if: ${{ !cancelled() && steps.native.outcome == 'success' && steps.evidence.outcome == 'success' }}
-        timeout-minutes: 10
-        env:
-          SWIFTC_MAXIMUM_DETERMINISM: '1'
-        run: |
-          set -euo pipefail
-          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
-            -configuration Release -destination 'generic/platform=iOS' \
-            -derivedDataPath artifacts/UnsignedReleaseDerivedData -jobs 1 \
-            SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build \
-            2>&1 | tee artifacts/native/unsigned-release-build.log
-          grep -Fxq '** BUILD SUCCEEDED **' artifacts/native/unsigned-release-build.log
-          printf '%s\n' 'UnsignedReleaseBuildEvidence configuration=Release sdk=iphoneos action=build maximumBuildJobs=1 signed=false archived=false published=false'

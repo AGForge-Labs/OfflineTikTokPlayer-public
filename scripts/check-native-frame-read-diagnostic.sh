@@ -2,26 +2,14 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=868f876cae9a6e45dfe733c3c6cb1051e8542db6
-expected_ios_tree=52490fa51ef029b78399abd0c27137c861b18267
+expected_code_source=f3689f5e4096dc54cb6f7dbb88c276b2de06881c
+expected_ios_tree=32c0cd07b7e628e3f4dcf1933ea829cc6f831e76
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionDefaultReadinessRequiresTheSelectedCPPOutput
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSeekAfterVisibleReadinessRequiresFreshCPPImageBeforeReadyReturns
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff
-  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame
-  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource
-  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks
-  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testSupersededCurrentFrameMonitorCannotCompleteItsReplacement
-  OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testSuspendedPausedImageRequiresTwoFreshTicksAfterResume
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -47,21 +35,9 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionDefaultReadinessRequiresTheSelectedCPPOutput',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSeekAfterVisibleReadinessRequiresFreshCPPImageBeforeReadyReturns',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff',
-    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame',
-    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource',
-    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks',
-    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testSupersededCurrentFrameMonitorCannotCompleteItsReplacement',
-    'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/testSuspendedPausedImageRequiresTwoFreshTicksAfterResume'}
-if len(expected) != 13 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly thirteen diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption'}
+if len(expected) != 1 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly one held-completion diagnostic identity must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -70,7 +46,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=13 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=1 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -165,8 +141,8 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=13 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# Invoke the single filtered native attempt.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=1 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# One unchanged test body localizes rejected injected commands; this cannot accept the app repair.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
 xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
