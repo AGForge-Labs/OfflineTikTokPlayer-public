@@ -730,6 +730,20 @@ extension ContinuousPCMRenderer {
         public var firstFrame: Int64
         public var endFrame: Int64
     }
+    /// Completed app-written pairs only; no PCM, sample-time or callback history.
+    public struct DebugSourceOutputSnapshot: Sendable {
+        public var enabled = false
+        public var callbacks: UInt64 = 0, frames: UInt64 = 0
+        public var stereoZeroFrames: UInt64 = 0, nonfiniteFrames: UInt64 = 0
+        public var longestZeroRun: UInt64 = 0, trailingZeroRun: UInt64 = 0
+        public var invalidCallbacks: UInt64 = 0
+        public var lastHostTime: UInt64 = 0, lastFrameCount: UInt64 = 0
+        public var lastHostTimeValid = false
+    }
+    public struct DebugSourceOutputSpan: Sendable {
+        public let callbacks: UInt64, frames: UInt64
+        public let stereoZeroFrames: UInt64, nonfiniteFrames: UInt64
+    }
     /// A value copy of one record, not a joint snapshot with renderer/worker state.
     public struct DebugRenderAccountingSnapshot: Sendable {
         public var sequence: UInt64 = 0
@@ -754,7 +768,28 @@ extension ContinuousPCMRenderer {
         public var lastSourceHostTimeValid = false
         public var lastSourceHostTime: UInt64 = 0
         public var pcmOrigin: DebugPCMOriginReceipt?
+        public var sourceOutput = DebugSourceOutputSnapshot()
         public var overflowed = false
+
+        /// Source-local completed-callback coverage only. Caller must establish
+        /// the same graph owner; host bounds do not establish tap containment.
+        public func sourceOutputSpan(since before: Self) -> DebugSourceOutputSpan? {
+            let b = before.sourceOutput, e = sourceOutput
+            guard b.enabled, e.enabled, !before.overflowed, !overflowed,
+                  b.callbacks > 0, e.callbacks > b.callbacks, e.frames > b.frames,
+                  before.sourceCallbacksEntered == before.sourceCallbacksCompleted,
+                  sourceCallbacksEntered == sourceCallbacksCompleted,
+                  before.kernelCallsEntered == before.kernelCallsCompleted, kernelCallsEntered == kernelCallsCompleted,
+                  b.callbacks == before.sourceCallbacksCompleted, e.callbacks == sourceCallbacksCompleted,
+                  sourceFramesCompleted >= before.sourceFramesCompleted,
+                  e.frames - b.frames == sourceFramesCompleted - before.sourceFramesCompleted,
+                  e.invalidCallbacks == b.invalidCallbacks,
+                  e.stereoZeroFrames >= b.stereoZeroFrames, e.nonfiniteFrames >= b.nonfiniteFrames,
+                  b.lastHostTimeValid, e.lastHostTimeValid, e.lastHostTime > b.lastHostTime else { return nil }
+            return DebugSourceOutputSpan(callbacks: e.callbacks - b.callbacks, frames: e.frames - b.frames,
+                stereoZeroFrames: e.stereoZeroFrames - b.stereoZeroFrames,
+                nonfiniteFrames: e.nonfiniteFrames - b.nonfiniteFrames)
+        }
     }
 
     /// Optional immutable render configuration. One graph/kernel render writer only.
@@ -762,7 +797,10 @@ extension ContinuousPCMRenderer {
     /// Entry/completion are separate short publications, never odd across render/SDK work.
     public final class DebugRenderAccountingRecorder: @unchecked Sendable {
         public let capturesPCMOrigin: Bool
+        public let capturesSourceOutput: Bool
         private var state = DebugRenderAccountingSnapshot() // Render writer only.
+        private var outputPending = DebugSourceOutputSnapshot()
+        private var outputOpen = false
         private let sequence = Atomic<UInt64>(0)
         private let publicationExhausted = Atomic<Bool>(false)
         private final class PublicationBank: @unchecked Sendable {
@@ -794,8 +832,9 @@ extension ContinuousPCMRenderer {
             }
         }
 
-        public init(capturePCMOrigin: Bool = false) {
-            capturesPCMOrigin = capturePCMOrigin; testHooks = nil
+        public init(capturePCMOrigin: Bool = false, captureSourceOutput: Bool = false) {
+            capturesPCMOrigin = capturePCMOrigin; capturesSourceOutput = captureSourceOutput; testHooks = nil
+            state.sourceOutput.enabled = captureSourceOutput
             if capturePCMOrigin {
                 state.pcmOrigin = DebugPCMOriginReceipt(valid: false, completion: 0,
                     token: 0, visit: 0, epoch: 0, firstFrame: 0, endFrame: 0)
@@ -803,9 +842,10 @@ extension ContinuousPCMRenderer {
             first.value = state
             first.sequence.store(0, ordering: .sequentiallyConsistent)
         }
-        init(capturePCMOrigin: Bool = false, testHooks: PublicationTestHooks) {
+        init(capturePCMOrigin: Bool = false, captureSourceOutput: Bool = false, testHooks: PublicationTestHooks) {
             precondition(testHooks.initialSequence & 1 == 0)
-            capturesPCMOrigin = capturePCMOrigin; self.testHooks = testHooks
+            capturesPCMOrigin = capturePCMOrigin; capturesSourceOutput = captureSourceOutput; self.testHooks = testHooks
+            state.sourceOutput.enabled = captureSourceOutput
             if capturePCMOrigin {
                 state.pcmOrigin = DebugPCMOriginReceipt(valid: false, completion: 0,
                     token: 0, visit: 0, epoch: 0, firstFrame: 0, endFrame: 0)
@@ -828,6 +868,11 @@ extension ContinuousPCMRenderer {
 
         /// Only supplied callback arguments are observed; no host-clock conversion occurs here.
         public func sourceCallbackEntered(frames: Int, hostTimeValid: Bool, hostTime: UInt64) {
+            if capturesSourceOutput {
+                if outputOpen { state.sourceOutput.invalidCallbacks = add(state.sourceOutput.invalidCallbacks, 1) }
+                outputPending = state.sourceOutput
+                outputOpen = true
+            }
             state.sourceCallbacksEntered = add(state.sourceCallbacksEntered, 1)
             state.sourceFramesRequested = add(state.sourceFramesRequested, UInt64(max(0, frames)))
             state.lastSourceFrameCount = UInt64(max(0, frames))
@@ -843,7 +888,42 @@ extension ContinuousPCMRenderer {
                 state.invalidLayoutCallbacks = add(state.invalidLayoutCallbacks, 1)
                 state.invalidLayoutFrames = add(state.invalidLayoutFrames, UInt64(max(0, frames)))
             }
+            if capturesSourceOutput {
+                if outputOpen {
+                    let expected = UInt64(max(0, frames))
+                    let invalid = invalidLayout || frames <= 0 || !state.lastSourceHostTimeValid
+                        || outputPending.frames < state.sourceOutput.frames
+                        || outputPending.frames - state.sourceOutput.frames != expected
+                        || (outputPending.callbacks > 0 && state.lastSourceHostTime <= outputPending.lastHostTime)
+                    if invalid { outputPending.invalidCallbacks = add(outputPending.invalidCallbacks, 1) }
+                    outputPending.callbacks = add(outputPending.callbacks, 1)
+                    outputPending.lastHostTime = state.lastSourceHostTime
+                    outputPending.lastHostTimeValid = state.lastSourceHostTimeValid
+                    outputPending.lastFrameCount = expected
+                    state.sourceOutput = outputPending
+                    outputOpen = false
+                } else { state.sourceOutput.invalidCallbacks = add(state.sourceOutput.invalidCallbacks, 1) }
+            }
             publish()
+        }
+
+        /// The graph supplies the same values it just stored, after DSP. Nothing
+        /// is published per pair; an incomplete callback never becomes complete.
+        public func sourceOutputPair(left: Float, right: Float) {
+            guard capturesSourceOutput else { return }
+            guard outputOpen else {
+                state.sourceOutput.invalidCallbacks = add(state.sourceOutput.invalidCallbacks, 1)
+                return
+            }
+            outputPending.frames = add(outputPending.frames, 1)
+            if !left.isFinite || !right.isFinite {
+                outputPending.nonfiniteFrames = add(outputPending.nonfiniteFrames, 1)
+                outputPending.trailingZeroRun = 0
+            } else if left == 0 && right == 0 {
+                outputPending.stereoZeroFrames = add(outputPending.stereoZeroFrames, 1)
+                outputPending.trailingZeroRun = add(outputPending.trailingZeroRun, 1)
+                outputPending.longestZeroRun = max(outputPending.longestZeroRun, outputPending.trailingZeroRun)
+            } else { outputPending.trailingZeroRun = 0 }
         }
 
         /// Accepted calls only: the original output-span guard has already succeeded.

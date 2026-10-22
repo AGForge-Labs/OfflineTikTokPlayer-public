@@ -1464,13 +1464,8 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             }
         }
         CVPixelBufferUnlockBaseAddress(buffer, [])
+        var acceptedCount = 0
         for index in 0..<frameCount {
-            var attempts = 0
-            while !input.isReadyForMoreMediaData && attempts < 200 {
-                attempts += 1
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            XCTAssertTrue(input.isReadyForMoreMediaData)
             let frameBuffer: CVPixelBuffer
             if presentationTimes != nil {
                 // Separate real buffers prevent the encoder observing later mutations.
@@ -1496,17 +1491,37 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                     }
                 }
             } else { frameBuffer = buffer }
-            if let presentationTimes {
-                XCTAssertTrue(adaptor.append(frameBuffer, withPresentationTime: presentationTimes[index]))
-            } else {
-                XCTAssertTrue(adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(index), timescale: 24)))
+            let pts = presentationTimes?[index] ?? CMTime(value: Int64(index), timescale: 24)
+            var attempts = 0
+            try Task.checkCancellation()
+            while !input.isReadyForMoreMediaData && writer.status == .writing && attempts < 200 {
+                attempts += 1
+                try await Task.sleep(for: .milliseconds(10))
             }
+            try Task.checkCancellation()
+            let status = writer.status, ready = input.isReadyForMoreMediaData
+            guard ready, status == .writing else {
+                print("AsymmetricFixtureWriter schema=1 stage=not-ready index=\(index) frameCount=\(frameCount) pts=\(pts.value)/\(pts.timescale)/\(pts.flags.rawValue)/\(pts.epoch) polls=\(attempts) ready=\(ready) writerStatus=\(status.rawValue) appendIssued=false encodedQualification=unavailable")
+                XCTFail("The fixture writer must be ready before its one append attempt")
+                throw writer.error ?? NSError(domain: "AsymmetricFixtureWriter", code: -6)
+            }
+            var accepted = false
+            XCTAssertTrue({
+                accepted = adaptor.append(frameBuffer, withPresentationTime: pts)
+                return accepted
+            }())
+            guard accepted else {
+                print("AsymmetricFixtureWriter schema=1 stage=append-rejected index=\(index) frameCount=\(frameCount) pts=\(pts.value)/\(pts.timescale)/\(pts.flags.rawValue)/\(pts.epoch) polls=\(attempts) readyAtEntry=\(ready) writerStatusAtEntry=\(status.rawValue) appendAttempts=1 encodedQualification=unavailable")
+                throw writer.error ?? NSError(domain: "AsymmetricFixtureWriter", code: -7)
+            }
+            acceptedCount += 1
         }
         if let endTime { writer.endSession(atSourceTime: endTime) }
         else { writer.endSession(atSourceTime: CMTime(value: Int64(frameCount), timescale: 24)) }
         input.markAsFinished()
         await writer.finishWriting()
-        guard writer.status == .completed else { throw writer.error ?? NSError(domain: AVFoundationErrorDomain, code: -4) }
+        guard writer.status == .completed, acceptedCount == frameCount else { throw writer.error ?? NSError(domain: AVFoundationErrorDomain, code: -4) }
+        print("AsymmetricFixtureWriter schema=1 stage=completed frameCount=\(frameCount) acceptedCount=\(acceptedCount) writerCompleted=true source=writer-call-results encodedQualification=pending")
         completed = true
         return url
     }

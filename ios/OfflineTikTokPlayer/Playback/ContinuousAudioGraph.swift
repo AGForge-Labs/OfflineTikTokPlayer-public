@@ -92,10 +92,27 @@ final class ContinuousAudioGraph {
             while offset < Int(count) {
                 let frames = min(512, Int(count) - offset)
                 storage.renderer.render(interleaved: UnsafeMutableBufferPointer(start: storage.scratch, count: frames * 2), frameCount: frames)
+                #if DEBUG
+                if let audit = storage.debugRenderAccounting, audit.capturesSourceOutput {
+                    for frame in 0..<frames {
+                        let l = storage.scratch[frame * 2]
+                        left[offset + frame] = l
+                        let r = storage.scratch[frame * 2 + 1]
+                        right[offset + frame] = r
+                        audit.sourceOutputPair(left: l, right: r)
+                    }
+                } else {
+                    for frame in 0..<frames {
+                        left[offset + frame] = storage.scratch[frame * 2]
+                        right[offset + frame] = storage.scratch[frame * 2 + 1]
+                    }
+                }
+                #else
                 for frame in 0..<frames {
                     left[offset + frame] = storage.scratch[frame * 2]
                     right[offset + frame] = storage.scratch[frame * 2 + 1]
                 }
+                #endif
                 offset += frames
             }
             if timestamp.pointee.mFlags.contains(.hostTimeValid) {

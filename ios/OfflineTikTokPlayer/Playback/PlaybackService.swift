@@ -1399,30 +1399,43 @@ final class PlaybackService: NSObject {
             lastUnderrun = sample.underrunFrames; recordDiagnostic(.rendererUnderrun)
         }
         if sample.visit != audioVisit {
-            #if DEBUG
-            if shouldDebugDeferAudioVisit?(generation) == true { return }
-            #endif
-            let changedSource = sample.token != audioToken
-            let ownedInitialVisit = consumeInitialZeroVisit(sample, entry: entry, changedSource: changedSource)
-            audioVisit = sample.visit; audioToken = sample.token
-            if !ownedInitialVisit { continuousPiP.flushForSeek() }
-            continuousAudio.adoptRendered(id: entry.id)
-            if changedSource, entry.id != queue.currentID {
-                var following = queue
-                guard following.next(explicit: false) == entry.id else {
-                    continuousAudio.suspend(); return
-                }
-                queue = following
-                let video = buffer.advance(to: entry.id)
-                loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
-            } else if !ownedInitialVisit {
+            visitAdoption: do {
                 #if DEBUG
-                synchronizeVideoToAudio(force: true, reason: .sourceVisit)
-                #else
-                synchronizeVideoToAudio(force: true)
+                if shouldDebugDeferAudioVisit?(generation) == true {
+                    // Only an issued, exact selected start may qualify its clock
+                    // while adoption remains held. Other controls keep the full return.
+                    guard intent.canPlay, videoAllowed,
+                          let binding = pendingInitialClockBinding,
+                          binding.accepted, binding.issued,
+                          statusHandledGeneration == binding.request,
+                          let item = observedItem,
+                          ownsInitialClockBinding(binding, item: item),
+                          initialClockSnapshotMatches(binding, sample) else { return }
+                    break visitAdoption
+                }
                 #endif
+                let changedSource = sample.token != audioToken
+                let ownedInitialVisit = consumeInitialZeroVisit(sample, entry: entry, changedSource: changedSource)
+                audioVisit = sample.visit; audioToken = sample.token
+                if !ownedInitialVisit { continuousPiP.flushForSeek() }
+                continuousAudio.adoptRendered(id: entry.id)
+                if changedSource, entry.id != queue.currentID {
+                    var following = queue
+                    guard following.next(explicit: false) == entry.id else {
+                        continuousAudio.suspend(); return
+                    }
+                    queue = following
+                    let video = buffer.advance(to: entry.id)
+                    loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
+                } else if !ownedInitialVisit {
+                    #if DEBUG
+                    synchronizeVideoToAudio(force: true, reason: .sourceVisit)
+                    #else
+                    synchronizeVideoToAudio(force: true)
+                    #endif
+                }
+                prepareUpcoming()
             }
-            prepareUpcoming()
         }
         clock.sample(position: Double(sample.frame) / 48_000)
         clock.updateDuration(Double(entry.frames) / 48_000)

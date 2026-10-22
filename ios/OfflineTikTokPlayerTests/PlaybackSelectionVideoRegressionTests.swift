@@ -23,6 +23,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     #if DEBUG
     // Test-only immutable per-arm input to the unchanged benchmark signature.
     private var acceptedPCMOriginBenchmarkMode: Bool?
+    private var sourceOutputBenchmarkMode: Bool?
     #endif
 
     private func recordRuntimeHost() throws {
@@ -845,6 +846,35 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTFail("Accepted PCM origin diagnostic requires DEBUG")
         #endif
     }
+
+    func testSourceOutputWitnessOffThenOn() async throws {
+        #if DEBUG
+        try await runSourceOutputWitness(order: "off-then-on", enabled: [false, true])
+        #else
+        XCTFail("Source output witness requires DEBUG")
+        #endif
+    }
+
+    func testSourceOutputWitnessOnThenOff() async throws {
+        #if DEBUG
+        try await runSourceOutputWitness(order: "on-then-off", enabled: [true, false])
+        #else
+        XCTFail("Source output witness requires DEBUG")
+        #endif
+    }
+
+    #if DEBUG
+    private func runSourceOutputWitness(order: String, enabled: [Bool]) async throws {
+        try recordRuntimeHost()
+        defer { sourceOutputBenchmarkMode = nil; acceptedPCMOriginBenchmarkMode = nil }
+        for (ordinal, value) in enabled.enumerated() {
+            acceptedPCMOriginBenchmarkMode = true // Same existing accounting/read timing in both arms.
+            sourceOutputBenchmarkMode = value
+            print("SourceOutputWitnessArm schema=1 order=\(order) ordinal=\(ordinal) enabled=\(value) acceptedOrigin=true fixedWindows=3 secondsPerWindow=8 newSampler=false newSDKQueries=0 perPairAudit=\(value) runtimeFrameJoin=false perturbation=possible originalGuards=retained")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false)
+        }
+    }
+    #endif
 
     func testDefaultFrameMonitorReadTimingUntracedThenTraced() async throws {
         try recordRuntimeHost()
@@ -2188,6 +2218,16 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 traceReturnedAProducerBoundary: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if sourceOutputBenchmarkMode != nil {
+            guard acceptedPCMOriginBenchmarkMode == true, !traceVideoSeeks, frameMonitorAlternative == nil,
+                  !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
+                  !auditSavedAAfterCleanup, traceClockHandoff == nil, freshPreviousBundle == nil,
+                  queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil else {
+                XCTFail("Source-output witness varies only its optional output audit")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
         if let enabled = traceReturnedAProducerBoundary {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
@@ -2301,7 +2341,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let originRecorder = acceptedPCMOrigin == true ? DebugAcceptedPCMOriginRecorder() : nil
         let originReply = acceptedPCMOrigin == true ? ProductionPCMOriginReply() : nil
         let accounting = renderAccounting == true || acceptedPCMOrigin == true
-            ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(capturePCMOrigin: acceptedPCMOrigin == true) : nil
+            ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(capturePCMOrigin: acceptedPCMOrigin == true,
+                captureSourceOutput: sourceOutputBenchmarkMode == true) : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity,
                                           debugRenderAccounting: accounting, debugAcceptedPCMOrigin: originRecorder,
                                           debugFirstFailure: firstFailure)
@@ -2462,6 +2503,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var returnedEnd: Int?
         var returnedOrigin: Double?
         var previousBundleBodyError: Error?
+        #if DEBUG
+        let sourceOutputGraph = sourceOutputBenchmarkMode == nil ? nil : audio.graph
+        var sourceOutputBefore: ContinuousPCMRenderer.DebugRenderAccountingSnapshot?
+        var sourceOutputAfter: ContinuousPCMRenderer.DebugRenderAccountingSnapshot?
+        var sourceOutputOwnerBefore = false
+        #endif
         do {
         for phase in 0..<3 {
             let id = phase == 1 ? fixture.bID : fixture.aID
@@ -2497,6 +2544,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             } else { qualification = nil }
             #else
             qualification = nil
+            #endif
+            #if DEBUG
+            if sourceOutputBenchmarkMode != nil, phase == 2 {
+                sourceOutputOwnerBefore = sourceOutputGraph === audio.graph
+                sourceOutputBefore = accounting?.snapshot() // Before the unchanged command origin.
+            }
             #endif
             let measurement = try await measureProductionSelection(service, screen: screen, fixture: fixture,
                 audio: audio, tap: tap, seeks: seeks, startup: startup, phase: phase, id: id,
@@ -2560,7 +2613,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 before: before, after: after, quantum: service.audioRenderQuantumFrames, result: result,
                 memoryBytes: audio.renderer.retainedPCMMemoryBytes,
                 sameStorage: originalSources == (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }))
-            if phase == 2 { returnedEnd = tap.stop() }
+            if phase == 2 {
+                returnedEnd = tap.stop()
+                #if DEBUG
+                if sourceOutputBenchmarkMode != nil { sourceOutputAfter = accounting?.snapshot() }
+                #endif
+            }
             #if DEBUG
             if let control = suppressionControl {
                 // The original measurement and eight-second sampler/tap endpoint
@@ -2791,6 +2849,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         startup.dumpAndAssert()
         #if DEBUG
         startup.pollSummary?.dumpAndAssert()
+        if let enabled = sourceOutputBenchmarkMode {
+            let owner = sourceOutputOwnerBefore && sourceOutputGraph === audio.graph
+            let span = owner && mayRemoveFixture
+                ? sourceOutputBefore.flatMap { b in sourceOutputAfter?.sourceOutputSpan(since: b) } : nil
+            let zeroFree = span.map { $0.stereoZeroFrames == 0 && $0.nonfiniteFrames == 0 ? "true" : "false" } ?? "unavailable"
+            print("SourceOutputWitness schema=1 enabled=\(enabled) ownerMatches=\(owner) cleanupAcknowledged=\(mayRemoveFixture) beforeAvailable=\(sourceOutputBefore != nil) afterAvailable=\(sourceOutputAfter != nil) sourceLocalCoverage=\(span != nil) coverage=completed-callback-pairs frames=\(span?.frames ?? 0) callbacks=\(span?.callbacks ?? 0) stereoZeroFrames=\(span?.stereoZeroFrames ?? 0) nonfiniteFrames=\(span?.nonfiniteFrames ?? 0) sourceLocalZeroFree=\(zeroFree) actualTapContainment=unqualified runtimeFrameJoin=false causalProof=false")
+            for (label, record) in [("before", sourceOutputBefore), ("after", sourceOutputAfter)] {
+                guard let record else { continue }
+                let output = record.sourceOutput
+                print("SourceOutputEndpoint schema=1 endpoint=\(label) sequence=\(record.sequence) completedCallback=\(output.callbacks) auditedFrames=\(output.frames) stereoZeroFrames=\(output.stereoZeroFrames) nonfiniteFrames=\(output.nonfiniteFrames) cumulativeLongestWrittenZeroRun=\(output.longestZeroRun) invalidCallbacks=\(output.invalidCallbacks) lastCompletedHostValid=\(output.lastHostTimeValid) lastCompletedHostTicks=\(output.lastHostTime) lastCompletedFrameCount=\(output.lastFrameCount) overflow=\(record.overflowed) timestampScope=supplied-not-execution-time")
+            }
+            XCTAssertTrue(owner); XCTAssertNotNil(sourceOutputBefore); XCTAssertNotNil(sourceOutputAfter)
+            if enabled { XCTAssertNotNil(span, "Missing completed output coverage is unavailable, never zero-free") }
+            else {
+                XCTAssertFalse(sourceOutputBefore?.sourceOutput.enabled ?? true)
+                XCTAssertFalse(sourceOutputAfter?.sourceOutput.enabled ?? true)
+            }
+        }
         #endif
         if let previousBundleBodyError {
             // Everything since the retained error report is an existing cached
@@ -3889,6 +3965,276 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testSupersededInitialOrdinaryCompletionCannotClearNewExplicitPausedSeek() async throws {
+        #if DEBUG
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            throw SelectionVideoTestFailure.timeout
+        }
+        let completions = InitialBindingSupersessionHold()
+        var stage = 0, receipt: String?
+        defer {
+            completions.releaseAll()
+            print("InitialBindingSupersessionSummary schema=1 stage=\(stage) retained=\(completions.retainedCount) capacity=2 nativeCallbacks=\(completions.nativeCallbackCount) forwarded=\(completions.forwardedCount) rejected=\(completions.rejectedCommands) overflow=\(completions.overflow) oldFinished=\(completions.finished(at: 0).map { String($0) } ?? "missing") newFinished=\(completions.finished(at: 1).map { String($0) } ?? "missing") oldTaskReturned=\(completions.acknowledged(at: 0)) newTaskReturned=\(completions.acknowledged(at: 1)) cleanupAcknowledged=\(completions.cleanupAcknowledged) intervention=real-native-zero-rate-anchor latencyAcceptance=false xctestOutcome=external")
+            if let receipt { print(receipt) }
+        }
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer,
+            seekVideo: { player, time, callback in completions.seek(player, time, callback) },
+            additionalCleanupAcknowledged: { completions.cleanupAcknowledged }) { fixture, audio, service, screen in
+            let request = service.debugInitialVideoReadyState.generation + 1
+            let ready = SelectionInitialReadyOrderingProbe(generation: request)
+            var starts = 0, interventionQualified = false, observerOverflow = false
+            var expectedItem: ObjectIdentifier?, expectedToken = 0, expectedVisit: Int64 = 0
+            var oldCompletionRates = 0, observeOldCompletion = false
+            service.onDebugInitialVideoReady = { generation in await ready.hold(request: generation) }
+            service.onDebugVideoSeekStamp = { [weak service] stamp in
+                guard let service else { return }
+                completions.recordIssued(stamp, binding: service.debugInitialClockBindingState)
+            }
+            service.onDebugVideoSeekCompletionTerminal = { [weak completions] value in completions?.recordTerminal(value) }
+            service.onDebugVideoRateHandoff = { [weak service] value in
+                guard let service, value.request == request else { return }
+                if value.cause == .correctionCompletion, observeOldCompletion {
+                    if oldCompletionRates < 2 { oldCompletionRates += 1 } else { observerOverflow = true }
+                }
+                guard value.cause == .initialReady else { return }
+                guard starts < 2 else { observerOverflow = true; return }
+                starts += 1
+                guard starts == 1 else { return }
+                let binding = service.debugInitialClockBindingState, sample = service.audioSnapshot
+                interventionQualified = value.entryGeneration == request && value.returnGeneration == request
+                    && value.item == expectedItem && value.presentationUnchanged
+                    && value.presentationTicket != nil && value.presentationTicket == value.returnPresentationTicket
+                    && value.entryObservedItemMatches && value.returnObservedItemMatches && value.requestedRate == 1
+                    && binding.request == request && binding.accepted && binding.issued && binding.nativeSeek == nil
+                    && service.debugInitialVideoReadyState.readyGeneration == nil && service.isLoading
+                    && sample.token == expectedToken && sample.visit == expectedVisit && sample.frame >= 9_600
+                    && !sample.ended && !audio.isSelectionPending(in: sample)
+                guard interventionQualified else { return }
+                // Genuine SDK intervention after the original native start returned.
+                // The unchanged ordinary reader must independently prove >80 ms drift.
+                service.player.setRate(1, time: .zero, atHostTime: CMClockGetTime(CMClockGetHostTimeClock()))
+            }
+            defer {
+                ready.release(); completions.releaseAll()
+                service.onDebugInitialVideoReady = nil; service.onDebugVideoSeekStamp = nil
+                service.onDebugVideoSeekCompletionTerminal = nil; service.onDebugVideoRateHandoff = nil
+            }
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await require({
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return ready.isHolding && state.generation == request && state.readyGeneration == nil
+                    && state.syncingVideoGeneration == nil && state.audioVisit == sample.visit
+                    && sample.token > 0 && sample.visit > 0 && sample.frame >= 9_600 && !sample.ended
+                    && !audio.isSelectionPending(in: sample) && service.wantsToPlay && service.audioEngineRunning
+            }, "Real acknowledged A PCM must advance 200 ms while its original ready callback is held")
+            let item = try XCTUnwrap(service.player.currentItem)
+            let token = try XCTUnwrap(audio.entry(for: fixture.aID)).token
+            let initial = service.audioSnapshot
+            expectedItem = ObjectIdentifier(item); expectedToken = token; expectedVisit = initial.visit
+            XCTAssertEqual(initial.token, token); XCTAssertGreaterThan(token, 0)
+            XCTAssertEqual(initial.underrunFrames, 0)
+            let sources = (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+            completions.arm(player: service.player, request: request, token: token, visit: initial.visit,
+                maximumTarget: SelectionVideoFixture.duration - 2)
+            ready.release()
+            try await require({
+                let state = service.debugInitialVideoReadyState, binding = service.debugInitialClockBindingState
+                let sample = service.audioSnapshot, frame = service.debugAlignedVideoPollState.frame
+                return interventionQualified && starts == 1 && !observerOverflow && completions.isHolding(at: 0)
+                    && completions.rejectedCommands == 0 && !completions.overflow
+                    && state.generation == request && state.readyGeneration == nil && state.syncingVideoGeneration == request
+                    && binding.request == request && binding.accepted && binding.issued
+                    && binding.nativeSeek == completions.stamp(at: 0)?.nativeSeekTicket
+                    && frame.activeSeekTicket == binding.nativeSeek && !frame.coherent
+                    && sample.token == token && sample.visit == initial.visit
+                    && sample.selectionVersion == initial.selectionVersion && sample.frame >= initial.frame
+                    && sample.underrunFrames == initial.underrunFrames && !sample.ended
+                    && service.player.currentItem === item && service.isLoading
+            }, "A real successful ordinary correction must be held while its exact initial binding remains pending")
+            let old = try XCTUnwrap(completions.stamp(at: 0))
+            XCTAssertFalse(old.force); XCTAssertEqual(old.reason, .drift)
+            XCTAssertGreaterThan(abs(old.requestedPosition - (old.ordinaryDriftVideoPositionSeconds ?? .nan)), 0.080)
+            XCTAssertFalse(ready.timedOut); XCTAssertFalse(ready.cancelled); XCTAssertFalse(ready.overflow)
+            stage = 1
+
+            service.pause(); service.seek(0.4)
+            try await require({
+                let state = service.debugInitialVideoReadyState, frame = service.debugAlignedVideoPollState.frame
+                return completions.isHolding(at: 0) && completions.isHolding(at: 1)
+                    && completions.retainedCount == 2 && !completions.overflow && completions.rejectedCommands == 0
+                    && state.generation == request && state.readyGeneration == request && state.syncingVideoGeneration == request
+                    && frame.activeSeekTicket == completions.stamp(at: 1)?.nativeSeekTicket && !frame.coherent
+                    && service.debugInitialClockBindingState.request == nil && !service.isLoading
+                    && !service.wantsToPlay && !service.audioEngineRunning && service.player.currentItem === item
+            }, "The real explicit paused seek must acquire a newer ticket while the old successful callback remains withheld")
+            let newer = try XCTUnwrap(completions.stamp(at: 1))
+            XCTAssertTrue(newer.force); XCTAssertEqual(newer.reason, .userPausedSeek)
+            XCTAssertGreaterThan(newer.nativeSeekTicket, old.nativeSeekTicket)
+            XCTAssertEqual(newer.requestedPosition, 0.4, accuracy: 0.5 / 48_000)
+            let pendingFrame = service.debugAlignedVideoPollState.frame
+            let submitted = service.submittedVideoFrameCount
+            observeOldCompletion = true
+            completions.release(at: 0)
+            let oldReturned = await waitUntil(timeout: 0.75) { completions.acknowledged(at: 0) }
+            let afterOld = service.debugAlignedVideoPollState, afterState = service.debugInitialVideoReadyState
+            XCTAssertTrue(oldReturned, "The exact old service completion task must return before inspecting newer ownership")
+            guard oldReturned else { throw SelectionVideoTestFailure.timeout }
+            stage = 2
+            // The old actual callback must not release, install or activate the newer seek.
+            XCTAssertTrue(completions.isHolding(at: 1)); XCTAssertFalse(completions.acknowledged(at: 1))
+            XCTAssertEqual(afterState.syncingVideoGeneration, request)
+            XCTAssertEqual(afterOld.frame.activeSeekTicket, newer.nativeSeekTicket)
+            XCTAssertEqual(afterOld.frame.ticket, pendingFrame.ticket)
+            XCTAssertFalse(afterOld.frame.coherent)
+            XCTAssertEqual(service.submittedVideoFrameCount, submitted)
+            XCTAssertEqual(oldCompletionRates, 0)
+            XCTAssertEqual(completions.rejectedCommands, 0); XCTAssertFalse(completions.overflow)
+            XCTAssertNil(service.debugInitialClockBindingState.request)
+            XCTAssertFalse(service.wantsToPlay); XCTAssertFalse(service.audioEngineRunning)
+            observeOldCompletion = false
+            completions.release(at: 1)
+            try await require({
+                let sample = service.audioSnapshot
+                return completions.acknowledged(at: 1) && service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                    && service.debugInitialVideoReadyState.readyGeneration == request && !service.isLoading
+                    && !service.wantsToPlay && !service.audioEngineRunning && service.player.rate == 0
+                    && service.player.currentItem === item && abs(service.player.currentTime().seconds - 0.4) < 0.040
+                    && service.videoFramePositionSeconds.map { abs($0 - 0.4) < 0.080 } == true
+                    && sample.token == token && sample.visit > initial.visit && sample.selectionVersion > initial.selectionVersion
+                    && !sample.ended && !audio.isSelectionPending(in: sample) && sample.underrunFrames == 0
+            }, "Only the newer actual completion may reveal the explicit paused .4 frame")
+            stage = 3
+            completions.stopInterception()
+            let paused = service.audioSnapshot
+            try await Task.sleep(for: .milliseconds(200))
+            let held = service.audioSnapshot
+            XCTAssertFalse(service.wantsToPlay); XCTAssertFalse(service.audioEngineRunning); XCTAssertEqual(service.player.rate, 0)
+            XCTAssertEqual(held.token, paused.token); XCTAssertEqual(held.visit, paused.visit)
+            XCTAssertEqual(held.selectionVersion, paused.selectionVersion); XCTAssertEqual(held.frame, paused.frame)
+            XCTAssertEqual(held.underrunFrames, 0)
+            service.play()
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            try await require({ service.audioSnapshot.frame >= held.frame + 2_400 }, "Only explicit Play may resume real A PCM")
+            await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "superseded-initial-ordinary-completion-recovered-A")
+            XCTAssertEqual(starts, 1); XCTAssertFalse(observerOverflow); XCTAssertFalse(completions.overflow)
+            XCTAssertTrue(completions.cleanupAcknowledged); XCTAssertEqual(completions.retainedCount, 2)
+            XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, 6_912_000)
+            XCTAssertEqual((0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }, sources)
+            XCTAssertLessThanOrEqual(service.preparedAudioCount, 3); XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
+            receipt = "InitialBindingSupersessionDecision schema=1 request=\(request) oldTicket=\(old.nativeSeekTicket) newTicket=\(newer.nativeSeekTicket) oldTarget=\(old.requestedPosition) newTarget=\(newer.requestedPosition) oldRead=\(old.ordinaryDriftVideoPositionSeconds.map { String($0) } ?? "missing") pendingBindingAtOldIssue=true oldFinished=\(completions.finished(at: 0) == true) newFinished=\(completions.finished(at: 1) == true) oldTaskReturned=\(oldReturned) newTaskReturned=\(completions.acknowledged(at: 1)) newerSyncAfterOld=\(afterState.syncingVideoGeneration.map { String($0) } ?? "nil") newerActiveAfterOld=\(afterOld.frame.activeSeekTicket.map { String($0) } ?? "nil") coherentAfterOld=\(afterOld.frame.coherent) oldCorrectionRates=\(oldCompletionRates) pausedHoldMs=200 movingRecoveryChecksReturned=true xctestOutcome=external latencyAcceptance=false output=after-owned-cleanup-attempt"
+            stage = 4
+        }
+        #else
+        XCTFail("Genuine initial-binding completion supersession requires DEBUG ownership hooks")
+        #endif
+    }
+
+    #if DEBUG
+    @MainActor private final class InitialBindingSupersessionHold {
+        private struct Held {
+            let stamp: PlaybackService.DebugVideoSeekStamp
+            var callbacks = 0, terminalEvents = 0
+            var finished: Bool?, callback: (@Sendable (Bool) -> Void)?
+            var released = false, forwarded = false
+        }
+        private var slots: [Held] = [] // Exactly two retained actual callback slots.
+        private var player: ObjectIdentifier?, request = 0, token = 0
+        private var visit: Int64 = 0, maximumTarget = 0.0
+        private var armed = false, stopped = false, releasedAll = false
+        private var pendingIssue: PlaybackService.DebugVideoSeekStamp?
+        private(set) var rejectedCommands = 0, overflow = false
+        var retainedCount: Int { slots.count }
+        var nativeCallbackCount: Int { slots.reduce(0) { $0 + $1.callbacks } }
+        var forwardedCount: Int { slots.filter(\.forwarded).count }
+        var cleanupAcknowledged: Bool { rejectedCommands == 0 && !overflow && slots.indices.allSatisfy { acknowledged(at: $0) } }
+        init() { slots.reserveCapacity(2) }
+        func arm(player: AVPlayer, request: Int, token: Int, visit: Int64, maximumTarget: Double) {
+            self.player = ObjectIdentifier(player); self.request = request; self.token = token
+            self.visit = visit; self.maximumTarget = maximumTarget; armed = true
+        }
+        func stamp(at index: Int) -> PlaybackService.DebugVideoSeekStamp? { slots.indices.contains(index) ? slots[index].stamp : nil }
+        func finished(at index: Int) -> Bool? { slots.indices.contains(index) ? slots[index].finished : nil }
+        func isHolding(at index: Int) -> Bool {
+            slots.indices.contains(index) && slots[index].callbacks == 1 && slots[index].finished == true
+                && slots[index].callback != nil && !slots[index].released && !overflow
+        }
+        func acknowledged(at index: Int) -> Bool {
+            guard slots.indices.contains(index) else { return false }
+            let value = slots[index]
+            return !overflow && value.callbacks == 1 && value.forwarded && value.callback == nil && value.terminalEvents == 1
+        }
+        func recordIssued(_ stamp: PlaybackService.DebugVideoSeekStamp,
+            binding: PlaybackService.DebugInitialClockBindingState) {
+            pendingIssue = nil
+            guard armed, !stopped else { return }
+            let common = stamp.request == request && stamp.generation == request && stamp.cachedSelected
+                && stamp.selectedMatchesQueue && stamp.observedItemMatches && stamp.presentationRequestMatches
+                && stamp.cachedAudioToken == token && !stamp.audioLoading && !stamp.pendingAudioSeek
+                && stamp.videoAllowed && stamp.requestedPosition.isFinite
+            let eligible: Bool
+            if slots.isEmpty {
+                eligible = common && !stamp.force && stamp.reason == .drift && stamp.canPlay
+                    && stamp.readyGeneration == nil && stamp.cachedAudioVisit == visit
+                    && binding.request == request && binding.accepted && binding.issued
+                    && binding.nativeSeek == stamp.nativeSeekTicket
+                    && stamp.requestedPosition >= 0.15 && stamp.requestedPosition < maximumTarget
+                    && stamp.ordinaryDriftVideoPositionSeconds.map { $0.isFinite && abs(stamp.requestedPosition - $0) > 0.080 } == true
+            } else {
+                eligible = common && slots.count == 1 && isHolding(at: 0) && stamp.force
+                    && stamp.reason == .userPausedSeek && !stamp.canPlay && stamp.readyGeneration == request
+                    && binding.request == nil && abs(stamp.requestedPosition - 0.4) <= 0.5 / 48_000
+                    && stamp.nativeSeekTicket > slots[0].stamp.nativeSeekTicket
+            }
+            if eligible { pendingIssue = stamp }
+        }
+        func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
+            let issue = pendingIssue; pendingIssue = nil
+            let quantized = issue.map { CMTime(seconds: $0.requestedPosition, preferredTimescale: 48_000) }
+            let eligible = armed && !stopped && slots.count < 2 && self.player == ObjectIdentifier(player)
+                && issue != nil && time.isNumeric && time.timescale == 48_000 && quantized?.isNumeric == true
+                && time.value == quantized?.value && time.epoch == quantized?.epoch
+            let index: Int?
+            if eligible, let issue { index = slots.count; slots.append(Held(stamp: issue)) }
+            else {
+                index = nil
+                if armed, !stopped { if rejectedCommands < 8 { rejectedCommands += 1 } else { overflow = true } }
+            }
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+                guard let index else { completion(finished); return }
+                Task { @MainActor [weak self] in
+                    guard let self else { completion(finished); return }
+                    guard self.slots[index].callbacks == 0 else { self.overflow = true; completion(finished); return }
+                    self.slots[index].callbacks = 1; self.slots[index].finished = finished
+                    if self.releasedAll || self.slots[index].released {
+                        self.slots[index].forwarded = true; completion(finished)
+                    } else { self.slots[index].callback = completion }
+                }
+            }
+        }
+        func release(at index: Int) {
+            guard slots.indices.contains(index) else { return }
+            slots[index].released = true
+            guard let callback = slots[index].callback, let finished = slots[index].finished else { return }
+            slots[index].callback = nil
+            if slots[index].forwarded { overflow = true }
+            slots[index].forwarded = true; callback(finished)
+        }
+        func releaseAll() { releasedAll = true; for index in slots.indices { release(at: index) } }
+        func stopInterception() { stopped = true; pendingIssue = nil }
+        func recordTerminal(_ value: PlaybackService.DebugVideoSeekCompletionTerminal) {
+            for index in slots.indices where slots[index].stamp.request == value.request
+                && slots[index].stamp.nativeSeekTicket == value.nativeSeekTicket {
+                if slots[index].terminalEvents < 2 { slots[index].terminalEvents += 1 } else { overflow = true }
+                if slots[index].terminalEvents != 1 { overflow = true }
+            }
+        }
+    }
+    #endif
+
+
     func testInitialZeroClockBindingPauseBeforeApplicationCannotResumeAndRecovers() async throws {
         #if DEBUG
         try await runInitialClockBindingTransferControl(pausedTarget: nil)
@@ -3917,7 +4263,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private func runInitialClockBindingTransferControl(pausedTarget: Double?,
         beforeInitialStart: Bool = false) async throws {
         var receipt: String?
-        defer { if let receipt { print(receipt) } }
+        let diagnostic = beforeInitialStart || pausedTarget == nil ? InitialClockTransferTrace() : nil
+        defer { diagnostic?.dumpAndAssert(); if let receipt { print(receipt) } }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             throw SelectionVideoTestFailure.timeout
@@ -3954,13 +4301,16 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 // This actual status-acceptance callback precedes metadata and native start.
                 transfer(service)
             }
-            service.onDebugVideoSeekStamp = { value in
+            service.onDebugVideoSeekStamp = { [weak service] value in
+                if value.request == request, let service { diagnostic?.record(service, kind: 0, seek: value) }
                 if value.request == request, value.reason == .userPausedSeek {
                     userSeekIssued = true
                 }
             }
             service.onDebugVideoRateHandoff = { [weak service] value in
-                guard let service, value.request == request, value.cause == .initialReady else { return }
+                guard let service, value.request == request else { return }
+                diagnostic?.record(service, kind: 1, rate: value)
+                guard value.cause == .initialReady else { return }
                 guard starts < 2 else { overflow = true; return }
                 starts += 1
                 if beforeInitialStart { return }
@@ -3978,10 +4328,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 // Real commands after the actual native start returned. No native result is synthesized.
                 transfer(service)
             }
+            if let diagnostic {
+                service.onDebugVideoSeekCompletionTerminal = { [weak service, weak diagnostic] value in
+                    if value.request == request, let service { diagnostic?.record(service, kind: 2, terminal: value) }
+                }
+            }
             defer {
+                diagnostic?.record(service, kind: 3)
+                diagnostic?.phase = 7 // Later captured terminal callbacks belong to owned cleanup.
                 service.onDebugVideoRateHandoff = nil
                 service.onDebugVideoSeekStamp = nil
                 service.onDebugVideoStartupStamp = nil
+                service.onDebugVideoSeekCompletionTerminal = nil
             }
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
             try await require({
@@ -3996,14 +4354,25 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if beforeInitialStart { XCTAssertEqual(readyAccepts, 1) }
             XCTAssertEqual(readyAtReturn, false); XCTAssertEqual(loadingAtReturn, true)
             XCTAssertEqual(pendingAtReturn, true); XCTAssertTrue(transferred)
+            diagnostic?.phase = 1; diagnostic?.record(service, kind: 3)
             if let pausedTarget {
                 try await require({
-                    userSeekIssued && service.debugInitialVideoReadyState.syncingVideoGeneration == nil
-                        && abs(service.player.currentTime().seconds - pausedTarget) < 0.040
-                        && service.videoFramePositionSeconds.map { abs($0 - pausedTarget) < 0.080 } == true
+                    // Cache only the original short-circuit operands, in their original order.
+                    diagnostic?.beginTargetPoll(userSeekIssued: userSeekIssued)
+                    guard userSeekIssued else { return false }
+                    let syncNil = service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                    diagnostic?.targetSyncNil = syncNil
+                    guard syncNil else { return false }
+                    let native = service.player.currentTime().seconds
+                    diagnostic?.targetNative = native
+                    guard abs(native - pausedTarget) < 0.040 else { return false }
+                    let frame = service.videoFramePositionSeconds
+                    diagnostic?.targetFrameEvaluated = true; diagnostic?.targetFrame = frame
+                    return frame.map { abs($0 - pausedTarget) < 0.080 } == true
                 }, "The explicit paused target must own the real completed native seek and custom frame")
                 XCTAssertNil(service.debugInitialClockBindingState.request)
             } else { XCTAssertFalse(userSeekIssued) }
+            diagnostic?.phase = 2; diagnostic?.record(service, kind: 3)
             let paused = audio.renderer.snapshot
             try await Task.sleep(for: .milliseconds(200))
             let held = audio.renderer.snapshot
@@ -4012,12 +4381,16 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(held.token, paused.token); XCTAssertEqual(held.visit, paused.visit)
             XCTAssertEqual(held.selectionVersion, paused.selectionVersion); XCTAssertEqual(held.frame, paused.frame)
             XCTAssertEqual(held.underrunFrames, 0)
+            diagnostic?.phase = 3; diagnostic?.record(service, kind: 3)
             service.play()
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            diagnostic?.phase = 4; diagnostic?.record(service, kind: 3)
             try await require({ service.audioSnapshot.frame >= held.frame + 2_400 },
                 "Only explicit Play may resume actual selected PCM progress")
+            diagnostic?.phase = 5; diagnostic?.record(service, kind: 3)
             await assertMovingVisibleVideo(service, screen: screen, identity: .a,
                 label: pausedTarget == nil ? "initial-clock-pause-recovered-A" : "initial-clock-explicit-seek-recovered-A")
+            diagnostic?.phase = 6; diagnostic?.record(service, kind: 3)
             XCTAssertNil(service.debugInitialClockBindingState.request)
             XCTAssertEqual(service.debugInitialClockBindingState.statusHandledGeneration, request)
             XCTAssertEqual(starts, beforeInitialStart ? 0 : 1); XCTAssertFalse(overflow)
@@ -4026,6 +4399,56 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
             XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
             receipt = "InitialClockBindingTransfer schema=2 beforeInitialStart=\(beforeInitialStart) explicitPausedSeek=\(pausedTarget != nil) request=\(request) actualReadyAccepts=\(readyAccepts) actualInitialStarts=\(starts) qualified=\(qualified) readyAtIntervention=\(readyAtReturn.map { String($0) } ?? "unavailable") loadingAtIntervention=\(loadingAtReturn.map { String($0) } ?? "unavailable") pendingAtIntervention=\(pendingAtReturn.map { String($0) } ?? "unavailable") statusTransferred=\(transferred) pausedHoldMs=200 realUserSeekIssued=\(userSeekIssued) overflow=\(overflow) movingRecoveryChecksReturned=true xctestOutcome=external output=after-owned-cleanup-attempt latencyAcceptance=false"
+        }
+    }
+
+    /// MainActor metadata only. No native getter, renderer snapshot, clock or new frame callback.
+    @MainActor private final class InitialClockTransferTrace {
+        private struct Event {
+            let phase: Int, kind: Int
+            let seek: PlaybackService.DebugVideoSeekStamp?
+            let rate: PlaybackService.DebugVideoRateHandoff?
+            let terminal: PlaybackService.DebugVideoSeekCompletionTerminal?
+            let owner: PlaybackService.DebugAlignedVideoPollState
+            let ready: PlaybackService.DebugInitialVideoReadyState
+            let binding: PlaybackService.DebugInitialClockBindingState
+            let submitted: UInt64, frame: Double?, copied: Double?
+            let videoReady: Bool, loading: Bool, canPlay: Bool
+            let clockPosition: Double, duration: Double
+        }
+        var phase = 0
+        private var events: [Event] = []
+        private var overflow = false
+        private var targetPolls = 0
+        private var targetUserSeekIssued: Bool?
+        var targetSyncNil: Bool?, targetNative: Double?, targetFrame: Double?
+        var targetFrameEvaluated = false
+        init() { events.reserveCapacity(24) }
+        func beginTargetPoll(userSeekIssued: Bool) {
+            if targetPolls < Int.max { targetPolls += 1 } else { overflow = true }
+            targetUserSeekIssued = userSeekIssued; targetSyncNil = nil; targetNative = nil
+            targetFrame = nil; targetFrameEvaluated = false
+        }
+        func record(_ service: PlaybackService, kind: Int,
+            seek: PlaybackService.DebugVideoSeekStamp? = nil,
+            rate: PlaybackService.DebugVideoRateHandoff? = nil,
+            terminal: PlaybackService.DebugVideoSeekCompletionTerminal? = nil) {
+            guard events.count < 24 else { overflow = true; return }
+            events.append(Event(phase: phase, kind: kind, seek: seek, rate: rate, terminal: terminal,
+                owner: service.debugAlignedVideoPollState, ready: service.debugInitialVideoReadyState,
+                binding: service.debugInitialClockBindingState, submitted: service.submittedVideoFrameCount,
+                frame: service.videoFramePositionSeconds, copied: service.copiedVideoFramePositionSeconds,
+                videoReady: service.isVideoReady, loading: service.isLoading, canPlay: service.wantsToPlay,
+                clockPosition: service.clock.position, duration: service.clock.duration))
+        }
+        func dumpAndAssert() {
+            func show<T>(_ value: T?) -> String { value.map { String(describing: $0) } ?? "unavailable" }
+            print("InitialClockTransferTraceCoverage schema=1 retained=\(events.count) capacity=24 overflow=\(overflow) lastPhase=\(phase) targetPolls=\(targetPolls) userSeekIssued=\(show(targetUserSeekIssued)) syncNil=\(show(targetSyncNil)) nativePosition=\(show(targetNative)) frameEvaluated=\(targetFrameEvaluated) framePosition=\(show(targetFrame)) predicateScope=last-original-short-circuit-poll endpointScope=separate-cached-observation nativeFinished=unavailable output=after-owned-cleanup-attempt xctestOutcome=external")
+            XCTAssertFalse(overflow, "The bounded clock-transfer diagnostic must retain all observed metadata")
+            for (index, event) in events.enumerated() {
+                let frame = event.owner.frame, seek = event.seek, rate = event.rate
+                print("InitialClockTransferTrace schema=1 index=\(index) phase=\(event.phase) kind=\(event.kind) generation=\(event.owner.generation) request=\(show(event.owner.request)) readyGeneration=\(show(event.ready.readyGeneration)) syncingGeneration=\(show(event.ready.syncingVideoGeneration)) presentationMatches=\(event.owner.presentationMatches) observedItemMatches=\(event.owner.observedItemMatches) seekSerial=\(frame.seekSerial) activeSeek=\(show(frame.activeSeekTicket)) imageEpoch=\(frame.imageEpoch) coherent=\(frame.coherent) bindingRequest=\(show(event.binding.request)) bindingAccepted=\(event.binding.accepted) bindingIssued=\(event.binding.issued) bindingSeek=\(show(event.binding.nativeSeek)) submitted=\(event.submitted) submittedPTS=\(show(event.frame)) copiedPTS=\(show(event.copied)) videoReady=\(event.videoReady) loading=\(event.loading) canPlay=\(event.canPlay) clockPosition=\(event.clockPosition) duration=\(event.duration) seekReason=\(show(seek?.reason.rawValue)) seekTicket=\(show(seek?.nativeSeekTicket)) seekTarget=\(show(seek?.requestedPosition)) force=\(show(seek?.force)) ordinaryNative=\(show(seek?.ordinaryDriftVideoPositionSeconds)) rateCause=\(show(rate?.cause.rawValue)) requestedRate=\(show(rate?.requestedRate)) rateAnchor=\(show(rate?.anchorTime.seconds)) rateEntryNs=\(show(rate?.entryNs)) rateReturnNs=\(show(rate?.returnNs)) terminalRequest=\(show(event.terminal?.request)) terminalSeek=\(show(event.terminal?.nativeSeekTicket)) nativeFinished=unavailable")
+            }
         }
     }
 
