@@ -3,6 +3,9 @@ import AVKit
 import CoreMedia
 import CoreVideo
 import Foundation
+#if DEBUG
+import CoreFoundation
+#endif
 
 /// A video-only PiP surface. Its supported sample-buffer delegate forwards user commands to
 /// the service that owns continuous audio; muted AVPlayer rate changes are never user commands.
@@ -80,6 +83,10 @@ final class ContinuousPictureInPicture: NSObject {
     @MainActor final class PreparedVideoResource {
         #if DEBUG
         fileprivate(set) var debugSuppressesPlayerRendering = false
+        fileprivate(set) var debugNativeGeometry: VideoResourcePreparation.NativeVideoGeometry?
+        var debugNativeGeometryValidated: Bool { debugNativeGeometry != nil }
+        fileprivate(set) var debugUsesNativeGeometry = false
+        var debugInstalledComposition: AVVideoComposition? { installedComposition }
         #endif
         private(set) weak var item: AVPlayerItem?
         fileprivate(set) var output: AVPlayerItemVideoOutput?
@@ -118,6 +125,58 @@ final class ContinuousPictureInPicture: NSObject {
     }
     /// Metadata only until install. Stale tasks cannot leave an attached output across an await.
     @MainActor final class VideoResourcePreparation {
+        #if DEBUG
+        /// Geometry permission only, not proof of arbitrary source/edit stability.
+        struct NativeVideoGeometry: Equatable {
+            let width: Int32
+            let height: Int32
+            private init(width: Int32, height: Int32) { self.width = width; self.height = height }
+            static func validate(naturalSize: CGSize, preferredTransform: CGAffineTransform,
+                                 formatDescriptions: [CMFormatDescription]) -> NativeVideoGeometry? {
+                guard preferredTransform == .identity,
+                      naturalSize.width.isFinite, naturalSize.height.isFinite,
+                      naturalSize.width > 0, naturalSize.height > 0,
+                      naturalSize.width.rounded() == naturalSize.width,
+                      naturalSize.height.rounded() == naturalSize.height,
+                      naturalSize.width <= CGFloat(Int32.max), naturalSize.height <= CGFloat(Int32.max),
+                      !formatDescriptions.isEmpty else { return nil }
+                let width = Int32(naturalSize.width), height = Int32(naturalSize.height)
+                let fullAperture = CGRect(origin: .zero, size: naturalSize)
+                for description in formatDescriptions {
+                    guard CMFormatDescriptionGetMediaType(description) == kCMMediaType_Video else { return nil }
+                    let coded = CMVideoFormatDescriptionGetDimensions(description)
+                    guard coded.width == width, coded.height == height else { return nil }
+                    if let value = CMFormatDescriptionGetExtension(description,
+                        extensionKey: kCMFormatDescriptionExtension_PixelAspectRatio) {
+                        guard let fields = value as? [String: Any],
+                              let horizontal = scalar(fields[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing as String]),
+                              let vertical = scalar(fields[kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing as String]),
+                              horizontal > 0, horizontal <= Double(Int32.max), horizontal.rounded() == horizontal,
+                              vertical == horizontal else { return nil }
+                    }
+                    if let value = CMFormatDescriptionGetExtension(description,
+                        extensionKey: kCMFormatDescriptionExtension_CleanAperture) {
+                        guard let fields = value as? [String: Any],
+                              scalar(fields[kCMFormatDescriptionKey_CleanApertureWidth as String]) == Double(width),
+                              scalar(fields[kCMFormatDescriptionKey_CleanApertureHeight as String]) == Double(height),
+                              scalar(fields[kCMFormatDescriptionKey_CleanApertureHorizontalOffset as String]) == 0,
+                              scalar(fields[kCMFormatDescriptionKey_CleanApertureVerticalOffset as String]) == 0 else { return nil }
+                    }
+                    guard CMVideoFormatDescriptionGetCleanAperture(description, originIsAtTopLeft: true) == fullAperture,
+                          CMVideoFormatDescriptionGetPresentationDimensions(description,
+                            usePixelAspectRatio: true, useCleanAperture: false) == naturalSize,
+                          CMVideoFormatDescriptionGetPresentationDimensions(description,
+                            usePixelAspectRatio: true, useCleanAperture: true) == naturalSize else { return nil }
+                }
+                return NativeVideoGeometry(width: width, height: height)
+            }
+            private static func scalar(_ value: Any?) -> Double? {
+                guard let number = value as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite else { return nil }
+                return number.doubleValue
+            }
+        }
+        #endif
         private weak var item: AVPlayerItem?
         private var original: AVVideoComposition?
         private var composition: AVVideoComposition?
@@ -125,6 +184,9 @@ final class ContinuousPictureInPicture: NSObject {
         #if DEBUG
         fileprivate weak var debugTraceOwner: ContinuousPictureInPicture?
         private var debugSuppressesPlayerRendering = false
+        fileprivate weak var debugNativeAsset: AVURLAsset?
+        fileprivate var debugNativeGeometry: NativeVideoGeometry?
+        private var debugUsesNativeGeometry = false
         /// Select only before this one-shot plan attaches its output.
         func install(debugSuppressesPlayerRendering: Bool,
                      ifEligible: () -> Bool = { true }) -> PreparedVideoResource? {
@@ -136,13 +198,52 @@ final class ContinuousPictureInPicture: NSObject {
         fileprivate init(item: AVPlayerItem, original: AVVideoComposition?, composition: AVVideoComposition) {
             self.item = item; self.original = original; self.composition = composition
         }
-        func install(ifEligible: () -> Bool = { true }) -> PreparedVideoResource? {
+        #if DEBUG
+        fileprivate init(item: AVPlayerItem, asset: AVURLAsset, nativeGeometry: NativeVideoGeometry) {
+            self.item = item; debugNativeAsset = asset; debugNativeGeometry = nativeGeometry
+            debugUsesNativeGeometry = true
+        }
+        private func debugInstallNative(ifEligible: () -> Bool) -> PreparedVideoResource? {
             guard !consumed else { return nil }
             consumed = true
             defer { composition = nil; original = nil }
+            guard let item, let asset = debugNativeAsset, debugNativeGeometry != nil,
+                  ifEligible(), item.asset === asset, item.videoComposition == nil else { return nil }
+            let resource = PreparedVideoResource(item: item)
+            resource.debugNativeGeometry = debugNativeGeometry; resource.debugUsesNativeGeometry = true
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ])
+            output.suppressesPlayerRendering = debugSuppressesPlayerRendering
+            resource.debugSuppressesPlayerRendering = debugSuppressesPlayerRendering
+            guard ifEligible(), item.asset === asset, item.videoComposition == nil else { resource.retire(); return nil }
+            if let owner = debugTraceOwner {
+                owner.debugTraceRender(.outputAttached) { item.add(output) }
+            } else { item.add(output) }
+            resource.output = output; resource.isAttached = true
+            guard ifEligible(), item.asset === asset, item.videoComposition == nil else { resource.retire(); return nil }
+            return resource
+        }
+        #endif
+        func install(ifEligible: () -> Bool = { true }) -> PreparedVideoResource? {
+            #if DEBUG
+            if debugUsesNativeGeometry { return debugInstallNative(ifEligible: ifEligible) }
+            #endif
+            guard !consumed else { return nil }
+            consumed = true
+            defer { composition = nil; original = nil }
+            #if DEBUG
+            if debugNativeGeometry != nil {
+                guard let item, let asset = debugNativeAsset, item.asset === asset else { return nil }
+            }
+            #endif
             guard let item, let composition, ifEligible(),
                   item.videoComposition === original else { return nil }
             let resource = PreparedVideoResource(item: item)
+            #if DEBUG
+            resource.debugNativeGeometry = debugNativeGeometry
+            #endif
             if original == nil {
                 resource.originalComposition = original
                 #if DEBUG
@@ -192,6 +293,49 @@ final class ContinuousPictureInPicture: NSObject {
         try Task.checkCancellation()
         return VideoResourcePreparation(item: item, original: original, composition: composition)
     }
+    #if DEBUG
+    enum DebugNativeGeometryFailure: Error { case unqualified }
+    /// Explicit comparison API only. The default API above always composes.
+    static func debugPrepareVideoResource(for item: AVPlayerItem, nativeGeometry enabled: Bool) async throws -> VideoResourcePreparation {
+        guard item.videoComposition == nil, let asset = item.asset as? AVURLAsset, asset.url.isFileURL else {
+            throw DebugNativeGeometryFailure.unqualified
+        }
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard tracks.count == 1, let track = tracks.first, try await track.load(.isEnabled) else {
+            throw DebugNativeGeometryFailure.unqualified
+        }
+        let natural = try await track.load(.naturalSize), transform = try await track.load(.preferredTransform)
+        let descriptions = try await track.load(.formatDescriptions)
+        let duration = try await asset.load(.duration), range = try await track.load(.timeRange)
+        let segments = try await track.load(.segments)
+        try Task.checkCancellation()
+        guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0, range.start.isNumeric,
+              range.duration.isNumeric, CMTimeCompare(range.start, .zero) == 0,
+              CMTimeCompare(CMTimeRangeGetEnd(range), duration) == 0,
+              segments.count == 1, let segment = segments.first, !segment.isEmpty else {
+            throw DebugNativeGeometryFailure.unqualified
+        }
+        let mapping = segment.timeMapping
+        guard mapping.source.start.isNumeric, mapping.target.start.isNumeric,
+              mapping.source.duration.isNumeric, mapping.target.duration.isNumeric,
+              CMTimeCompare(mapping.source.start, .zero) >= 0,
+              CMTimeCompare(mapping.target.start, .zero) == 0,
+              CMTimeCompare(mapping.source.duration, duration) == 0,
+              CMTimeCompare(mapping.target.duration, duration) == 0,
+              CMTimeCompare(CMTimeRangeGetEnd(mapping.target), duration) == 0,
+              item.asset === asset, item.videoComposition == nil,
+              let geometry = VideoResourcePreparation.NativeVideoGeometry.validate(naturalSize: natural,
+                preferredTransform: transform, formatDescriptions: descriptions) else {
+            throw DebugNativeGeometryFailure.unqualified
+        }
+        if enabled { return VideoResourcePreparation(item: item, asset: asset, nativeGeometry: geometry) }
+        let plan = try await prepareVideoResource(for: item)
+        try Task.checkCancellation()
+        guard item.asset === asset, item.videoComposition == nil else { throw DebugNativeGeometryFailure.unqualified }
+        plan.debugNativeAsset = asset; plan.debugNativeGeometry = geometry
+        return plan
+    }
+    #endif
     #if DEBUG
     struct DebugNativeSeekState: Equatable, Sendable {
         let serial: UInt64

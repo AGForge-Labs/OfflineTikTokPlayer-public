@@ -24,6 +24,7 @@ final class PlaybackBuffer {
     var previousMediaID: String? { previous?.mediaID }
     #if DEBUG
     let debugSuppressesPlayerRendering: Bool
+    let debugNativeGeometry: Bool?
     var debugPreviousNeedsRewind: Bool? { previous?.needsRewind }
     #endif
     var retainedItems: [AVPlayerItem] {
@@ -55,15 +56,31 @@ final class PlaybackBuffer {
     #if DEBUG
     init(debugSuppressesPlayerRendering: Bool) {
         self.debugSuppressesPlayerRendering = debugSuppressesPlayerRendering
+        debugNativeGeometry = nil
         player.actionAtItemEnd = .pause
         observation = player.observe(\.currentItem, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in self?.synchronize() }
         }
     }
+    init(debugNativeGeometry: Bool) {
+        self.debugNativeGeometry = debugNativeGeometry
+        debugSuppressesPlayerRendering = false
+        player.actionAtItemEnd = .pause
+        observation = player.observe(\.currentItem, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in self?.synchronize() }
+        }
+    }
+    func debugPrepareVideoResource(for item: AVPlayerItem) async throws -> ContinuousPictureInPicture.VideoResourcePreparation {
+        if let enabled = debugNativeGeometry {
+            return try await ContinuousPictureInPicture.debugPrepareVideoResource(for: item, nativeGeometry: enabled)
+        }
+        return try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+    }
     #endif
     init() {
         #if DEBUG
         debugSuppressesPlayerRendering = false
+        debugNativeGeometry = nil
         #endif
         player.actionAtItemEnd = .pause
         observation = player.observe(\.currentItem, options: [.new]) { [weak self] _, _ in

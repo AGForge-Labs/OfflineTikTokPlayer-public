@@ -206,6 +206,292 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         print("NativeGeometryVideoDecode schema=1 nativeFrames=\(native.count) composedFrames=\(composed.count) activeBytesPerReader=\(native.bytes) nativePTSHash=\(native.ptsHash) composedPTSHash=\(composed.ptsHash) nativePixelHash=\(native.pixelHash) composedPixelHash=\(composed.pixelHash) nativeLastFrameHash=\(native.lastFrameHash) composedLastFrameHash=\(composed.lastFrameHash) completeEOF=true scope=full-source-video-decode playbackEvidence=false latencyEvidence=false")
     }
 
+    func testZeroBasedVFRNativeComparisonPreservesEveryImportedFrameAndTimestamp() async throws {
+        #if DEBUG
+        let times = [0, 1, 3, 6, 7].map { CMTime(value: Int64($0), timescale: 24) }
+        let end = CMTime(value: 8, timescale: 24)
+        let url = try await makeAsymmetricVideo(transform: .identity, frameCount: times.count,
+            presentationTimes: times, endTime: end)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = AVURLAsset(url: url)
+        let (track, native, _) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end)
+        let item = AVPlayerItem(asset: asset), bridge = ContinuousPictureInPicture()
+        var owned: ContinuousPictureInPicture.PreparedVideoResource?
+        defer { bridge.invalidate(); owned?.retire(); XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition) }
+        let plan = try await ContinuousPictureInPicture.debugPrepareVideoResource(for: item, nativeGeometry: true)
+        owned = plan.install()
+        let resource = try XCTUnwrap(owned), output = try XCTUnwrap(resource.output)
+        XCTAssertNil(item.videoComposition)
+        XCTAssertTrue(resource.debugNativeGeometryValidated); XCTAssertTrue(resource.debugUsesNativeGeometry)
+        XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(item.outputs.first === output)
+        _ = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+        XCTAssertTrue(resource.isBorrowed); XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
+        let composition = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
+        let composed = try readTinyVideoFrames(asset, track: track, composition: composition, mode: "composed")
+        guard composed.count == native.count else {
+            XCTFail("The composition must preserve the complete actual VFR frame count"); throw TinyVideoFailure.comparison
+        }
+        for index in native.indices {
+            XCTAssertEqual(CMTimeCompare(composed[index].pts, native[index].pts), 0, "VFR actual PTS index \(index)")
+            XCTAssertEqual(CMTimeCompare(composed[index].duration, native[index].duration), 0, "VFR duration index \(index)")
+            XCTAssertEqual(composed[index].pixels, native[index].pixels, "VFR actual pixels index \(index)")
+        }
+        XCTAssertTrue(resource.isBorrowed); XCTAssertEqual(item.outputs.count, 1)
+        #else
+        XCTFail("VFR comparison requires the separate DEBUG native preparation API")
+        #endif
+    }
+
+    func testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback() async throws {
+        #if DEBUG
+        let times = [6, 7, 9, 12, 13].map { CMTime(value: Int64($0), timescale: 24) }
+        let end = CMTime(value: 14, timescale: 24)
+        let url = try await makeAsymmetricVideo(transform: .identity, frameCount: times.count,
+            presentationTimes: times, endTime: end)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = AVURLAsset(url: url)
+        let (track, native, range) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end)
+        guard CMTimeCompare(try XCTUnwrap(native.first).pts, .zero) > 0 else {
+            XCTFail("The offset must survive actual import and complete native decode"); throw TinyVideoFailure.fixture
+        }
+        try await assertTinyConservativeFallback(asset)
+        let mutable = AVMutableComposition()
+        let target = try XCTUnwrap(mutable.addMutableTrack(withMediaType: .video,
+            preferredTrackID: kCMPersistentTrackID_Invalid))
+        try target.insertTimeRange(range, of: track, at: .zero)
+        try await assertTinyConservativeFallback(mutable)
+        let immutable = try XCTUnwrap(mutable.copy() as? AVComposition)
+        XCTAssertFalse(immutable is AVMutableComposition)
+        try await assertTinyConservativeFallback(immutable)
+        #else
+        XCTFail("Offset/composition refusal requires the separate DEBUG native preparation API")
+        #endif
+    }
+
+    #if DEBUG
+    private enum TinyVideoFailure: Error { case fixture, comparison, policy }
+    private struct TinyVideoFrame { let pts: CMTime, duration: CMTime, pixels: String }
+
+    private func qualifyTinyImportedVideo(_ asset: AVURLAsset, expectedTimes: [CMTime], end: CMTime)
+        async throws -> (AVAssetTrack, [TinyVideoFrame], CMTimeRange) {
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard tracks.count == 1, let track = tracks.first else {
+            XCTFail("The tiny imported fixture needs exactly one actual video track"); throw TinyVideoFailure.fixture
+        }
+        let range = try await track.load(.timeRange), duration = try await asset.load(.duration)
+        print("TinyVideoImportObserved schema=1 rangeStartValue=\(range.start.value) rangeStartScale=\(range.start.timescale) rangeStartFlags=\(range.start.flags.rawValue) rangeStartEpoch=\(range.start.epoch) rangeDurationValue=\(range.duration.value) rangeDurationScale=\(range.duration.timescale) rangeDurationFlags=\(range.duration.flags.rawValue) assetDurationValue=\(duration.value) assetDurationScale=\(duration.timescale) assetDurationFlags=\(duration.flags.rawValue) fixtureQualification=pending latencyEvidence=false")
+        let segments = try await track.load(.segments)
+        func raw(_ time: CMTime) -> String {
+            "\(time.value)/\(time.timescale)/\(time.flags.rawValue)/\(time.epoch)"
+        }
+        print("TinyVideoSegmentsObserved schema=1 count=\(segments.count) emitted=\(min(segments.count, 8)) truncated=\(segments.count > 8) expectedFirst=\(raw(expectedTimes[0])) rawTimeFields=value/scale/flags/epoch fixtureQualification=pending latencyEvidence=false")
+        for (index, segment) in segments.prefix(8).enumerated() {
+            let mapping = segment.timeMapping
+            print("TinyVideoSegmentObserved schema=1 index=\(index) isEmpty=\(segment.isEmpty) sourceStart=\(raw(mapping.source.start)) sourceDuration=\(raw(mapping.source.duration)) targetStart=\(raw(mapping.target.start)) targetDuration=\(raw(mapping.target.duration)) rawTimeFields=value/scale/flags/epoch fixtureQualification=pending latencyEvidence=false")
+        }
+        let frames = try readTinyVideoFrames(asset, track: track, composition: nil, mode: "native")
+        guard frames.count == expectedTimes.count, frames.count >= 3, frames.count <= 8,
+              range.start.isNumeric, range.duration.isNumeric, duration.isNumeric,
+              (CMTimeCompare(range.start, expectedTimes[0]) == 0 || CMTimeCompare(range.start, .zero) == 0),
+              CMTimeCompare(duration, end) == 0,
+              CMTimeCompare(CMTimeRangeGetEnd(range), end) == 0,
+              Set(frames.map { $0.pixels }).count == frames.count else {
+            XCTFail("Actual imported range, all distinguishable native frames and endpoint must qualify"); throw TinyVideoFailure.fixture
+        }
+        for index in frames.indices {
+            guard CMTimeCompare(frames[index].pts, expectedTimes[index]) == 0 else {
+                XCTFail("Writer inputs are not proof: actual imported PTS index \(index) must match"); throw TinyVideoFailure.fixture
+            }
+            let next = index + 1 < frames.count ? frames[index + 1].pts : end
+            guard CMTimeCompare(CMTimeAdd(frames[index].pts, frames[index].duration), next) == 0 else {
+                XCTFail("Every actual native sample duration must preserve full coverage"); throw TinyVideoFailure.fixture
+            }
+        }
+        let intervals = zip(frames, frames.dropFirst()).map { CMTimeSubtract($1.pts, $0.pts) }
+        guard intervals.dropFirst().contains(where: { CMTimeCompare($0, intervals[0]) != 0 }) else {
+            XCTFail("The imported native sequence must remain nonuniform"); throw TinyVideoFailure.fixture
+        }
+        print("TinyVideoImported schema=1 frames=\(frames.count) rangeStartValue=\(range.start.value) rangeStartScale=\(range.start.timescale) rangeDurationValue=\(range.duration.value) rangeDurationScale=\(range.duration.timescale) assetDurationValue=\(duration.value) assetDurationScale=\(duration.timescale) nonuniform=true allPixelsDistinct=true source=actual-import-and-native-EOF latencyEvidence=false")
+        return (track, frames, range)
+    }
+
+    private func readTinyVideoFrames(_ asset: AVAsset, track: AVAssetTrack,
+        composition: AVVideoComposition?, mode: String) throws -> [TinyVideoFrame] {
+        let reader = try AVAssetReader(asset: asset)
+        let settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+        let output: AVAssetReaderOutput
+        if let composition {
+            let composed = AVAssetReaderVideoCompositionOutput(videoTracks: [track], videoSettings: settings)
+            composed.videoComposition = composition; output = composed
+        } else { output = AVAssetReaderTrackOutput(track: track, outputSettings: settings) }
+        output.alwaysCopiesSampleData = false
+        defer { reader.cancelReading() }
+        guard reader.canAdd(output) else { throw TinyVideoFailure.fixture }
+        reader.add(output) // Entire asset; no timeRange, offset subtraction or cadence conversion.
+        guard reader.startReading() else { throw reader.error ?? TinyVideoFailure.fixture }
+        var frames: [TinyVideoFrame] = []; frames.reserveCapacity(32)
+        while true {
+            try Task.checkCancellation()
+            let frame = try autoreleasepool { () throws -> TinyVideoFrame? in
+                guard let sample = output.copyNextSampleBuffer() else { return nil }
+                guard frames.count < 32, CMSampleBufferGetNumSamples(sample) == 1 else {
+                    XCTFail("The complete tiny decode exceeded its fixed frame bound"); throw TinyVideoFailure.fixture
+                }
+                let pts = CMSampleBufferGetPresentationTimeStamp(sample), duration = CMSampleBufferGetDuration(sample)
+                print("TinyVideoFrameObserved schema=1 mode=\(mode) index=\(frames.count) ptsValue=\(pts.value) ptsScale=\(pts.timescale) ptsFlags=\(pts.flags.rawValue) ptsEpoch=\(pts.epoch) durationValue=\(duration.value) durationScale=\(duration.timescale) durationFlags=\(duration.flags.rawValue) durationEpoch=\(duration.epoch) timingQualification=pending latencyEvidence=false")
+                guard pts.isNumeric, duration.isNumeric, pts.epoch == 0, duration.epoch == 0,
+                      CMTimeCompare(duration, .zero) > 0,
+                      frames.last.map({ CMTimeCompare(pts, $0.pts) > 0 }) ?? true else {
+                    XCTFail("Actual decoded timestamps/durations must be numeric and ordered"); throw TinyVideoFailure.fixture
+                }
+                let pixel = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+                let stride = CVPixelBufferGetBytesPerRow(pixel)
+                guard CVPixelBufferGetWidth(pixel) == 32, CVPixelBufferGetHeight(pixel) == 16,
+                      !CVPixelBufferIsPlanar(pixel), CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
+                      stride >= 128, stride <= 4_096, CVPixelBufferGetDataSize(pixel) >= stride * 16,
+                      CVPixelBufferGetDataSize(pixel) <= 1_048_576,
+                      CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else {
+                    XCTFail("Every actual tiny frame needs bounded full BGRA pixels"); throw TinyVideoFailure.fixture
+                }
+                defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+                let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixel))
+                var hash = SHA256()
+                for row in 0..<16 { hash.update(data: Data(bytes: base.advanced(by: row * stride), count: 128)) }
+                let pixels = hash.finalize().map { String(format: "%02x", $0) }.joined()
+                return TinyVideoFrame(pts: pts, duration: duration, pixels: pixels)
+            }
+            guard let frame else { break }
+            frames.append(frame)
+        }
+        guard reader.status == .completed, !frames.isEmpty else {
+            XCTFail("The complete tiny reader must reach actual EOF"); throw reader.error ?? TinyVideoFailure.fixture
+        }
+        for (index, frame) in frames.enumerated() {
+            print("TinyVideoDecoded schema=1 mode=\(mode) index=\(index) count=\(frames.count) ptsValue=\(frame.pts.value) ptsScale=\(frame.pts.timescale) durationValue=\(frame.duration.value) durationScale=\(frame.duration.timescale) pixelHash=\(frame.pixels) completedEOF=true latencyEvidence=false")
+        }
+        return frames
+    }
+
+    private func assertTinyConservativeFallback(_ asset: AVAsset) async throws {
+        let item = AVPlayerItem(asset: asset), bridge = ContinuousPictureInPicture()
+        var owned: ContinuousPictureInPicture.PreparedVideoResource?
+        defer { bridge.invalidate(); owned?.retire(); XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition) }
+        for enabled in [false, true] {
+            var refused = false
+            do {
+                _ = try await ContinuousPictureInPicture.debugPrepareVideoResource(for: item, nativeGeometry: enabled)
+            } catch ContinuousPictureInPicture.DebugNativeGeometryFailure.unqualified { refused = true }
+            XCTAssertTrue(refused, "Both explicit comparison arms must refuse this unqualified asset")
+            guard refused else { throw TinyVideoFailure.policy }
+            XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition)
+        }
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+        owned = plan.install()
+        let resource = try XCTUnwrap(owned), installed = try XCTUnwrap(item.videoComposition)
+        let output = try XCTUnwrap(resource.output)
+        XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(item.outputs.first === output)
+        _ = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+        XCTAssertTrue(resource.isBorrowed); XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
+        XCTAssertTrue(item.videoComposition === installed)
+    }
+    #endif
+
+    func testNativeVideoGeometryRequiresSquareFullIntegralIdentityDescriptions() throws {
+        #if DEBUG
+        typealias Geometry = ContinuousPictureInPicture.VideoResourcePreparation.NativeVideoGeometry
+        let size = CGSize(width: 160, height: 96)
+        func description(width: Int32 = 160, height: Int32 = 96,
+                         extensions: [String: Any] = [:]) throws -> CMFormatDescription {
+            var result: CMVideoFormatDescription?
+            let status = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+                codecType: kCVPixelFormatType_32BGRA, width: width, height: height,
+                extensions: extensions.isEmpty ? nil : (extensions as CFDictionary), formatDescriptionOut: &result)
+            XCTAssertEqual(status, 0, "CoreMedia must create the actual geometry description")
+            return try XCTUnwrap(result)
+        }
+        let aperture: [String: Any] = [
+            kCMFormatDescriptionKey_CleanApertureWidth as String: 160,
+            kCMFormatDescriptionKey_CleanApertureHeight as String: 96,
+            kCMFormatDescriptionKey_CleanApertureHorizontalOffset as String: 0,
+            kCMFormatDescriptionKey_CleanApertureVerticalOffset as String: 0
+        ]
+        let square: [String: Any] = [
+            kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing as String: 1,
+            kCMFormatDescriptionKey_PixelAspectRatioVerticalSpacing as String: 1
+        ]
+        let plain = try description()
+        let full = try description(extensions: [
+            kCMFormatDescriptionExtension_CleanAperture as String: aperture,
+            kCMFormatDescriptionExtension_PixelAspectRatio as String: square
+        ])
+        for formats in [[plain], [full], [plain, full]] {
+            let proof = try XCTUnwrap(Geometry.validate(naturalSize: size, preferredTransform: .identity,
+                formatDescriptions: formats))
+            XCTAssertEqual(proof.width, 160); XCTAssertEqual(proof.height, 96)
+        }
+        var cropped = aperture, nonSquare = square, compensated = aperture
+        cropped[kCMFormatDescriptionKey_CleanApertureWidth as String] = 144
+        nonSquare[kCMFormatDescriptionKey_PixelAspectRatioHorizontalSpacing as String] = 2
+        compensated[kCMFormatDescriptionKey_CleanApertureWidth as String] = 80
+        let crop = try description(extensions: [kCMFormatDescriptionExtension_CleanAperture as String: cropped])
+        let aspect = try description(extensions: [kCMFormatDescriptionExtension_PixelAspectRatio as String: nonSquare])
+        let cropAspect = try description(extensions: [
+            kCMFormatDescriptionExtension_CleanAperture as String: compensated,
+            kCMFormatDescriptionExtension_PixelAspectRatio as String: nonSquare
+        ])
+        let wide = try description(width: 320)
+        let refusals: [(String, CGSize, CGAffineTransform, [CMFormatDescription])] = [
+            ("rotated", size, CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 96, ty: 0), [plain]),
+            ("mirrored", size, CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: 160, ty: 0), [plain]),
+            ("translated", size, CGAffineTransform(translationX: 1, y: 0), [plain]),
+            ("fractional-size", CGSize(width: 160.5, height: 96), .identity, [plain]),
+            ("empty-size", .zero, .identity, [plain]),
+            ("empty-descriptions", size, .identity, []),
+            ("mixed-coded-dimensions", size, .identity, [plain, wide]),
+            ("crop", size, .identity, [crop]),
+            ("non-square-PAR", size, .identity, [aspect]),
+            ("crop-aspect-compensation", size, .identity, [cropAspect])
+        ]
+        for (label, natural, transform, formats) in refusals {
+            XCTAssertNil(Geometry.validate(naturalSize: natural, preferredTransform: transform,
+                formatDescriptions: formats), label)
+        }
+        #else
+        XCTFail("Native geometry proof validation requires the DEBUG comparison API")
+        #endif
+    }
+
+    func testPreparedExistingVideoCompositionSurvivesPreparationBorrowAndRetirement() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let asset = AVURLAsset(url: url)
+        let item = AVPlayerItem(asset: asset)
+        let external = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
+        item.videoComposition = external
+        let installedExternal = try XCTUnwrap(item.videoComposition)
+        let bridge = ContinuousPictureInPicture()
+        var owned: ContinuousPictureInPicture.PreparedVideoResource?
+        defer {
+            bridge.invalidate(); owned?.retire()
+            XCTAssertTrue(item.outputs.isEmpty)
+            XCTAssertTrue(item.videoComposition === installedExternal)
+        }
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+        XCTAssertTrue(item.videoComposition === installedExternal)
+        owned = plan.install()
+        let resource = try XCTUnwrap(owned), output = try XCTUnwrap(resource.output)
+        XCTAssertTrue(item.videoComposition === installedExternal)
+        XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(item.outputs.first === output)
+        _ = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+        XCTAssertTrue(resource.isAttached); XCTAssertTrue(resource.isBorrowed); XCTAssertFalse(resource.isRetired)
+        resource.retire()
+        XCTAssertTrue(resource.isRetired); XCTAssertTrue(resource.isBorrowed); XCTAssertTrue(resource.isAttached)
+        XCTAssertTrue(resource.output === output); XCTAssertEqual(item.outputs.count, 1)
+        XCTAssertTrue(item.videoComposition === installedExternal)
+        bridge.setCurrentItem(nil)
+        XCTAssertFalse(resource.isBorrowed); XCTAssertFalse(resource.isAttached); XCTAssertNil(resource.output)
+        XCTAssertTrue(item.outputs.isEmpty); XCTAssertTrue(item.videoComposition === installedExternal)
+    }
+
     func testPortraitAndMirrorCompositionProducesOrientedPixelsAndPreservesSourceTiming() async throws {
         let cases: [(CGAffineTransform, CGSize, Bool)] = [
             (CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 16, ty: 0), CGSize(width: 16, height: 32), false),
@@ -222,10 +508,25 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             XCTAssertEqual(composition.renderSize, expectedSize)
             XCTAssertEqual(composition.sourceTrackIDForFrameTiming, track.trackID)
             XCTAssertEqual(CMTimeCompare(try XCTUnwrap(composition.instructions.first).timeRange.duration, duration), 0)
+            let item = AVPlayerItem(asset: asset)
+            var owned: ContinuousPictureInPicture.PreparedVideoResource?
+            defer {
+                owned?.retire()
+                XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition)
+            }
+            let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+            owned = plan.install()
+            let resource = try XCTUnwrap(owned), preparedOutput = try XCTUnwrap(resource.output)
+            let routed = try XCTUnwrap(item.videoComposition, "Non-native geometry must route through preparation's composition")
+            XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired); XCTAssertFalse(resource.isBorrowed)
+            XCTAssertEqual(item.outputs.count, 1); XCTAssertTrue(item.outputs.first === preparedOutput)
+            XCTAssertEqual(routed.renderSize, expectedSize)
+            XCTAssertEqual(routed.sourceTrackIDForFrameTiming, track.trackID)
+            XCTAssertEqual(CMTimeCompare(try XCTUnwrap(routed.instructions.first).timeRange.duration, duration), 0)
             let reader = try AVAssetReader(asset: asset)
             let output = AVAssetReaderVideoCompositionOutput(videoTracks: tracks,
                 videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-            output.videoComposition = composition
+            output.videoComposition = routed
             reader.add(output)
             XCTAssertTrue(reader.startReading())
             defer { reader.cancelReading() }
@@ -242,6 +543,8 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             }
             let second = try XCTUnwrap(output.copyNextSampleBuffer())
             XCTAssertEqual(CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(second)), 1.0 / 24, accuracy: 0.000_01)
+            XCTAssertNil(output.copyNextSampleBuffer())
+            XCTAssertEqual(reader.status, .completed)
         }
     }
 
@@ -775,7 +1078,22 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         return returned && completion.result == true
     }
 
-    private func makeAsymmetricVideo(transform: CGAffineTransform, frameCount: Int = 2) async throws -> URL {
+    private func makeAsymmetricVideo(transform: CGAffineTransform, frameCount: Int = 2,
+        presentationTimes: [CMTime]? = nil, endTime: CMTime? = nil) async throws -> URL {
+        if let presentationTimes {
+            guard frameCount >= 3, frameCount <= 8, presentationTimes.count == frameCount,
+                  let endTime, endTime.isNumeric, endTime.epoch == 0,
+                  presentationTimes.allSatisfy({ $0.isNumeric && $0.epoch == 0 }),
+                  CMTimeCompare(presentationTimes[0], .zero) >= 0,
+                  CMTimeCompare(endTime, presentationTimes[frameCount - 1]) > 0 else {
+                throw NSError(domain: "TimedAsymmetricFixture", code: -1)
+            }
+            for index in 1..<frameCount {
+                guard CMTimeCompare(presentationTimes[index], presentationTimes[index - 1]) > 0 else {
+                    throw NSError(domain: "TimedAsymmetricFixture", code: -2)
+                }
+            }
+        } else if endTime != nil { throw NSError(domain: "TimedAsymmetricFixture", code: -3) }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("mov")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         var completed = false
@@ -789,6 +1107,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 32, AVVideoHeightKey: 16
         ])
         input.transform = transform
+        if presentationTimes != nil { input.mediaTimeScale = 600 }
         let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: 32, kCVPixelBufferHeightKey as String: 16,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:]]
@@ -820,9 +1139,39 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(10))
             }
             XCTAssertTrue(input.isReadyForMoreMediaData)
-            XCTAssertTrue(adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(index), timescale: 24)))
+            let frameBuffer: CVPixelBuffer
+            if presentationTimes != nil {
+                // Separate real buffers prevent the encoder observing later mutations.
+                var generated: CVPixelBuffer?
+                guard CVPixelBufferCreate(kCFAllocatorDefault, 32, 16, kCVPixelFormatType_32BGRA,
+                    attributes as CFDictionary, &generated) == kCVReturnSuccess, let generated else {
+                    throw NSError(domain: "TimedAsymmetricFixture", code: -4)
+                }
+                frameBuffer = generated
+                guard CVPixelBufferLockBaseAddress(frameBuffer, []) == kCVReturnSuccess else {
+                    throw NSError(domain: "TimedAsymmetricFixture", code: -5)
+                }
+                defer { CVPixelBufferUnlockBaseAddress(frameBuffer, []) }
+                let pixels = try XCTUnwrap(CVPixelBufferGetBaseAddress(frameBuffer)).assumingMemoryBound(to: UInt8.self)
+                let stride = CVPixelBufferGetBytesPerRow(frameBuffer)
+                for row in 0..<16 {
+                    for column in 0..<32 {
+                        let offset = row * stride + column * 4
+                        pixels[offset] = column < 16 ? UInt8(index * 16) : 255
+                        pixels[offset + 1] = UInt8(index * 24)
+                        pixels[offset + 2] = column < 16 ? 255 : UInt8(index * 8)
+                        pixels[offset + 3] = 255
+                    }
+                }
+            } else { frameBuffer = buffer }
+            if let presentationTimes {
+                XCTAssertTrue(adaptor.append(frameBuffer, withPresentationTime: presentationTimes[index]))
+            } else {
+                XCTAssertTrue(adaptor.append(buffer, withPresentationTime: CMTime(value: Int64(index), timescale: 24)))
+            }
         }
-        writer.endSession(atSourceTime: CMTime(value: Int64(frameCount), timescale: 24))
+        if let endTime { writer.endSession(atSourceTime: endTime) }
+        else { writer.endSession(atSourceTime: CMTime(value: Int64(frameCount), timescale: 24)) }
         input.markAsFinished()
         await writer.finishWriting()
         guard writer.status == .completed else { throw writer.error ?? NSError(domain: AVFoundationErrorDomain, code: -4) }

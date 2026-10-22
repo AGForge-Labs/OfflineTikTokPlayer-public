@@ -529,6 +529,38 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testPreparedNativeGeometryOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [false, true].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PreparedNativeGeometryArm schema=1 armID=\(armID) order=off-then-on ordinal=\(ordinal) nativeGeometry=\(enabled) suppressesPlayerRendering=false otherInstrumentation=unset preparation=explicit-validated-file-only defaultPrepareAPI=composed captures=post-each-stream design=ordered-fresh-fixture-not-causal-proof acceptance=unchanged")
+            defer { print("PreparedNativeGeometryArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false, nativeVideoGeometry: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Native geometry comparison requires DEBUG")
+        #endif
+    }
+
+    func testPreparedNativeGeometryOnThenOff() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [true, false].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PreparedNativeGeometryArm schema=1 armID=\(armID) order=on-then-off ordinal=\(ordinal) nativeGeometry=\(enabled) suppressesPlayerRendering=false otherInstrumentation=unset preparation=explicit-validated-file-only defaultPrepareAPI=composed captures=post-each-stream design=ordered-fresh-fixture-not-causal-proof acceptance=unchanged")
+            defer { print("PreparedNativeGeometryArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false, nativeVideoGeometry: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Native geometry comparison requires DEBUG")
+        #endif
+    }
+
     func testPreparedVideoRenderingSuppressionOffThenOn() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -2002,20 +2034,22 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 auditSavedAAfterCleanup: Bool = false,
                                                 traceClockHandoff: Bool? = nil,
                                                 freshPreviousBundle: Bool? = nil,
-                                                suppressNativePlayerRendering: Bool? = nil) async throws {
+                                                suppressNativePlayerRendering: Bool? = nil,
+                                                nativeVideoGeometry: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
-        if suppressNativePlayerRendering != nil {
+        if suppressNativePlayerRendering != nil || nativeVideoGeometry != nil {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil,
                   !auditSavedAAfterCleanup, traceClockHandoff == nil,
-                  freshPreviousBundle == nil, acceptedPCMOriginBenchmarkMode == nil else {
+                  freshPreviousBundle == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  !(suppressNativePlayerRendering != nil && nativeVideoGeometry != nil) else {
                 XCTFail("Suppression control requires the otherwise unset production benchmark")
                 throw SelectionVideoTestFailure.timeout
             }
         }
         #else
-        if suppressNativePlayerRendering != nil {
+        if suppressNativePlayerRendering != nil || nativeVideoGeometry != nil {
             XCTFail("Suppression control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
         }
@@ -2036,8 +2070,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             references.append((try await fixture.decodedTone(id: id), frequency))
         }
         #if DEBUG
-        let suppressionControl = suppressNativePlayerRendering.map {
-            PreparedRenderingSuppressionControl(enabled: $0, fixture: fixture)
+        let suppressionControl: PreparedRenderingSuppressionControl?
+        if let nativeVideoGeometry {
+            suppressionControl = PreparedRenderingSuppressionControl(enabled: false, fixture: fixture,
+                nativeGeometry: nativeVideoGeometry)
+        } else {
+            suppressionControl = suppressNativePlayerRendering.map {
+                PreparedRenderingSuppressionControl(enabled: $0, fixture: fixture)
+            }
         }
         let previousBundleControl: SelectionPreviousBundleControl?
         if let fresh = freshPreviousBundle {
@@ -2302,7 +2342,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 // history; they never stand in for the original timed evidence.
                 try control.qualify(phase: phase, stage: 2, service: service, audio: audio)
                 await assertMovingVisibleVideo(service, screen: screen, identity: phase == 1 ? .b : .a,
-                    label: "suppression-\(control.enabled ? "on" : "off")-phase-\(phase)")
+                    label: control.captureLabel(phase: phase))
                 try control.qualify(phase: phase, stage: 3, service: service, audio: audio)
             }
             try previousBundleControl?.completedPhase(phase, service: service, audio: audio)
@@ -2377,7 +2417,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             // or skip the existing queued-cleanup acknowledgement to report it.
             #if DEBUG
             if suppressionControl != nil {
-                XCTFail("Prepared suppression setup/owner qualification failed: \(previousBundleBodyError)")
+                XCTFail("Prepared rendering setup/owner qualification failed: \(previousBundleBodyError)")
             } else {
                 XCTFail("Previous-bundle setup/owner qualification failed: \(previousBundleBodyError)")
             }
@@ -6021,6 +6061,7 @@ private final class ProductionSelectionPollSummary {
 private final class PreparedRenderingSuppressionControl {
     enum Failure: Error { case qualification(Int, Int) }
     let enabled: Bool
+    let nativeGeometry: Bool?
     let buffer: PlaybackBuffer
     private let aID: String, bID: String
     private let urls: [String: URL]
@@ -6033,10 +6074,13 @@ private final class PreparedRenderingSuppressionControl {
         var source = false, oneOutput = false, prepared = false, borrowed = false
         var identity = false, cppOwner = false
         var actualMode = -1, resourceMode = -1
+        var geometryQualified = true, geometryValidated = false, usesNativeGeometry = false
+        var compositionPresent = -1
+        var geometryWidth = -1, geometryHeight = -1
         func qualifies(mode: Bool, borrowed expectedBorrow: Bool) -> Bool {
             source && oneOutput && prepared && borrowed == expectedBorrow && identity
                 && actualMode == (mode ? 1 : 0) && resourceMode == (mode ? 1 : 0)
-                && (!expectedBorrow || cppOwner)
+                && (!expectedBorrow || cppOwner) && geometryQualified
         }
     }
     private struct Row {
@@ -6048,12 +6092,25 @@ private final class PreparedRenderingSuppressionControl {
     }
     private var rows: [Row] = []
     private var overflow = false
-    init(enabled: Bool, fixture: SelectionVideoFixture) {
+    init(enabled: Bool, fixture: SelectionVideoFixture, nativeGeometry: Bool? = nil) {
         self.enabled = enabled
-        buffer = PlaybackBuffer(debugSuppressesPlayerRendering: enabled)
+        self.nativeGeometry = nativeGeometry
+        if let nativeGeometry { buffer = PlaybackBuffer(debugNativeGeometry: nativeGeometry) }
+        else { buffer = PlaybackBuffer(debugSuppressesPlayerRendering: enabled) }
         aID = fixture.aID; bID = fixture.bID
         urls = fixture.savedURLs.mapValues { $0.standardizedFileURL }
         rows.reserveCapacity(12)
+    }
+    func captureLabel(phase: Int) -> String {
+        if let nativeGeometry { return "native-geometry-\(nativeGeometry ? "on" : "off")-phase-\(phase)" }
+        return "suppression-\(enabled ? "on" : "off")-phase-\(phase)"
+    }
+    private func geometryMatches(_ item: AVPlayerItem, resource: ContinuousPictureInPicture.PreparedVideoResource,
+                                 actualComposition: AVVideoComposition?) -> Bool {
+        guard let nativeGeometry else { return true }
+        return resource.debugNativeGeometryValidated && resource.debugUsesNativeGeometry == nativeGeometry
+            && (nativeGeometry ? actualComposition == nil
+                : actualComposition != nil && actualComposition === resource.debugInstalledComposition)
     }
     private func rememberOrMatch(_ item: AVPlayerItem,
         resource: ContinuousPictureInPicture.PreparedVideoResource, output: AVPlayerItemVideoOutput,
@@ -6085,6 +6142,16 @@ private final class PreparedRenderingSuppressionControl {
         result.borrowed = resource.isBorrowed
         result.actualMode = output.suppressesPlayerRendering ? 1 : 0
         result.resourceMode = resource.debugSuppressesPlayerRendering ? 1 : 0
+        if nativeGeometry != nil {
+            let composition = item.videoComposition
+            result.compositionPresent = composition == nil ? 0 : 1
+            result.geometryValidated = resource.debugNativeGeometryValidated
+            result.usesNativeGeometry = resource.debugUsesNativeGeometry
+            if let geometry = resource.debugNativeGeometry {
+                result.geometryWidth = Int(geometry.width); result.geometryHeight = Int(geometry.height)
+            }
+            result.geometryQualified = geometryMatches(item, resource: resource, actualComposition: composition)
+        }
         result.identity = rememberOrMatch(item, resource: resource, output: output, id: id, remember: remember)
         let owner = service.debugAlignedVideoPollState
         result.cppOwner = owner.presentationMatches && owner.observedItemMatches && owner.frame.coherent
@@ -6117,6 +6184,7 @@ private final class PreparedRenderingSuppressionControl {
             return outputs.count == 1 && outputs.first === output
                 && resource.debugSuppressesPlayerRendering == enabled
                 && output.suppressesPlayerRendering == enabled
+                && (nativeGeometry == nil || geometryMatches(item, resource: resource, actualComposition: item.videoComposition))
         }
         let finalAudio = audio.renderer.snapshot
         let ownerStable = service.player.currentItem === selectedItem
@@ -6130,6 +6198,7 @@ private final class PreparedRenderingSuppressionControl {
             : selectedItem == nil && service.queue.currentID == nil && audio.selectedID == nil && retained.isEmpty
         let mode = service.debugUsesCurrentCustomFrameForReadiness
             && buffer.debugSuppressesPlayerRendering == enabled && service.player === buffer.player
+            && buffer.debugNativeGeometry == nativeGeometry
         let selectedReady = !selectedRequired || (service.isVideoReady && !service.isLoading)
         let qualified = ownerStable && audioOwner && selectedReady && mode && retained.count <= 3 && allRetainedPolicies
             && (!selectedRequired || selected.qualifies(mode: enabled, borrowed: true))
@@ -6143,10 +6212,20 @@ private final class PreparedRenderingSuppressionControl {
         guard qualified else { throw Failure.qualification(phase, stage) }
     }
     func dumpAndAssert(setupCompleted: Bool) {
+        if let nativeGeometry {
+            print("PreparedNativeGeometryScope schema=1 nativeGeometry=\(nativeGeometry) suppressesPlayerRendering=\(enabled) rows=\(rows.count) capacity=12 overflow=\(overflow) setupCompleted=\(setupCompleted) currentCPPMonitor=true sdkReads=outside-original-windows fallback=unqualified eligibility=file-single-enabled-full-zero-based-track-known-geometry-only originalCaptureFreeWorkload=false captures=post-each-stream causalBenefit=unproven")
+            for (ordinal, row) in rows.enumerated() {
+                print("PreparedNativeGeometryQualification schema=1 ordinal=\(ordinal) phase=\(row.phase) stage=\(row.stage) beginNs=\(row.begin) endNs=\(row.end) retained=\(row.retained) selectedRequired=\(row.selectedRequired) selectedSource=\(row.selected.source) selectedOneOutput=\(row.selected.oneOutput) selectedPrepared=\(row.selected.prepared) selectedBorrowed=\(row.selected.borrowed) selectedIdentity=\(row.selected.identity) selectedCPPOwner=\(row.selected.cppOwner) selectedCompositionPresent=\(row.selected.compositionPresent) selectedActualSuppression=\(row.selected.actualMode) selectedResourceSuppression=\(row.selected.resourceMode) selectedGeometryValidated=\(row.selected.geometryValidated) selectedGeometryWidth=\(row.selected.geometryWidth) selectedGeometryHeight=\(row.selected.geometryHeight) selectedUsesNativeGeometry=\(row.selected.usesNativeGeometry) selectedGeometryQualified=\(row.selected.geometryQualified) targetRequired=\(row.targetRequired) targetSource=\(row.target.source) targetOneOutput=\(row.target.oneOutput) targetPrepared=\(row.target.prepared) targetBorrowed=\(row.target.borrowed) targetIdentity=\(row.target.identity) targetCompositionPresent=\(row.target.compositionPresent) targetActualSuppression=\(row.target.actualMode) targetResourceSuppression=\(row.target.resourceMode) targetGeometryValidated=\(row.target.geometryValidated) targetGeometryWidth=\(row.target.geometryWidth) targetGeometryHeight=\(row.target.geometryHeight) targetUsesNativeGeometry=\(row.target.usesNativeGeometry) targetGeometryQualified=\(row.target.geometryQualified) allRetainedPolicies=\(row.allRetainedPolicies) ownerStable=\(row.ownerStable) audioOwner=\(row.audioOwner) selectedReady=\(row.selectedReady) mode=\(row.mode) qualified=\(row.qualified)")
+            }
+        }
+        if nativeGeometry == nil {
         print("PreparedRenderingSuppressionScope schema=1 suppressesPlayerRendering=\(enabled) rows=\(rows.count) capacity=12 overflow=\(overflow) setupCompleted=\(setupCompleted) currentCPPMonitor=true sdkReads=outside-original-windows fallback=unqualified retainedClaim=published-boundaries-only captures=post-each-stream originalCaptureFreeWorkload=false causalBenefit=unproven")
+        }
         XCTAssertFalse(overflow); XCTAssertTrue(setupCompleted); XCTAssertEqual(rows.count, 12)
         for (ordinal, row) in rows.enumerated() {
+            if nativeGeometry == nil {
             print("PreparedRenderingSuppressionQualification schema=1 ordinal=\(ordinal) phase=\(row.phase) stage=\(row.stage) beginNs=\(row.begin) endNs=\(row.end) retained=\(row.retained) selectedRequired=\(row.selectedRequired) selectedSource=\(row.selected.source) selectedOneOutput=\(row.selected.oneOutput) selectedPrepared=\(row.selected.prepared) selectedBorrowed=\(row.selected.borrowed) selectedIdentity=\(row.selected.identity) selectedCPPOwner=\(row.selected.cppOwner) selectedActualMode=\(row.selected.actualMode) selectedResourceMode=\(row.selected.resourceMode) targetRequired=\(row.targetRequired) targetSource=\(row.target.source) targetOneOutput=\(row.target.oneOutput) targetPrepared=\(row.target.prepared) targetBorrowed=\(row.target.borrowed) targetIdentity=\(row.target.identity) targetActualMode=\(row.target.actualMode) targetResourceMode=\(row.target.resourceMode) allRetainedPolicies=\(row.allRetainedPolicies) ownerStable=\(row.ownerStable) audioOwner=\(row.audioOwner) selectedReady=\(row.selectedReady) mode=\(row.mode) qualified=\(row.qualified)")
+            }
             XCTAssertTrue(row.qualified)
             XCTAssertLessThanOrEqual(row.retained, 3)
             XCTAssertGreaterThanOrEqual(row.end, row.begin)

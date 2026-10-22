@@ -733,7 +733,11 @@ final class PlaybackService: NSObject {
                     self.resumeContinuousAudio()
                     self.recordPlaybackEvent("coldAudioPrepared")
                     // Audio starts first; video setup still commits before this item joins the queue.
+                    #if DEBUG
+                    let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: playerItem)
+                    #else
                     let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: playerItem)
+                    #endif
                     guard !Task.isCancelled, self.generation == request else { return }
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.bufferReplaceAndObserve, request: request)
@@ -1105,7 +1109,11 @@ final class PlaybackService: NSObject {
                     playerItem.preferredForwardBufferDuration = 8
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+                    #if DEBUG
+                    let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: playerItem)
+                    #else
                     let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: playerItem)
+                    #endif
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil),
                         after: active?.id, videoPreparation: videoPreparation, ifEligible: {
@@ -1129,7 +1137,11 @@ final class PlaybackService: NSObject {
                     _ = await PlaybackPreparation.value(within: .milliseconds(500)) { try? await item.asset.load(.isPlayable) }
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+                    #if DEBUG
+                    let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: item)
+                    #else
                     let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: item)
+                    #endif
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stagePrevious(.init(mediaID: previous.id, item: item, isLocal: saved != nil || cached != nil),
                         videoPreparation: videoPreparation, ifEligible: {
@@ -1153,7 +1165,11 @@ final class PlaybackService: NSObject {
                     if requireLocal || !self.buffer.hasPrepared(item.id) {
                         let playerItem = AVPlayerItem(url: url)
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
+                        #if DEBUG
+                        let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: playerItem)
+                        #else
                         let videoPreparation = try? await ContinuousPictureInPicture.prepareVideoResource(for: playerItem)
+                        #endif
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
                         self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal,
                             after: active?.id, videoPreparation: videoPreparation, ifEligible: {
