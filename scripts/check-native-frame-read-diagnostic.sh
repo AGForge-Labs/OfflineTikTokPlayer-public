@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=0c479107f5d4df0a0bfe5e584336e1da18ba5d52
-expected_ios_tree=ebfeb587d5c38c80757e3ccbe7e043a44f2e8b74
+expected_code_source=bbae31de82789d446feaecb29d805f92e4cd6dd2
+expected_ios_tree=39202bc7e291f30a4af790a2af43d46f4a70dd8e
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
@@ -13,6 +13,7 @@ cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -43,9 +44,10 @@ expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking'}
-if len(expected) != 6 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly six diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery'}
+if len(expected) != 7 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly seven diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -54,7 +56,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=6 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=7 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -105,7 +107,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=6 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=7 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Invoke the single filtered native attempt.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e

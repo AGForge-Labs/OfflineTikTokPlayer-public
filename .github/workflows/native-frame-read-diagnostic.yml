@@ -40,7 +40,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run only the six native clock handoff diagnostic identities
+      - name: Run only the seven native clock handoff diagnostic identities
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
@@ -50,7 +50,7 @@ jobs:
         id: xcresult_export
         if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
         run: python3 scripts/export-native-xcresult.py
-      - name: Independently require the six exact identities and zero native exit
+      - name: Independently require the seven exact identities and zero native exit
         id: evidence
         if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
         run: bash scripts/check-native-frame-read-diagnostic.sh --verify-results
