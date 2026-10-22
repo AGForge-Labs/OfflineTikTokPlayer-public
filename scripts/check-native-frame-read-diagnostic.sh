@@ -2,17 +2,17 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=c5a3ee6a5f94d8ac57ce9f137bd78c2678c8d9ea
-expected_ios_tree=5326b32ffd7a193216a8bfb4b0ee1fcd860a4603
+expected_code_source=0c479107f5d4df0a0bfe5e584336e1da18ba5d52
+expected_ios_tree=ebfeb587d5c38c80757e3ccbe7e043a44f2e8b74
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryVideoDriftUsesItemTimebaseAndPreservesForcedOwnership
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -38,12 +38,12 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryVideoDriftUsesItemTimebaseAndPreservesForcedOwnership',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion'}
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking'}
 if len(expected) != 6 or not expected.issubset(evidence.source_manifest(root)):
     raise SystemExit('Exactly six diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:

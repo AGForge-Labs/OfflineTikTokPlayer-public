@@ -1,10 +1,13 @@
-name: Native default frame read diagnostic
+name: Native clock handoff diagnostic
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
     paths: ['.github/workflows/native-frame-read-diagnostic.yml', 'scripts/check-native-frame-read-diagnostic.sh', 'tests/validation-shell/test_native_frame_read_diagnostic.py']
 permissions:
   contents: read
+concurrency:
+  group: offline-player-native-validation
+  cancel-in-progress: true
 jobs:
   native-frame-read-diagnostic:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
@@ -37,7 +40,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run only the six native diagnostic identities
+      - name: Run only the six native clock handoff diagnostic identities
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:

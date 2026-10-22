@@ -16,12 +16,12 @@ SOURCE = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_SOURCE",
 WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
 CASES = (
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryVideoDriftUsesItemTimebaseAndPreservesForcedOwnership",
-    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff",
     "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking",
 )
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
@@ -244,6 +244,8 @@ exit "$FRAME_READ_TEE_EXIT"
         self.assertEqual(re.findall(r"^  ([a-z][a-z-]*):\s*$", workflow.split("jobs:\n", 1)[1],
                                     re.MULTILINE), ["native-frame-read-diagnostic"])
         self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertIn("concurrency:\n  group: offline-player-native-validation\n"
+                      "  cancel-in-progress: true\njobs:\n", workflow)
         self.assertIn("persist-credentials: false", workflow)
         self.assertIn("github.event.repository.private == false", workflow)
         self.assertEqual(workflow.count("steps.native.outputs.attempted == 'true'"), 2)
