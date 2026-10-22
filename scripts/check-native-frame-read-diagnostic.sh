@@ -2,37 +2,23 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=a7947a0536e27be4a13223d0b11ed0551e8953fd
-expected_ios_tree=138ded8401ffdb30fdb335d7dec426535a99fca5
+expected_code_source=acb67877b0a3b19391bff8384cab21aac298df44
+expected_ios_tree=cf012d7bf00194e9f18d482fba04d566805d933a
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback
-  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetNativeMinimumFrameDurationCompositionPreservesEveryImage
-  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testLeadingEmptyEditCadenceRequiresExactNativeGridAndUnscaledCoverage
-  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testOffGridLeadingEmptyEditKeepsAssetCompositionCadence
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testAudioOnlyAndForegroundRestoreSelectedBWithoutOverridingPause
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitPausedSeekSupersedesPendingStart
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingPauseBeforeApplicationCannotResumeAndRecovers
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOnThenOff
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOnThenOff
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSupersededInitialOrdinaryCompletionCannotClearNewExplicitPausedSeek
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -58,32 +44,18 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback',
-    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testImportedPositiveOffsetNativeMinimumFrameDurationCompositionPreservesEveryImage',
-    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testLeadingEmptyEditCadenceRequiresExactNativeGridAndUnscaledCoverage',
-    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testOffGridLeadingEmptyEditKeepsAssetCompositionCadence',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testAudioOnlyAndForegroundRestoreSelectedBWithoutOverridingPause',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitPausedSeekSupersedesPendingStart',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingPauseBeforeApplicationCannotResumeAndRecovers',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemTimebaseCalibratesAcrossPlaybackSeekAndReinsertion',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceOutputWitnessOnThenOff',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSupersededInitialOrdinaryCompletionCannotClearNewExplicitPausedSeek'}
-if len(expected) != 24 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly twenty-four cadence, initial-zero, native-clock and source-output identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousQueueLeadOnThenOff',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek'}
+if len(expected) != 10 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly ten paused-seek, initial-zero and queue-lead identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -92,7 +64,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=24 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=10 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -193,10 +165,10 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=24 expectedUI=0 expectedCore=107 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# This exact subset retains strict default-composition and cadence assertions.
-# Initial-zero, explicit seek/pause, stereo and restoration guards stay intact.
-# Default and startup-traced benchmarks keep their distinct original callbacks.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=10 expectedUI=0 expectedCore=107 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# This exact subset retains paused-seek and initial-zero ownership assertions.
+# The default benchmark keeps its existing capture-free measurement behavior.
+# Queue-lead trace design and all test-body acceptance guards are source-owned.
 # There is no promotion prefix. Actual XCTest start/result records determine
 # execution history; selected-list order is not a matched-history guarantee.
 # All other cases remain in full source; full acceptance remains mandatory.
