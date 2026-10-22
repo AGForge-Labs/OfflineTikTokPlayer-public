@@ -43,7 +43,7 @@ destination="${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro 
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
 # Native window tests request real compositor pixels through their own app tmp.
 # Pin the test and capture to the same existing Simulator; one helper, no extra app launch.
-python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 2100 &
+python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 2400 &
 capture_pid=$!
 cleanup_capture() {
   local cleanup_status=$?

@@ -315,6 +315,67 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         #endif
     }
 
+    func testLeadingEmptyEditCadenceRequiresExactNativeGridAndUnscaledCoverage() throws {
+        let choose = ContinuousPictureInPicture.frameDurationForLeadingEmptyEdit
+        let minimum = CMTime(value: 25, timescale: 600), end = CMTime(value: 350, timescale: 600)
+        let empty = CMTimeRange(start: .zero, duration: CMTime(value: 150, timescale: 600))
+        let source = CMTimeRange(start: .zero, duration: CMTime(value: 200, timescale: 600))
+        let media = CMTimeMapping(source: source,
+            target: CMTimeRange(start: CMTime(value: 150, timescale: 600), duration: source.duration))
+        XCTAssertEqual(CMTimeCompare(try XCTUnwrap(choose(minimum, end, empty, media)), minimum), 0)
+        let invalid = [CMTime.invalid, .zero, .indefinite, CMTime(value: -25, timescale: 600),
+            CMTime(value: 25, timescale: 600, flags: [.valid, .hasBeenRounded], epoch: 0),
+            CMTime(value: 25, timescale: 600, flags: .valid, epoch: 1)]
+        for value in invalid { XCTAssertNil(choose(value, end, empty, media)) }
+        let offGrid = CMTimeRange(start: .zero, duration: CMTime(value: 151, timescale: 600))
+        let offMedia = CMTimeMapping(source: source,
+            target: CMTimeRange(start: offGrid.duration, duration: source.duration))
+        XCTAssertNil(choose(minimum, CMTime(value: 351, timescale: 600), offGrid, offMedia))
+        let transitionOnly = CMTimeMapping(source: CMTimeRange(start: .zero, duration: CMTime(value: 199, timescale: 600)),
+            target: CMTimeRange(start: offGrid.duration, duration: CMTime(value: 199, timescale: 600)))
+        XCTAssertNil(choose(minimum, end, offGrid, transitionOnly))
+        let endpointOnly = CMTimeMapping(source: CMTimeRange(start: .zero, duration: CMTime(value: 201, timescale: 600)),
+            target: CMTimeRange(start: empty.duration, duration: CMTime(value: 201, timescale: 600)))
+        XCTAssertNil(choose(minimum, CMTime(value: 351, timescale: 600), empty, endpointOnly))
+        let scaled = CMTimeMapping(source: source,
+            target: CMTimeRange(start: media.target.start, duration: CMTime(value: 201, timescale: 600)))
+        XCTAssertNil(choose(minimum, CMTime(value: 351, timescale: 600), empty, scaled))
+        let partial = CMTimeMapping(source: CMTimeRange(start: minimum, duration: source.duration), target: media.target)
+        XCTAssertNil(choose(minimum, end, empty, partial))
+        XCTAssertNil(choose(minimum, end,
+            CMTimeRange(start: minimum, duration: CMTime(value: 125, timescale: 600)), media))
+        XCTAssertNil(choose(minimum, end, CMTimeRange(start: .zero, duration: .zero), media))
+        XCTAssertNil(choose(minimum, CMTime(value: 351, timescale: 600), empty, media))
+    }
+
+    func testOffGridLeadingEmptyEditKeepsAssetCompositionCadence() async throws {
+        #if DEBUG
+        let times = [151, 176, 226, 301, 326].map { CMTime(value: Int64($0), timescale: 600) }
+        let end = CMTime(value: 351, timescale: 600)
+        let url = try await makeAsymmetricVideo(transform: .identity, frameCount: times.count,
+            presentationTimes: times, endTime: end)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = AVURLAsset(url: url)
+        let (track, _, _, witness) = try await qualifyTinyImportedVideo(asset, expectedTimes: times,
+            end: end, fixtureID: "offset-off-grid")
+        let minimum = try await track.load(.minFrameDuration)
+        guard minimum.isNumeric, minimum.epoch == 0, !minimum.flags.contains(.hasBeenRounded),
+              CMTimeCompare(minimum, CMTime(value: 25, timescale: 600)) == 0 else {
+            XCTFail("The imported fixture must prove its actual off-grid boundary against a native25/600 minimum"); throw TinyVideoFailure.fixture
+        }
+        let empty = try XCTUnwrap(witness.emptyTarget)
+        XCTAssertNil(ContinuousPictureInPicture.frameDurationForLeadingEmptyEdit(nativeMinimum: minimum,
+            assetDuration: witness.end, emptyTarget: empty, media: witness.mapping))
+        let baseline = AVMutableVideoComposition(propertiesOf: asset)
+        let actual = try await assertTinyConservativeFallback(asset)
+        XCTAssertEqual(tinyRawTime(actual.frameDuration), tinyRawTime(baseline.frameDuration))
+        try assertTinyComposition(actual, track: track, end: witness.end)
+        print("TinyVideoOffGridCadence schema=1 mediaStart=\(tinyRawTime(witness.mapping.target.start)) nativeMinimum=\(tinyRawTime(minimum)) actualFrameDuration=\(tinyRawTime(actual.frameDuration)) assetPropertyFrameDuration=\(tinyRawTime(baseline.frameDuration)) rawTimeFields=value/scale/flags/epoch fallbackPolicy=retain-asset-property-cadence composedPTSParity=not-tested physicalHoldProof=false latencyEvidence=false xctestOutcome=external")
+        #else
+        XCTFail("Off-grid import qualification requires the existing DEBUG fixture API")
+        #endif
+    }
+
     #if DEBUG
     private enum TinyVideoFailure: Error { case fixture, comparison, policy }
     private struct TinyVideoFrame { let pts: CMTime, duration: CMTime, pixels: String }

@@ -737,8 +737,28 @@ final class ContinuousPictureInPicture: NSObject {
         resource?.releaseBorrow()
     }
 
+    /// A narrow leading-empty cadence choice, never permission to bypass composition or source timing.
+    static func frameDurationForLeadingEmptyEdit(nativeMinimum: CMTime, assetDuration: CMTime,
+        emptyTarget: CMTimeRange, media: CMTimeMapping) -> CMTime? {
+        let emptyEnd = CMTimeRangeGetEnd(emptyTarget), mediaEnd = CMTimeRangeGetEnd(media.target)
+        let times = [nativeMinimum, assetDuration, emptyTarget.start, emptyTarget.duration, emptyEnd,
+            media.source.start, media.source.duration, media.target.start, media.target.duration, mediaEnd]
+        guard times.allSatisfy({ $0.isNumeric && $0.timescale > 0 && $0.epoch == 0 && !$0.flags.contains(.hasBeenRounded) }),
+              nativeMinimum.value > 0, nativeMinimum.timescale > 0,
+              CMTimeCompare(emptyTarget.start, .zero) == 0, CMTimeCompare(emptyTarget.duration, .zero) > 0,
+              CMTimeCompare(media.source.start, .zero) == 0, CMTimeCompare(media.source.duration, .zero) > 0,
+              CMTimeCompare(media.source.duration, media.target.duration) == 0,
+              CMTimeCompare(emptyEnd, media.target.start) == 0, CMTimeCompare(mediaEnd, assetDuration) == 0 else { return nil }
+        for boundary in [emptyTarget.start, emptyEnd, mediaEnd] {
+            let scaled = CMTimeConvertScale(boundary, timescale: nativeMinimum.timescale, method: .roundTowardZero)
+            guard scaled.isNumeric, scaled.epoch == 0, !scaled.flags.contains(.hasBeenRounded),
+                  CMTimeCompare(scaled, boundary) == 0, scaled.value >= 0, scaled.value % nativeMinimum.value == 0 else { return nil }
+        }
+        return nativeMinimum
+    }
+
     /// Normalize the preferred source transform into actual output pixels. A layer-only transform
-    /// would leave PiP free to display the unrotated pixels. Source frame timing and duration remain intact.
+    /// would leave PiP free to display the unrotated pixels.
     static func makeVideoComposition(for asset: AVAsset) async throws -> AVVideoComposition {
         guard let track = try await asset.loadTracks(withMediaType: .video).first else {
             throw NSError(domain: AVFoundationErrorDomain, code: -1)
@@ -746,15 +766,24 @@ final class ContinuousPictureInPicture: NSObject {
         let size = try await track.load(.naturalSize)
         let transform = try await track.load(.preferredTransform)
         let duration = try await asset.load(.duration)
+        var leadingEmptyCadence: CMTime?
+        if let localAsset = asset as? AVURLAsset, localAsset.url.isFileURL,
+           let segments = try? await track.load(.segments), segments.count == 2,
+           segments[0].isEmpty, !segments[1].isEmpty,
+           let minimum = try? await track.load(.minFrameDuration) {
+            leadingEmptyCadence = frameDurationForLeadingEmptyEdit(nativeMinimum: minimum, assetDuration: duration,
+                emptyTarget: segments[0].timeMapping.target, media: segments[1].timeMapping)
+        }
         try Task.checkCancellation()
         let bounds = CGRect(origin: .zero, size: size).applying(transform).standardized
         guard bounds.width.isFinite, bounds.height.isFinite, bounds.minX.isFinite, bounds.minY.isFinite,
               bounds.width > 0, bounds.height > 0, duration.isNumeric, CMTimeCompare(duration, .zero) > 0 else {
             throw NSError(domain: AVFoundationErrorDomain, code: -2)
         }
-        // The asset properties supply the fallback cadence. A valid source ID tells the compositor
-        // to use the source samples' timing, including variable frame rate, rather than inventing 30fps.
+        // Source timing drives media; empty edits use frameDuration. Override only a proved local
+        // leading-empty mapping whose full boundaries lie exactly on the native minimum cadence.
         let composition = AVMutableVideoComposition(propertiesOf: asset)
+        if let leadingEmptyCadence { composition.frameDuration = leadingEmptyCadence }
         composition.sourceTrackIDForFrameTiming = track.trackID
         composition.renderSize = CGSize(width: ceil(bounds.width), height: ceil(bounds.height))
         let instruction = AVMutableVideoCompositionInstruction()

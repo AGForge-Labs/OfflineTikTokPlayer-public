@@ -259,6 +259,22 @@ final class PlaybackService: NSObject {
         DebugInitialVideoReadyState(audioVisit: audioVisit, readyGeneration: readyGeneration,
             generation: generation, syncingVideoGeneration: syncingVideoGeneration)
     }
+    struct DebugInitialClockBindingState: Sendable {
+        let statusHandledGeneration: Int?
+        let request: Int?
+        let item: ObjectIdentifier?
+        let accepted: Bool
+        let issued: Bool
+        let nativeSeek: UInt64?
+    }
+    var debugInitialClockBindingState: DebugInitialClockBindingState {
+        DebugInitialClockBindingState(statusHandledGeneration: statusHandledGeneration,
+            request: pendingInitialClockBinding?.request,
+            item: pendingInitialClockBinding?.ticket.debugItemIdentity,
+            accepted: pendingInitialClockBinding?.accepted ?? false,
+            issued: pendingInitialClockBinding?.issued ?? false,
+            nativeSeek: pendingInitialClockBinding?.nativeSeek)
+    }
     #endif
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
     @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
@@ -312,6 +328,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var audioVisit: Int64 = -1
     @ObservationIgnored private var audioToken = 0
     @ObservationIgnored private var syncingVideoGeneration: Int?
+    @ObservationIgnored private var syncingVideoSeek: UInt64?
     @ObservationIgnored private var audioLoadingID: String?
     @ObservationIgnored private var pendingAudioSeek: (seek: PlaybackTimeline.Seek, version: Int)?
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
@@ -352,6 +369,19 @@ final class PlaybackService: NSObject {
     }
     // One record: a successful zero-selection candidate becomes an item-ticket owner.
     @ObservationIgnored private var initialZeroVisitOwnership: InitialZeroVisitOwnership?
+    private struct InitialClockBinding: Equatable, Sendable {
+        let request: Int
+        let ticket: ContinuousPictureInPicture.PresentationTicket
+        let mediaID: String
+        let token: Int
+        let visit: Int64
+        var selectionVersion: Int?
+        var accepted = false
+        var issued = false
+        var nativeSeek: UInt64? = nil
+    }
+    @ObservationIgnored private var pendingInitialClockBinding: InitialClockBinding?
+    @ObservationIgnored private var statusHandledGeneration: Int?
     @ObservationIgnored private var explicitVideoSeekGeneration: Int?
     @ObservationIgnored private var readyGeneration: Int?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
@@ -520,6 +550,7 @@ final class PlaybackService: NSObject {
     func pause() {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
+        transferInitialClockBinding(retainActivation: true)
         intent.pause()
         recordDiagnostic(.pauseRequested)
         continuousAudio.suspend()
@@ -533,6 +564,7 @@ final class PlaybackService: NSObject {
     /// queued cleanup; neither acknowledgement proves SDK-internal quiescence.
     func debugStopPreparation(_ completion: @escaping @Sendable () -> Void) {
         generation += 1; warmRevision += 1
+        pendingInitialClockBinding = nil; statusHandledGeneration = nil
         observedItem = nil; itemObservation = nil; readyGeneration = nil
         let tasks = [loadTask, warmTask, audioCheckTask, audioPollTask, stallTask].compactMap { $0 }
         loadTask = nil; warmTask = nil; audioCheckTask = nil; audioPollTask = nil; stallTask = nil
@@ -585,6 +617,7 @@ final class PlaybackService: NSObject {
     func seek(_ seconds: Double) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
+        transferInitialClockBinding(retainActivation: false)
         explicitVideoSeekGeneration = generation
         pendingInitialZeroStart = nil
         initialZeroVisitOwnership = nil
@@ -634,6 +667,7 @@ final class PlaybackService: NSObject {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         pendingAudioSeek = nil; completePiPSkip()
+        pendingInitialClockBinding = nil; statusHandledGeneration = nil
         pendingInitialZeroStart = nil
         initialZeroVisitOwnership = nil
         if !audioAlreadySelected { audioLoadingID = queue.currentID }
@@ -824,8 +858,10 @@ final class PlaybackService: NSObject {
                 owner.ticket = ticket
                 initialZeroVisitOwnership = owner
             } else { initialZeroVisitOwnership = nil }
+            pendingInitialClockBinding = initialClockBinding(request: request, ticket: ticket)
         } else {
             initialZeroVisitOwnership = nil
+            pendingInitialClockBinding = nil
         }
         refreshAudioProcessing()
         audioCheckTask = Task { [weak self, weak playerItem] in
@@ -841,7 +877,8 @@ final class PlaybackService: NSObject {
             Task { @MainActor in
                 guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
                 if playerItem.status == .readyToPlay {
-                    guard self.readyGeneration != request else { return }
+                    guard self.statusHandledGeneration != request else { return }
+                    self.statusHandledGeneration = request
                     #if DEBUG
                     if let gate = self.onDebugInitialVideoReady {
                         await gate(request)
@@ -850,27 +887,51 @@ final class PlaybackService: NSObject {
                         guard !Task.isCancelled, self.generation == request,
                               self.player.currentItem === playerItem,
                               playerItem.status == .readyToPlay,
-                              self.readyGeneration != request else { return }
+                              self.statusHandledGeneration == request else { return }
                     }
                     #endif
                     self.continuousPiP.beginReadinessUpdates()
                     defer { self.continuousPiP.endReadinessUpdates() }
+                    var statusBinding = self.pendingInitialClockBinding
+                    let waitsForClock = position == 0 && !rewind && self.intent.canPlay && self.videoAllowed
+                        && statusBinding.map {
+                            self.ownsInitialClockBinding($0, item: playerItem) && !$0.issued
+                        } == true
+                    if waitsForClock, var accepted = statusBinding {
+                        accepted.accepted = true
+                        self.pendingInitialClockBinding = accepted
+                        statusBinding = accepted
+                    }
+                    let explicitAtAcceptance = self.explicitVideoSeekGeneration
+                    @MainActor func ownsAcceptedStatus() -> Bool {
+                        self.generation == request && self.observedItem === playerItem
+                            && self.statusHandledGeneration == request
+                            && (!waitsForClock || self.explicitVideoSeekGeneration == explicitAtAcceptance)
+                            && (!waitsForClock || self.pendingInitialClockBinding == statusBinding)
+                    }
                     #if DEBUG
                     self.debugTraceVideoStartup(.readyAccepted, request: request) {}
                     #endif
+                    guard ownsAcceptedStatus() else { return }
                     if let owner = self.pendingInitialZeroStart, owner.request == request,
                        self.currentVideoPresentation(for: playerItem, request: request) == owner.ticket {
                         self.pendingInitialZeroStart = nil
                     }
-                    self.readyGeneration = request
+                    guard ownsAcceptedStatus() else { return }
+                    if !waitsForClock {
+                        self.pendingInitialClockBinding = nil
+                        self.readyGeneration = request
+                    }
                     self.refreshAudioProcessing()
                     self.clock.updateDuration(playerItem.duration.seconds)
-                    self.isLoading = false
+                    guard ownsAcceptedStatus() else { return }
+                    if !waitsForClock { self.isLoading = false }
                     #if DEBUG
                     self.debugTraceVideoStartup(.itemReadyEvent, request: request) { self.recordPlaybackEvent("itemReady") }
                     #else
                     self.recordPlaybackEvent("itemReady")
                     #endif
+                    guard ownsAcceptedStatus() else { return }
                     // A new or prebuffered item is already at zero; an exact zero seek discards that benefit.
                     if position > 0 || rewind {
                         // Audio already owns its position. Readiness of a reused
@@ -892,9 +953,35 @@ final class PlaybackService: NSObject {
                                 durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay)
                             if installed { playbackAnchor = (host, desired) }
                         }
+                        guard ownsAcceptedStatus() else { return }
+                        if waitsForClock {
+                            guard let statusBinding, self.pendingInitialClockBinding == statusBinding,
+                                  self.ownsInitialClockBinding(statusBinding, item: playerItem) else { return }
+                        }
+                        if waitsForClock, installed,
+                           var binding = self.pendingInitialClockBinding, binding.ticket == ticket,
+                           self.ownsInitialClockBinding(binding, item: playerItem) {
+                            binding.issued = true
+                            self.pendingInitialClockBinding = binding
+                            if !self.intent.canPlay || !self.videoAllowed {
+                                self.transferInitialClockBinding(retainActivation: true)
+                            }
+                        } else if waitsForClock {
+                            // Preserve the existing fallback when no owned timeline installed.
+                            self.pendingInitialClockBinding = nil
+                            self.readyGeneration = request; self.isLoading = false
+                        }
+                        let startBinding = self.pendingInitialClockBinding
+                        @MainActor func ownsNativeStart() -> Bool {
+                            self.generation == request && self.observedItem === playerItem
+                                && self.intent.canPlay && self.videoAllowed
+                                && (!waitsForClock || (self.pendingInitialClockBinding == startBinding
+                                    && self.explicitVideoSeekGeneration == explicitAtAcceptance))
+                        }
                         if self.intent.canPlay, self.videoAllowed {
                             if installed, let ticket, let anchor = playbackAnchor,
                                self.currentVideoPresentation(for: playerItem, request: request) == ticket {
+                                guard ownsNativeStart() else { return }
                                 #if DEBUG
                                 self.debugTraceVideoStartup(.setRate, request: request, installed: installed,
                                     anchorHostSeconds: anchor.host.seconds, anchorPosition: anchor.position) {
@@ -906,6 +993,7 @@ final class PlaybackService: NSObject {
                                                     atHostTime: anchor.host)
                                 #endif
                             } else {
+                                guard ownsNativeStart() else { return }
                                 #if DEBUG
                                 self.debugTraceVideoStartup(.playImmediately, request: request, installed: installed) {
                                     self.player.playImmediately(atRate: 1)
@@ -919,7 +1007,7 @@ final class PlaybackService: NSObject {
                             self.debugTraceVideoStartup(.startSkipped, request: request, installed: installed) {}
                             #endif
                         }
-                        if installed, let ticket,
+                        if !waitsForClock, installed, let ticket, self.pendingInitialClockBinding == nil,
                            self.currentVideoPresentation(for: playerItem, request: request) == ticket {
                             _ = self.continuousPiP.activate(ticket)
                         }
@@ -1029,6 +1117,60 @@ final class PlaybackService: NSObject {
               owner.request == generation, explicitVideoSeekGeneration != generation,
               let item = observedItem else { return false }
         return currentVideoPresentation(for: item, request: owner.request) == owner.ticket
+    }
+
+    private func initialClockBinding(request: Int,
+        ticket: ContinuousPictureInPicture.PresentationTicket) -> InitialClockBinding? {
+        guard let id = queue.currentID, continuousAudio.selectedID == id,
+              let entry = continuousAudio.entry(for: id), entry.token > 0 else { return nil }
+        let sample = continuousAudio.snapshot
+        let expectedVisit: Int64
+        if let owner = initialZeroVisitOwnership, owner.request == request,
+           owner.ticket == ticket, owner.mediaID == id, owner.token == entry.token,
+           owner.baselineVisit < Int64.max {
+            expectedVisit = owner.baselineVisit + 1
+        } else {
+            guard sample.token == entry.token, sample.visit > 0, !sample.ended,
+                  !continuousAudio.isSelectionPending(in: sample) else { return nil }
+            expectedVisit = sample.visit
+        }
+        let acknowledged = sample.token == entry.token && sample.visit == expectedVisit
+            && !sample.ended && !continuousAudio.isSelectionPending(in: sample)
+        return InitialClockBinding(request: request, ticket: ticket, mediaID: id,
+            token: entry.token, visit: expectedVisit,
+            selectionVersion: acknowledged ? sample.selectionVersion : nil)
+    }
+
+    // Cached ownership only. The ordinary decision already checked the actual SDK item.
+    private func ownsInitialClockBinding(_ owner: InitialClockBinding, item: AVPlayerItem) -> Bool {
+        generation == owner.request && observedItem === item
+            && videoPresentation?.request == owner.request && videoPresentation?.ticket == owner.ticket
+            && audioLoadingID == nil && continuousAudio.isSelected
+            && queue.currentID == owner.mediaID && continuousAudio.selectedID == owner.mediaID
+            && continuousAudio.entry(for: owner.mediaID)?.token == owner.token
+            && explicitVideoSeekGeneration != owner.request && pendingAudioSeek == nil
+    }
+
+    private func initialClockSnapshotMatches(_ owner: InitialClockBinding,
+        _ sample: ContinuousPCMRenderer.Snapshot) -> Bool {
+        sample.token == owner.token && sample.visit == owner.visit && !sample.ended
+            && !continuousAudio.isSelectionPending(in: sample)
+            && (owner.selectionVersion == nil || owner.selectionVersion == sample.selectionVersion)
+    }
+
+    private func transferInitialClockBinding(retainActivation: Bool) {
+        if let owner = pendingInitialClockBinding, owner.accepted,
+           statusHandledGeneration == owner.request, let item = observedItem,
+           ownsInitialClockBinding(owner, item: item) {
+            readyGeneration = owner.request; isLoading = false
+            if !retainActivation, owner.issued, syncingVideoGeneration == owner.request,
+               syncingVideoSeek == owner.nativeSeek {
+                // Release only this binding's seek (or its pre-begin reservation).
+                // The existing forced command can then issue its own newer ticket.
+                syncingVideoGeneration = nil; syncingVideoSeek = nil
+            }
+        }
+        if !retainActivation { pendingInitialClockBinding = nil }
     }
 
     /// Consume before any visit side effects. Missed/intervening visits fall back
@@ -1211,6 +1353,7 @@ final class PlaybackService: NSObject {
               continuousAudio.selectedID == queue.currentID else { return }
         do { try continuousAudio.setPlaying(true) }
         catch {
+            transferInitialClockBinding(retainActivation: true)
             intent.activationCompleted(succeeded: false)
             continuousAudio.suspend(); player.pause()
             message = "Audio could not restart. Tap Play to try again."
@@ -1447,6 +1590,7 @@ final class PlaybackService: NSObject {
     private func synchronizeVideoToAudio(force: Bool = false) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
+        if force { transferInitialClockBinding(retainActivation: false) }
         #if DEBUG
         let reason = debugVideoSeekReason
         #endif
@@ -1460,13 +1604,17 @@ final class PlaybackService: NSObject {
         let initialSelectionPending = continuousAudio.isSelectionPending(in: visit)
         let canPlay = intent.canPlay
         let readReadyGeneration = readyGeneration, readExplicitSeekGeneration = explicitVideoSeekGeneration
+        let bindingAtRead = pendingInitialClockBinding
+        var sampledNativePosition: Double?
+        var sampledAudioGoal: Double?
+        var decisionSample: ContinuousPCMRenderer.Snapshot?
         var currentItemAfterRead = true
         #if DEBUG
         var ordinaryDriftVideoPositionSeconds: Double? = nil
         var ordinaryDriftReadEntryNs: UInt64? = nil
         var ordinaryDriftReadReturnNs: UInt64? = nil
         #endif
-        guard let position = PlaybackTimeline.videoCorrectionTarget(force: force, readVideoPosition: {
+        let correction = PlaybackTimeline.videoCorrectionTarget(force: force, readVideoPosition: {
             let sampledPosition: Double
             #if DEBUG
             if self.onDebugVideoSeekStamp != nil {
@@ -1480,13 +1628,16 @@ final class PlaybackService: NSObject {
             #else
             sampledPosition = self.readOrdinaryVideoPosition(item)
             #endif
+            sampledNativePosition = sampledPosition
             // Revalidate the SDK-owned queue before taking the fresh audio goal.
             // No SDK item/position query follows that goal in this decision.
             currentItemAfterRead = self.player.currentItem === item
             return sampledPosition
         }, readAudioPosition: {
             let host = CMClockGetTime(CMClockGetHostTimeClock())
-            return self.continuousAudio.presentationPosition(at: host)
+            let goal = self.continuousAudio.presentationPosition(at: host)
+            sampledAudioGoal = goal
+            return goal
         }, isCurrent: {
             guard currentItemAfterRead, self.generation == request,
                   self.observedItem === item, self.videoAllowed,
@@ -1505,11 +1656,62 @@ final class PlaybackService: NSObject {
                 guard let expectedToken, expectedToken > 0, visit.token == expectedToken else { return false }
             }
             let current = self.continuousAudio.snapshot
-            return current.token == visit.token && current.visit == visit.visit
+            let matches = current.token == visit.token && current.visit == visit.visit
                 && current.selectionVersion == visit.selectionVersion
-        }) else { return }
+            if matches, sampledAudioGoal != nil { decisionSample = current }
+            return matches
+        })
+        if !force, var binding = bindingAtRead, binding == pendingInitialClockBinding, binding.issued,
+           ownsInitialClockBinding(binding, item: item), let sample = decisionSample,
+           initialClockSnapshotMatches(binding, sample) {
+            binding.selectionVersion = sample.selectionVersion
+            pendingInitialClockBinding = binding
+            if let native = sampledNativePosition, let goal = sampledAudioGoal,
+               native.isFinite, goal.isFinite, abs(native - goal) <= 0.080 {
+                // The existing read proved application; command return never did.
+                guard continuousPiP.activate(binding.ticket) else { return }
+                let current = continuousAudio.snapshot
+                guard pendingInitialClockBinding == binding,
+                      ownsInitialClockBinding(binding, item: item),
+                      initialClockSnapshotMatches(binding, current) else { return }
+                pendingInitialClockBinding = nil
+                readyGeneration = request; isLoading = false
+                updateNowPlaying()
+                return
+            }
+        }
+        guard let position = correction else { return }
+        var bindingBeforeSeek = pendingInitialClockBinding
+        if var binding = bindingBeforeSeek, binding.issued,
+           ownsInitialClockBinding(binding, item: item) {
+            binding.nativeSeek = nil // Exact reservation until beginSeek returns its ticket.
+            pendingInitialClockBinding = binding
+            bindingBeforeSeek = binding
+        }
         syncingVideoGeneration = request
+        syncingVideoSeek = nil
         let videoSeek = continuousPiP.beginSeek()
+        guard generation == request, syncingVideoGeneration == request, syncingVideoSeek == nil else {
+            if syncingVideoGeneration == request, syncingVideoSeek == nil { syncingVideoGeneration = nil }
+            continuousPiP.completeSeek(videoSeek)
+            return
+        }
+        syncingVideoSeek = videoSeek
+        if let binding = bindingBeforeSeek, binding.issued,
+           pendingInitialClockBinding != binding || !ownsInitialClockBinding(binding, item: item) {
+            if syncingVideoSeek == videoSeek { syncingVideoSeek = nil; syncingVideoGeneration = nil }
+            continuousPiP.completeSeek(videoSeek)
+            return
+        }
+        if var binding = pendingInitialClockBinding, binding.issued,
+           ownsInitialClockBinding(binding, item: item) {
+            binding.nativeSeek = videoSeek
+            pendingInitialClockBinding = binding
+        }
+        // Capture authority at issuance, before a newer forced command can clear it.
+        let initialBindingAtIssue = pendingInitialClockBinding.flatMap {
+            $0.issued && $0.nativeSeek == videoSeek ? $0 : nil
+        }
         #if DEBUG
         if let observer = onDebugVideoSeekStamp {
             observer(DebugVideoSeekStamp(reason: reason, request: request, generation: generation,
@@ -1529,6 +1731,14 @@ final class PlaybackService: NSObject {
         #if DEBUG
         let completionTerminalObserver = onDebugVideoSeekCompletionTerminal
         #endif
+        if let binding = initialBindingAtIssue,
+           pendingInitialClockBinding != binding || !ownsInitialClockBinding(binding, item: item) {
+            if syncingVideoGeneration == request, syncingVideoSeek == videoSeek {
+                syncingVideoGeneration = nil; syncingVideoSeek = nil
+            }
+            continuousPiP.completeSeek(videoSeek)
+            return
+        }
         seekVideo(player, CMTime(seconds: position, preferredTimescale: 48_000)) { [weak self, weak item] finished in
             Task { @MainActor in
                 #if DEBUG
@@ -1550,13 +1760,24 @@ final class PlaybackService: NSObject {
                             selectedID: selectedID, seek: videoSeek)
                     }
                 }
-                guard self.syncingVideoGeneration == request else { return }
+                @MainActor func ownsInitialIssue() -> Bool {
+                    guard let binding = initialBindingAtIssue else { return true }
+                    guard let item else { return false }
+                    return self.pendingInitialClockBinding == binding
+                        && self.ownsInitialClockBinding(binding, item: item)
+                }
+                guard self.syncingVideoGeneration == request, self.syncingVideoSeek == videoSeek else { return }
+                guard ownsInitialIssue() else {
+                    self.syncingVideoGeneration = nil; self.syncingVideoSeek = nil
+                    return
+                }
                 self.syncingVideoGeneration = nil
+                self.syncingVideoSeek = nil
                 guard finished, let item, self.generation == request,
                       self.player.currentItem === item, self.videoAllowed else { return }
                 let host = CMClockGetTime(CMClockGetHostTimeClock())
                 let desired = self.continuousAudio.presentationPosition(at: host)
-                guard self.ownsVideoCorrectionCompletion(for: item, request: request,
+                guard ownsInitialIssue(), self.ownsVideoCorrectionCompletion(for: item, request: request,
                     selectedID: selectedID) else { return }
                 // A newer paused request must win even within the drift threshold;
                 // compare requested targets rather than native seek quantization.
@@ -1564,7 +1785,7 @@ final class PlaybackService: NSObject {
                 var needsPausedCorrection = requestedFrameChanged
                 if !self.intent.canPlay && !requestedFrameChanged {
                     let nativePosition = item.currentTime().seconds
-                    guard self.ownsVideoCorrectionCompletion(for: item, request: request,
+                    guard ownsInitialIssue(), self.ownsVideoCorrectionCompletion(for: item, request: request,
                         selectedID: selectedID) else { return }
                     needsPausedCorrection = abs(nativePosition - desired) > 0.080
                 }
@@ -1584,7 +1805,8 @@ final class PlaybackService: NSObject {
                 // Resolve the live ticket here: initial owner installation may
                 // legitimately follow issuance. Revalidate after its SDK query.
                 @MainActor func ownsPresentation() -> Bool {
-                    self.ownsVideoCorrectionCompletion(for: item, request: request, selectedID: selectedID)
+                    ownsInitialIssue()
+                        && self.ownsVideoCorrectionCompletion(for: item, request: request, selectedID: selectedID)
                         && self.videoPresentation?.request == request && self.videoPresentation?.ticket == ticket
                 }
                 guard ownsPresentation(),
@@ -1605,7 +1827,7 @@ final class PlaybackService: NSObject {
                                         atHostTime: host)
                     #endif
                 }
-                if ownsPresentation() {
+                if initialBindingAtIssue == nil, ownsPresentation(), self.pendingInitialClockBinding == nil {
                     _ = self.continuousPiP.activate(ticket)
                 }
             }
@@ -1667,6 +1889,7 @@ final class PlaybackService: NSObject {
             recordDiagnostic(.audioSessionActivated)
             recordPlaybackEvent("activationCompleted")
         } catch {
+            transferInitialClockBinding(retainActivation: true)
             intent.activationCompleted(succeeded: false); continuousAudio.suspend(); player.pause(); cancelStallRecovery()
             recordDiagnostic(.audioSessionActivationFailed, error: PlaybackDiagnosticError(family: .audioSession, code: (error as NSError).code))
             message = "Audio is in use. Tap Play after the camera or call finishes."
@@ -1692,6 +1915,7 @@ final class PlaybackService: NSObject {
     func handleInterruption(began: Bool, shouldResume: Bool = false) {
         recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
+            transferInitialClockBinding(retainActivation: true)
             intent.interruptionBegan(); cancelStallRecovery()
             continuousAudio.suspend()
             player.pause(); persist()
@@ -1724,7 +1948,10 @@ final class PlaybackService: NSObject {
         surface.isHidden = audioOnly
         pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
-        if !videoAllowed { player.pause(); continuousPiP.suspendFrameFeed() }
+        if !videoAllowed {
+            transferInitialClockBinding(retainActivation: true)
+            player.pause(); continuousPiP.suspendFrameFeed()
+        }
         else { continuousPiP.resumeFrameFeed() }
         if actions.restoreInlineVideo {
             #if DEBUG

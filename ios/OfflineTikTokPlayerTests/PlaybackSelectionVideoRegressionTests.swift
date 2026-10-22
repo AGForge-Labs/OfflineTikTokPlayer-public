@@ -1990,6 +1990,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(audit.rightSquareSum, stereoSilent ? 0 : 30)
             XCTAssertEqual(audit.nonfiniteFrames, 0)
             XCTAssertTrue(audit.stereoZeroEvidenceQualified)
+            XCTAssertFalse(audit.hasNoTenMillisecondStereoSilence(expectedFrames: 480, rate: 48_000),
+                           "Stereo silence fails continuity; antiphase cancellation fails run qualification")
             XCTAssertEqual(audit.layout.buffers, 1); XCTAssertEqual(audit.layout.frames, 480)
             XCTAssertEqual(audit.layout.firstChannelCount, 2); XCTAssertEqual(audit.layout.lastChannelCount, 2)
             XCTAssertFalse(audit.layout.firstInterleaved); XCTAssertFalse(audit.layout.lastInterleaved)
@@ -2005,6 +2007,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(run.leftSquareSum, stereoSilent ? 0 : 30)
             XCTAssertEqual(run.rightSquareSum, stereoSilent ? 0 : 30)
             XCTAssertNil(audit.run(at: 1)); XCTAssertNil(audit.run(at: 4))
+        }
+        // Threshold-length zero runs straddle two aligned 10 ms windows and
+        // two real append calls. The old quiet oracle misses these placements.
+        for zeroFrames in [1, 479, 480, 644] {
+            let tap = ProductionSelectionOutputTap()
+            let pcm = try buffer(left: 0.25, right: 0.25)
+            let channels = try XCTUnwrap(pcm.floatChannelData)
+            tap.begin(auditChannels: true)
+            for packet in 0..<2 {
+                for frame in 0..<480 {
+                    let absolute = packet * 480 + frame
+                    let value: Float = (200..<(200 + zeroFrames)).contains(absolute) ? 0 : 0.25
+                    channels[0][frame] = value; channels[1][frame] = value
+                }
+                tap.append(pcm, time: time(packet * 480))
+            }
+            let end = tap.stop(), audit = tap.channelAudit()
+            let recording = tap.samples(from: 0, to: end)
+            XCTAssertEqual(ProductionSelectionOutputTap.quietRun(recording.values, rate: recording.rate), 0)
+            XCTAssertEqual(audit.stereoZeroFrames, zeroFrames)
+            XCTAssertEqual(audit.qualifiedRuns, zeroFrames >= 480 ? 1 : 0)
+            XCTAssertEqual(audit.hasNoTenMillisecondStereoSilence(expectedFrames: 960, rate: recording.rate),
+                           zeroFrames < 480, "The contiguous threshold is inclusive; isolated crossings remain allowed")
         }
         // Actual mono zero is duplicated by the unchanged mono oracle. The old
         // stereoZeroFrames value remains visible, but cannot establish two channels.
@@ -2032,6 +2057,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertEqual(emptyAudit.observedFrames, 0)
         XCTAssertEqual(emptyAudit.layout.buffers, 0); XCTAssertEqual(emptyAudit.layout.frames, 0)
         XCTAssertFalse(emptyAudit.layout.allInputActualStereo); XCTAssertFalse(emptyAudit.stereoZeroEvidenceQualified)
+        XCTAssertFalse(emptyAudit.hasNoTenMillisecondStereoSilence(expectedFrames: 480, rate: 48_000))
         monoPCM.frameLength = 480
 
         let packedFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32,
@@ -2072,6 +2098,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertEqual(overflow.observedFrames, 4_800); XCTAssertEqual(overflow.monoZeroFrames, 2_400)
         XCTAssertEqual(overflow.qualifiedRuns, 5); XCTAssertEqual(overflow.retainedRuns, 4)
         XCTAssertEqual(overflow.droppedRuns, 1); XCTAssertTrue(overflow.overflow)
+        XCTAssertFalse(overflow.hasNoTenMillisecondStereoSilence(expectedFrames: 4_800, rate: 48_000))
         for ordinal in 0..<4 {
             let run = try XCTUnwrap(overflow.run(at: ordinal))
             XCTAssertEqual(run.firstFrame, ordinal * 960); XCTAssertEqual(run.frames, 480)
@@ -2717,6 +2744,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertLessThanOrEqual(channelAudit.retainedRuns, 4)
         XCTAssertEqual(channelAudit.droppedRuns, 0)
         XCTAssertFalse(channelAudit.overflow)
+        XCTAssertTrue(channelAudit.hasNoTenMillisecondStereoSilence(expectedFrames: returned.values.count, rate: returned.rate),
+                      "Pure-tone output requires a complete actual-stereo audit and no contiguous exact stereo-zero run of at least 10 ms")
         for ordinal in 0..<4 {
             guard let run = channelAudit.run(at: ordinal) else { continue }
             let firstOffset = returnedOrigin.map { (run.firstHost - $0) * 1_000 }
@@ -3860,7 +3889,146 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testInitialZeroClockBindingPauseBeforeApplicationCannotResumeAndRecovers() async throws {
+        #if DEBUG
+        try await runInitialClockBindingTransferControl(pausedTarget: nil)
+        #else
+        XCTFail("Initial clock binding controls require DEBUG cached ownership")
+        #endif
+    }
+
+    func testInitialZeroClockBindingExplicitPausedSeekSupersedesPendingStart() async throws {
+        #if DEBUG
+        try await runInitialClockBindingTransferControl(pausedTarget: 0.4)
+        #else
+        XCTFail("Initial clock binding controls require DEBUG cached ownership")
+        #endif
+    }
+
+    func testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup() async throws {
+        #if DEBUG
+        try await runInitialClockBindingTransferControl(pausedTarget: 0.4, beforeInitialStart: true)
+        #else
+        XCTFail("Initial clock binding controls require DEBUG cached ownership")
+        #endif
+    }
+
     #if DEBUG
+    private func runInitialClockBindingTransferControl(pausedTarget: Double?,
+        beforeInitialStart: Bool = false) async throws {
+        var receipt: String?
+        defer { if let receipt { print(receipt) } }
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            throw SelectionVideoTestFailure.timeout
+        }
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            let request = service.debugInitialVideoReadyState.generation + 1
+            var starts = 0, overflow = false, qualified = false
+            var readyAtReturn: Bool?, loadingAtReturn: Bool?, pendingAtReturn: Bool?
+            var transferred = false, userSeekIssued = false
+            var startedItem: ObjectIdentifier?
+            var readyAccepts = 0
+            @MainActor func transfer(_ service: PlaybackService) {
+                service.pause()
+                if let pausedTarget { service.seek(pausedTarget) }
+                let state = service.debugInitialVideoReadyState
+                transferred = state.readyGeneration == request && !service.isLoading
+            }
+            service.onDebugVideoStartupStamp = { [weak service] value in
+                guard beforeInitialStart, let service,
+                      value.request == request, value.kind == .readyAccepted else { return }
+                guard readyAccepts < 2 else { overflow = true; return }
+                readyAccepts += 1
+                guard readyAccepts == 1 else { return }
+                let binding = service.debugInitialClockBindingState
+                qualified = value.entryGeneration == request && value.returnGeneration == request
+                    && value.presentationUnchanged && binding.request == request
+                    && binding.accepted && !binding.issued && binding.item != nil
+                guard qualified else { return }
+                startedItem = binding.item
+                readyAtReturn = service.debugInitialVideoReadyState.readyGeneration == request
+                loadingAtReturn = service.isLoading
+                pendingAtReturn = binding.accepted && !binding.issued
+                // This actual status-acceptance callback precedes metadata and native start.
+                transfer(service)
+            }
+            service.onDebugVideoSeekStamp = { value in
+                if value.request == request, value.reason == .userPausedSeek {
+                    userSeekIssued = true
+                }
+            }
+            service.onDebugVideoRateHandoff = { [weak service] value in
+                guard let service, value.request == request, value.cause == .initialReady else { return }
+                guard starts < 2 else { overflow = true; return }
+                starts += 1
+                if beforeInitialStart { return }
+                guard starts == 1 else { return }
+                qualified = value.entryGeneration == request && value.returnGeneration == request
+                    && value.presentationTicket != nil && value.presentationTicket == value.returnPresentationTicket
+                    && value.entryObservedItemMatches && value.returnObservedItemMatches && value.presentationUnchanged
+                    && value.requestedRate == 1
+                guard qualified else { return }
+                startedItem = value.item
+                readyAtReturn = service.debugInitialVideoReadyState.readyGeneration == request
+                loadingAtReturn = service.isLoading
+                let binding = service.debugInitialClockBindingState
+                pendingAtReturn = binding.request == request && binding.issued
+                // Real commands after the actual native start returned. No native result is synthesized.
+                transfer(service)
+            }
+            defer {
+                service.onDebugVideoRateHandoff = nil
+                service.onDebugVideoSeekStamp = nil
+                service.onDebugVideoStartupStamp = nil
+            }
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await require({
+                let state = service.debugInitialVideoReadyState, sample = audio.renderer.snapshot
+                return qualified && transferred && state.generation == request && state.readyGeneration == request
+                    && state.syncingVideoGeneration == nil && !service.isLoading
+                    && !service.wantsToPlay && !service.audioEngineRunning && service.player.rate == 0
+                    && service.player.currentItem.map { ObjectIdentifier($0) } == startedItem
+                    && !audio.isSelectionPending(in: sample)
+            }, "The actual pending initial start must transfer to paused readiness without resuming")
+            XCTAssertEqual(starts, beforeInitialStart ? 0 : 1); XCTAssertFalse(overflow)
+            if beforeInitialStart { XCTAssertEqual(readyAccepts, 1) }
+            XCTAssertEqual(readyAtReturn, false); XCTAssertEqual(loadingAtReturn, true)
+            XCTAssertEqual(pendingAtReturn, true); XCTAssertTrue(transferred)
+            if let pausedTarget {
+                try await require({
+                    userSeekIssued && service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                        && abs(service.player.currentTime().seconds - pausedTarget) < 0.040
+                        && service.videoFramePositionSeconds.map { abs($0 - pausedTarget) < 0.080 } == true
+                }, "The explicit paused target must own the real completed native seek and custom frame")
+                XCTAssertNil(service.debugInitialClockBindingState.request)
+            } else { XCTAssertFalse(userSeekIssued) }
+            let paused = audio.renderer.snapshot
+            try await Task.sleep(for: .milliseconds(200))
+            let held = audio.renderer.snapshot
+            XCTAssertFalse(service.wantsToPlay); XCTAssertFalse(service.audioEngineRunning)
+            XCTAssertEqual(service.player.rate, 0)
+            XCTAssertEqual(held.token, paused.token); XCTAssertEqual(held.visit, paused.visit)
+            XCTAssertEqual(held.selectionVersion, paused.selectionVersion); XCTAssertEqual(held.frame, paused.frame)
+            XCTAssertEqual(held.underrunFrames, 0)
+            service.play()
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            try await require({ service.audioSnapshot.frame >= held.frame + 2_400 },
+                "Only explicit Play may resume actual selected PCM progress")
+            await assertMovingVisibleVideo(service, screen: screen, identity: .a,
+                label: pausedTarget == nil ? "initial-clock-pause-recovered-A" : "initial-clock-explicit-seek-recovered-A")
+            XCTAssertNil(service.debugInitialClockBindingState.request)
+            XCTAssertEqual(service.debugInitialClockBindingState.statusHandledGeneration, request)
+            XCTAssertEqual(starts, beforeInitialStart ? 0 : 1); XCTAssertFalse(overflow)
+            XCTAssertEqual(service.audioSnapshot.underrunFrames, 0)
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, 6_912_000)
+            XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
+            receipt = "InitialClockBindingTransfer schema=2 beforeInitialStart=\(beforeInitialStart) explicitPausedSeek=\(pausedTarget != nil) request=\(request) actualReadyAccepts=\(readyAccepts) actualInitialStarts=\(starts) qualified=\(qualified) readyAtIntervention=\(readyAtReturn.map { String($0) } ?? "unavailable") loadingAtIntervention=\(loadingAtReturn.map { String($0) } ?? "unavailable") pendingAtIntervention=\(pendingAtReturn.map { String($0) } ?? "unavailable") statusTransferred=\(transferred) pausedHoldMs=200 realUserSeekIssued=\(userSeekIssued) overflow=\(overflow) movingRecoveryChecksReturned=true xctestOutcome=external output=after-owned-cleanup-attempt latencyAcceptance=false"
+        }
+    }
+
     private struct InitialReadyNativeClockObservation {
         let begin: UInt64, beforeSnapshotReturnNs: UInt64, nativeReturnNs: UInt64, end: UInt64
         func dumpBoundaries(request: Int, label: String) {
@@ -7784,6 +7952,19 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         // Qualifies the existing count's input layout; it does not assert that zeros occurred.
         var stereoZeroEvidenceQualified: Bool {
             layout.allInputActualStereo && layout.frames == observedFrames
+        }
+        /// Off-render pure-tone benchmark guard. False also means unavailable
+        /// qualification; it is not by itself a claim that stereo silence occurred.
+        func hasNoTenMillisecondStereoSilence(expectedFrames: Int, rate: Double) -> Bool {
+            guard rate == 48_000, expectedFrames > 0, observedFrames == expectedFrames,
+                  minimumRunFrames == Int(rate * 0.01), stereoZeroEvidenceQualified,
+                  !layout.changed, layout.firstRate == rate, layout.lastRate == rate,
+                  nonfiniteFrames == 0, droppedRuns == 0, !overflow,
+                  qualifiedRuns == retainedRuns,
+                  monoZeroFrames == stereoZeroFrames else { return false }
+            // Existing runs are mono-zero ranges. Equality above proves every
+            // such frame is also exact zero on both actual input channels.
+            return qualifiedRuns == 0
         }
         func run(at ordinal: Int) -> ChannelRun? {
             switch ordinal {
