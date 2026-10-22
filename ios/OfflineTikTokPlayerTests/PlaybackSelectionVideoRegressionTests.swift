@@ -496,7 +496,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         for (ordinal, enabled) in [false, true].enumerated() {
             print("NativeClockHandoffArm schema=1 order=off-then-on ordinal=\(ordinal) enabled=\(enabled) acceptance=unchanged")
-            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+            try await runProductionSelectionBenchmark(traceVideoSeeks: enabled, recordHost: false,
                 traceClockHandoff: enabled)
         }
         #else
@@ -509,7 +509,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         for (ordinal, enabled) in [true, false].enumerated() {
             print("NativeClockHandoffArm schema=1 order=on-then-off ordinal=\(ordinal) enabled=\(enabled) acceptance=unchanged")
-            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+            try await runProductionSelectionBenchmark(traceVideoSeeks: enabled, recordHost: false,
                 traceClockHandoff: enabled)
         }
         #else
