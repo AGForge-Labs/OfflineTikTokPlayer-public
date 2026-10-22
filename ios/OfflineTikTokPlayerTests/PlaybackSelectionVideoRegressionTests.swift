@@ -2525,8 +2525,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         suppressionControl?.dumpAndAssert(setupCompleted: previousBundleBodyError == nil)
         #endif
         if let previousBundleBodyError {
-            // Rejected setup is not a comparison. Never issue a displaced Previous
-            // or skip the existing queued-cleanup acknowledgement to report it.
+            // Rejected setup is still a failure. After acknowledged cleanup, the
+            // original nonthrowing validators below must also report whatever
+            // bounded evidence was collected before that failure. Missing phases
+            // retain their original failing count/window assertions.
             #if DEBUG
             if suppressionControl != nil {
                 XCTFail("Prepared rendering setup/owner qualification failed: \(previousBundleBodyError)")
@@ -2536,7 +2538,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             #else
             XCTFail("Previous-bundle setup/owner qualification failed: \(previousBundleBodyError)")
             #endif
-            throw previousBundleBodyError
+            print("ProductionSelectionCachedFailureEvidence schema=1 cleanupAcknowledged=\(mayRemoveFixture) measurementsCollected=\(measurements.count) streamsCollected=\(streams.count) measurementCapacity=3 streamCapacity=3 returnedStartPresent=\(returnedStart != nil) returnedEndPresent=\(returnedEnd != nil) partialCollectedData=true fullApplicationAcceptance=false originalBodyErrorRetained=true publication=\(mayRemoveFixture ? "existing-cached-validators" : "blocked-uncertain-cleanup")")
+            if !mayRemoveFixture { throw previousBundleBodyError }
         }
         #if DEBUG
         if let alternative = observedFrameMode {
@@ -2651,6 +2654,16 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         startup.dumpAndAssert()
         #if DEBUG
         startup.pollSummary?.dumpAndAssert()
+        #endif
+        if let previousBundleBodyError {
+            // Everything since the retained error report is an existing cached
+            // assertion/dump or original post-cleanup resource/counter check and
+            // cannot throw another error. Preserve the exact original Error, and
+            // never start the optional reference decoder on this failure path.
+            print("ProductionSelectionCachedFailureEvidenceEnd schema=1 validatorsReturned=true originalBodyErrorRetained=true rethrow=original fullApplicationAcceptance=false")
+            throw previousBundleBodyError
+        }
+        #if DEBUG
         if auditSavedAAfterCleanup {
             // All original acceptance checks above execute before this optional audit.
             guard renderAccounting == true, !traceVideoSeeks, !traceNativeRefill,

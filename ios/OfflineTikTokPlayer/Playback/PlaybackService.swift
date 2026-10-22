@@ -1076,7 +1076,16 @@ final class PlaybackService: NSObject {
         continuousAudio.setWindow(pcmIDs)
         updateAudioSuccessor()
         if buffer.nextMediaID != naturalID { buffer.discardNext() }
+        guard generation == request, warmRevision == revision else { return }
+        if let successor, let currentID = active?.id,
+           buffer.previousMediaID == successor.id, buffer.previousMediaID != previous?.id {
+            let allowRemote = downloads.network.isConnected && !downloads.readyIDs.contains(successor.id)
+            buffer.promotePreviousToNext(mediaID: successor.id, after: currentID, allowRemote: allowRemote,
+                ifEligible: { self.generation == request && self.warmRevision == revision })
+        }
+        guard generation == request, warmRevision == revision else { return }
         if buffer.previousMediaID != previous?.id { buffer.discardPrevious() }
+        guard generation == request, warmRevision == revision else { return }
         warmTask = Task { [weak self] in
             guard let self else { return }
             let pinned = ([active, previous].compactMap { $0 } + upcoming).compactMap(\.asset)

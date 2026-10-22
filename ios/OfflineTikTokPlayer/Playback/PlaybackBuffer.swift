@@ -200,6 +200,53 @@ final class PlaybackBuffer {
         defer { retireReleased(oldResources) }
         previous?.item.cancelPendingSeeks(); previous = nil
     }
+
+    /// Move a retained item into its intended forward slot without cancelling its rewind.
+    /// False means exact queued ownership was not confirmed, not that no move committed.
+    @discardableResult
+    func promotePreviousToNext(mediaID: String, after currentID: String, allowRemote: Bool = true,
+                               ifEligible: () -> Bool = { true }) -> Bool {
+        guard ifEligible(), let candidate = previous, let current = active?.item else { return false }
+        let oldResources = videoResources
+        defer { retireReleased(oldResources) }
+        @MainActor func ownsMoveSource(status: AVPlayerItem.Status, items: [AVPlayerItem],
+                                       currentItem: AVPlayerItem?) -> Bool {
+            return candidate.mediaID == mediaID && mediaID != currentID
+                && candidate.item !== current && status != .failed
+                && items.count == 1 && items.first === current && currentItem === current
+                && active?.mediaID == currentID && active?.item === current
+                && previous?.mediaID == mediaID && previous?.item === candidate.item
+                && previous?.videoResource === candidate.videoResource && (previous?.isLocal == true || allowRemote)
+                && next == nil && loopReserve == nil
+        }
+        let initialStatus = candidate.item.status
+        let initialItems = player.items()
+        let initialCurrent = player.currentItem
+        guard ownsMoveSource(status: initialStatus, items: initialItems, currentItem: initialCurrent),
+              player.canInsert(candidate.item, after: current) else { return false }
+        let finalStatus = candidate.item.status
+        let finalItems = player.items()
+        let finalCurrent = player.currentItem
+        // All potentially reentrant SDK reads precede the caller's final ownership check.
+        guard ifEligible(),
+              ownsMoveSource(status: finalStatus, items: finalItems, currentItem: finalCurrent),
+              let committed = previous else { return false }
+        // Destination ownership precedes source removal and all insertion notifications.
+        // Copy the live Prepared value: a completed rewind must not become pending again.
+        next = committed
+        previous = nil
+        player.insert(committed.item, after: current)
+        updateEndAction()
+        // A newer owner may have claimed these slots during an SDK notification.
+        // Never undo that owner's move or remove/retire its item on this return path.
+        let status = committed.item.status
+        let items = player.items()
+        return status != .failed && items.count == 2 && items.first === current && items.last === committed.item
+            && player.currentItem === current && active?.item === current
+            && next?.mediaID == mediaID && next?.item === committed.item
+            && next?.videoResource === committed.videoResource && loopReserve == nil
+    }
+
     @discardableResult
     func stagePrevious(_ prepared: Prepared,
                        videoPreparation: ContinuousPictureInPicture.VideoResourcePreparation? = nil,
