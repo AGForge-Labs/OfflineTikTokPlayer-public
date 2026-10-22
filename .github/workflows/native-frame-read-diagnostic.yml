@@ -1,4 +1,4 @@
-name: Complete video reader PTS diagnostic
+name: Native geometry routes with strict playback controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -45,7 +45,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run the exact complete-video PTS calibration
+      - name: Run sixteen route contract and playback controls
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
@@ -60,7 +60,7 @@ jobs:
         run: |
           cp artifacts/native/native-frame-read.log artifacts/native/xcodebuild-test.log
           python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
-      - name: Independently require the exact identity and zero native exit
+      - name: Independently require sixteen exact identities and zero native exit
         id: evidence
         if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
         run: bash scripts/check-native-frame-read-diagnostic.sh --verify-results
