@@ -4260,18 +4260,34 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace() async throws {
+        #if DEBUG
+        try await runInitialClockBindingTransferControl(pausedTarget: 0.4, beforeInitialStart: true,
+            traceColdBoundary: true)
+        #else
+        XCTFail("Initial clock binding controls require DEBUG cached ownership")
+        #endif
+    }
+
     #if DEBUG
     private func runInitialClockBindingTransferControl(pausedTarget: Double?,
-        beforeInitialStart: Bool = false) async throws {
+        beforeInitialStart: Bool = false, traceColdBoundary: Bool = false) async throws {
         var receipt: String?
         let diagnostic = beforeInitialStart || pausedTarget == nil ? InitialClockTransferTrace() : nil
-        defer { diagnostic?.dumpAndAssert(); if let receipt { print(receipt) } }
+        var coldObservation: (probe: NaturalNativeRunwayProbe, reached: Bool)?
+        defer {
+            // Publish retained cadence rows only after owned fixture cleanup.
+            if let coldObservation { coldObservation.probe.dumpAndAssert(reached: coldObservation.reached) }
+            diagnostic?.dumpAndAssert(); if let receipt { print(receipt) }
+        }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             throw SelectionVideoTestFailure.timeout
         }
         let buffer = PlaybackBuffer()
-        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+        let traceCold = traceColdBoundary && beforeInitialStart
+        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceCold, buffer: buffer) { fixture, audio, service, screen in
+            if traceCold { service.debugInitialLoadPhaseEnabled = true }
             let request = service.debugInitialVideoReadyState.generation + 1
             var starts = 0, overflow = false, qualified = false
             var readyAtReturn: Bool?, loadingAtReturn: Bool?, pendingAtReturn: Bool?
@@ -4350,15 +4366,50 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 service.onDebugVideoStartupStamp = nil
                 service.onDebugVideoSeekCompletionTerminal = nil
             }
+            let coldProbe = traceCold
+                ? NaturalNativeRunwayProbe(phase: "initial-clock-preissue-cold", minimumFailureSeconds: 3) : nil
+            var coldRenderer: ContinuousPCMRenderer.Snapshot?
+            if let coldProbe {
+                let sample = audio.renderer.snapshot
+                coldRenderer = sample
+                coldProbe.sample(audio: audio, service: service, renderer: sample, force: true)
+            }
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
-            try await require({
-                let state = service.debugInitialVideoReadyState, sample = audio.renderer.snapshot
-                return qualified && transferred && state.generation == request && state.readyGeneration == request
-                    && state.syncingVideoGeneration == nil && !service.isLoading
-                    && !service.wantsToPlay && !service.audioEngineRunning && service.player.rate == 0
-                    && service.player.currentItem.map { ObjectIdentifier($0) } == startedItem
-                    && !audio.isSelectionPending(in: sample)
-            }, "The actual pending initial start must transfer to paused readiness without resuming")
+            if let coldProbe, let initialColdRenderer = coldRenderer {
+                var lastRenderer = initialColdRenderer
+                do {
+                    try await require({
+                        let state = service.debugInitialVideoReadyState, sample = audio.renderer.snapshot
+                        lastRenderer = sample
+                        coldProbe.sample(audio: audio, service: service, renderer: sample)
+                        return qualified && transferred && state.generation == request && state.readyGeneration == request
+                            && state.syncingVideoGeneration == nil && !service.isLoading
+                            && !service.wantsToPlay && !service.audioEngineRunning && service.player.rate == 0
+                            && service.player.currentItem.map { ObjectIdentifier($0) } == startedItem
+                            && !audio.isSelectionPending(in: sample)
+                    }, "The actual pending initial start must transfer to paused readiness without resuming")
+                } catch {
+                    let originalColdError = error
+                    // Final lane/load endpoint reuses the last predicate's renderer sample.
+                    coldProbe.sample(audio: audio, service: service, renderer: lastRenderer, force: true)
+                    coldObservation = (coldProbe, false)
+                    await recordNaturalRunwayFailure(audio: audio,
+                        expectedToken: audio.entry(for: fixture.aID)?.token ?? 0,
+                        stage: "initial-clock-preissue-cold", captureNativeLaneActivity: true)
+                    throw originalColdError
+                }
+                coldProbe.sample(audio: audio, service: service, renderer: lastRenderer, force: true)
+                coldObservation = (coldProbe, true)
+            } else {
+                try await require({
+                    let state = service.debugInitialVideoReadyState, sample = audio.renderer.snapshot
+                    return qualified && transferred && state.generation == request && state.readyGeneration == request
+                        && state.syncingVideoGeneration == nil && !service.isLoading
+                        && !service.wantsToPlay && !service.audioEngineRunning && service.player.rate == 0
+                        && service.player.currentItem.map { ObjectIdentifier($0) } == startedItem
+                        && !audio.isSelectionPending(in: sample)
+                }, "The actual pending initial start must transfer to paused readiness without resuming")
+            }
             XCTAssertEqual(starts, beforeInitialStart ? 0 : 1); XCTAssertFalse(overflow)
             if beforeInitialStart { XCTAssertEqual(readyAccepts, 1) }
             XCTAssertEqual(readyAtReturn, false); XCTAssertEqual(loadingAtReturn, true)
@@ -6129,16 +6180,30 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         return rows
     }
 
-    private func recordNaturalRunwayFailure(audio: ContinuousAudioPlayer, expectedToken: Int, stage: String = "seek-runway") async {
+    private func recordNaturalRunwayFailure(audio: ContinuousAudioPlayer, expectedToken: Int,
+        stage: String = "seek-runway", captureNativeLaneActivity: Bool = false) async {
         // Called only after the unchanged preparation or runway guard has failed.
         let before = naturalFailureEndpoints(audio: audio, phase: stage + "-before-worker", expectedToken: expectedToken)
+        let nativeBefore = captureNativeLaneActivity
+            ? (0..<3).map { audio.debugNativeLaneActivitySnapshot(at: $0) } : []
         let mailbox = NaturalFailureStateMailbox()
         audio.debugDecoderFailureState { mailbox.complete($0) }
         let returned = await waitUntil(timeout: 1) { mailbox.result != nil }
         let state = mailbox.result
+        let nativeAfter = captureNativeLaneActivity
+            ? (0..<3).map { audio.debugNativeLaneActivitySnapshot(at: $0) } : []
         let after = naturalFailureEndpoints(audio: audio, phase: stage + "-after-worker", expectedToken: expectedToken)
         for row in before { print(row) }
-        print("NaturalFailureWorker schema=1 stage=\(stage) returnedWithinOneSecond=\(returned) snapshotAvailable=\(state != nil) nativePhaseAvailable=false sdkWaitEstablished=false")
+        let nativeAvailable = captureNativeLaneActivity && nativeBefore.count == 3 && nativeAfter.count == 3
+            && nativeBefore.allSatisfy { $0 != nil } && nativeAfter.allSatisfy { $0 != nil }
+        print("NaturalFailureWorker schema=1 stage=\(stage) returnedWithinOneSecond=\(returned) snapshotAvailable=\(state != nil) nativePhaseAvailable=\(nativeAvailable) sdkWaitEstablished=false")
+        if captureNativeLaneActivity {
+            for (endpoint, values) in [("before-worker", nativeBefore), ("after-worker", nativeAfter)] {
+                for (lane, value) in values.enumerated() {
+                    print("NaturalFailureNativeLane schema=1 stage=\(stage) endpoint=\(endpoint) lane=\(lane) recordAvailable=\(value != nil) packedState=\(value.map { String($0.packedState) } ?? "unavailable") copySequence=\(value.map { String($0.copySequence) } ?? "unavailable") stageCode=\(value.map { String($0.stageCode) } ?? "unavailable") overflow=\(value.map { String($0.sequenceOverflowed) } ?? "unavailable") coherence=independent-lane-record noExecutionTimestamp=true sdkWaitEstablished=false")
+                }
+            }
+        }
         if let state {
             let stats = state.stats
             print("NaturalFailureWorkerStats schema=1 leased=\(stats.leasedReaders) peakLeased=\(stats.peakLeasedReaders) retired=\(stats.retiredLeasesAwaitingClose) starting=\(stats.startingLeases) preparations=\(stats.pendingPreparations) pendingReads=\(stats.readJobsAwaitingAcceptanceOrClose) packets=\(stats.mailboxPackets) occupiedPackets=\(stats.pendingOrMailboxPacketSlots) overflowed=\(stats.counterOverflowed) shutdown=\(stats.shutdownRequested) closed=\(stats.readerLeasesClosed) preparationTokens=\(state.preparationTokens.map { String($0) }.joined(separator: ",")) coherence=worker-owned-fields")

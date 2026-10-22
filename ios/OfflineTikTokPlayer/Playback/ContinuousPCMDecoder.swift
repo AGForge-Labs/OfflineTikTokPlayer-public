@@ -50,6 +50,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     enum DebugNativeLaneActivityStage: UInt64, Sendable {
         case none = 0, construction = 1, startReading = 2, nativeReadEntered = 3
         case copyEntered = 4, copyReturned = 5, parser = 6, nativeReadReturned = 7, close = 8
+        case startReadingReturned = 9, constructionReturned = 10, buffersReady = 11
+        case startResultReady = 12, startCompletionReturned = 13, closeReturned = 14
     }
     struct DebugNativeLaneActivitySnapshot: Sendable {
         let laneIndex: Int
@@ -345,6 +347,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         debugActivity = description.debugNativeLaneActivityRecorder?.record(at: index)
                         debugActivity?.publish(.construction)
                         let created = try NativeReader(description: description, debugActivity: debugActivity)
+                        debugActivity?.publish(.constructionReturned)
                         #else
                         let created = try NativeReader(description: description)
                         #endif
@@ -353,11 +356,20 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                             interleaved: true),
                             let createdBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_096)
                             else { throw Failure.unsupportedPCM }
+                        #if DEBUG
+                        debugActivity?.publish(.buffersReady)
+                        #endif
                         reader = created; buffer = createdBuffer
                         return .success(created.totalFrames)
                     } catch { return .failure((error as? Failure) ?? .cannotDecode) }
                 }
+                #if DEBUG
+                debugActivity?.publish(.startResultReady)
+                #endif
                 completion(result)
+                #if DEBUG
+                debugActivity?.publish(.startCompletionReturned)
+                #endif
             }
         }
         func read(maximumFrames: Int,
@@ -410,6 +422,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                     reader = nil // NativeReader.deinit/cancelReading run only here.
                 }
                 #if DEBUG
+                debugActivity?.publish(.closeReturned)
                 debugActivity = nil
                 #endif
                 completion()
@@ -1327,7 +1340,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             // Request the complete declared asset/track interval explicitly.
             reader.timeRange = CMTimeRange(start: .zero, duration: description.endTime)
             debugActivity?.publish(.startReading)
-            guard reader.startReading() else { throw Failure.cannotDecode }
+            let started = reader.startReading()
+            debugActivity?.publish(.startReadingReturned)
+            guard started else { throw Failure.cannotDecode }
         }
         #else
         init(description: Description) throws {
