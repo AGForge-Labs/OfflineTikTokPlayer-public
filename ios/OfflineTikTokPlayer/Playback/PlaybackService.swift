@@ -344,6 +344,42 @@ final class PlaybackService: NSObject {
         var completedEpoch: UInt64?
     }
     @ObservationIgnored private var pausedExplicitVisitOwnership: PausedExplicitVisitOwnership?
+    #if DEBUG
+    struct DebugPausedExplicitVisitState: Sendable {
+        let request: Int
+        let mediaID: String
+        let token: Int
+        let selectionVersion: Int
+        let visit: Int64
+        let target: Double
+        let item: ObjectIdentifier?
+        let ticket: ContinuousPictureInPicture.PresentationTicket?
+        let nativeSeek: UInt64?
+        let completedEpoch: UInt64?
+        let ownsCurrentPausedCommand: Bool
+    }
+    // Copies cached marker state only; never creates/seals/consumes the marker.
+    var debugPausedExplicitVisitState: DebugPausedExplicitVisitState? {
+        guard let owner = pausedExplicitVisitOwnership else { return nil }
+        return DebugPausedExplicitVisitState(request: owner.request, mediaID: owner.mediaID,
+            token: owner.token, selectionVersion: owner.selectionVersion, visit: owner.visit,
+            target: owner.target, item: owner.item, ticket: owner.ticket, nativeSeek: owner.nativeSeek,
+            completedEpoch: owner.completedEpoch,
+            ownsCurrentPausedCommand: observedItem.map { ownsPausedExplicitVisit(owner, item: $0) } == true)
+    }
+    @ObservationIgnored var shouldDebugAcquireVideoFrame:
+        (@MainActor (ContinuousPictureInPicture.CurrentFrameReceipt) -> Bool)? {
+        didSet {
+            guard shouldDebugAcquireVideoFrame != nil else {
+                continuousPiP.shouldDebugAcquireFrame = nil
+                return
+            }
+            continuousPiP.shouldDebugAcquireFrame = { [weak self] receipt in
+                self?.shouldDebugAcquireVideoFrame?(receipt) ?? true
+            }
+        }
+    }
+    #endif
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
     var videoFramePositionSeconds: Double? { continuousPiP.lastFramePositionSeconds }
     var copiedVideoFramePositionSeconds: Double? { continuousPiP.lastCopiedFramePositionSeconds }

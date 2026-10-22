@@ -4269,16 +4269,34 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testCompletedPausedExplicitSeekKeepsItsTimelineWhileFirstImageIsPending() async throws {
+        #if DEBUG
+        try await runInitialClockBindingTransferControl(pausedTarget: 0.4, beforeInitialStart: true,
+            completedOwnerPendingImage: true)
+        #else
+        XCTFail("Completed paused owner controls require DEBUG acquisition/marker observation")
+        #endif
+    }
+
     #if DEBUG
     private func runInitialClockBindingTransferControl(pausedTarget: Double?,
-        beforeInitialStart: Bool = false, traceColdBoundary: Bool = false) async throws {
+        beforeInitialStart: Bool = false, traceColdBoundary: Bool = false,
+        completedOwnerPendingImage: Bool = false) async throws {
+        if completedOwnerPendingImage {
+            guard beforeInitialStart, pausedTarget == 0.4, !traceColdBoundary else {
+                XCTFail("Pending-image control requires the exact preissue paused .4 fixture")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
         var receipt: String?
+        var pendingImageReceipt: String?
         let diagnostic = beforeInitialStart || pausedTarget == nil ? InitialClockTransferTrace() : nil
         var coldObservation: (probe: NaturalNativeRunwayProbe, reached: Bool)?
         defer {
             // Publish retained cadence rows only after owned fixture cleanup.
             if let coldObservation { coldObservation.probe.dumpAndAssert(reached: coldObservation.reached) }
             diagnostic?.dumpAndAssert(); if let receipt { print(receipt) }
+            if let pendingImageReceipt { print(pendingImageReceipt) }
         }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
@@ -4296,6 +4314,27 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             var observePausedSourceVisits = true
             var startedItem: ObjectIdentifier?
             var readyAccepts = 0
+            var holdPendingImage = completedOwnerPendingImage
+            var holdPendingImageAdoption = completedOwnerPendingImage
+            var pendingImageVetoCalls = 0, pendingImageGateOverflow = false
+            var pendingImagePull: ContinuousPictureInPicture.CurrentFrameReceipt?
+            var pendingImageIssue: PlaybackService.DebugVideoSeekStamp?
+            var pendingImageTerminals = 0
+            if completedOwnerPendingImage {
+                service.shouldDebugDeferAudioVisit = { generation in
+                    holdPendingImageAdoption && generation == request
+                }
+                service.shouldDebugAcquireVideoFrame = { [weak service] pull in
+                    guard holdPendingImage else { return true }
+                    guard let service else { return true }
+                    if service.debugInitialVideoReadyState.generation == request {
+                        if pendingImageVetoCalls < Int.max { pendingImageVetoCalls += 1 }
+                        else { pendingImageGateOverflow = true }
+                        pendingImagePull = pull
+                    }
+                    return false
+                }
+            }
             @MainActor func transfer(_ service: PlaybackService) {
                 service.pause()
                 if let pausedTarget { service.seek(pausedTarget) }
@@ -4330,6 +4369,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
                 if value.request == request, value.reason == .userPausedSeek {
                     userSeekIssued = true
+                    if completedOwnerPendingImage {
+                        if pendingImageIssue == nil { pendingImageIssue = value }
+                        else { pendingImageGateOverflow = true }
+                    }
                 }
             }
             service.onDebugVideoRateHandoff = { [weak service] value in
@@ -4356,9 +4399,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if let diagnostic {
                 service.onDebugVideoSeekCompletionTerminal = { [weak service, weak diagnostic] value in
                     if value.request == request, let service { diagnostic?.record(service, kind: 2, terminal: value) }
+                    if completedOwnerPendingImage, value.request == request,
+                       value.nativeSeekTicket == pendingImageIssue?.nativeSeekTicket {
+                        if pendingImageTerminals < 2 { pendingImageTerminals += 1 }
+                        else { pendingImageGateOverflow = true }
+                    }
                 }
             }
             defer {
+                holdPendingImage = false; holdPendingImageAdoption = false
+                if completedOwnerPendingImage {
+                    service.shouldDebugAcquireVideoFrame = nil
+                    service.shouldDebugDeferAudioVisit = nil
+                }
                 diagnostic?.record(service, kind: 3)
                 diagnostic?.phase = 7 // Later captured terminal callbacks belong to owned cleanup.
                 service.onDebugVideoRateHandoff = nil
@@ -4375,6 +4428,73 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 coldProbe.sample(audio: audio, service: service, renderer: sample, force: true)
             }
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            if completedOwnerPendingImage {
+                // The native callback runs normally. Only image acquisition and
+                // service adoption are held; the real renderer consumes the PCM command.
+                try await require({
+                    guard qualified, transferred, userSeekIssued, pendingImageTerminals == 1,
+                          !pendingImageGateOverflow, pendingImageVetoCalls > 0,
+                          let issue = pendingImageIssue, issue.request == request,
+                          issue.reason == .userPausedSeek, issue.force, !issue.canPlay,
+                          abs(issue.requestedPosition - 0.4) <= 1.0 / 48_000,
+                          let marker = service.debugPausedExplicitVisitState,
+                          marker.ownsCurrentPausedCommand, marker.request == request,
+                          marker.mediaID == fixture.aID, marker.item == startedItem,
+                          let ticket = marker.ticket, let epoch = marker.completedEpoch,
+                          marker.nativeSeek == issue.nativeSeekTicket,
+                          abs(marker.target - 0.4) <= 1.0 / 48_000,
+                          let pull = pendingImagePull else { return false }
+                    let owner = service.debugAlignedVideoPollState
+                    let sample = audio.renderer.snapshot
+                    return owner.generation == request && owner.request == request
+                        && owner.presentationMatches && owner.observedItemMatches
+                        && owner.frame.coherent && owner.frame.ticket == ticket
+                        && owner.frame.output == pull.output && pull.ticket == ticket
+                        && owner.frame.imageEpoch == epoch && pull.imageEpoch == epoch
+                        && owner.frame.seekSerial == issue.nativeSeekTicket
+                        && pull.seekSerial == issue.nativeSeekTicket && owner.frame.activeSeekTicket == nil
+                        && marker.token > 0 && sample.token == marker.token
+                        && sample.visit == marker.visit && sample.selectionVersion == marker.selectionVersion
+                        && !sample.ended && !audio.isSelectionPending(in: sample)
+                        && sample.frame == 19_200
+                        && service.debugInitialVideoReadyState.audioVisit != marker.visit
+                        && service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                        && service.submittedVideoFrameCount == 0
+                        && service.videoFramePositionSeconds == nil && service.copiedVideoFramePositionSeconds == nil
+                        && !service.isVideoReady && !service.wantsToPlay && !service.audioEngineRunning
+                }, "A real completed/activated exact .4 command and matching sealed owner must precede adoption; first image remains unacquired")
+                let marker = try XCTUnwrap(service.debugPausedExplicitVisitState)
+                let pull = try XCTUnwrap(pendingImagePull)
+                let epoch = try XCTUnwrap(marker.completedEpoch)
+                let sample = audio.renderer.snapshot
+                let blockedAtRelease = pendingImageVetoCalls
+                holdPendingImageAdoption = false // Release only service adoption, never native completion or acquisition.
+                try await require({ service.debugInitialVideoReadyState.audioVisit == marker.visit },
+                    "The actual acknowledged paused PCM visit must be adopted while image acquisition stays held")
+                let adopted = audio.renderer.snapshot, owner = service.debugAlignedVideoPollState
+                let duplicateIssues = pausedSourceVisitIssues
+                XCTAssertEqual(duplicateIssues, 0, "An already completed exact paused target must not issue another source-visit seek while its first image is pending")
+                XCTAssertEqual(owner.frame.ticket, marker.ticket)
+                XCTAssertEqual(owner.frame.output, pull.output)
+                XCTAssertEqual(owner.frame.imageEpoch, epoch, "The exact active timeline must survive its delayed PCM ACK without a flush")
+                XCTAssertEqual(owner.frame.seekSerial, marker.nativeSeek)
+                XCTAssertNil(owner.frame.activeSeekTicket)
+                XCTAssertTrue(owner.frame.coherent)
+                XCTAssertNil(service.debugInitialVideoReadyState.syncingVideoGeneration)
+                XCTAssertNil(service.debugPausedExplicitVisitState, "The exact visit marker remains single-use")
+                XCTAssertEqual(adopted.token, sample.token); XCTAssertEqual(adopted.visit, sample.visit)
+                XCTAssertEqual(adopted.selectionVersion, sample.selectionVersion); XCTAssertEqual(adopted.frame, sample.frame)
+                XCTAssertEqual(adopted.underrunFrames, 0)
+                XCTAssertEqual(service.submittedVideoFrameCount, 0)
+                XCTAssertNil(service.videoFramePositionSeconds); XCTAssertNil(service.copiedVideoFramePositionSeconds)
+                XCTAssertFalse(service.isVideoReady, "Timeline ownership is never frame/readiness credit")
+                XCTAssertFalse(service.wantsToPlay); XCTAssertFalse(service.audioEngineRunning)
+                XCTAssertFalse(pendingImageGateOverflow)
+                pendingImageReceipt = "CompletedOwnerPendingImage schema=1 request=\(request) nativeSeek=\(pull.seekSerial) completedEpoch=\(epoch) exactTarget=0.4 pcmToken=\(marker.token) pcmVisit=\(marker.visit) pcmVersion=\(marker.selectionVersion) vetoCallsAtRelease=\(blockedAtRelease) terminalCount=\(pendingImageTerminals) actualPCMFrame=\(adopted.frame) adoptedEpoch=\(owner.frame.imageEpoch) duplicateSourceVisitIssues=\(duplicateIssues) submitted=\(service.submittedVideoFrameCount) ready=\(service.isVideoReady) overflow=\(pendingImageGateOverflow) observation=cached-separate-owner-and-renderer-reads output=after-owned-cleanup-attempt xctestOutcome=external"
+                // Assertions above deliberately continue into the original strict
+                // .4 image / 200ms pause / explicit Play / moving-image recovery tail.
+                holdPendingImage = false
+            }
             if let coldProbe, let initialColdRenderer = coldRenderer {
                 var lastRenderer = initialColdRenderer
                 do {

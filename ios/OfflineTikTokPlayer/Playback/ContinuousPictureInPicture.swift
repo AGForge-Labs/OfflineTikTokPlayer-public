@@ -347,6 +347,9 @@ final class ContinuousPictureInPicture: NSObject {
     }
     /// Observes the actual SDK request without replacing its result.
     var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
+    // Timing-only test gate. A refusal leaves the same active timeline/epoch intact.
+    // Nil adds no SDK read, clock, task, counter or Release behavior.
+    var shouldDebugAcquireFrame: (@MainActor (CurrentFrameReceipt) -> Bool)?
     enum DebugNativePullStage: Int, CaseIterable, Sendable {
         case availability = 0, copy = 1, enqueue = 2
     }
@@ -915,6 +918,7 @@ final class ContinuousPictureInPicture: NSObject {
         installedTimeline = nil
         invalidateCurrentFrameProof()
         #if DEBUG
+        shouldDebugAcquireFrame = nil
         onFrameAcquisition = nil
         onDebugRenderStamp = nil
         onDebugNativePullStamp = nil
@@ -985,6 +989,10 @@ final class ContinuousPictureInPicture: NSObject {
             output: ObjectIdentifier(videoOutput), imageEpoch: imageEpoch, seekSerial: seekTicket)
         guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
+        if let shouldAcquire = shouldDebugAcquireFrame {
+            guard shouldAcquire(pullReceipt) else { return }
+            guard ownsFramePull(pullReceipt) else { return }
+        }
         debugTraceRender(.attempt, sourceTicket: debugSourceTicket)
         #endif
         guard ownsFramePull(pullReceipt) else { return }
