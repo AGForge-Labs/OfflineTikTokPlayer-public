@@ -3950,6 +3950,314 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "returned-A")
     }
 
+    func testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption() async throws {
+        #if DEBUG
+        let farTarget = SelectionVideoFixture.duration - 2
+        let completion = NaturalCompletionSeekHold(minimumTarget: farTarget,
+            maximumTarget: SelectionVideoFixture.duration)
+        var stage = 0
+        var decisionReceipt: String?, recoveryReceipt: String?
+        defer {
+            completion.release()
+            print("NaturalSeekCompletionSummary schema=1 stage=\(stage) intercepted=\(completion.intercepted) nativeCallbacks=\(completion.nativeCallbacks) nativeFinished=\(completion.nativeFinished.map { String($0) } ?? "missing") forwarded=\(completion.forwarded) rejectedCommands=\(completion.rejectedCommands) overflow=\(completion.overflow) cleanupAcknowledged=\(completion.cleanupAcknowledged) latencyAcceptance=false physicalOutput=unverified")
+            if let decisionReceipt { print(decisionReceipt) }
+            if let recoveryReceipt { print(recoveryReceipt) }
+        }
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer,
+            seekVideo: { player, time, callback in completion.seek(player, time, callback) },
+            additionalCleanupAcknowledged: { completion.cleanupAcknowledged }) { fixture, audio, service, screen in
+            service.isInteractingWithFeed = false
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            let prepared = await waitUntil(timeout: 3) {
+                self.explicitInitialReadySourceSettled(service, screen: screen)
+                    && service.preparedAudioCount == 2 && buffer.hasPrepared(fixture.bID)
+            }
+            XCTAssertTrue(prepared, "Real ready A and both complete Saved sources must precede the completion control")
+            guard prepared else { throw SelectionVideoTestFailure.timeout }
+            stage = 1
+            assertSelection(service, fixture: fixture, id: fixture.aID)
+            let itemA = try XCTUnwrap(service.player.currentItem)
+            let resourceA = try XCTUnwrap(buffer.resource(for: itemA))
+            let outputA = try XCTUnwrap(resourceA.output)
+            let aToken = try XCTUnwrap(audio.entry(for: fixture.aID)).token
+            let bToken = try XCTUnwrap(audio.entry(for: fixture.bID)).token
+            let request = service.debugInitialVideoReadyState.generation
+            let beforeSeek = service.audioSnapshot
+            let originalSources = (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+            let originalBytes = audio.renderer.retainedPCMMemoryBytes
+            XCTAssertEqual(service.queue.repeatMode, .off)
+            XCTAssertGreaterThan(aToken, 0); XCTAssertGreaterThan(bToken, 0); XCTAssertNotEqual(aToken, bToken)
+            XCTAssertEqual(beforeSeek.token, aToken); XCTAssertFalse(beforeSeek.ended)
+            XCTAssertFalse(audio.isSelectionPending(in: beforeSeek))
+            guard beforeSeek.visit <= Int64.max - 2 else {
+                XCTFail("One acknowledged far seek and one actual natural visit must remain representable")
+                throw SelectionVideoTestFailure.timeout
+            }
+            var expectedNaturalVisit: Int64?, acknowledgedVersion: Int?
+            var holdAdoption = true, gateTimedOut = false, gateOverflow = false
+            var gateDeadline: Double?, blockedAttempts = 0
+            var issued: PlaybackService.DebugVideoSeekStamp?, issuedCount = 0, issueOverflow = false
+            service.onDebugVideoSeekStamp = { stamp in
+                guard stamp.request == request, stamp.requestedPosition >= farTarget,
+                      stamp.requestedPosition < SelectionVideoFixture.duration else { return }
+                if issuedCount < 8 { issuedCount += 1; if issued == nil { issued = stamp } }
+                else { issueOverflow = true }
+            }
+            service.shouldDebugDeferAudioVisit = { generation in
+                guard holdAdoption, generation == request,
+                      let expectedNaturalVisit, let acknowledgedVersion else { return false }
+                let sample = service.audioSnapshot
+                // A's explicit far-seek acknowledgement is never deferred.
+                // Only the subsequent real B renderer visit can enter this gate.
+                guard sample.token == bToken, sample.visit == expectedNaturalVisit,
+                      sample.selectionVersion == acknowledgedVersion,
+                      !audio.isSelectionPending(in: sample) else { return false }
+                let now = ProcessInfo.processInfo.systemUptime
+                if gateDeadline == nil { gateDeadline = now + 3 }
+                guard now < (gateDeadline ?? now) else { gateTimedOut = true; return false }
+                guard blockedAttempts < 128 else { gateOverflow = true; return false }
+                blockedAttempts += 1
+                return true
+            }
+            defer {
+                holdAdoption = false
+                service.shouldDebugDeferAudioVisit = nil
+                service.onDebugVideoSeekStamp = nil
+                service.onDebugVideoRateHandoff = nil
+                service.onDebugVideoRenderStamp = nil
+                // Forward even if teardown wins before the actual SDK callback.
+                completion.release()
+            }
+            completion.arm(player: service.player)
+            let setupDeadline = ProcessInfo.processInfo.systemUptime + 10
+            service.seek(farTarget)
+            let heldOnA = await waitUntil(timeout: max(0, setupDeadline - ProcessInfo.processInfo.systemUptime)) {
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return completion.isHolding && issuedCount == 1 && !issueOverflow && !completion.overflow
+                    && completion.rejectedCommands == 0 && state.generation == request
+                    && state.readyGeneration == request && state.syncingVideoGeneration == request
+                    && state.audioVisit == sample.visit && sample.token == aToken
+                    && sample.visit == beforeSeek.visit + 1 && sample.selectionVersion > beforeSeek.selectionVersion
+                    && sample.frame >= Int64((farTarget + 0.05) * 48_000) && !sample.ended
+                    && !audio.isSelectionPending(in: sample) && service.queue.currentID == fixture.aID
+                    && audio.selectedID == fixture.aID && service.player.currentItem === itemA
+                    && service.wantsToPlay && service.audioEngineRunning && !service.isLoading && !service.audioOnly
+            }
+            XCTAssertTrue(heldOnA, "A must acknowledge the real far seek while its actual successful native completion alone is held")
+            guard heldOnA, let issued else { throw SelectionVideoTestFailure.timeout }
+            let acknowledgedA = service.audioSnapshot
+            guard acknowledgedA.token == aToken, acknowledgedA.visit == beforeSeek.visit + 1,
+                  acknowledgedA.selectionVersion > beforeSeek.selectionVersion,
+                  acknowledgedA.frame >= Int64((farTarget + 0.05) * 48_000), !acknowledgedA.ended,
+                  !audio.isSelectionPending(in: acknowledgedA) else {
+                XCTFail("A's fresh real far-seek acknowledgement must still precede the natural B handoff")
+                throw SelectionVideoTestFailure.timeout
+            }
+            stage = 2
+            let heldSeek = service.debugAlignedVideoPollState
+            XCTAssertTrue(issued.force); XCTAssertEqual(issued.reason, .sourceVisit)
+            XCTAssertEqual(issued.generation, request); XCTAssertTrue(issued.observedItemMatches)
+            XCTAssertTrue(issued.selectedMatchesQueue); XCTAssertTrue(issued.presentationRequestMatches)
+            XCTAssertEqual(heldSeek.frame.activeSeekTicket, issued.nativeSeekTicket)
+            XCTAssertEqual(heldSeek.frame.ticket?.debugItemIdentity, ObjectIdentifier(itemA))
+            expectedNaturalVisit = acknowledgedA.visit + 1
+            acknowledgedVersion = acknowledgedA.selectionVersion
+            let naturalB = await waitUntil(timeout: max(0, setupDeadline - ProcessInfo.processInfo.systemUptime)) {
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return completion.isHolding && blockedAttempts > 0 && !gateTimedOut && !gateOverflow
+                    && state.generation == request && state.readyGeneration == request
+                    && state.syncingVideoGeneration == request && state.audioVisit == acknowledgedA.visit
+                    && sample.token == bToken && sample.visit == expectedNaturalVisit
+                    && sample.selectionVersion == acknowledgedVersion && sample.frame > 2_400 && !sample.ended
+                    && !audio.isSelectionPending(in: sample) && service.queue.currentID == fixture.aID
+                    && audio.selectedID == fixture.aID && service.player.currentItem === itemA
+                    && service.wantsToPlay && service.audioEngineRunning && !service.isLoading && !service.audioOnly
+            }
+            XCTAssertTrue(naturalB, "Only an actual natural B render handoff may qualify this completion release")
+            guard naturalB else { throw SelectionVideoTestFailure.timeout }
+            stage = 3
+            let firstB = service.audioSnapshot
+            let progressed = await waitUntil(timeout: 0.75) {
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                return completion.isHolding && !gateTimedOut && !gateOverflow
+                    && state.generation == request && state.syncingVideoGeneration == request
+                    && state.audioVisit == acknowledgedA.visit && sample.token == bToken
+                    && sample.visit == firstB.visit && sample.selectionVersion == firstB.selectionVersion
+                    && sample.frame >= firstB.frame + 9_600 && !sample.ended
+                    && sample.underrunFrames == acknowledgedA.underrunFrames
+            }
+            let beforeRelease = service.audioSnapshot
+            let oldPresentation = service.debugAlignedVideoPollState
+            let nativeAStillCurrent = service.player.currentItem === itemA && itemA.status == .readyToPlay
+            let qualified = progressed && completion.isHolding && completion.nativeFinished == true
+                && !completion.overflow && completion.rejectedCommands == 0 && issuedCount == 1 && !issueOverflow
+                && !gateTimedOut && !gateOverflow && (gateDeadline.map { ProcessInfo.processInfo.systemUptime < $0 } ?? false)
+                && nativeAStillCurrent && service.queue.currentID == fixture.aID && audio.selectedID == fixture.aID
+                && oldPresentation.generation == request && oldPresentation.request == request
+                && oldPresentation.presentationMatches && oldPresentation.observedItemMatches
+                && oldPresentation.frame.ticket == heldSeek.frame.ticket
+                && oldPresentation.frame.activeSeekTicket == issued.nativeSeekTicket && !oldPresentation.frame.coherent
+                && resourceA.item === itemA && resourceA.output === outputA && resourceA.isAttached
+                && resourceA.isBorrowed && !resourceA.isRetired
+                && beforeRelease.token == bToken && beforeRelease.visit == firstB.visit
+                && beforeRelease.selectionVersion == firstB.selectionVersion && !beforeRelease.ended
+                && beforeRelease.underrunFrames == acknowledgedA.underrunFrames
+            XCTAssertTrue(qualified, "The successful already-issued A completion and exact unadopted B owner must qualify before release")
+            guard qualified else { throw SelectionVideoTestFailure.timeout }
+            stage = 4
+            var staleRateCount = 0, staleAttemptCount = 0, observerOverflow = false
+            var observedBAtRate = false, rateOwnerUnchanged = true
+            service.onDebugVideoRateHandoff = { stamp in
+                guard stamp.cause == .correctionCompletion, stamp.request == request,
+                      stamp.item == ObjectIdentifier(itemA) else { return }
+                if staleRateCount < 8 { staleRateCount += 1 } else { observerOverflow = true }
+                let sample = service.audioSnapshot
+                observedBAtRate = sample.token == bToken && sample.visit == beforeRelease.visit
+                    && sample.selectionVersion == beforeRelease.selectionVersion && !sample.ended
+                rateOwnerUnchanged = rateOwnerUnchanged && observedBAtRate
+                    && stamp.entryGeneration == request && stamp.returnGeneration == request
+                    && stamp.entryObservedItemMatches && stamp.returnObservedItemMatches && stamp.presentationUnchanged
+                    && stamp.presentationTicket == oldPresentation.frame.ticket
+                    && stamp.returnPresentationTicket == oldPresentation.frame.ticket
+            }
+            service.onDebugVideoRenderStamp = { stamp in
+                guard stamp.generation == request, stamp.render.stage == .attempt,
+                      stamp.render.ticket == oldPresentation.frame.ticket else { return }
+                if staleAttemptCount < 8 { staleAttemptCount += 1 } else { observerOverflow = true }
+            }
+            completion.release()
+            let completionProcessed = await waitUntil(timeout: 0.75) {
+                service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+            }
+            let after = service.audioSnapshot, afterPresentation = service.debugAlignedVideoPollState
+            let decisionState = service.debugInitialVideoReadyState
+            let nativeAAfterCompletion = service.player.currentItem === itemA
+            let insideHold = gateDeadline.map { ProcessInfo.processInfo.systemUptime < $0 } ?? false
+            let completionQualified = completionProcessed && completion.forwarded == 1 && !observerOverflow
+                && rateOwnerUnchanged && nativeAAfterCompletion && service.queue.currentID == fixture.aID
+                && audio.selectedID == fixture.aID && insideHold && !gateTimedOut && !gateOverflow
+                && blockedAttempts > 0 && blockedAttempts <= 128
+                && decisionState.generation == request && decisionState.readyGeneration == request
+                && decisionState.audioVisit == acknowledgedA.visit && decisionState.syncingVideoGeneration == nil
+                && after.token == bToken && after.visit == beforeRelease.visit
+                && after.selectionVersion == beforeRelease.selectionVersion && !after.ended
+                && after.frame >= beforeRelease.frame && after.underrunFrames == acknowledgedA.underrunFrames
+                && afterPresentation.frame.ticket == oldPresentation.frame.ticket
+                && afterPresentation.frame.activeSeekTicket == nil
+            let submittedAfterCompletion = service.submittedVideoFrameCount
+            decisionReceipt = "NaturalSeekCompletionDecision schema=1 qualified=\(qualified) completionQualified=\(completionQualified) request=\(request) issuedReason=\(issued.reason.rawValue) nativeSeekTicket=\(issued.nativeSeekTicket) nativeFinished=\(completion.nativeFinished == true) nativeTarget=\(completion.targetSeconds.map { String($0) } ?? "missing") selectedToken=\(aToken) acknowledgedAToken=\(acknowledgedA.token) acknowledgedAVisit=\(acknowledgedA.visit) acknowledgedAFrame=\(acknowledgedA.frame) renderedToken=\(after.token) renderedVisit=\(after.visit) cachedVisit=\(decisionState.audioVisit) selectionVersion=\(after.selectionVersion) acknowledgedAUnderruns=\(acknowledgedA.underrunFrames) coldSeekUnderrunDelta=\(acknowledgedA.underrunFrames - beforeSeek.underrunFrames) qualifiedUnderrunDelta=\(after.underrunFrames - acknowledgedA.underrunFrames) blockedAttempts=\(blockedAttempts) gateTimedOut=\(gateTimedOut) gateOverflow=\(gateOverflow) insideHold=\(insideHold) nativeAAfterCompletion=\(nativeAAfterCompletion) staleRateCount=\(staleRateCount) observedBAtRate=\(observedBAtRate) rateOwnerUnchanged=\(rateOwnerUnchanged) staleAttemptCount=\(staleAttemptCount) stalePresentationCoherent=\(afterPresentation.frame.coherent) observerOverflow=\(observerOverflow) latencyAcceptance=false physicalOutput=unverified"
+            // Release adoption before XCTest reports the deliberately failing assertions.
+            holdAdoption = false; service.shouldDebugDeferAudioVisit = nil
+            service.onDebugVideoRateHandoff = nil; service.onDebugVideoRenderStamp = nil
+            service.onDebugVideoSeekStamp = nil
+            XCTAssertTrue(completionQualified, "The actual A completion must finish while only the healthy B adoption gate remains held")
+            guard completionQualified else { throw SelectionVideoTestFailure.timeout }
+            completion.acknowledgeDelivery()
+            stage = 5
+            // Intended RED: do not allow A's completed seek to install/activate its
+            // stale ticket using the position of the already audible natural B.
+            XCTAssertEqual(staleRateCount, 0, "An already-issued A correction must not schedule native A after real audio has naturally entered B")
+            XCTAssertEqual(staleAttemptCount, 0, "An already-issued A completion must not reopen stale CPP acquisition")
+            XCTAssertFalse(afterPresentation.frame.coherent, "The stale A presentation must remain inactive after its completion")
+
+            try await require({
+                let state = service.debugInitialVideoReadyState, sample = service.audioSnapshot
+                guard let frame = service.videoFramePositionSeconds,
+                      let copied = service.copiedVideoFramePositionSeconds else { return false }
+                guard service.queue.currentID == fixture.bID && audio.selectedID == fixture.bID
+                    && state.generation > request && state.readyGeneration == state.generation
+                    && state.syncingVideoGeneration == nil && state.audioVisit == beforeRelease.visit
+                    && sample.token == bToken && sample.visit == beforeRelease.visit
+                    && sample.selectionVersion == beforeRelease.selectionVersion
+                    && sample.frame >= after.frame + 2_400 && !sample.ended && !audio.isSelectionPending(in: sample)
+                    && sample.underrunFrames == acknowledgedA.underrunFrames
+                    && service.submittedVideoFrameCount > submittedAfterCompletion && service.isVideoReady && !service.isLoading
+                    && screen.customVideoLayer?.isReadyForDisplay == true
+                    && frame.isFinite && copied.isFinite && frame >= 0 && copied >= 0
+                    && abs(frame - service.videoRequestedPositionSeconds) <= 0.080 && abs(copied - frame) <= 0.080
+                    else { return false }
+                let nativePosition = service.player.currentTime().seconds
+                let fresh = service.audioSnapshot
+                return fresh.token == bToken && fresh.visit == sample.visit
+                    && fresh.selectionVersion == sample.selectionVersion && fresh.frame >= sample.frame
+                    && fresh.underrunFrames == sample.underrunFrames && !fresh.ended
+                    && nativePosition.isFinite && abs(nativePosition - Double(fresh.frame) / 48_000) <= 0.080
+            }, "Releasing adoption must reveal the actual naturally rendered B with fresh aligned PCM and frames")
+            stage = 6
+            assertSelection(service, fixture: fixture, id: fixture.bID)
+            await assertMovingVisibleVideo(service, screen: screen, identity: .b,
+                label: "issued-A-completion-natural-B-recovery")
+            let final = service.audioSnapshot
+            XCTAssertEqual(final.token, bToken); XCTAssertEqual(final.visit, beforeRelease.visit)
+            XCTAssertEqual(final.selectionVersion, beforeRelease.selectionVersion)
+            XCTAssertGreaterThan(final.frame, after.frame); XCTAssertFalse(final.ended)
+            XCTAssertEqual(final.underrunFrames, acknowledgedA.underrunFrames)
+            XCTAssertTrue(service.wantsToPlay); XCTAssertTrue(service.audioEngineRunning)
+            XCTAssertFalse(gateTimedOut); XCTAssertFalse(gateOverflow); XCTAssertFalse(observerOverflow)
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3); XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
+            XCTAssertEqual(originalBytes, 6_912_000)
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, originalBytes)
+            XCTAssertEqual((0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }, originalSources)
+            recoveryReceipt = "NaturalSeekCompletionRecovery schema=1 request=\(request) incomingToken=\(final.token) incomingVisit=\(final.visit) selectionVersion=\(final.selectionVersion) pcmDelta=\(final.frame - after.frame) qualifiedUnderrunDelta=\(final.underrunFrames - acknowledgedA.underrunFrames) completionAcknowledged=\(completion.cleanupAcknowledged) latencyAcceptance=false compositorScope=asserted-moving-B physicalOutput=unverified"
+            stage = 7
+        }
+        #else
+        XCTFail("Already-issued natural-handoff completion controls require DEBUG ownership hooks")
+        #endif
+    }
+
+    #if DEBUG
+    @MainActor private final class NaturalCompletionSeekHold {
+        private let minimumTarget: Double, maximumTarget: Double
+        private var expectedPlayer: ObjectIdentifier?
+        private var armed = false, released = false, deliveryObserved = false
+        private var callback: (@Sendable (Bool) -> Void)?
+        private(set) var intercepted = false, overflow = false
+        private(set) var nativeCallbacks = 0, forwarded = 0, rejectedCommands = 0
+        private(set) var nativeFinished: Bool?
+        private(set) var targetSeconds: Double?
+        var isHolding: Bool { intercepted && nativeFinished == true && callback != nil && !released }
+        var cleanupAcknowledged: Bool {
+            !intercepted || (nativeCallbacks == 1 && forwarded == 1 && callback == nil && !overflow && deliveryObserved)
+        }
+        init(minimumTarget: Double, maximumTarget: Double) {
+            self.minimumTarget = minimumTarget; self.maximumTarget = maximumTarget
+        }
+        func arm(player: AVPlayer) { expectedPlayer = ObjectIdentifier(player); armed = true }
+        func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
+            let eligible = armed && !intercepted && expectedPlayer == ObjectIdentifier(player)
+                && time.isNumeric && time.seconds >= minimumTarget && time.seconds < maximumTarget
+            if armed, !intercepted, !eligible {
+                if rejectedCommands < 8 { rejectedCommands += 1 } else { overflow = true }
+            }
+            if eligible { intercepted = true; targetSeconds = time.seconds }
+            // Identical real SDK seek/tolerances to the default injection. There
+            // is no synthetic completion, reader gate, second item or player.
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+                guard eligible else { completion(finished); return }
+                Task { @MainActor [weak self] in
+                    guard let self else { completion(finished); return }
+                    guard self.nativeCallbacks == 0 else { self.overflow = true; completion(finished); return }
+                    self.nativeCallbacks = 1; self.nativeFinished = finished
+                    if self.released { self.forwarded = 1; completion(finished) }
+                    else { self.callback = completion }
+                }
+            }
+        }
+        func release() {
+            released = true
+            guard let callback, let nativeFinished else { return }
+            self.callback = nil
+            if forwarded == 0 { forwarded = 1 } else { overflow = true }
+            callback(nativeFinished)
+        }
+        func acknowledgeDelivery() {
+            deliveryObserved = nativeCallbacks == 1 && forwarded == 1 && callback == nil && !overflow
+        }
+    }
+    #endif
+
     func testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption() async throws {
         try recordRuntimeHost()
         #if DEBUG

@@ -166,12 +166,13 @@ class SimulatorBootPreflightTests(unittest.TestCase):
             self.assertEqual(result["stageCode"], 5)
             self.assertEqual(runner.call_count, 3)
         result, runner = self.call([(0, inventory(), 0), (0, b"", 0),
+                                   subprocess.TimeoutExpired("private raw command", 15),
                                    subprocess.TimeoutExpired("private raw command", 15)])
         self.assertEqual(result["statusCode"], 10)
         self.assertEqual(result["stageCode"], 5)
         self.assertEqual(result["lastQueryReturnCode"], -1)
         self.assertEqual(result["finalStateCode"], 0)
-        self.assertEqual(runner.call_count, 3)
+        self.assertEqual(runner.call_count, 4)
 
     def test_one_total_deadline_covers_all_commands_and_rejects_late_return(self):
         clock = Clock()
@@ -209,6 +210,71 @@ class SimulatorBootPreflightTests(unittest.TestCase):
         self.assertEqual(result["identityChecksPassed"], 2)
         self.assertEqual(result["elapsedMs"], 132000)
         self.assertEqual(runner.call_count, 4)
+
+    def test_only_one_final_query_timeout_can_retry_within_the_original_budget(self):
+        result, runner = self.call([(0, inventory("Shutdown"), 1), (0, b"", 1),
+                                   (0, b"", 100), (0, inventory(), 61), (0, inventory(), 2)])
+        self.assertEqual(result["statusCode"], 0)
+        self.assertEqual(result["stageCode"], 6)
+        self.assertEqual(result["elapsedMs"], 164000)
+        self.assertEqual(result["budgetSeconds"], 240)
+        self.assertEqual(result["queryCount"], 3)
+        self.assertEqual(result["identityChecksPassed"], 2)
+        self.assertEqual(result["finalQueryTimeouts"], 1)
+        self.assertEqual(result["finalQueryRetries"], 1)
+        self.assertEqual([call.kwargs["timeout"] for call in runner.call_args_list], [60, 30, 238, 60, 60])
+        self.assertEqual([call.args[0][2] for call in runner.call_args_list],
+                         ["list", "boot", "bootstatus", "list", "list"])
+
+    def test_repeated_final_timeouts_are_terminal_without_a_third_query(self):
+        result, runner = self.call([(0, inventory(), 1), (0, b"", 100),
+                                   (0, b"", 61), (0, b"", 61)])
+        self.assertEqual(result["statusCode"], 10)
+        self.assertEqual(result["stageCode"], 5)
+        self.assertEqual(result["elapsedMs"], 221000)
+        self.assertEqual(result["finalStateCode"], 0)
+        self.assertEqual(result["queryCount"], 3)
+        self.assertEqual(result["finalQueryTimeouts"], 2)
+        self.assertEqual(result["finalQueryRetries"], 1)
+        self.assertEqual(runner.call_count, 4)
+
+    def test_final_timeout_retry_shares_remaining_budget_and_never_runs_after_expiry(self):
+        for last, expected, elapsed in [(10, 0, 211000), (40, 10, 240000)]:
+            with self.subTest(last=last):
+                result, runner = self.call([(0, inventory(), 1), (0, b"", 140),
+                                           (0, b"", 61), (0, inventory(), last)])
+                self.assertEqual(result["statusCode"], expected)
+                self.assertEqual(result["elapsedMs"], elapsed)
+                self.assertEqual(runner.call_args_list[-1].kwargs["timeout"], 39)
+                self.assertEqual(result["finalQueryRetries"], 1)
+        result, runner = self.call([(0, inventory(), 1), (0, b"", 200), (0, b"", 40)])
+        self.assertEqual(result["statusCode"], 10)
+        self.assertEqual(result["elapsedMs"], 240000)
+        self.assertEqual(result["finalQueryRetries"], 0)
+        self.assertEqual(runner.call_count, 3)
+
+    def test_retry_requires_fresh_exact_inventory_and_never_reuses_partial_output(self):
+        for payload, expected in [(b"", 3), (b"invalid", 3), (inventory(udid=OTHER), 4),
+                                  (inventory(available=False), 6), (inventory("Shutdown"), 7)]:
+            with self.subTest(expected=expected):
+                clock = Clock()
+                invoke = self.runner([(0, inventory(), 1), (0, b"", 10),
+                                      (0, payload, 1)], clock)
+                calls = []
+                def run(arguments, **kwargs):
+                    calls.append(arguments)
+                    if len(calls) == 3:
+                        kwargs["stdout"].write(inventory())
+                        clock.value += 60
+                        raise subprocess.TimeoutExpired("PRIVATE", 60, output=inventory())
+                    return invoke(arguments, **kwargs)
+                result = MODULE.prepare_simulator(UDID, run=run, monotonic=clock)
+                self.assertEqual(result["statusCode"], expected)
+                self.assertEqual(result["stageCode"], 5)
+                self.assertEqual(result["finalStateCode"], 0 if expected != 7 else 2)
+                self.assertEqual(result["finalQueryRetries"], 1)
+                self.assertEqual(len(calls), 4)
+                self.assertNotIn("PRIVATE", json.dumps(result))
 
 
 if __name__ == "__main__":

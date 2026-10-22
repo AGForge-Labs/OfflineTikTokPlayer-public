@@ -36,7 +36,8 @@ def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotoni
     result = {"schema": 1, "statusCode": 0, "stageCode": 1, "budgetSeconds": BUDGET_SECONDS,
               "initialStateCode": 0, "finalStateCode": 0, "identityChecksPassed": 0,
               "bootRequested": False, "bootReturnCode": -1, "waitReturnCode": -1,
-              "lastQueryReturnCode": -1, "queryCount": 0, "elapsedMs": 0}
+              "lastQueryReturnCode": -1, "queryCount": 0, "elapsedMs": 0,
+              "finalQueryTimeouts": 0, "finalQueryRetries": 0}
 
     def command(arguments, *, stdout=subprocess.DEVNULL, maximum=None):
         remaining = deadline - monotonic()
@@ -116,7 +117,21 @@ def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotoni
         if result["waitReturnCode"]:
             raise PreflightError(9)
         result["stageCode"] = 5
-        result["finalStateCode"] = query(wanted)
+        try:
+            result["finalStateCode"] = query(wanted)
+        except subprocess.TimeoutExpired:
+            result["finalQueryTimeouts"] = 1
+            # A successful bootstatus can precede a transient inventory timeout.
+            # Retry only this read once, with a new stream and the same deadline.
+            # Identity/state/parse errors and late successful returns stay terminal.
+            if monotonic() >= deadline:
+                raise
+            result["finalQueryRetries"] = 1
+            try:
+                result["finalStateCode"] = query(wanted)
+            except subprocess.TimeoutExpired:
+                result["finalQueryTimeouts"] = 2
+                raise
         if result["finalStateCode"] != 1:
             raise PreflightError(7)
         if monotonic() >= deadline:
