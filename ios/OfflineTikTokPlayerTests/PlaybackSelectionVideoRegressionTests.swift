@@ -117,6 +117,92 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery() async throws {
+        #if DEBUG
+        try await withOwnedNaturalFixture { fixture, audio, service, screen in
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            let item = try XCTUnwrap(service.player.currentItem)
+            let timebase = try XCTUnwrap(item.timebase)
+            var reads: [PlaybackService.DebugVideoPositionRead] = []
+            var seeks: [PlaybackService.DebugVideoSeekStamp] = []
+            var overflow = false
+            service.onDebugVideoPositionRead = { value in
+                if reads.count < 8 { reads.append(value) } else { overflow = true }
+            }
+            service.onDebugVideoSeekStamp = { value in
+                if seeks.count < 8 { seeks.append(value) } else { overflow = true }
+            }
+            defer { service.onDebugVideoPositionRead = nil; service.onDebugVideoSeekStamp = nil }
+
+            // Keep the real PCM engine running and the playback intent unchanged.
+            // This isolated control deliberately withholds MainActor polling for
+            // one fixed 200 ms sleep; no CPU spin or benchmark budget is changed.
+            service.player.pause()
+            let initialNativeRate = CMTimebaseGetEffectiveRate(timebase)
+            XCTAssertEqual(initialNativeRate, 0)
+            let before = audio.renderer.snapshot
+            holdMainActorForStoppedNativeClockControl()
+            let after = audio.renderer.snapshot
+            let native = CMTimebaseGetTime(timebase).seconds
+            let goal = audio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+            XCTAssertTrue(service.wantsToPlay); XCTAssertTrue(service.audioEngineRunning)
+            XCTAssertEqual(before.token, after.token); XCTAssertEqual(before.visit, after.visit)
+            XCTAssertGreaterThan(Double(after.frame - before.frame) / 48_000, 0.080)
+            XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+            XCTAssertTrue(native.isFinite && goal.isFinite)
+            XCTAssertGreaterThan(goal - native, 0.080, "The real stopped clock must exceed the unchanged drift threshold")
+            let stoppedNativeRate = CMTimebaseGetEffectiveRate(timebase)
+            XCTAssertEqual(stoppedNativeRate, 0)
+            service.debugSynchronizeVideoToAudio()
+            XCTAssertEqual(reads.count, 1)
+            XCTAssertEqual(reads.first?.itemTimebaseEffectiveRate, 0)
+            XCTAssertTrue(reads.first?.position.isNaN == true,
+                          "A stopped playing clock is unavailable for ordinary drift comparison")
+            XCTAssertEqual(seeks.count, 0, "Waiting for a native clock must not flush a current frame through a drift seek")
+            XCTAssertNil(service.debugInitialVideoReadyState.syncingVideoGeneration)
+            let stoppedPhaseSeeks = seeks.count
+
+            let submitted = service.submittedVideoFrameCount
+            let readCount = reads.count
+            service.debugSynchronizeVideoToAudio(force: true)
+            XCTAssertEqual(reads.count, readCount, "Explicit recovery must retain its ordinary-clock bypass")
+            XCTAssertEqual(seeks.filter(\.force).count, 1)
+            service.onDebugVideoPositionRead = nil
+            var recoveredActualFrame = false
+            try await require({
+                guard service.player.currentItem === item, let currentTimebase = item.timebase,
+                      let frame = service.videoFramePositionSeconds else { return false }
+                let freshGoal = audio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+                let recovered = service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                    && CMTimebaseGetEffectiveRate(currentTimebase) > 0
+                    && service.submittedVideoFrameCount > submitted && abs(frame - freshGoal) <= 0.080
+                if recovered { recoveredActualFrame = true }
+                return recovered
+            }, "A forced actual native seek must recover advancing, newly submitted video")
+            service.onDebugVideoPositionRead = { value in
+                if reads.count < 8 { reads.append(value) } else { overflow = true }
+            }
+            service.debugSynchronizeVideoToAudio()
+            service.onDebugVideoPositionRead = nil
+            XCTAssertEqual(reads.count, readCount + 1)
+            XCTAssertTrue(reads.last?.position.isFinite == true)
+            XCTAssertGreaterThan(reads.last?.itemTimebaseEffectiveRate ?? -.infinity, 0,
+                                 "An actually advancing playing clock must remain available for drift correction")
+            XCTAssertFalse(overflow); XCTAssertLessThanOrEqual(reads.count, 8); XCTAssertLessThanOrEqual(seeks.count, 8)
+            print("StoppedNativeClockControl schema=1 native=\(native) audioGoal=\(goal) beforeFrame=\(before.frame) afterFrame=\(after.frame) initialEffectiveRate=\(initialNativeRate) stoppedEffectiveRate=\(stoppedNativeRate) stoppedOrdinarySeeks=\(stoppedPhaseSeeks) forcedSeekObserved=\(seeks.contains(where: \.force)) recoveredActualFrame=\(recoveredActualFrame) boundedMainActorHoldMs=200 latencyAcceptance=false")
+        }
+        #else
+        XCTFail("Stopped native clock contract requires DEBUG ownership seams")
+        #endif
+    }
+
+    #if DEBUG
+    private func holdMainActorForStoppedNativeClockControl() {
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+    #endif
+
     func testPeriodicVideoClockSkipsPCMAndPreservesLegacyOwnership() async throws {
         #if DEBUG
         try await withOwnedNaturalFixture { fixture, audio, service, screen in
@@ -5965,7 +6051,7 @@ private final class NativeClockHandoffTrace {
                 && read.entrySeekState == handoff.returnSeekState
                 && read.returnSeekState == handoff.returnSeekState
                 && read.observedItemMatches && read.presentationUnchanged
-            print("NativeClockFollowingRead schema=1 phase=\(phase) cause=\(handoff.cause.rawValue) request=\(read.request) item=\(read.item) entryNs=\(read.entryNs) returnNs=\(read.returnNs) position=\(read.position) effectiveRate=\(read.itemTimebaseEffectiveRate.map { String($0) } ?? "unavailable") seekSerial=\(read.entrySeekState.serial) activeSeek=\(read.entrySeekState.activeTicket.map { String($0) } ?? "none") joined=\(joined) clock=DispatchTime")
+            print("NativeClockFollowingRead schema=2 phase=\(phase) cause=\(handoff.cause.rawValue) request=\(read.request) item=\(read.item) entryNs=\(read.entryNs) returnNs=\(read.returnNs) position=\(read.position) rawPosition=\(read.rawItemTimebasePosition.map { String($0) } ?? "unavailable") effectiveRate=\(read.itemTimebaseEffectiveRate.map { String($0) } ?? "unavailable") seekSerial=\(read.entrySeekState.serial) activeSeek=\(read.entrySeekState.activeTicket.map { String($0) } ?? "none") joined=\(joined) clock=DispatchTime")
             XCTAssertTrue(joined, "The first following read must retain the exact handoff owner")
         }
     }

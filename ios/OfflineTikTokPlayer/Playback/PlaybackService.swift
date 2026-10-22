@@ -47,8 +47,9 @@ final class PlaybackService: NSObject {
         let returnPresentationTicket: ContinuousPictureInPicture.PresentationTicket?
         let entrySeekState: ContinuousPictureInPicture.DebugNativeSeekState
         let returnSeekState: ContinuousPictureInPicture.DebugNativeSeekState
-        // Queried from the same freshly fetched item timebase, only with a read observer.
+        // Captured from the same fresh timebase; the rate also qualifies the real decision.
         let itemTimebaseEffectiveRate: Double?
+        let rawItemTimebasePosition: Double?
     }
     enum DebugVideoRateHandoffCause: Int, Sendable {
         case initialReady = 0, correctionCompletion = 1
@@ -1236,15 +1237,24 @@ final class PlaybackService: NSObject {
         let request = generation, presentation = videoPresentation
         let enteredSeek = observer.map { _ in continuousPiP.debugNativeSeekState }
         var sampledEffectiveRate: Double?
+        var sampledRawPosition: Double?
         #endif
         @MainActor func read() -> Double {
             guard let timebase = item.timebase else { return .nan }
             let time = CMTimebaseGetTime(timebase)
+            let effectiveRate = CMTimebaseGetEffectiveRate(timebase)
             #if DEBUG
-            if observer != nil { sampledEffectiveRate = CMTimebaseGetEffectiveRate(timebase) }
+            if observer != nil {
+                sampledEffectiveRate = effectiveRate
+                sampledRawPosition = time.isNumeric ? time.seconds : nil
+            }
             #endif
             guard time.isNumeric else { return .nan }
             let seconds = time.seconds
+            // A scheduled/starting native item can report "playing" while its
+            // actual timebase is still stopped. Seeking that frozen clock keeps
+            // discarding its first frame. Explicit seeks bypass this reader.
+            guard !self.intent.canPlay || (effectiveRate.isFinite && effectiveRate > 0) else { return .nan }
             return seconds.isFinite ? seconds : .nan
         }
         #if DEBUG
@@ -1263,7 +1273,8 @@ final class PlaybackService: NSObject {
                 presentationRequest: presentation?.request, returnPresentationRequest: returnedPresentation?.request,
                 presentationTicket: presentation?.ticket, returnPresentationTicket: returnedPresentation?.ticket,
                 entrySeekState: enteredSeek, returnSeekState: continuousPiP.debugNativeSeekState,
-                itemTimebaseEffectiveRate: sampledEffectiveRate))
+                itemTimebaseEffectiveRate: sampledEffectiveRate,
+                rawItemTimebasePosition: sampledRawPosition))
             return position
         }
         #endif
