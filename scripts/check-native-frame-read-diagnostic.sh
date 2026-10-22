@@ -2,15 +2,15 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Immediate metadata parent; reviewed app/test source acb67877 has this same ios tree.
-expected_code_source=418caf79a282d55091ef05182ed7b1dfa4e672d5
-expected_ios_tree=cf012d7bf00194e9f18d482fba04d566805d933a
+# Exact cold-start trace source; paused ownership Release behavior remains reviewed acb67877.
+expected_code_source=e23e6e3fe48ffb057ed0a1c591c61c07e9366f0c
+expected_ios_tree=6010df625cb8ed3504499d2e06d4e3a426a77b8a
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -36,9 +36,9 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup'}
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace'}
 if len(expected) != 1 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly one initial-ready explicit-seek identity must exist in the pinned source')
+    raise SystemExit('Exactly one cold-boundary trace identity must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
