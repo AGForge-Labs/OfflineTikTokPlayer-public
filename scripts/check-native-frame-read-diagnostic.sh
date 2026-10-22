@@ -2,15 +2,22 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Exact completed-owner/pending-first-image baseline; Release ownership remains acb67877.
-expected_code_source=3a9d4f5e2e335f26266070204b9eb540b3b12e20
-expected_ios_tree=8c16aa086d985e27f122767f2b3c96fbc9b7000e
+# Exact paused timeline repair, original ownership controls and unchanged playback benchmark.
+expected_code_source=4119f1582f5e3f500c27aba482f9600e3c455120
+expected_ios_tree=b1e06539a0f67dd3d0a2ef66f186f410db9f8762
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
+  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testActiveTimelineReceiptRequiresLiveOwnerWithoutGrantingPendingImageCredit
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testCompletedPausedExplicitSeekKeepsItsTimelineWhileFirstImageIsPending
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSupersededInitialOrdinaryCompletionCannotClearNewExplicitPausedSeek
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -36,9 +43,17 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testCompletedPausedExplicitSeekKeepsItsTimelineWhileFirstImageIsPending'}
-if len(expected) != 1 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly one completed-owner pending-image identity must exist in the pinned source')
+    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testActiveTimelineReceiptRequiresLiveOwnerWithoutGrantingPendingImageCredit',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testCompletedPausedExplicitSeekKeepsItsTimelineWhileFirstImageIsPending',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSupersededInitialOrdinaryCompletionCannotClearNewExplicitPausedSeek',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+}
+if len(expected) != 8 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly eight paused-timeline repair identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -47,7 +62,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=1 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=8 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -148,7 +163,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=1 expectedUI=0 expectedCore=107 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=8 expectedUI=0 expectedCore=107 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Only this existing singleton is selected in a fresh hosted job/test process.
 # Its original lost-fixture, paused-seek and cleanup assertions stay intact.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
