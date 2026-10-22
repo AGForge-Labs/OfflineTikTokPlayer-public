@@ -777,6 +777,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(audit.leftSquareSum, stereoSilent ? 0 : 30)
             XCTAssertEqual(audit.rightSquareSum, stereoSilent ? 0 : 30)
             XCTAssertEqual(audit.nonfiniteFrames, 0)
+            XCTAssertTrue(audit.stereoZeroEvidenceQualified)
+            XCTAssertEqual(audit.layout.buffers, 1); XCTAssertEqual(audit.layout.frames, 480)
+            XCTAssertEqual(audit.layout.firstChannelCount, 2); XCTAssertEqual(audit.layout.lastChannelCount, 2)
+            XCTAssertFalse(audit.layout.firstInterleaved); XCTAssertFalse(audit.layout.lastInterleaved)
+            XCTAssertEqual(audit.layout.firstRate, 48_000); XCTAssertEqual(audit.layout.lastRate, 48_000)
+            XCTAssertFalse(audit.layout.changed)
+            XCTAssertEqual(audit.layout.monoDuplicatedFrames, 0)
+            XCTAssertEqual(audit.layout.stereoInputFrames, 480); XCTAssertEqual(audit.layout.otherInputFrames, 0)
             XCTAssertEqual(audit.qualifiedRuns, 1); XCTAssertEqual(audit.retainedRuns, 1)
             XCTAssertEqual(audit.droppedRuns, 0); XCTAssertFalse(audit.overflow)
             let run = try XCTUnwrap(audit.run(at: 0))
@@ -786,6 +794,60 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(run.rightSquareSum, stereoSilent ? 0 : 30)
             XCTAssertNil(audit.run(at: 1)); XCTAssertNil(audit.run(at: 4))
         }
+        // Actual mono zero is duplicated by the unchanged mono oracle. The old
+        // stereoZeroFrames value remains visible, but cannot establish two channels.
+        let monoFormat = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        let monoPCM = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: 480))
+        monoPCM.frameLength = 480
+        try XCTUnwrap(monoPCM.floatChannelData)[0].update(repeating: 0, count: 480)
+        let monoTap = ProductionSelectionOutputTap()
+        monoTap.begin(auditChannels: true); monoTap.append(monoPCM, time: time(0)); monoTap.stop()
+        let monoAudit = monoTap.channelAudit()
+        XCTAssertEqual(monoAudit.stereoZeroFrames, 480, "Existing duplicated-mono observation is unchanged")
+        XCTAssertFalse(monoAudit.stereoZeroEvidenceQualified)
+        XCTAssertEqual(monoAudit.layout.firstChannelCount, 1); XCTAssertEqual(monoAudit.layout.lastChannelCount, 1)
+        XCTAssertEqual(monoAudit.layout.monoDuplicatedFrames, 480)
+        XCTAssertEqual(monoAudit.layout.stereoInputFrames, 0); XCTAssertEqual(monoAudit.layout.otherInputFrames, 0)
+        XCTAssertFalse(monoAudit.layout.firstInterleaved); XCTAssertFalse(monoAudit.layout.changed)
+        let monoRecording = monoTap.samples(from: 0, to: monoTap.count)
+        XCTAssertTrue(monoRecording.values.allSatisfy { $0 == 0 })
+        XCTAssertEqual(ProductionSelectionOutputTap.quietRun(monoRecording.values, rate: monoRecording.rate), 0.01)
+
+        let emptyTap = ProductionSelectionOutputTap()
+        monoPCM.frameLength = 0
+        emptyTap.begin(auditChannels: true); emptyTap.append(monoPCM, time: time(0)); emptyTap.stop()
+        let emptyAudit = emptyTap.channelAudit()
+        XCTAssertEqual(emptyAudit.observedFrames, 0)
+        XCTAssertEqual(emptyAudit.layout.buffers, 0); XCTAssertEqual(emptyAudit.layout.frames, 0)
+        XCTAssertFalse(emptyAudit.layout.allInputActualStereo); XCTAssertFalse(emptyAudit.stereoZeroEvidenceQualified)
+        monoPCM.frameLength = 480
+
+        let packedFormat = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000, channels: 2, interleaved: true))
+        let packedPCM = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: packedFormat, frameCapacity: 480))
+        packedPCM.frameLength = 480
+        let packed = try XCTUnwrap(packedPCM.floatChannelData)[0]
+        for frame in 0..<480 { packed[frame * 2] = 0.25; packed[frame * 2 + 1] = -0.25 }
+        let packedTap = ProductionSelectionOutputTap()
+        packedTap.begin(auditChannels: true); packedTap.append(packedPCM, time: time(0)); packedTap.stop()
+        let packedAudit = packedTap.channelAudit()
+        XCTAssertTrue(packedAudit.stereoZeroEvidenceQualified)
+        XCTAssertTrue(packedAudit.layout.firstInterleaved); XCTAssertTrue(packedAudit.layout.lastInterleaved)
+        XCTAssertEqual(packedAudit.layout.stereoInputFrames, 480)
+        XCTAssertEqual(packedAudit.stereoZeroFrames, 0); XCTAssertEqual(packedAudit.monoZeroFrames, 480)
+
+        let mixedTap = ProductionSelectionOutputTap()
+        mixedTap.begin(auditChannels: true)
+        mixedTap.append(monoPCM, time: time(0)); mixedTap.append(packedPCM, time: time(480)); mixedTap.stop()
+        let mixedAudit = mixedTap.channelAudit()
+        XCTAssertTrue(mixedAudit.layout.changed); XCTAssertFalse(mixedAudit.stereoZeroEvidenceQualified)
+        XCTAssertEqual(mixedAudit.layout.buffers, 2); XCTAssertEqual(mixedAudit.layout.frames, 960)
+        XCTAssertEqual(mixedAudit.layout.firstChannelCount, 1); XCTAssertEqual(mixedAudit.layout.lastChannelCount, 2)
+        XCTAssertFalse(mixedAudit.layout.firstInterleaved); XCTAssertTrue(mixedAudit.layout.lastInterleaved)
+        XCTAssertEqual(mixedAudit.layout.monoDuplicatedFrames, 480)
+        XCTAssertEqual(mixedAudit.layout.stereoInputFrames, 480)
+        XCTAssertEqual(mixedAudit.observedFrames, 960); XCTAssertEqual(mixedAudit.monoZeroFrames, 960)
+        XCTAssertEqual(mixedAudit.stereoZeroFrames, 480)
         let overflowTap = ProductionSelectionOutputTap()
         let zero = try buffer(left: 0, right: 0), tone = try buffer(left: 0.25, right: 0.25)
         overflowTap.begin(auditChannels: true)
@@ -1034,7 +1096,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let validity = tap.validity()
         print("ProductionSelectionReturnedOutput seconds=\(returnedSeconds) wallSeconds=\(returnedWall) firstHostOffsetMs=\(((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0)) * 1_000) lastHostOffsetMs=\(((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity)) * 1_000) frames=\(returned.values.count) rate=\(returned.rate) toneBlocks=\(toneBlocks.total) correctToneBlocks=\(toneBlocks.correct) quietMs=\(returnedQuiet * 1_000) maximumHoleMs=\(returnedHole * 1_000) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) retainedFrames=\(tap.count) capacityFrames=576000")
         let channelAudit = tap.channelAudit()
-        print("ProductionSelectionReturnedChannelAudit schema=1 minimumRunFrames=\(channelAudit.minimumRunFrames) observedFrames=\(channelAudit.observedFrames) monoZeroFrames=\(channelAudit.monoZeroFrames) stereoZeroFrames=\(channelAudit.stereoZeroFrames) leftSquareSum=\(channelAudit.leftSquareSum) rightSquareSum=\(channelAudit.rightSquareSum) nonfiniteFrames=\(channelAudit.nonfiniteFrames) qualifiedRuns=\(channelAudit.qualifiedRuns) retainedRuns=\(channelAudit.retainedRuns) capacity=4 droppedRuns=\(channelAudit.droppedRuns) overflow=\(channelAudit.overflow) exactMonoZero=true playbackAcceptance=unchanged")
+        print("ProductionSelectionReturnedChannelAudit schema=1 minimumRunFrames=\(channelAudit.minimumRunFrames) observedFrames=\(channelAudit.observedFrames) monoZeroFrames=\(channelAudit.monoZeroFrames) stereoZeroFrames=\(channelAudit.stereoZeroFrames) leftSquareSum=\(channelAudit.leftSquareSum) rightSquareSum=\(channelAudit.rightSquareSum) nonfiniteFrames=\(channelAudit.nonfiniteFrames) qualifiedRuns=\(channelAudit.qualifiedRuns) retainedRuns=\(channelAudit.retainedRuns) capacity=4 droppedRuns=\(channelAudit.droppedRuns) overflow=\(channelAudit.overflow) layoutObserved=\(channelAudit.layout.buffers > 0) layoutBuffers=\(channelAudit.layout.buffers) layoutFrames=\(channelAudit.layout.frames) firstChannelCount=\(channelAudit.layout.firstChannelCount) lastChannelCount=\(channelAudit.layout.lastChannelCount) firstInterleaved=\(channelAudit.layout.firstInterleaved) lastInterleaved=\(channelAudit.layout.lastInterleaved) firstSampleRate=\(channelAudit.layout.firstRate) lastSampleRate=\(channelAudit.layout.lastRate) layoutChanged=\(channelAudit.layout.changed) monoDuplicatedFrames=\(channelAudit.layout.monoDuplicatedFrames) stereoInputFrames=\(channelAudit.layout.stereoInputFrames) otherInputFrames=\(channelAudit.layout.otherInputFrames) stereoZeroEvidenceQualified=\(channelAudit.stereoZeroEvidenceQualified) layoutScope=retained-audited-buffers interleavedScope=first-existing-left-index-read exactMonoZero=true playbackAcceptance=unchanged")
         XCTAssertEqual(channelAudit.observedFrames, returned.values.count)
         XCTAssertEqual(channelAudit.nonfiniteFrames, 0)
         XCTAssertLessThanOrEqual(channelAudit.retainedRuns, 4)
@@ -3437,72 +3499,141 @@ private final class DefaultFrameMonitorReadTrace {
         var first: Record?, maximum: Record?
     }
     private struct Request {
-        let phase: Int, request: Int
+        let phase: Int, request: Int, commandNs: UInt64
         let epoch: UInt64
         let item: ObjectIdentifier, output: ObjectIdentifier
+        let startAudioToken: Int, startAudioVisit: Int64
+        var latestAudioToken: Int, latestAudioVisit: Int64
+        var lifecycle: PlaybackFrameMonitor.DebugLifecycle
+        var starts: UInt64 = 0, observedTicks: UInt64 = 0
         var batches: UInt64 = 0, invalidMappings: UInt64 = 0, accepted: UInt64 = 0
         var stages = [Stage](repeating: Stage(), count: 4)
     }
     let enabled: Bool
-    private var phase = -1
+    private var commandAnchors = [UInt64?](repeating: nil, count: 3)
     private var requests: [Request] = []
     private var overflow = false
     private var qualityFailures: UInt64 = 0
     init(enabled: Bool) { self.enabled = enabled; requests.reserveCapacity(3) }
-    func beginPhase(_ value: Int) { phase = value }
+    func beginPhase(_ value: Int) {
+        guard commandAnchors.indices.contains(value), commandAnchors[value] == nil else {
+            increment(&qualityFailures); return
+        }
+        // Common test-only anchor in BOTH matched arms; no production nil-path clock.
+        commandAnchors[value] = DispatchTime.now().uptimeNanoseconds
+    }
     private func increment(_ value: inout UInt64) {
         if value == UInt64.max { overflow = true } else { value += 1 }
     }
     func record(_ owner: PlaybackService.DebugFrameMonitorReadBatch) {
-        guard enabled, (0..<3).contains(phase) else { increment(&qualityFailures); return }
-        let reads = owner.reads
-        guard !reads.epochOverflowed else { overflow = true; return }
+        guard enabled else { increment(&qualityFailures); return }
+        let batch = owner.reads, life = batch.lifecycle
+        guard !batch.epochOverflowed else { overflow = true; return }
         let index: Int
         if let found = requests.firstIndex(where: { $0.request == owner.request }) { index = found }
         else {
+            // Start-body exit binds the owner before any ordinary display-link tick.
+            // Locate phase by start time, never by the phase at callback delivery.
+            guard batch.isStartBodyExit,
+                  let phase = commandAnchors.indices.last(where: {
+                      commandAnchors[$0].map { $0 <= life.startEntryNs } ?? false
+                  }), let anchor = commandAnchors[phase] else {
+                increment(&qualityFailures); return
+            }
             guard requests.count < 3, !requests.contains(where: { $0.phase == phase }) else {
                 overflow = true; return
             }
-            requests.append(Request(phase: phase, request: owner.request, epoch: reads.epoch,
-                                    item: reads.item, output: reads.output))
+            requests.append(Request(phase: phase, request: owner.request, commandNs: anchor,
+                epoch: batch.epoch, item: batch.item, output: batch.output,
+                startAudioToken: owner.cachedAudioToken, startAudioVisit: owner.cachedAudioVisit,
+                latestAudioToken: owner.cachedAudioToken, latestAudioVisit: owner.cachedAudioVisit,
+                lifecycle: life))
             index = requests.count - 1
         }
         let initial = requests[index]
-        guard initial.phase == phase, initial.epoch == reads.epoch,
-              initial.item == reads.item, initial.output == reads.output else {
-            increment(&qualityFailures) // Reject mixed/restarted owners; never merge their spans.
-            return
+        guard initial.epoch == batch.epoch, initial.item == batch.item, initial.output == batch.output,
+              initial.lifecycle.startEntryNs == life.startEntryNs,
+              initial.lifecycle.startBodyExitNs == life.startBodyExitNs else {
+            increment(&qualityFailures); return // Never merge restarted or changed owners.
         }
         if owner.request != owner.generation || !owner.sourceItemMatches || !owner.observedItemMatches
-            || !owner.presentationMatches || !owner.selectedMatchesQueue
-            || reads.ownerAfterReadiness == reads.readinessAccepted
-            || (reads.fallback != nil) != !reads.mappedTime.isValid {
+            || !owner.presentationMatches || !owner.selectedMatchesQueue || !life.startOwnerCoherent
+            || life.ownerChanges != 0 || life.overflow || life.identity.overflow || life.status.overflow
+            || life.tickBody.overflow || life.ticks < initial.lifecycle.ticks
+            || life.identity.count < initial.lifecycle.identity.count
+            || life.status.count < initial.lifecycle.status.count
+            || life.tickBody.count < initial.lifecycle.tickBody.count {
             increment(&qualityFailures)
         }
-        // Copy one tiny aggregate; native owners are represented only by identifiers.
+        let ordered = [Optional(life.startEntryNs), life.startBodyExitNs, life.firstTickEntryNs,
+                       life.acceptedNs, life.cancelEntryNs, life.cancelReturnNs,
+                       life.completionEntryNs, life.completionReturnNs, life.lastTickBodyExitNs].compactMap { $0 }
+        if zip(ordered, ordered.dropFirst()).contains(where: { before, after in after < before }) { increment(&qualityFailures) }
         var request = requests[index]
-        increment(&request.batches)
-        if !reads.mappedTime.isValid { increment(&request.invalidMappings) }
-        if reads.readinessAccepted { increment(&request.accepted) }
-        let values = [Optional(reads.mapping), reads.fallback, Optional(reads.availability), Optional(reads.layer)]
-        for value in values.compactMap({ $0 }) {
-            if !value.ownerCoherent || value.returnNs < value.entryNs { increment(&qualityFailures) }
-            let index = value.stage.rawValue
-            var stage = request.stages[index]
-            increment(&stage.calls)
-            let record = Record(owner: owner, read: value)
-            if stage.first == nil { stage.first = record }
-            if stage.maximum == nil || record.span > stage.maximum!.span { stage.maximum = record }
-            request.stages[index] = stage
+        if batch.isStartBodyExit {
+            increment(&request.starts)
+            if batch.native != nil || life.ticks != 0 { increment(&qualityFailures) }
+        } else { increment(&request.observedTicks) }
+        request.lifecycle = life
+        request.latestAudioToken = owner.cachedAudioToken; request.latestAudioVisit = owner.cachedAudioVisit
+        if life.ticks != request.observedTicks { increment(&qualityFailures) }
+        if let reads = batch.native {
+            if reads.ownerAfterReadiness == reads.readinessAccepted
+                || (reads.fallback != nil) != !reads.mappedTime.isValid { increment(&qualityFailures) }
+            increment(&request.batches)
+            if !reads.mappedTime.isValid { increment(&request.invalidMappings) }
+            if reads.readinessAccepted { increment(&request.accepted) }
+            let values = [Optional(reads.mapping), reads.fallback, Optional(reads.availability), Optional(reads.layer)]
+            for value in values.compactMap({ $0 }) {
+                if !value.ownerCoherent || value.returnNs < value.entryNs { increment(&qualityFailures) }
+                let index = value.stage.rawValue
+                var stage = request.stages[index]
+                increment(&stage.calls)
+                let record = Record(owner: owner, read: value)
+                if stage.first == nil { stage.first = record }
+                if stage.maximum == nil || record.span > stage.maximum!.span { stage.maximum = record }
+                request.stages[index] = stage
+            }
         }
         requests[index] = request
+    }
+    private func dumpLifecycle(_ request: Request) {
+        let l = request.lifecycle
+        func ns(_ value: UInt64?) -> String { value.map(String.init) ?? "unavailable" }
+        print("DefaultFrameMonitorLifecycleSummary schema=1 phase=\(request.phase) request=\(request.request) epoch=\(request.epoch) item=\(request.item) output=\(request.output) commandEntryNs=\(request.commandNs) startEntryNs=\(l.startEntryNs) startBodyExitNs=\(ns(l.startBodyExitNs)) firstTickEntryNs=\(ns(l.firstTickEntryNs)) lastTickBodyExitNs=\(ns(l.lastTickBodyExitNs)) starts=\(request.starts) ticks=\(l.ticks) observedReturnedTicks=\(request.observedTicks) nativeBatches=\(request.batches) missingOwners=\(l.missingOwners) identityRejected=\(l.identityRejected) statusNotReady=\(l.statusNotReady) identityCalls=\(l.identity.count) statusCalls=\(l.status.count) tickBodies=\(l.tickBody.count) firstDecodedNs=\(ns(l.firstDecodedNs)) firstLayerReadyNs=\(ns(l.firstLayerReadyNs)) acceptedNs=\(ns(l.acceptedNs)) cancelReason=\(l.cancelReason.map(String.init) ?? "unavailable") cancelEntryNs=\(ns(l.cancelEntryNs)) cancelReturnNs=\(ns(l.cancelReturnNs)) completionEntryNs=\(ns(l.completionEntryNs)) completionReturnNs=\(ns(l.completionReturnNs)) completionPresent=\(l.completionPresent.map(String.init) ?? "unavailable") startAudioToken=\(request.startAudioToken) startAudioVisit=\(request.startAudioVisit) latestAudioToken=\(request.latestAudioToken) latestAudioVisit=\(request.latestAudioVisit) cachedAudioOnly=true ownerChanges=\(l.ownerChanges) clock=DispatchTime bodyExcludesObserver=true externalCancellationCovered=false unreturnedCalls=unverified")
+        XCTAssertEqual(request.starts, 1)
+        XCTAssertNotNil(l.startBodyExitNs); XCTAssertNotNil(l.firstTickEntryNs)
+        XCTAssertEqual(l.ticks, request.observedTicks); XCTAssertEqual(l.tickBody.count, l.ticks)
+        for (actual, total, excluded) in [(l.identity.count, l.ticks, l.missingOwners),
+                                         (l.status.count, l.identity.count, l.identityRejected),
+                                         (request.batches, l.status.count, l.statusNotReady)] {
+            let expected = total.subtractingReportingOverflow(excluded)
+            XCTAssertFalse(expected.overflow); XCTAssertEqual(actual, expected.partialValue)
+        }
+        XCTAssertEqual(l.cancelReason, 2); XCTAssertEqual(l.completionPresent, true)
+        XCTAssertNotNil(l.acceptedNs); XCTAssertNotNil(l.cancelEntryNs); XCTAssertNotNil(l.cancelReturnNs)
+        XCTAssertNotNil(l.completionEntryNs); XCTAssertNotNil(l.completionReturnNs)
+        for (name, span) in [("identity", l.identity), ("status", l.status), ("tickBody", l.tickBody)] {
+            XCTAssertFalse(span.overflow)
+            XCTAssertEqual(span.first == nil, span.count == 0)
+            XCTAssertEqual(span.maximum == nil, span.count == 0)
+            for (role, value) in [("first", span.first), ("maximum", span.maximum)] {
+                guard let value else { continue }
+                XCTAssertGreaterThanOrEqual(value.returnNs, value.entryNs)
+                print("DefaultFrameMonitorLifecycleSpan schema=1 phase=\(request.phase) request=\(request.request) epoch=\(request.epoch) stage=\(name) role=\(role) calls=\(span.count) entryNs=\(value.entryNs) returnNs=\(value.returnNs) spanNs=\(value.span) bodyExcludesObserver=true")
+            }
+        }
     }
     func dumpAndAssert() {
         let retained = requests.reduce(0) { sum, request in
             sum + request.stages.reduce(0) { $0 + ($1.first == nil ? 0 : 1) + ($1.maximum == nil ? 0 : 1) }
         }
-        print("DefaultFrameMonitorReadSummary schema=1 enabled=\(enabled) requests=\(requests.count) maximumRequests=3 stages=4 retainedRecords=\(retained) capacityRecords=24 overflow=\(overflow) qualityFailures=\(qualityFailures) wholeTickCoverage=false nativeEntryGuardsCovered=false")
+        print("DefaultFrameMonitorReadSummary schema=1 enabled=\(enabled) requests=\(requests.count) maximumRequests=3 stages=4 retainedRecords=\(retained) capacityRecords=24 overflow=\(overflow) qualityFailures=\(qualityFailures) wholeTickCoverage=false nativeEntryGuardsCovered=\(enabled) lifecycleSnapshotsMaximum=3 lifecycleSpanKinds=3")
         XCTAssertFalse(overflow); XCTAssertEqual(qualityFailures, 0); XCTAssertLessThanOrEqual(retained, 24)
+        for (phase, anchor) in commandAnchors.enumerated() {
+            print("DefaultFrameMonitorLifecycleCommand schema=1 enabled=\(enabled) phase=\(phase) commandEntryNs=\(anchor.map(String.init) ?? "unavailable") clock=DispatchTime")
+            XCTAssertNotNil(anchor)
+        }
         if !enabled {
             XCTAssertTrue(requests.isEmpty, "Nil observer must not synthesize zero-valued native read evidence")
             return
@@ -3510,6 +3641,7 @@ private final class DefaultFrameMonitorReadTrace {
         XCTAssertEqual(requests.count, 3)
         XCTAssertEqual(Set(requests.map(\.phase)), Set(0..<3))
         for request in requests {
+            dumpLifecycle(request)
             XCTAssertGreaterThan(request.batches, 0)
             XCTAssertGreaterThan(request.accepted, 0, "Each selected request needs an actual accepted monitor tick")
             for kind in PlaybackFrameMonitor.DebugReadStage.allCases {
@@ -3519,10 +3651,11 @@ private final class DefaultFrameMonitorReadTrace {
                 print("DefaultFrameMonitorReadCount schema=1 phase=\(request.phase) request=\(request.request) stage=\(kind.rawValue) calls=\(stage.calls) batches=\(request.batches) invalidMappings=\(request.invalidMappings) accepted=\(request.accepted) absentFallbackIsZero=\(kind == .fallback && stage.calls == 0)")
                 for (role, value) in [("first", stage.first), ("maximum", stage.maximum)] {
                     guard let value else { continue }
-                    let owner = value.owner, reads = owner.reads
+                    let owner = value.owner, batch = owner.reads
+                    guard let reads = batch.native else { XCTFail("A retained native record must contain actual reads"); continue }
                     let mapped = reads.mappedTime.isNumeric ? String(reads.mappedTime.seconds) : "nonnumeric"
                     let chosen = reads.chosenTime.isNumeric ? String(reads.chosenTime.seconds) : "nonnumeric"
-                    print("DefaultFrameMonitorRead schema=1 phase=\(request.phase) request=\(request.request) role=\(role) stage=\(kind.rawValue) epoch=\(reads.epoch) entryNs=\(value.read.entryNs) returnNs=\(value.read.returnNs) spanNs=\(value.span) operationOwnerCoherent=\(value.read.ownerCoherent) sourceItemMatches=\(owner.sourceItemMatches) observedItemMatches=\(owner.observedItemMatches) presentationMatches=\(owner.presentationMatches) selectedMatchesQueue=\(owner.selectedMatchesQueue) generation=\(owner.generation) cachedAudioToken=\(owner.cachedAudioToken) cachedAudioVisit=\(owner.cachedAudioVisit) mappedValid=\(reads.mappedTime.isValid) mappedNumeric=\(reads.mappedTime.isNumeric) mappedSeconds=\(mapped) chosenValid=\(reads.chosenTime.isValid) chosenNumeric=\(reads.chosenTime.isNumeric) chosenSeconds=\(chosen) fallbackTaken=\(reads.fallback != nil) decoded=\(reads.decoded) layerReady=\(reads.layerReady) readinessAccepted=\(reads.readinessAccepted) expectedTerminalCancellation=\(reads.readinessAccepted) ownerAfterReadiness=\(reads.ownerAfterReadiness) displayTimestamp=\(reads.displayTimestamp) targetTimestamp=\(reads.targetTimestamp) wholeTickCoverage=false")
+                    print("DefaultFrameMonitorRead schema=1 phase=\(request.phase) request=\(request.request) role=\(role) stage=\(kind.rawValue) epoch=\(batch.epoch) entryNs=\(value.read.entryNs) returnNs=\(value.read.returnNs) spanNs=\(value.span) operationOwnerCoherent=\(value.read.ownerCoherent) sourceItemMatches=\(owner.sourceItemMatches) observedItemMatches=\(owner.observedItemMatches) presentationMatches=\(owner.presentationMatches) selectedMatchesQueue=\(owner.selectedMatchesQueue) generation=\(owner.generation) cachedAudioToken=\(owner.cachedAudioToken) cachedAudioVisit=\(owner.cachedAudioVisit) mappedValid=\(reads.mappedTime.isValid) mappedNumeric=\(reads.mappedTime.isNumeric) mappedSeconds=\(mapped) chosenValid=\(reads.chosenTime.isValid) chosenNumeric=\(reads.chosenTime.isNumeric) chosenSeconds=\(chosen) fallbackTaken=\(reads.fallback != nil) decoded=\(reads.decoded) layerReady=\(reads.layerReady) readinessAccepted=\(reads.readinessAccepted) expectedTerminalCancellation=\(reads.readinessAccepted) ownerAfterReadiness=\(reads.ownerAfterReadiness) displayTimestamp=\(reads.displayTimestamp) targetTimestamp=\(reads.targetTimestamp) wholeTickCoverage=false")
                 }
             }
         }
@@ -3826,12 +3959,45 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         var stereoZeroFrames: Int
         var frames: Int { endFrame - firstFrame }
     }
+
+    /// Observed only for admitted frames, under the existing tap lock.
+    /// Counts cannot exceed the fixed PCM capacity; no format history is retained.
+    struct TapLayout {
+        var buffers = 0, frames = 0
+        var firstChannelCount = 0, lastChannelCount = 0
+        var firstInterleaved = false, lastInterleaved = false
+        var firstRate = 0.0, lastRate = 0.0
+        var changed = false
+        var monoDuplicatedFrames = 0, stereoInputFrames = 0, otherInputFrames = 0
+        var allInputActualStereo: Bool {
+            buffers > 0 && frames > 0 && stereoInputFrames == frames
+                && monoDuplicatedFrames == 0 && otherInputFrames == 0
+        }
+        mutating func observe(channelCount: Int, interleaved: Bool, rate: Double, retainedFrames: Int) {
+            guard retainedFrames > 0 else { return }
+            if buffers == 0 {
+                firstChannelCount = channelCount; firstInterleaved = interleaved; firstRate = rate
+            } else if channelCount != firstChannelCount || interleaved != firstInterleaved || rate != firstRate {
+                changed = true
+            }
+            lastChannelCount = channelCount; lastInterleaved = interleaved; lastRate = rate
+            buffers += 1; frames += retainedFrames
+            if channelCount == 1 { monoDuplicatedFrames += retainedFrames }
+            else if channelCount == 2 { stereoInputFrames += retainedFrames }
+            else { otherInputFrames += retainedFrames }
+        }
+    }
     struct ChannelAudit {
         let firstFrame: Int, minimumRunFrames: Int, observedFrames: Int
         let monoZeroFrames: Int, stereoZeroFrames: Int, nonfiniteFrames: Int
         let leftSquareSum: Double, rightSquareSum: Double
         let qualifiedRuns: Int, retainedRuns: Int, droppedRuns: Int, overflow: Bool
         let first: ChannelRun?, second: ChannelRun?, third: ChannelRun?, fourth: ChannelRun?
+        let layout: TapLayout
+        // Qualifies the existing count's input layout; it does not assert that zeros occurred.
+        var stereoZeroEvidenceQualified: Bool {
+            layout.allInputActualStereo && layout.frames == observedFrames
+        }
         func run(at ordinal: Int) -> ChannelRun? {
             switch ordinal {
             case 0: return first
@@ -3857,6 +4023,7 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     private var auditLeftSquareSum = 0.0, auditRightSquareSum = 0.0
     private var auditQualifiedRuns = 0, auditDroppedRuns = 0
     private var auditOverflow = false
+    private var auditLayout = TapLayout()
     private var auditPending: ChannelRun?
     private var auditFirst: ChannelRun?, auditSecond: ChannelRun?, auditThird: ChannelRun?, auditFourth: ChannelRun?
 
@@ -3873,6 +4040,7 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
             auditMonoZeroFrames = 0; auditStereoZeroFrames = 0; auditNonfiniteFrames = 0
             auditLeftSquareSum = 0; auditRightSquareSum = 0
             auditQualifiedRuns = 0; auditDroppedRuns = 0; auditOverflow = false
+            auditLayout = TapLayout()
             auditPending = nil; auditFirst = nil; auditSecond = nil; auditThird = nil; auditFourth = nil
         }
         return values.count
@@ -3893,7 +4061,8 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
             leftSquareSum: auditLeftSquareSum, rightSquareSum: auditRightSquareSum,
             qualifiedRuns: auditQualifiedRuns, retainedRuns: min(4, auditQualifiedRuns),
             droppedRuns: auditDroppedRuns, overflow: auditOverflow,
-            first: auditFirst, second: auditSecond, third: auditThird, fourth: auditFourth)
+            first: auditFirst, second: auditSecond, third: auditThird, fourth: auditFourth,
+            layout: auditLayout)
     }
 
     /// Called only under the existing append/stop lock.
@@ -3950,12 +4119,20 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         let frames = min(Int(buffer.frameLength), capacity - values.count)
         droppedFrames += Int(buffer.frameLength) - frames
         for frame in 0..<frames {
-            let left = channels[0][buffer.format.isInterleaved ? frame * channelCount : frame]
+            // Bind the first existing format read; retain the original right-side read below.
+            let interleaved = buffer.format.isInterleaved
+            let left = channels[0][interleaved ? frame * channelCount : frame]
             let right = channelCount > 1
                 ? (buffer.format.isInterleaved ? channels[0][frame * channelCount + 1] : channels[1][frame]) : left
             let mono = (left + right) * 0.5
             let host = start + Double(frame) / actualRate
-            if auditEnabled { auditChannels(left: left, right: right, mono: mono, frame: values.count, host: host, rate: actualRate) }
+            if auditEnabled {
+                if frame == 0 {
+                    auditLayout.observe(channelCount: channelCount, interleaved: interleaved,
+                                        rate: actualRate, retainedFrames: frames)
+                }
+                auditChannels(left: left, right: right, mono: mono, frame: values.count, host: host, rate: actualRate)
+            }
             values.append(mono)
             hosts.append(host)
         }
