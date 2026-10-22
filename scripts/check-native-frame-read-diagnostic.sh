@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=PENDING
-expected_ios_tree=PENDING
+expected_code_source=9ae306227ee401e19f111542e677b9bfa50ca7ca
+expected_ios_tree=9197a70ce7658408efb09ba305945a6c99fdd736
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
