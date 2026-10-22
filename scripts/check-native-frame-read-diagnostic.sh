@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=4ee8606b177fbe85aca57c2b210a6b589194701f
-expected_ios_tree=81957d5cd04a47ea27f46b8f6eec4baa33a1c1b5
+expected_code_source=eb7f63b538bafaca89e46427f46f65944e8301c8
+expected_ios_tree=3477441bd9483a892df085f2d7254a1c2db5ce6f
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
@@ -15,6 +15,9 @@ cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOffThenOn
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOnThenOff
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn
+  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testAbandonTimelineRequiresMatchingOwnerAndPreservesReentrantPresentation
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedVideoRenderingSuppressionOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedVideoRenderingSuppressionOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -45,9 +48,12 @@ expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOffThenOn',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testProductionRenderDemandAccountingOnThenOff',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn'}
-if len(expected) != 6 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly six warm-handoff/accounting/cleanup diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn',
+    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testAbandonTimelineRequiresMatchingOwnerAndPreservesReentrantPresentation',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedVideoRenderingSuppressionOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedVideoRenderingSuppressionOnThenOff'}
+if len(expected) != 9 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly nine ownership/rendering/accounting/cleanup diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -56,7 +62,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=6 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=9 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -157,7 +163,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=6 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=9 expectedUI=0 expectedCore=101 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Default then Issued must be qualified by actual order and runtime PID/module nonce.
 # Accounting cases use the unchanged nil-default workload; no full acceptance follows.
 # The real error-cleanup regression runs last to preserve that original order.
