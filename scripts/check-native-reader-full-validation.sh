@@ -4,8 +4,8 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 # Require the reviewed final app/test commit and its exact ios tree.
-expected_code_source=dc81cff5c66aed1e9c2cb9ebdab035a0ae0d9ac7
-expected_ios_tree=1c76994fc20df7de625faff05270469fb794e650
+expected_code_source=9fd7ff44bd6859808d0099723d5160f775c5edf6
+expected_ios_tree=f539c40dc7f4a19349adbed1c8bec3530396ca6d
 verify_source() {
   case "$expected_code_source" in
     ''|PENDING|*[!0-9a-f]*) printf '%s\n' 'A final committed app/test source pin is required.' >&2; return 2 ;;
