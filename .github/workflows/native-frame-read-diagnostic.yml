@@ -34,19 +34,23 @@ jobs:
           python3 tests/validation-shell/test_native_xcresult_export.py
           python3 tests/validation-shell/test_native_frame_read_diagnostic.py
           python3 tests/validation-shell/test_preroll_crash_evidence.py
+      - name: Compile exact source with bounded SDK work before simulator boot
+        id: prepared
+        if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
+        run: bash scripts/check-native-frame-read-diagnostic.sh --prepare
       - name: Resolve within sixty seconds and boot within four minutes
         id: simulator_boot
-        if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.prepared.outcome == 'success' }}
         run: |
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
       - name: Run ownership readiness continuity and refusal regression checks
         id: native
-        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
           SIMULATOR_DESTINATION: platform=iOS Simulator,id=${{ steps.simulator_boot.outputs.simulator_id }}
-        run: bash scripts/check-native-frame-read-diagnostic.sh
+        run: bash scripts/check-native-frame-read-diagnostic.sh --prepared-native
       - name: Export bounded raw structured records after an actual attempt
         id: xcresult_export
         if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}

@@ -2,10 +2,12 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=fd438d1f57bff10a3a4e1fac988b71909327c7aa
+expected_code_source=868f876cae9a6e45dfe733c3c6cb1051e8542db6
 expected_ios_tree=52490fa51ef029b78399abd0c27137c861b18267
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
+preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
+mode=all
 cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionDefaultReadinessRequiresTheSelectedCPPOutput
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSeekAfterVisibleReadinessRequiresFreshCPPImageBeforeReadyReturns
@@ -78,14 +80,23 @@ elif [ "$#" -eq 1 ] && [ "$1" = --verify-results ]; then
   verify_source
   evidence_tool results
   exit 0
+elif [ "$#" -eq 1 ] && [ "$1" = --prepare ]; then
+  mode=prepare
+elif [ "$#" -eq 1 ] && [ "$1" = --prepared-native ]; then
+  mode=prepared-native
 elif [ "$#" -ne 0 ]; then
-  printf '%s\n' 'Usage: check-native-frame-read-diagnostic.sh [--verify-source|--verify-results]' >&2
+  printf '%s\n' 'Usage: check-native-frame-read-diagnostic.sh [--verify-source|--verify-results|--prepare|--prepared-native]' >&2
   exit 2
 fi
 mkdir -p artifacts/native
 # Early failures cannot reuse an old native result or successful exit receipt.
 : > "$native_log"
 : > "$native_status"
+if [ "$mode" != prepared-native ]; then
+  # A new preparation attempt revokes prior authorization even if its first
+  # source, inventory, stale-result or tool-availability gate fails.
+  : > "$preparation_receipt"
+fi
 verify_source
 evidence_tool inventory
 shopt -s nullglob dotglob nocaseglob
@@ -94,12 +105,47 @@ shopt -u nullglob dotglob nocaseglob
 test "${#existing_results[@]}" -eq 0 || { printf '%s\n' 'A fresh job with no preexisting xcresult is required.' >&2; exit 2; }
 export SWIFTC_MAXIMUM_DETERMINISM=1
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode on macOS is required.' >&2; exit 2; }
+if [ "$mode" = prepared-native ]; then
+  if [ ! -f "$preparation_receipt" ] || [ -L "$preparation_receipt" ] || \
+     ! cmp -s "$preparation_receipt" <(printf '%s\t%s\t0\t0\n' "$expected_code_source" "$expected_ios_tree"); then
+    printf '%s\n' 'Exact successful preparation required before native execution.' >&2
+    exit 2
+  fi
+else
+set +e
 printf '' | python3 scripts/run-owned-xcodebuild.py --phase driver -- xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/frame-read-swift-plan.log 2>&1
+driver_status=("${PIPESTATUS[@]}")
+set -e
 cat artifacts/native/frame-read-swift-plan.log
+if [ "${driver_status[0]}" -ne 0 ]; then exit "${driver_status[0]}"; fi
+if [ "${driver_status[1]}" -ne 0 ]; then exit "${driver_status[1]}"; fi
 grep -Fq 'SWIFTC_MAXIMUM_DETERMINISM overriding -j' artifacts/native/frame-read-swift-plan.log
 python3 scripts/generate-ios-project.py --check
 bash scripts/test-core.sh
 bash scripts/test-apple-buffer.sh
+if [ "$mode" = prepare ]; then
+  # Compile before boot so a CoreSimulator stall cannot hide SDK source errors.
+  # The later ordinary `test` action retains its source checks and may perform
+  # an incremental build; this receipt never claims an immutable test plan.
+  build_log=artifacts/native/frame-read-build.log
+  set +e
+  python3 scripts/run-owned-xcodebuild.py --phase build -- xcodebuild \
+    -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+    -destination 'generic/platform=iOS Simulator' -derivedDataPath artifacts/DerivedData \
+    -jobs 1 -parallel-testing-enabled NO \
+    SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+    CODE_SIGNING_ALLOWED=NO build-for-testing 2>&1 | tee "$build_log"
+  build_status=("${PIPESTATUS[@]}")
+  set -e
+  if [ "${build_status[0]}" -ne 0 ]; then exit "${build_status[0]}"; fi
+  if [ "${build_status[1]}" -ne 0 ]; then exit "${build_status[1]}"; fi
+  grep -Fxq '** TEST BUILD SUCCEEDED **' "$build_log"
+  verify_source
+  printf '%s\t%s\t0\t0\n' "$expected_code_source" "$expected_ios_tree" > "$preparation_receipt"
+  printf '%s\n' "NativeFrameReadPreparedEvidence appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree maximumBuildJobs=1 nativeAttempted=false buildDeadlineSeconds=720 driverDeadlineSeconds=60"
+  exit 0
+fi
+fi
 destination="${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro Max}"
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
 capture_pid=''

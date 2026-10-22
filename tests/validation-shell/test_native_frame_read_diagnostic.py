@@ -52,7 +52,7 @@ def write(path, content):
 
 
 class NativeFrameReadDiagnosticTests(unittest.TestCase):
-    def exercise(self, scenario="success"):
+    def exercise(self, scenario="success", mode=None):
         (ROOT / "artifacts").mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="frame-read-unit-", dir=ROOT / "artifacts") as directory:
             root = Path(directory)
@@ -109,8 +109,8 @@ class NativeFrameReadDiagnosticTests(unittest.TestCase):
                     lines.append(f"Test Case '{identity}' passed (0.001 seconds).")
             lines.append("** TEST SUCCEEDED **")
             write(root / "native-output.log", "\n".join(lines) + "\n")
-            write(scripts / "test-core.sh", '#!/usr/bin/env bash\nexit "${FRAME_READ_CORE_EXIT}"\n')
-            write(scripts / "test-apple-buffer.sh", "#!/usr/bin/env bash\nexit 0\n")
+            write(scripts / "test-core.sh", '#!/usr/bin/env bash\nprintf "core\\n" >> "$FRAME_READ_ROOT/order.log"\nexit "${FRAME_READ_CORE_EXIT}"\n')
+            write(scripts / "test-apple-buffer.sh", '#!/usr/bin/env bash\nprintf "apple\\n" >> "$FRAME_READ_ROOT/order.log"\nexit 0\n')
             write(tools / "git", '''#!/usr/bin/env bash
 if [ "$1" = rev-parse ]; then printf '%s\\n' "$FRAME_READ_TREE"; fi
 exit 0
@@ -118,7 +118,14 @@ exit 0
             write(tools / "python3", '''#!/usr/bin/env bash
 case "$1" in
   scripts/run-owned-xcodebuild.py)
+    if [ "$3" = build ]; then
+      printf '%s\\n' "$@" > "$FRAME_READ_ROOT/build.args"
+      printf 'build\\n' >> "$FRAME_READ_ROOT/order.log"
+      printf '%s\\n' 'Owned build receipt retained' '** TEST BUILD SUCCEEDED **'
+      exit "$FRAME_READ_BUILD_EXIT"
+    fi
     printf '%s\\n' "$@" > "$FRAME_READ_ROOT/driver.args"
+    printf 'driver\\n' >> "$FRAME_READ_ROOT/order.log"
     printf '%s\\n' 'remark: SWIFTC_MAXIMUM_DETERMINISM overriding -j'
     exit "$FRAME_READ_DRIVER_EXIT" ;;
   scripts/generate-ios-project.py) exit 0 ;;
@@ -157,9 +164,10 @@ exit "$FRAME_READ_TEE_EXIT"
                 FRAME_READ_ROOT=root.as_posix(), FRAME_READ_PYTHON=Path(sys.executable).as_posix(),
                 FRAME_READ_TREE=tree, FRAME_READ_SIMULATOR=SIMULATOR,
                 FRAME_READ_NATIVE_EXIT="65" if scenario == "native-failure" else "0",
-                FRAME_READ_TEE_EXIT="17" if scenario == "tee-failure" else "0",
+                FRAME_READ_TEE_EXIT="17" if scenario in ("tee-failure", "build-tee-failure") else "0",
                 FRAME_READ_CORE_EXIT="19" if scenario == "core-failure" else "0",
                 FRAME_READ_DRIVER_EXIT="31" if scenario == "driver-failure" else "0",
+                FRAME_READ_BUILD_EXIT="29" if scenario == "build-failure" else "0",
                 GITHUB_OUTPUT=(root / "step.outputs").as_posix(),
                 SIMULATOR_DESTINATION=f"platform=iOS Simulator,id={SIMULATOR}")
             # Git Bash puts /usr/bin before the inherited Windows PATH. Put the
@@ -168,10 +176,43 @@ exit "$FRAME_READ_TEE_EXIT"
             command = [bash_path(), "-c",
                        'export PATH="$(cd "$FRAME_READ_ROOT/bin" && pwd):$PATH"; source "$0" "$@"',
                        launcher.as_posix()]
-            result = subprocess.run(command, env=environment,
+            prepared_receipt = native / "frame-read-prepared-source.tsv"
+            if mode == "--prepare" and scenario == "stale-bundle":
+                prepared_receipt.write_text("a" * 40 + "\t" + tree + "\t0\t0\n")
+            if mode == "--prepared-native" and scenario.startswith("prepared-"):
+                prepared = subprocess.run(command + ["--prepare"], env=environment,
+                                          text=True, capture_output=True, timeout=15)
+                self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+                self.assertFalse((root / "native.args").exists())
+                self.assertFalse((root / "step.outputs").exists())
+                if scenario == "prepared-wrong-source":
+                    prepared_receipt.write_text("0" * 40 + "\t" + tree + "\t0\t0\n")
+                elif scenario == "prepared-nonzero":
+                    prepared_receipt.write_text(prepared_receipt.read_text().replace("\t0\t0", "\t29\t0"))
+                elif scenario == "prepared-extra-line":
+                    with prepared_receipt.open("a") as stream:
+                        stream.write("0\t0\n")
+            result = subprocess.run(command + ([mode] if mode else []), env=environment,
                                     text=True, capture_output=True, timeout=15)
+            if mode == "--prepare" and scenario == "stale-bundle":
+                self.assertEqual(prepared_receipt.read_text(), "", "Failed early preparation must revoke its previous authorization")
             args_file = root / "native.args"
             arguments = args_file.read_text().splitlines() if args_file.exists() else []
+            if scenario in ("build-failure", "build-tee-failure", "success") and mode == "--prepare":
+                build = (root / "build.args").read_text().splitlines()
+                self.assertEqual(build[:4], ["scripts/run-owned-xcodebuild.py", "--phase", "build", "--"])
+                self.assertEqual(build[4], "xcodebuild")
+                self.assertEqual(build[build.index("-jobs") + 1], "1")
+                self.assertEqual(build[build.index("-destination") + 1], "generic/platform=iOS Simulator")
+                self.assertIn("build-for-testing", build)
+                self.assertIn("CODE_SIGNING_ALLOWED=NO", build)
+                self.assertEqual((root / "order.log").read_text().splitlines(), ["driver", "core", "apple", "build"])
+                self.assertNotIn("-resultBundlePath", build, "Build bundles cannot contaminate native-only export")
+                self.assertIn("Owned build receipt retained", result.stdout)
+                if scenario != "success":
+                    self.assertEqual(prepared_receipt.read_text(), "", "A failed build cannot authorize native execution")
+            if scenario == "prepared-success":
+                self.assertEqual((root / "order.log").read_text().splitlines(), ["driver", "core", "apple", "build"])
             if arguments:
                 self.assertTrue((root / "helper.pid").is_file(), result.stdout + result.stderr)
                 self.assertTrue((root / "helper.stopped").is_file(), "Owned capture helper must be reaped")
@@ -239,6 +280,51 @@ exit "$FRAME_READ_TEE_EXIT"
                 if scenario == "pending-pins":
                     self.assertIn("Final committed source pins required.", result.stderr)
 
+    def test_driver_failure_exposes_its_original_output_and_exit_without_launch(self):
+        result, arguments, _, verified = self.exercise("driver-failure")
+        self.assertEqual(result.returncode, 31, result.stdout + result.stderr)
+        self.assertEqual(arguments, [])
+        self.assertIsNone(verified)
+        self.assertIn("remark: SWIFTC_MAXIMUM_DETERMINISM overriding -j", result.stdout)
+
+    def test_prepare_builds_exact_source_before_boot_without_claiming_native_attempt(self):
+        result, arguments, _, verified = self.exercise(mode="--prepare")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(arguments, [])
+        self.assertIsNone(verified)
+        self.assertIn("NativeFrameReadPreparedEvidence", result.stdout)
+
+    def test_failed_prepare_build_exposes_receipt_and_preserves_exit(self):
+        for scenario, expected in (("build-failure", 29), ("build-tee-failure", 17)):
+            with self.subTest(scenario=scenario):
+                result, arguments, _, verified = self.exercise(scenario, mode="--prepare")
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(arguments, [])
+                self.assertIsNone(verified)
+
+    def test_prepared_native_requires_the_exact_successful_preparation_receipt(self):
+        for scenario in ("success", "prepared-wrong-source", "prepared-nonzero", "prepared-extra-line"):
+            with self.subTest(scenario=scenario):
+                result, arguments, _, _ = self.exercise(scenario, mode="--prepared-native")
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(arguments, [])
+                self.assertIn("Exact successful preparation required", result.stderr)
+
+    def test_prepared_native_uses_only_the_qualified_source_with_original_test_action(self):
+        result, arguments, receipt, verified = self.exercise("prepared-success", mode="--prepared-native")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+        self.assertEqual(receipt, "0\t0\n")
+        self.assertIn("test", arguments)
+        self.assertNotIn("test-without-building", arguments)
+        self.assertEqual([v for v in arguments if v.startswith("-only-testing:")],
+                         [f"-only-testing:{selector}" for selector in CASES])
+
+    def test_early_prepare_failure_revokes_previous_success(self):
+        result, arguments, _, _ = self.exercise("stale-bundle", mode="--prepare")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(arguments, [])
+
     def test_source_inventory_and_workflow_are_dedicated_and_bounded(self):
         source = SOURCE.read_text(encoding="utf-8")
         declaration = re.search(r"^cases=\((.*?)\)\s*$", source, re.MULTILINE | re.DOTALL)
@@ -259,6 +345,9 @@ exit "$FRAME_READ_TEE_EXIT"
         self.assertEqual(workflow.count("steps.native.outputs.attempted == 'true'"), 2)
         self.assertIn("python3 scripts/export-native-xcresult.py", workflow)
         self.assertIn("bash scripts/check-native-frame-read-diagnostic.sh --verify-results", workflow)
+        self.assertLess(workflow.index("bash scripts/check-native-frame-read-diagnostic.sh --prepare"),
+                        workflow.index("python3 scripts/ensure-simulator-booted.py"))
+        self.assertIn("bash scripts/check-native-frame-read-diagnostic.sh --prepared-native", workflow)
         self.assertNotIn("upload-artifact", workflow)
         self.assertNotIn("secrets.", workflow)
         paths = re.search(r"^    paths: \[(.*?)\]$", workflow, re.MULTILINE)
