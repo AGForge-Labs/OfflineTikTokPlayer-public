@@ -875,8 +875,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             Self.preparedPrerollToken += 1
             let owner = PreparedNextPrerollOwner(token: Self.preparedPrerollToken,
                 enabled: enabled, order: order, ordinal: ordinal)
-            try await runPreparedNextVideoFirstFrameCapabilityBeforeSelection(prerollOwner: owner)
+            try await runPreparedNextPrerollArm(owner)
         }
+    }
+
+    // Code-generation/lifetime control for the attributed Swift task-deallocation
+    // abort. Same helper, owner, suspension points, deadlines and assertions.
+    @MainActor @inline(never)
+    private func runPreparedNextPrerollArm(_ owner: PreparedNextPrerollOwner) async throws {
+        print("PrerollAsyncArmBoundary schema=1 token=\(owner.token) phase=entry separateTask=false body=unchanged")
+        try await runPreparedNextVideoFirstFrameCapabilityBeforeSelection(prerollOwner: owner)
+        print("PrerollAsyncArmBoundary schema=1 token=\(owner.token) phase=return separateTask=false body=unchanged")
     }
 
     @MainActor private final class PreparedNextPrerollOwner {
@@ -2895,13 +2904,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private struct InitialReadyNativeClockObservation {
         let begin: UInt64, beforeSnapshotReturnNs: UInt64, nativeReturnNs: UInt64, end: UInt64
         func dumpBoundaries(request: Int, label: String) {
-            print("InitialReadyNativeClockBoundaries schema=2 label=\(label) request=\(request) beginNs=\(begin) beforeSnapshotReturnNs=\(beforeSnapshotReturnNs) nativeReturnNs=\(nativeReturnNs) endNs=\(end) beforeSnapshotSpanNs=\(beforeSnapshotReturnNs - begin) nativeBracketSpanNs=\(nativeReturnNs - beforeSnapshotReturnNs) afterSnapshotSpanNs=\(end - nativeReturnNs) nativeReads=1 snapshotReads=2 clock=DispatchTime spansIncludeMarkers=true")
+            print("InitialReadyNativeClockBoundaries schema=2 label=\(label) request=\(request) beginNs=\(begin) beforeSnapshotReturnNs=\(beforeSnapshotReturnNs) nativeReturnNs=\(nativeReturnNs) endNs=\(end) beforeSnapshotSpanNs=\(beforeSnapshotReturnNs - begin) nativeBracketSpanNs=\(nativeReturnNs - beforeSnapshotReturnNs) afterSnapshotSpanNs=\(end - nativeReturnNs) nativeReads=1 snapshotReads=2 nativeSource=fresh-item-timebase nativeOwnerQueries=2 itemTimebaseLookups=1 clock=DispatchTime spansIncludeMarkers=true")
         }
         let before: ContinuousPCMRenderer.Snapshot, after: ContinuousPCMRenderer.Snapshot
         let nativePosition: Double
+        let nativeOwnerUnchanged: Bool
         var acquisitionSeconds: Double { Double(end - begin) / 1_000_000_000 }
         var sameIdentity: Bool {
-            before.token > 0 && before.token == after.token && before.visit == after.visit
+            nativeOwnerUnchanged && before.token > 0 && before.token == after.token && before.visit == after.visit
                 && before.selectionVersion == after.selectionVersion && !before.ended && !after.ended
                 && after.frame >= before.frame
         }
@@ -2918,13 +2928,16 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let begin = DispatchTime.now().uptimeNanoseconds
         let before = service.audioSnapshot
         let beforeSnapshotReturnNs = DispatchTime.now().uptimeNanoseconds
-        let native = service.player.currentTime().seconds
+        let item = service.player.currentItem
+        let timebase = item?.timebase
+        let native = timebase.map { CMTimebaseGetTime($0).seconds } ?? .nan
+        let nativeOwnerUnchanged = item != nil && service.player.currentItem === item
         let nativeReturnNs = DispatchTime.now().uptimeNanoseconds
         let after = service.audioSnapshot
         let end = DispatchTime.now().uptimeNanoseconds
         return InitialReadyNativeClockObservation(begin: begin, beforeSnapshotReturnNs: beforeSnapshotReturnNs,
             nativeReturnNs: nativeReturnNs, end: end, before: before, after: after,
-                                                  nativePosition: native)
+                                                  nativePosition: native, nativeOwnerUnchanged: nativeOwnerUnchanged)
     }
     #endif
 
