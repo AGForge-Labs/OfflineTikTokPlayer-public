@@ -880,12 +880,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     // Code-generation/lifetime control for the attributed Swift task-deallocation
-    // abort. Same helper, owner, suspension points, deadlines and assertions.
+    // abort. Original owner, suspension points, deadlines and playback guards.
     @MainActor @inline(never)
     private func runPreparedNextPrerollArm(_ owner: PreparedNextPrerollOwner) async throws {
-        print("PrerollAsyncArmBoundary schema=1 token=\(owner.token) phase=entry separateTask=false body=unchanged")
+        let nativeAttachProbeCalibrated = OPDebugCalibrateNativeAttachProbe()
+        XCTAssertTrue(nativeAttachProbeCalibrated, "The native exception observer must rethrow the original calibration exception")
+        guard nativeAttachProbeCalibrated else { throw SelectionVideoTestFailure.timeout }
+        print("PrerollAsyncArmBoundary schema=2 token=\(owner.token) phase=entry separateTask=false nativeAttach=observe-rethrow originalGuards=unchanged")
         try await runPreparedNextVideoFirstFrameCapabilityBeforeSelection(prerollOwner: owner)
-        print("PrerollAsyncArmBoundary schema=1 token=\(owner.token) phase=return separateTask=false body=unchanged")
+        print("PrerollAsyncArmBoundary schema=2 token=\(owner.token) phase=return separateTask=false nativeAttach=observe-rethrow originalGuards=unchanged")
     }
 
     @MainActor private final class PreparedNextPrerollOwner {
@@ -1040,7 +1043,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             valid = boundary("attach-same-B", beforeQueued: false, beforeHelper: false,
                 afterQueued: false, afterHelper: true) {
                     attached = DispatchTime.now().uptimeNanoseconds
-                    created.replaceCurrentItem(with: b)
+                    OPDebugObservePlayerAttachment(created, item: b, token: owner.token)
                 }
         }
         let deadline = attached + 1_000_000_000
@@ -1596,7 +1599,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         if let enabled = traceClockHandoff {
             print("NativeClockHandoffInstrumentationBundle schema=2 enabled=\(enabled) actualRateAndOrdinaryRead=true snapshotReadReceipt=\(enabled) firstAlignedEnqueue=\(enabled) compoundPollPair=\(enabled) observersBundled=true individualObserverAttribution=false acceptance=unchanged")
-            XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
+            XCTAssertEqual(traceVideoSeeks, enabled); XCTAssertFalse(traceNativeRefill)
             XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(traceDefaultFrameMonitor)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
             if enabled {

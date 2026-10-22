@@ -37,11 +37,12 @@ def generate():
         for file in sorted(path.iterdir()):
             if file.is_dir() and file.suffix != ".xcassets": children.append(group(file, target)); continue
             if file.name.startswith("."): continue
-            filetype = {".swift": "sourcecode.swift", ".plist": "text.plist.xml", ".entitlements": "text.plist.entitlements",
+            filetype = {".swift": "sourcecode.swift", ".m": "sourcecode.c.objc", ".h": "sourcecode.c.h",
+                        ".plist": "text.plist.xml", ".entitlements": "text.plist.entitlements",
                         ".xcprivacy": "text.xml", ".xcassets": "folder.assetcatalog", ".mp4": "file", ".mp3": "audio.mp3", ".svg": "image.svg"}.get(file.suffix, "text")
             ref = add("file:" + file.relative_to(ROOT).as_posix(), "PBXFileReference", lastKnownFileType=filetype, path=file.name, sourceTree="<group>")
             children.append(ref)
-            if file.suffix == ".swift": build_sources[target].append(add("source:" + file.relative_to(ROOT).as_posix(), "PBXBuildFile", fileRef=ref))
+            if file.suffix in (".swift", ".m"): build_sources[target].append(add("source:" + file.relative_to(ROOT).as_posix(), "PBXBuildFile", fileRef=ref))
             if file.suffix in (".xcassets", ".xcprivacy", ".mp4", ".mp3"):
                 resources[target].append(add("resource:" + file.relative_to(ROOT).as_posix(), "PBXBuildFile", fileRef=ref))
         return add("group:" + path.relative_to(ROOT).as_posix(), "PBXGroup", children=children, path=path.name, sourceTree="<group>")
@@ -89,7 +90,9 @@ def generate():
                         remoteGlobalIDString=identity("target:" + APP), remoteInfo=APP)
             deps = [add("dependency:" + name, "PBXTargetDependency", target=identity("target:" + APP), targetProxy=proxy)]
             if name.endswith("UITests"): settings.update(TEST_TARGET_NAME=APP)
-            else: settings.update(TEST_HOST="$(BUILT_PRODUCTS_DIR)/" + APP + ".app/" + APP, BUNDLE_LOADER="$(TEST_HOST)")
+            else: settings.update(TEST_HOST="$(BUILT_PRODUCTS_DIR)/" + APP + ".app/" + APP, BUNDLE_LOADER="$(TEST_HOST)",
+                                  SWIFT_OBJC_BRIDGING_HEADER=APP + "Tests/PrerollNativeAttachProbe.h",
+                                  CLANG_ENABLE_OBJC_ARC="YES", GCC_ENABLE_OBJC_EXCEPTIONS="YES")
         phases = [add("sources:" + name, "PBXSourcesBuildPhase", buildActionMask=2147483647, files=build_sources[name], runOnlyForDeploymentPostprocessing=0),
                   add("frameworks:" + name, "PBXFrameworksBuildPhase", buildActionMask=2147483647, files=framework_files if name == APP else [], runOnlyForDeploymentPostprocessing=0),
                   add("resources:" + name, "PBXResourcesBuildPhase", buildActionMask=2147483647, files=resources[name], runOnlyForDeploymentPostprocessing=0)]
