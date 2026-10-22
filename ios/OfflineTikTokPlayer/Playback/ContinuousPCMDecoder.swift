@@ -473,6 +473,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private let yieldCount = Atomic<Int64>(0)
     #if DEBUG
     private let debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?
+    private let debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder?
     private var peakLeasedReaders = 0
     private var positiveInputRanDryBuffersRetained: UInt64 = 0
     private var positiveInputRanDryFramesRetained: UInt64 = 0
@@ -488,8 +489,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     var cooperativeYieldCount: Int64 { yieldCount.load(ordering: .acquiring) }
 
     #if DEBUG
-    init(renderer: ContinuousPCMRenderer, debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder? = nil) {
+    init(renderer: ContinuousPCMRenderer, debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder? = nil,
+         debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder? = nil) {
         self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
+        self.debugAcceptedPCMOrigin = debugAcceptedPCMOrigin
         self.renderer = renderer
         let timer = DispatchSource.makeTimerSource(queue: worker)
         self.timer = timer
@@ -634,6 +637,12 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     #if DEBUG
+    /// Worker-coherent metadata only. Call after measured output stops; no SDK
+    /// query, scan or observer wait occurs here. Nil means not configured.
+    func debugAcceptedPCMOriginSnapshot(_ completion: @escaping @Sendable (DebugAcceptedPCMOriginSnapshot?) -> Void) {
+        worker.async { [self] in completion(debugAcceptedPCMOrigin?.snapshotOnWorker()) }
+    }
+
     /// Default off; applies only to subsequently created Streams. Map one real,
     /// successful positive haveData result per Stream to the downstream inputRanDry
     /// contract. PCM, frame length, error and endOfStream are never substituted.
@@ -795,6 +804,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
     private func retireSlot(at index: Int) {
         guard let slot = slots[index] else { return }
+        #if DEBUG
+        debugAcceptedPCMOrigin?.close(token: slot.token)
+        #endif
         slots[index] = nil
         retireStream(slot.stream)
         slot.stream = nil
@@ -917,6 +929,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                     prefix: UnsafeBufferPointer(rebasing: $0[..<(pending.prefixCount * 2)]))
             }
             guard published else { throw Failure.slotInUse }
+            #if DEBUG
+            if let origin = debugAcceptedPCMOrigin {
+                pending.prefix.withUnsafeBufferPointer {
+                    origin.recordPrefix(token: pending.token, slot: pending.index,
+                        interleaved: UnsafeBufferPointer(rebasing: $0[..<(pending.prefixCount * 2)]))
+                }
+            }
+            #endif
             let request = pending.source.streamRequest
             guard pending.source.beginStream(epoch: request.epoch) else { throw Failure.cancelled }
             pending.published = true
@@ -949,6 +969,15 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let accepted = scratch.withUnsafeBufferPointer {
                 slot.source.append(interleaved: UnsafeBufferPointer(rebasing: $0[..<(count * 2)]), epoch: slot.epoch)
             }
+            #if DEBUG
+            if let origin = debugAcceptedPCMOrigin, accepted > 0 {
+                let start = stream.debugProgress.cursor - Int64(count)
+                scratch.withUnsafeBufferPointer {
+                    origin.recordRing(token: slot.token, slot: pending.index, epoch: slot.epoch,
+                        startFrame: start, interleaved: UnsafeBufferPointer(rebasing: $0[..<(accepted * 2)]))
+                }
+            }
+            #endif
             guard accepted == count else { throw Failure.cancelled }
             pending.initialWritten += count; budget -= count
             if pending.initialWritten == pending.initialGoal || stream.reachedEnd {
@@ -1020,6 +1049,16 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             let accepted = scratch.withUnsafeBufferPointer {
                 slot.source.append(interleaved: UnsafeBufferPointer(rebasing: $0[..<(count * 2)]), epoch: slot.epoch)
             }
+            #if DEBUG
+            if let origin = debugAcceptedPCMOrigin, accepted > 0 {
+                let start = stream.debugProgress.cursor - Int64(count)
+                let index = slots.firstIndex(where: { $0 === slot }) ?? -1
+                scratch.withUnsafeBufferPointer {
+                    origin.recordRing(token: slot.token, slot: index, epoch: slot.epoch,
+                        startFrame: start, interleaved: UnsafeBufferPointer(rebasing: $0[..<(accepted * 2)]))
+                }
+            }
+            #endif
             guard accepted == count else { throw Failure.cancelled }
             budget -= count
         }

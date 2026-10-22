@@ -352,6 +352,8 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         #if DEBUG
         debugRenderAccounting?.kernelEntered(frames: frameCount)
         var debugCopied = 0, debugEOF = 0, debugUnderrun = 0
+        var debugOriginToken = 0, debugOriginEpoch = 0, debugOriginSpans = 0
+        var debugOriginVisit: Int64 = 0, debugOriginFirst: Int64 = 0, debugOriginEnd: Int64 = 0
         #endif
         // Initialize only the requested span. Silence here is pause/EOF/starvation,
         // never an implicit boundary fade or a fabricated source trim.
@@ -368,6 +370,16 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     #endif
                     underrun += Int64(frameCount - outputFrame); break
                 }
+                #if DEBUG
+                if debugRenderAccounting?.capturesPCMOrigin == true {
+                    // Plain render-owned fields, read under the existing source claim.
+                    // Multiple spans (including a loop or EOF adoption) invalidate this receipt.
+                    debugOriginSpans += 1
+                    debugOriginToken = activeToken; debugOriginVisit = visit
+                    debugOriginEpoch = source.renderedEpoch
+                    debugOriginFirst = cursor; debugOriginEnd = cursor
+                }
+                #endif
                 let total = source.totalFrames
                 if cursor >= total {
                     let next = source.successor.load(ordering: .acquiring)
@@ -406,6 +418,9 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     if shouldEnhance { speaker.process(UnsafeMutableBufferPointer(start: destination, count: channels)) }
                     cursor += 1; outputFrame += 1
                 }
+                #if DEBUG
+                if debugRenderAccounting?.capturesPCMOrigin == true { debugOriginEnd = cursor }
+                #endif
                 source.release()
                 if starved {
                     #if DEBUG
@@ -423,7 +438,13 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         debugRenderAccounting?.kernelCompleted(copied: debugCopied,
             paused: !consumedPlaying && activeToken > 0 ? frameCount : 0,
             inactive: activeToken <= 0 ? frameCount : 0, eof: debugEOF,
-            underrun: debugUnderrun, token: activeToken, visit: visit)
+            underrun: debugUnderrun, token: activeToken, visit: visit,
+            origin: debugRenderAccounting?.capturesPCMOrigin == true ? DebugPCMOriginReceipt(
+                valid: consumedPlaying && debugCopied == frameCount && debugEOF == 0 && debugUnderrun == 0
+                    && debugOriginSpans == 1 && debugOriginEpoch > 0
+                    && debugOriginToken == activeToken && debugOriginVisit == visit,
+                completion: 0, token: debugOriginToken, visit: debugOriginVisit,
+                epoch: debugOriginEpoch, firstFrame: debugOriginFirst, endFrame: debugOriginEnd) : nil)
         #endif
     }
 
@@ -473,6 +494,17 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
 
 #if DEBUG
 extension ContinuousPCMRenderer {
+    /// One fully copied single-source kernel span; not a mixer/tap or worker snapshot.
+    /// Source entry/completion publications can retain this last completed receipt.
+    public struct DebugPCMOriginReceipt: Sendable, Equatable {
+        public var valid: Bool
+        public var completion: UInt64
+        public var token: Int
+        public var visit: Int64
+        public var epoch: Int
+        public var firstFrame: Int64
+        public var endFrame: Int64
+    }
     /// A value copy of one record, not a joint snapshot with renderer/worker state.
     public struct DebugRenderAccountingSnapshot: Sendable {
         public var sequence: UInt64 = 0
@@ -496,6 +528,7 @@ extension ContinuousPCMRenderer {
         public var lastSourceFrameCount: UInt64 = 0
         public var lastSourceHostTimeValid = false
         public var lastSourceHostTime: UInt64 = 0
+        public var pcmOrigin: DebugPCMOriginReceipt?
         public var overflowed = false
     }
 
@@ -503,6 +536,7 @@ extension ContinuousPCMRenderer {
     /// All storage is fixed before rendering; methods allocate, scan, clock and lock nothing.
     /// Entry/completion are separate short publications, never odd across render/SDK work.
     public final class DebugRenderAccountingRecorder: @unchecked Sendable {
+        public let capturesPCMOrigin: Bool
         private var state = DebugRenderAccountingSnapshot() // Render writer only.
         private let sequence = Atomic<UInt64>(0)
         private let publicationExhausted = Atomic<Bool>(false)
@@ -527,8 +561,15 @@ extension ContinuousPCMRenderer {
         private let lastSourceHostTimeValid = Atomic<Bool>(false)
         private let lastSourceHostTime = Atomic<UInt64>(0)
         private let overflowed = Atomic<Bool>(false)
+        private let originValid = Atomic<Bool>(false)
+        private let originCompletion = Atomic<UInt64>(0)
+        private let originToken = Atomic<Int>(0)
+        private let originVisit = Atomic<Int64>(0)
+        private let originEpoch = Atomic<Int>(0)
+        private let originFirst = Atomic<Int64>(0)
+        private let originEnd = Atomic<Int64>(0)
 
-        public init() {}
+        public init(capturePCMOrigin: Bool = false) { capturesPCMOrigin = capturePCMOrigin }
 
         /// Only supplied callback arguments are observed; no host-clock conversion occurs here.
         public func sourceCallbackEntered(frames: Int, hostTimeValid: Bool, hostTime: UInt64) {
@@ -558,7 +599,8 @@ extension ContinuousPCMRenderer {
         }
 
         fileprivate func kernelCompleted(copied: Int, paused: Int, inactive: Int, eof: Int,
-                                         underrun: Int, token: Int, visit: Int64) {
+                                         underrun: Int, token: Int, visit: Int64,
+                                         origin: DebugPCMOriginReceipt? = nil) {
             state.kernelCallsCompleted = add(state.kernelCallsCompleted, 1)
             state.copiedPCMFrames = add(state.copiedPCMFrames, UInt64(copied))
             state.pausedPositiveTokenFrames = add(state.pausedPositiveTokenFrames, UInt64(paused))
@@ -572,7 +614,11 @@ extension ContinuousPCMRenderer {
             state.kernelFramesClassified = add(state.kernelFramesClassified, UInt64(underrun))
             state.lastKernelToken = token
             state.lastKernelVisit = visit
-            publish()
+            if capturesPCMOrigin, var origin {
+                origin.completion = state.kernelCallsCompleted
+                state.pcmOrigin = origin
+            }
+            publish(includePCMOrigin: capturesPCMOrigin)
         }
 
         static func saturatingAdd(_ value: UInt64, _ amount: UInt64) -> (value: UInt64, overflowed: Bool) {
@@ -586,7 +632,7 @@ extension ContinuousPCMRenderer {
             return result.value
         }
 
-        private func publish() {
+        private func publish(includePCMOrigin: Bool = false) {
             // Sequence exhaustion fails closed without wrapping/reusing a version.
             // Rendering continues; no writer waits for an observer.
             guard !publicationExhausted.load(ordering: .relaxed) else { return }
@@ -617,6 +663,16 @@ extension ContinuousPCMRenderer {
             lastSourceHostTimeValid.store(state.lastSourceHostTimeValid, ordering: .sequentiallyConsistent)
             lastSourceHostTime.store(state.lastSourceHostTime, ordering: .sequentiallyConsistent)
             overflowed.store(state.overflowed, ordering: .sequentiallyConsistent)
+            // Only the existing kernel completion publication writes receipt fields.
+            if includePCMOrigin, let origin = state.pcmOrigin {
+                originValid.store(origin.valid, ordering: .sequentiallyConsistent)
+                originCompletion.store(origin.completion, ordering: .sequentiallyConsistent)
+                originToken.store(origin.token, ordering: .sequentiallyConsistent)
+                originVisit.store(origin.visit, ordering: .sequentiallyConsistent)
+                originEpoch.store(origin.epoch, ordering: .sequentiallyConsistent)
+                originFirst.store(origin.firstFrame, ordering: .sequentiallyConsistent)
+                originEnd.store(origin.endFrame, ordering: .sequentiallyConsistent)
+            }
             sequence.store(state.sequence, ordering: .sequentiallyConsistent)
         }
 
@@ -649,6 +705,16 @@ extension ContinuousPCMRenderer {
                 result.lastSourceHostTimeValid = lastSourceHostTimeValid.load(ordering: .sequentiallyConsistent)
                 result.lastSourceHostTime = lastSourceHostTime.load(ordering: .sequentiallyConsistent)
                 result.overflowed = overflowed.load(ordering: .sequentiallyConsistent)
+                if capturesPCMOrigin {
+                    result.pcmOrigin = DebugPCMOriginReceipt(
+                        valid: originValid.load(ordering: .sequentiallyConsistent),
+                        completion: originCompletion.load(ordering: .sequentiallyConsistent),
+                        token: originToken.load(ordering: .sequentiallyConsistent),
+                        visit: originVisit.load(ordering: .sequentiallyConsistent),
+                        epoch: originEpoch.load(ordering: .sequentiallyConsistent),
+                        firstFrame: originFirst.load(ordering: .sequentiallyConsistent),
+                        endFrame: originEnd.load(ordering: .sequentiallyConsistent))
+                }
                 if before == sequence.load(ordering: .sequentiallyConsistent),
                    !publicationExhausted.load(ordering: .sequentiallyConsistent) { return result }
             }

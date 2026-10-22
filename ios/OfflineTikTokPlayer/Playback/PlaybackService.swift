@@ -34,6 +34,18 @@ final class PlaybackService: NSObject {
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     #if DEBUG
     @ObservationIgnored var debugUsesCurrentCustomFrameForReadiness = false
+    struct DebugCPPNativePullStamp {
+        let request: Int, generation: Int
+        let sourceItem: ObjectIdentifier
+        let sourceItemMatches: Bool, observedItemMatches: Bool
+        // May be absent/stale before setCurrentItem returns; not required for raw-item binding.
+        let presentationRequest: Int?, presentationMatches: Bool
+        let cachedAudioToken: Int, cachedAudioVisit: Int64
+        let pull: ContinuousPictureInPicture.DebugNativePullStamp
+    }
+    @ObservationIgnored var onDebugCPPNativePullStamp: ((DebugCPPNativePullStamp) -> Void)? {
+        didSet { continuousPiP.onDebugNativePullStamp = nil }
+    }
     // One synchronous notification per start, no retained event history or SDK reads.
     struct DebugFrameMonitorReadBatch {
         let request: Int, generation: Int
@@ -688,6 +700,22 @@ final class PlaybackService: NSObject {
 
     private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
         observedItem = playerItem
+        #if DEBUG
+        if let observer = onDebugCPPNativePullStamp {
+            let sourceItem = ObjectIdentifier(playerItem)
+            // Bind before setCurrentItem: pulls need not wait for videoPresentation/monitor startup.
+            continuousPiP.onDebugNativePullStamp = { [weak self] pull in
+                guard let self else { return }
+                observer(DebugCPPNativePullStamp(request: request, generation: self.generation,
+                    sourceItem: sourceItem, sourceItemMatches: pull.item == sourceItem,
+                    observedItemMatches: self.observedItem.map { ObjectIdentifier($0) == sourceItem } ?? false,
+                    presentationRequest: self.videoPresentation?.request,
+                    presentationMatches: self.videoPresentation?.request == request
+                        && self.videoPresentation?.ticket == pull.ticket,
+                    cachedAudioToken: self.audioToken, cachedAudioVisit: self.audioVisit, pull: pull))
+            }
+        } else { continuousPiP.onDebugNativePullStamp = nil }
+        #endif
         videoPresentation = continuousPiP.setCurrentItem(playerItem,
             preparedVideo: buffer.resource(for: playerItem)).map { (request, $0) }
         if position == 0, !rewind, explicitVideoSeekGeneration != request,

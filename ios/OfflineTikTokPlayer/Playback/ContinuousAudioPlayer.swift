@@ -42,11 +42,13 @@ final class ContinuousAudioPlayer {
 
     #if DEBUG
     init(debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil,
-         debugRenderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil) {
+         debugRenderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil,
+         debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder? = nil) {
         renderer = ContinuousPCMRenderer(debugRenderAccounting: debugRenderAccounting)
         self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
         graph = ContinuousAudioGraph(renderer: renderer)
-        decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder)
+        decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder,
+                                       debugAcceptedPCMOrigin: debugAcceptedPCMOrigin)
     }
     #else
     init() {
@@ -65,6 +67,10 @@ final class ContinuousAudioPlayer {
     var isSelected: Bool { selectedID != nil }
 
     #if DEBUG
+    func debugAcceptedPCMOriginSnapshot(_ completion: @escaping @Sendable (DebugAcceptedPCMOriginSnapshot?) -> Void) {
+        decoder.debugAcceptedPCMOriginSnapshot(completion)
+    }
+
     struct DebugPreparationState: Sendable {
         let activeCalls: Int
         let sharedTasks: Int

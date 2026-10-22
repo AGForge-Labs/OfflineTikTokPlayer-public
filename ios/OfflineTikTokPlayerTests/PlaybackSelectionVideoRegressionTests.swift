@@ -19,6 +19,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private static var unresolvedPreparedPrerollOwner: PreparedNextPrerollOwner?
     // One test-module nonce per app process, not an operating-system birth timestamp.
     private static let runtimeHostModuleNonce = UUID().uuidString.lowercased()
+    #if DEBUG
+    // Test-only immutable per-arm input to the unchanged benchmark signature.
+    private var acceptedPCMOriginBenchmarkMode: Bool?
+    #endif
 
     private func recordRuntimeHost() throws {
         let process = ProcessInfo.processInfo
@@ -50,6 +54,34 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             auditSavedAAfterCleanup: true)
         #else
         XCTFail("Render accounting diagnostic requires DEBUG")
+        #endif
+    }
+
+    func testDefaultAcceptedPCMOriginOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        defer { acceptedPCMOriginBenchmarkMode = nil }
+        for (ordinal, enabled) in [false, true].enumerated() {
+            acceptedPCMOriginBenchmarkMode = enabled
+            print("AcceptedPCMOriginArm schema=1 order=off-then-on ordinal=\(ordinal) enabled=\(enabled) defaultMonitor=true videoSeekTrace=false design=ordered-fresh-arm-not-causal-proof")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false)
+        }
+        #else
+        XCTFail("Accepted PCM origin diagnostic requires DEBUG")
+        #endif
+    }
+
+    func testDefaultAcceptedPCMOriginOnThenOff() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        defer { acceptedPCMOriginBenchmarkMode = nil }
+        for (ordinal, enabled) in [true, false].enumerated() {
+            acceptedPCMOriginBenchmarkMode = enabled
+            print("AcceptedPCMOriginArm schema=1 order=on-then-off ordinal=\(ordinal) enabled=\(enabled) defaultMonitor=true videoSeekTrace=false design=ordered-fresh-arm-not-causal-proof")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false)
+        }
+        #else
+        XCTFail("Accepted PCM origin diagnostic requires DEBUG")
         #endif
     }
 
@@ -889,9 +921,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #if DEBUG
         let nativeActivity = traceNativeRefill ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
-        let accounting = renderAccounting == true ? ContinuousPCMRenderer.DebugRenderAccountingRecorder() : nil
+        let acceptedPCMOrigin = acceptedPCMOriginBenchmarkMode
+        let originRecorder = acceptedPCMOrigin == true ? DebugAcceptedPCMOriginRecorder() : nil
+        let originReply = acceptedPCMOrigin == true ? ProductionPCMOriginReply() : nil
+        let accounting = renderAccounting == true || acceptedPCMOrigin == true
+            ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(capturePCMOrigin: acceptedPCMOrigin == true) : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity,
-                                          debugRenderAccounting: accounting)
+                                          debugRenderAccounting: accounting, debugAcceptedPCMOrigin: originRecorder)
+        if let enabled = acceptedPCMOrigin {
+            print("AcceptedPCMOriginScope schema=1 enabled=\(enabled) prefixCapacity=3 ringEpochCapacity=12 minimumZeroRunFrames=480 normalizedRate=48000 channels=2 noRetainedPCM=true noWorkerClock=true receipt=existing-kernel-completion rendererSnapshotUnchanged=true nativeTrace=false defaultMonitor=true independentDomains=true originalGuards=unchanged")
+            XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
+            XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
+            XCTAssertNil(traceDefaultFrameMonitor); XCTAssertFalse(auditSavedAAfterCleanup)
+        }
         if let enabled = renderAccounting {
             print("ProductionRenderAccountingScope schema=1 enabled=\(enabled) immutableAtConstruction=true nativeRefillTrace=\(traceNativeRefill) videoSeekTrace=\(traceVideoSeeks) defaultVideoMonitor=\(frameMonitorAlternative == nil) samplesPerWindow=128 windows=3 intervalMs=100 snapshotAttempts=3 clocksOnRender=false pcmScan=false jointCoherence=false playbackAcceptance=unchanged")
             XCTAssertFalse(traceNativeRefill); XCTAssertFalse(traceVideoSeeks)
@@ -913,12 +955,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #if DEBUG
         let monitorReadTrace = traceDefaultFrameMonitor.map { DefaultFrameMonitorReadTrace(enabled: $0) }
+        let cppNativePullTrace = traceDefaultFrameMonitor.map { CPPNativePullDurationTrace(enabled: $0) }
         if let enabled = traceDefaultFrameMonitor {
             XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
             print("DefaultFrameMonitorReadScope schema=1 enabled=\(enabled) defaultMonitor=true videoSeekTrace=false nativeRefillTrace=false renderAccounting=false maximumRequests=3 stages=4 maximumRetainedRecords=24 wholeTickCoverage=false releaseBehaviorChange=false playbackAcceptance=unchanged")
+            print("CPPNativePullScope schema=1 enabled=\(enabled) stages=3 maximumRequests=3 maximumRetainedRecords=18 legacySeekTrace=false defaultMonitor=true phaseBinding=monitor-start-request-item nilObserverClocks=false releaseBehaviorChange=false playbackAcceptance=unchanged")
             if enabled {
-                service.onDebugFrameMonitorReadBatch = { [weak monitorReadTrace] value in monitorReadTrace?.record(value) }
+                service.onDebugFrameMonitorReadBatch = { [weak monitorReadTrace, weak cppNativePullTrace] value in
+                    monitorReadTrace?.record(value); cppNativePullTrace?.recordMonitor(value)
+                }
+                service.onDebugCPPNativePullStamp = { [weak cppNativePullTrace] value in cppNativePullTrace?.record(value) }
             }
         }
         var monitorRows: [(phase: Int, selectedID: String?, expectedID: String?, outputs: Int, preparedIdentity: Bool)] = []
@@ -944,7 +991,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugVideoRenderStamp = { [weak startup] stamp in startup?.recordRender(stamp) }
         }
         defer {
-            if traceDefaultFrameMonitor != nil { service.onDebugFrameMonitorReadBatch = nil }
+            if traceDefaultFrameMonitor != nil {
+                service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
+            }
             if frameMonitorAlternative != nil { service.debugAfterFirstFrameMonitorStart = nil }
             if traceVideoSeeks {
                 service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil
@@ -980,7 +1029,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 audio: audio, tap: tap, seeks: seeks, startup: startup, phase: phase, id: id,
                 frequency: frequency, prepared: prepared, preparedBefore: preparedBefore) {
                 #if DEBUG
-                monitorReadTrace?.beginPhase(phase)
+                if let monitorReadTrace {
+                    let commandNs = monitorReadTrace.beginPhase(phase)
+                    cppNativePullTrace?.beginPhase(phase, commandNs: commandNs)
+                }
                 if frameMonitorAlternative != nil {
                     monitorPhase = phase
                     monitorExpectedID = id
@@ -1026,14 +1078,28 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         service.debugStopPreparation { preparation.complete(true) }
         audio.debugShutdown { shutdown.complete($0) }
+        if let originReply {
+            audio.debugAcceptedPCMOriginSnapshot { snapshot in originReply.complete(snapshot) }
+        }
         #endif
-        let cleanupReturned = await waitUntil(timeout: 3) { shutdown.result != nil && preparation.result != nil }
+        let cleanupReturned = await waitUntil(timeout: 3) {
+            let acknowledged = shutdown.result != nil && preparation.result != nil
+            #if DEBUG
+            // Same off-window deadline; only origin-ON also waits for its one
+            // already-queued numerical reply. Nil/OFF retains the original test.
+            if let originReply { return acknowledged && originReply.read().received }
+            #endif
+            return acknowledged
+        }
         let preparationAck = preparation.result, decoderAck = shutdown.result
         mayRemoveFixture = cleanupReturned && decoderAck == true && preparationAck == true
         print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
         #if DEBUG
-        if traceDefaultFrameMonitor != nil { service.onDebugFrameMonitorReadBatch = nil }
+        if traceDefaultFrameMonitor != nil {
+            service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
+        }
         monitorReadTrace?.dumpAndAssert()
+        cppNativePullTrace?.dumpAndAssert()
         nativeTrace?.dumpAfterCleanup()
         #endif
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
@@ -1077,6 +1143,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         if let enabled = renderAccounting {
             for stream in streams { assertProductionRenderAccounting(stream, enabled: enabled) }
+        }
+        if let enabled = acceptedPCMOrigin {
+            for stream in streams { assertProductionRenderAccounting(stream, enabled: enabled) }
+            assertAcceptedPCMOrigin(enabled: enabled, reply: originReply, streams: streams,
+                                    cleanupAcknowledged: mayRemoveFixture)
         }
         #endif
         if measurements.count == 3 {
@@ -1625,6 +1696,54 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
 
     #if DEBUG
+    private func assertAcceptedPCMOrigin(enabled: Bool, reply: ProductionPCMOriginReply?,
+                                         streams: [ProductionSelectionStream], cleanupAcknowledged: Bool) {
+        let response = reply?.read()
+        let snapshot = response?.snapshot
+        print("AcceptedPCMOriginWorker schema=1 enabled=\(enabled) replyReceived=\(response?.received ?? false) available=\(snapshot != nil) cleanupAcknowledged=\(cleanupAcknowledged) records=\(snapshot?.records.count ?? 0) capacityExceeded=\(snapshot?.capacityExceeded ?? false) invalidInput=\(snapshot?.invalidInput ?? false) overflowed=\(snapshot?.overflowed ?? false) workerCoherent=\(snapshot != nil) rendererJointCoherence=false tapJointCoherence=false runtimeFrameJoin=false")
+        guard enabled else { XCTAssertNil(reply); return }
+        XCTAssertTrue(cleanupAcknowledged)
+        XCTAssertEqual(response?.received, true)
+        guard let snapshot else { XCTFail("Accepted-origin worker response is unavailable"); return }
+        XCTAssertFalse(snapshot.failed)
+        XCTAssertLessThanOrEqual(snapshot.records.filter { $0.kind == 1 }.count, 3)
+        XCTAssertLessThanOrEqual(snapshot.records.filter { $0.kind == 2 }.count, 12)
+        for row in snapshot.records {
+            print("AcceptedPCMOriginRange schema=1 kind=\(row.kind) token=\(row.token) slot=\(row.slot) epoch=\(row.epoch) firstFrame=\(row.firstFrame) endFrame=\(row.endFrame) acceptedFrames=\(row.acceptedFrames) batches=\(row.batches) zeroFrames=\(row.zeroFrames) leadingZeroFrames=\(row.leadingZeroFrames) trailingZeroFrames=\(row.trailingZeroFrames) longestZeroFrames=\(row.longestZeroFrames) firstRunStart=\(row.firstRunStart) firstRunEnd=\(row.firstRunEnd) longestRunStart=\(row.longestRunStart) longestRunEnd=\(row.longestRunEnd) trailingRunTouchesCoverageEnd=\(row.trailingRunTouchesCoverageEnd) nonFiniteFrames=\(row.nonFiniteFrames) coverageFailed=\(row.coverageFailed) closed=\(row.closed) frameEndExclusive=true domain=accepted-post-src")
+        }
+        guard let returned = streams.first(where: { $0.phase == 2 }) else {
+            XCTFail("Returned-A source window is unavailable"); return
+        }
+        let samples = returned.result.samples.filter {
+            $0.end >= returned.result.origin && $0.end - returned.result.origin <= 8_000_000_000
+        }
+        var priorCompletion: UInt64 = 0, firstCompletion: UInt64 = 0, epoch = 0
+        var maximumFrame = max(returned.baseline.frame, returned.final.frame)
+        var allJoined = !samples.isEmpty
+        for sample in samples {
+            let receipt = sample.renderAccounting?.pcmOrigin
+            let joined = receipt.map {
+                snapshot.coverage(token: $0.token, epoch: $0.epoch, through: $0.endFrame)
+            }
+            print("AcceptedPCMOriginReceipt schema=1 phase=2 beginNs=\(sample.begin) endNs=\(sample.end) available=\(receipt != nil) valid=\(receipt?.valid ?? false) completion=\(receipt?.completion ?? 0) token=\(receipt?.token ?? 0) visit=\(receipt?.visit ?? 0) epoch=\(receipt?.epoch ?? 0) firstFrame=\(receipt?.firstFrame ?? -1) endFrame=\(receipt?.endFrame ?? -1) workerCoverage=\(joined?.complete ?? false) qualifyingZeroInAcceptedRange=\(joined?.hasQualifyingZero ?? false) longestAcceptedZeroFrames=\(joined?.longestZeroFrames ?? 0) rendererSampleToken=\(sample.audio.token) rendererSampleVisit=\(sample.audio.visit) rendererSampleFrame=\(sample.audio.frame) receiptScope=last-completed-kernel independentDomains=true runtimeFrameJoin=false")
+            guard let receipt else { allJoined = false; continue }
+            if firstCompletion == 0 { firstCompletion = receipt.completion; epoch = receipt.epoch }
+            let valid = receipt.valid && receipt.completion > 0 && receipt.completion >= priorCompletion
+                && receipt.token == returned.baseline.token && receipt.visit == returned.baseline.visit
+                && receipt.epoch == epoch && receipt.epoch > 0 && receipt.epoch % 2 == 0
+                && receipt.firstFrame >= 0 && receipt.endFrame > receipt.firstFrame
+                && joined?.complete == true
+            allJoined = allJoined && valid
+            priorCompletion = receipt.completion
+            maximumFrame = max(maximumFrame, max(sample.audio.frame, receipt.endFrame))
+        }
+        let envelope = snapshot.coverage(token: returned.baseline.token, epoch: epoch, through: maximumFrame)
+        allJoined = allJoined && envelope.complete
+        XCTAssertTrue(allJoined, "Each retained completed span must identify the returned token/visit/epoch and have accepted prefix+ring coverage")
+        XCTAssertGreaterThan(priorCompletion, firstCompletion)
+        print("AcceptedPCMOriginJoin schema=1 phase=2 token=\(returned.baseline.token) visit=\(returned.baseline.visit) epoch=\(epoch) sourceEnvelopeStart=0 sourceEnvelopeEnd=\(maximumFrame) samples=\(samples.count) allEpochCoverage=\(allJoined) qualifyingZeroInAcceptedRange=\(envelope.hasQualifyingZero) longestAcceptedZeroFrames=\(envelope.longestZeroFrames) boundaryRunStart=\(envelope.boundaryRunStart) boundaryRunEnd=\(envelope.boundaryRunEnd) completionAdvanced=\(priorCompletion > firstCompletion) envelope=all-retained-source-position-observations exactTapFrameJoin=false zeroInterpretation=accepted-range-not-encoded-or-tap")
+    }
+
     /// Cumulative record differences are diagnostic evidence, not a new timing allowance.
     /// Samples retain unavailable/overflow states and stay inside the original acquisition bracket.
     private func assertProductionRenderAccounting(_ value: ProductionSelectionStream, enabled: Bool) {
@@ -3486,6 +3605,141 @@ private final class ProductionVideoStartupTrace {
 }
 
 #if DEBUG
+/// Returned durations only; fixed three raw-source requests, no SDK queries or per-call logging.
+@MainActor
+private final class CPPNativePullDurationTrace {
+    private struct Record {
+        let owner: PlaybackService.DebugCPPNativePullStamp
+        var span: UInt64 { owner.pull.returnNs - owner.pull.entryNs }
+    }
+    private struct Stage {
+        var calls: UInt64 = 0
+        var first: Record?, maximum: Record?
+    }
+    private struct Request {
+        let request: Int, sourceItem: ObjectIdentifier
+        var phase: Int?, monitorEpoch: UInt64?, monitorOutput: ObjectIdentifier?
+        var monitorStartEntryNs: UInt64?, monitorStarts: UInt64 = 0
+        var cppTicket: ContinuousPictureInPicture.PresentationTicket?, cppOutput: ObjectIdentifier?
+        var cppRevision: Int?, pendingPhaseCalls: UInt64 = 0
+        var stages = [Stage](repeating: Stage(), count: 3)
+    }
+    private let enabled: Bool
+    private var anchors = [UInt64?](repeating: nil, count: 3)
+    private var requests: [Request] = []
+    private var observed = [UInt64](repeating: 0, count: 3)
+    private var orphans = [UInt64](repeating: 0, count: 3)
+    private var unmatchedMonitorStarts: UInt64 = 0, qualityFailures: UInt64 = 0
+    private var overflow = false
+    init(enabled: Bool) { self.enabled = enabled; requests.reserveCapacity(3) }
+    private func increment(_ value: inout UInt64) {
+        if value == .max { overflow = true } else { value += 1 }
+    }
+    func beginPhase(_ phase: Int, commandNs: UInt64?) {
+        guard anchors.indices.contains(phase), anchors[phase] == nil, let commandNs else {
+            increment(&qualityFailures); return
+        }
+        anchors[phase] = commandNs // Reuse the existing lifecycle anchor, no extra clock.
+    }
+    private func slot(request: Int, item: ObjectIdentifier) -> Int? {
+        if let index = requests.firstIndex(where: { $0.request == request }) {
+            guard requests[index].sourceItem == item else { increment(&qualityFailures); return nil }
+            return index
+        }
+        guard requests.count < 3 else { overflow = true; return nil }
+        requests.append(Request(request: request, sourceItem: item))
+        return requests.count - 1
+    }
+    func record(_ owner: PlaybackService.DebugCPPNativePullStamp) {
+        let pull = owner.pull, stageIndex = pull.stage.rawValue
+        increment(&observed[stageIndex])
+        guard enabled, owner.request == owner.generation, owner.sourceItemMatches,
+              owner.observedItemMatches, pull.ticket != nil, pull.entryOwnerCoherent,
+              pull.ownerUnchanged, pull.returnNs >= pull.entryNs,
+              let index = slot(request: owner.request, item: owner.sourceItem) else {
+            increment(&orphans[stageIndex]); increment(&qualityFailures); return
+        }
+        if (requests[index].cppTicket != nil && requests[index].cppTicket != pull.ticket)
+            || (requests[index].cppOutput != nil && requests[index].cppOutput != pull.output) {
+            increment(&orphans[stageIndex]); increment(&qualityFailures); return
+        }
+        requests[index].cppTicket = pull.ticket; requests[index].cppOutput = pull.output
+        requests[index].cppRevision = pull.entryRevision
+        if requests[index].phase == nil { increment(&requests[index].pendingPhaseCalls) }
+        var stage = requests[index].stages[stageIndex]
+        increment(&stage.calls)
+        let record = Record(owner: owner)
+        if stage.first == nil { stage.first = record }
+        if stage.maximum == nil || record.span > stage.maximum!.span { stage.maximum = record }
+        requests[index].stages[stageIndex] = stage
+    }
+    func recordMonitor(_ owner: PlaybackService.DebugFrameMonitorReadBatch) {
+        let batch = owner.reads
+        guard batch.isStartBodyExit else { return }
+        guard enabled, !batch.epochOverflowed, owner.request == owner.generation,
+              owner.sourceItemMatches, owner.observedItemMatches, owner.presentationMatches,
+              let phase = anchors.indices.last(where: {
+                  anchors[$0].map { $0 <= batch.lifecycle.startEntryNs } ?? false
+              }), let index = slot(request: owner.request, item: batch.item) else {
+            increment(&unmatchedMonitorStarts); increment(&qualityFailures); return
+        }
+        var request = requests[index]
+        guard request.phase == nil, !requests.contains(where: { $0.phase == phase }) else {
+            increment(&unmatchedMonitorStarts); increment(&qualityFailures); return
+        }
+        request.phase = phase; request.monitorEpoch = batch.epoch; request.monitorOutput = batch.output
+        request.monitorStartEntryNs = batch.lifecycle.startEntryNs
+        increment(&request.monitorStarts)
+        requests[index] = request
+    }
+    func dumpAndAssert() {
+        func optional<T>(_ value: T?) -> String { value.map { String(describing: $0) } ?? "unavailable" }
+        let retained = requests.reduce(0) { total, request in
+            total + request.stages.reduce(0) { $0 + ($1.first == nil ? 0 : 1) + ($1.maximum == nil ? 0 : 1) }
+        }
+        let unjoined = requests.filter { $0.phase == nil }.count
+        print("CPPNativePullSummary schema=1 enabled=\(enabled) requests=\(requests.count) maximumRequests=3 retainedRecords=\(retained) capacityRecords=18 orphanAvailability=\(orphans[0]) orphanCopy=\(orphans[1]) orphanEnqueue=\(orphans[2]) observedAvailability=\(observed[0]) observedCopy=\(observed[1]) observedEnqueue=\(observed[2]) unjoinedRequests=\(unjoined) unmatchedMonitorStarts=\(unmatchedMonitorStarts) qualityFailures=\(qualityFailures) overflow=\(overflow) returnedCallsOnly=true unreturnedCalls=unverified wholeRenderFrameCovered=false clock=DispatchTime")
+        XCTAssertFalse(overflow); XCTAssertEqual(qualityFailures, 0); XCTAssertLessThanOrEqual(retained, 18)
+        XCTAssertEqual(unjoined, 0); XCTAssertEqual(unmatchedMonitorStarts, 0)
+        for stage in ContinuousPictureInPicture.DebugNativePullStage.allCases {
+            let index = stage.rawValue
+            XCTAssertEqual(orphans[index], 0)
+            var accounted = orphans[index]
+            for request in requests {
+                let sum = accounted.addingReportingOverflow(request.stages[index].calls)
+                XCTAssertFalse(sum.overflow); accounted = sum.partialValue
+            }
+            XCTAssertEqual(observed[index], accounted)
+        }
+        for anchor in anchors { XCTAssertNotNil(anchor) }
+        if !enabled { XCTAssertTrue(requests.isEmpty); return }
+        XCTAssertEqual(requests.count, 3)
+        XCTAssertEqual(Set(requests.compactMap(\.phase)), Set(0..<3))
+        for request in requests {
+            let phase = request.phase
+            let anchor = phase.flatMap { anchors[$0] }
+            print("CPPNativePullRequest schema=1 phase=\(optional(phase)) request=\(request.request) rawSourceItem=\(request.sourceItem) cppOutput=\(optional(request.cppOutput)) cppRevision=\(optional(request.cppRevision)) monitorEpoch=\(optional(request.monitorEpoch)) monitorOutput=\(optional(request.monitorOutput)) monitorStartEntryNs=\(optional(request.monitorStartEntryNs)) commandEntryNs=\(optional(anchor)) monitorStarts=\(request.monitorStarts) callsBeforePhaseJoin=\(request.pendingPhaseCalls) phaseJoin=exact-request-and-raw-item cppAndMonitorOutputsDistinct=true")
+            XCTAssertEqual(request.monitorStarts, 1)
+            XCTAssertNotNil(request.cppTicket); XCTAssertNotNil(request.cppOutput)
+            XCTAssertGreaterThan(request.stages[0].calls, 0)
+            XCTAssertLessThanOrEqual(request.stages[1].calls, request.stages[0].calls)
+            XCTAssertLessThanOrEqual(request.stages[2].calls, request.stages[1].calls)
+            for kind in ContinuousPictureInPicture.DebugNativePullStage.allCases {
+                let stage = request.stages[kind.rawValue]
+                XCTAssertEqual(stage.first == nil, stage.calls == 0)
+                XCTAssertEqual(stage.maximum == nil, stage.calls == 0)
+                print("CPPNativePullCount schema=1 phase=\(optional(phase)) request=\(request.request) stage=\(kind.rawValue) calls=\(stage.calls)")
+                for (role, record) in [("first", stage.first), ("maximum", stage.maximum)] {
+                    guard let record else { continue }
+                    let owner = record.owner, pull = owner.pull
+                    if let anchor { XCTAssertGreaterThanOrEqual(pull.entryNs, anchor) }
+                    print("CPPNativePullDuration schema=1 phase=\(optional(phase)) request=\(request.request) stage=\(kind.rawValue) role=\(role) calls=\(stage.calls) rawSourceItem=\(owner.sourceItem) cppItem=\(optional(pull.item)) cppOutput=\(pull.output) entryRevision=\(pull.entryRevision) returnRevision=\(pull.returnRevision) sourceNativeSeekTicket=\(optional(pull.sourceNativeSeekTicket)) nativeSeekTicket=\(pull.nativeSeekTicket) activeSeekTicket=\(optional(pull.activeSeekTicket)) entryNs=\(pull.entryNs) returnNs=\(pull.returnNs) spanNs=\(record.span) entryOwnerCoherent=\(pull.entryOwnerCoherent) ownerUnchanged=\(pull.ownerUnchanged) serviceGeneration=\(owner.generation) sourceItemMatches=\(owner.sourceItemMatches) observedItemMatches=\(owner.observedItemMatches) presentationRequest=\(optional(owner.presentationRequest)) presentationMatches=\(owner.presentationMatches) cachedAudioToken=\(owner.cachedAudioToken) cachedAudioVisit=\(owner.cachedAudioVisit) cachedAudioOnly=true operationResultRecorded=false enqueueReturnProvesDisplay=false clock=DispatchTime")
+                }
+            }
+        }
+    }
+}
+
 /// No native queries or per-call logging. Fixed first+maximum per stage/request.
 @MainActor
 private final class DefaultFrameMonitorReadTrace {
@@ -3515,12 +3769,13 @@ private final class DefaultFrameMonitorReadTrace {
     private var overflow = false
     private var qualityFailures: UInt64 = 0
     init(enabled: Bool) { self.enabled = enabled; requests.reserveCapacity(3) }
-    func beginPhase(_ value: Int) {
+    @discardableResult func beginPhase(_ value: Int) -> UInt64? {
         guard commandAnchors.indices.contains(value), commandAnchors[value] == nil else {
-            increment(&qualityFailures); return
+            increment(&qualityFailures); return nil
         }
         // Common test-only anchor in BOTH matched arms; no production nil-path clock.
         commandAnchors[value] = DispatchTime.now().uptimeNanoseconds
+        return commandAnchors[value]
     }
     private func increment(_ value: inout UInt64) {
         if value == UInt64.max { overflow = true } else { value += 1 }
@@ -4381,6 +4636,18 @@ private final class ProductionSelectionShutdown: @unchecked Sendable {
 }
 
 #if DEBUG
+private final class ProductionPCMOriginReply: @unchecked Sendable {
+    private let lock = NSLock()
+    private var received = false
+    private var snapshot: DebugAcceptedPCMOriginSnapshot?
+    func complete(_ snapshot: DebugAcceptedPCMOriginSnapshot?) {
+        lock.lock(); self.snapshot = snapshot; received = true; lock.unlock()
+    }
+    func read() -> (received: Bool, snapshot: DebugAcceptedPCMOriginSnapshot?) {
+        lock.lock(); defer { lock.unlock() }; return (received, snapshot)
+    }
+}
+
 private final class NaturalFailureStateMailbox: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ContinuousPCMDecoder.DebugFailureState?

@@ -116,6 +116,44 @@ final class ContinuousPictureInPicture: NSObject {
     #if DEBUG
     /// Observes the actual SDK request without replacing its result.
     var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
+    enum DebugNativePullStage: Int, CaseIterable, Sendable {
+        case availability = 0, copy = 1, enqueue = 2
+    }
+    struct DebugNativePullStamp: Sendable {
+        let stage: DebugNativePullStage
+        // Source captured at renderFrame entry, before callbacks, not relabeled at call time.
+        let ticket: PresentationTicket?
+        let item: ObjectIdentifier?, output: ObjectIdentifier
+        let entryRevision: Int, returnRevision: Int
+        let sourceNativeSeekTicket: UInt64?
+        let nativeSeekTicket: UInt64, activeSeekTicket: UInt64?
+        let entryNs: UInt64, returnNs: UInt64
+        let entryOwnerCoherent: Bool, ownerUnchanged: Bool
+    }
+    // Separate from legacy point stamps and their capacity/masks.
+    var onDebugNativePullStamp: (@MainActor (DebugNativePullStamp) -> Void)?
+    private func debugNativePull<T>(_ stage: DebugNativePullStage,
+        sourceTicket: PresentationTicket?, sourceNativeSeekTicket: UInt64?, output: AVPlayerItemVideoOutput,
+        _ operation: @MainActor () -> T) -> T {
+        guard let observer = onDebugNativePullStamp else { return operation() }
+        let revision = presentationRevision, nativeSeek = seekTicket, activeSeek = activeSeekTicket
+        let enteredOwner = (sourceTicket.map { owns($0) } ?? false)
+            && videoOutput === output && activeSeek == nil && sourceNativeSeekTicket == nativeSeek
+        let entered = DispatchTime.now().uptimeNanoseconds
+        let result = operation()
+        let returned = DispatchTime.now().uptimeNanoseconds
+        let unchanged = enteredOwner && (sourceTicket.map { owns($0) } ?? false)
+            && videoOutput === output && revision == presentationRevision
+            && nativeSeek == seekTicket && activeSeek == activeSeekTicket
+        observer(DebugNativePullStamp(stage: stage, ticket: sourceTicket,
+            item: sourceTicket?.item, output: ObjectIdentifier(output),
+            entryRevision: revision, returnRevision: presentationRevision,
+            sourceNativeSeekTicket: sourceNativeSeekTicket,
+            nativeSeekTicket: nativeSeek, activeSeekTicket: activeSeek,
+            entryNs: entered, returnNs: returned,
+            entryOwnerCoherent: enteredOwner, ownerUnchanged: unchanged))
+        return result
+    }
     // Cached proof only: no output pull or SDK query is performed by its getter.
     private var debugImageEpoch: UInt64 = 0
     private var debugImageEpochSaturated = false
@@ -524,6 +562,7 @@ final class ContinuousPictureInPicture: NSObject {
         #if DEBUG
         onFrameAcquisition = nil
         onDebugRenderStamp = nil
+        onDebugNativePullStamp = nil
         #endif
         activeSeekTicket = nil
         preparationTask?.cancel()
@@ -572,6 +611,7 @@ final class ContinuousPictureInPicture: NSObject {
         let debugEnqueueTicket = currentItem.map {
             PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0))
         }
+        let debugPullSeekTicket = onDebugNativePullStamp == nil ? nil : seekTicket
         let debugSourceTicket = onDebugRenderStamp == nil ? nil : debugEnqueueTicket
         #endif
         guard activeSeekTicket == nil else {
@@ -607,15 +647,26 @@ final class ContinuousPictureInPicture: NSObject {
         if let item = currentItem { onFrameAcquisition?(item, requestedTime) }
         #endif
         #if DEBUG
-        let hasNew = videoOutput.hasNewPixelBuffer(forItemTime: requestedTime)
+        let hasNew = debugNativePull(.availability, sourceTicket: debugEnqueueTicket,
+            sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
+            videoOutput.hasNewPixelBuffer(forItemTime: requestedTime)
+        }
         debugTraceRender(hasNew ? .hasNewTrue : .hasNewFalse, requested: requestedTime, sourceTicket: debugSourceTicket)
         guard hasNew else { return }
         #else
         guard videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
         #endif
         var displayTime = CMTime.invalid
+        #if DEBUG
+        let copied = debugNativePull(.copy, sourceTicket: debugEnqueueTicket,
+            sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
+            videoOutput.copyPixelBuffer(forItemTime: requestedTime, itemTimeForDisplay: &displayTime)
+        }
+        guard let pixel = copied else { return }
+        #else
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
+        #endif
         if !displayTime.isNumeric { displayTime = requestedTime }
         lastCopiedFramePositionSeconds = CMTimeGetSeconds(displayTime)
         #if DEBUG
@@ -659,7 +710,14 @@ final class ContinuousPictureInPicture: NSObject {
         #if DEBUG
         let debugEnqueueEpoch = debugImageEpoch
         #endif
+        #if DEBUG
+        debugNativePull(.enqueue, sourceTicket: debugEnqueueTicket,
+            sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
+            displayLayer.enqueue(sample)
+        }
+        #else
         displayLayer.enqueue(sample)
+        #endif
         lastEnqueuedTime = displayTime
         lastFramePositionSeconds = CMTimeGetSeconds(displayTime)
         submittedFrameCount &+= 1
