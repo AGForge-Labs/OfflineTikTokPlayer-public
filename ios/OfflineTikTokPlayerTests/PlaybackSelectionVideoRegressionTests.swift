@@ -3962,6 +3962,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("NaturalSeekCompletionSummary schema=1 stage=\(stage) intercepted=\(completion.intercepted) nativeCallbacks=\(completion.nativeCallbacks) nativeFinished=\(completion.nativeFinished.map { String($0) } ?? "missing") forwarded=\(completion.forwarded) rejectedCommands=\(completion.rejectedCommands) overflow=\(completion.overflow) cleanupAcknowledged=\(completion.cleanupAcknowledged) latencyAcceptance=false physicalOutput=unverified")
             if let decisionReceipt { print(decisionReceipt) }
             if let recoveryReceipt { print(recoveryReceipt) }
+            completion.dumpCommandTrace()
         }
         let buffer = PlaybackBuffer()
         try await withOwnedNaturalFixture(buffer: buffer,
@@ -3999,6 +4000,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             var gateDeadline: Double?, blockedAttempts = 0
             var issued: PlaybackService.DebugVideoSeekStamp?, issuedCount = 0, issueOverflow = false
             service.onDebugVideoSeekStamp = { stamp in
+                completion.recordIssued(stamp)
                 guard stamp.request == request, stamp.requestedPosition >= farTarget,
                       stamp.requestedPosition < SelectionVideoFixture.duration else { return }
                 if issuedCount < 8 { issuedCount += 1; if issued == nil { issued = stamp } }
@@ -4209,10 +4211,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     #if DEBUG
     @MainActor private final class NaturalCompletionSeekHold {
+        private struct CommandTrace {
+            let issued: PlaybackService.DebugVideoSeekStamp?
+            let target: Double?
+            let playerMatches: Bool, numeric: Bool, lowerBoundMatches: Bool, upperBoundMatches: Bool
+            let armed: Bool, intercepted: Bool, eligible: Bool
+        }
         private let minimumTarget: Double, maximumTarget: Double
         private var expectedPlayer: ObjectIdentifier?
         private var armed = false, released = false, deliveryObserved = false
         private var callback: (@Sendable (Bool) -> Void)?
+        private var issueForNextCommand: PlaybackService.DebugVideoSeekStamp?
+        private var commandTrace: [CommandTrace] = []
+        private var traceDropped = 0, traceSaturated = false
         private(set) var intercepted = false, overflow = false
         private(set) var nativeCallbacks = 0, forwarded = 0, rejectedCommands = 0
         private(set) var nativeFinished: Bool?
@@ -4223,11 +4234,23 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         init(minimumTarget: Double, maximumTarget: Double) {
             self.minimumTarget = minimumTarget; self.maximumTarget = maximumTarget
+            commandTrace.reserveCapacity(8)
         }
         func arm(player: AVPlayer) { expectedPlayer = ObjectIdentifier(player); armed = true }
+        func recordIssued(_ stamp: PlaybackService.DebugVideoSeekStamp) { issueForNextCommand = stamp }
         func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
             let eligible = armed && !intercepted && expectedPlayer == ObjectIdentifier(player)
                 && time.isNumeric && time.seconds >= minimumTarget && time.seconds < maximumTarget
+            let target = time.isNumeric ? time.seconds : nil
+            if commandTrace.count < 8 {
+                commandTrace.append(CommandTrace(issued: issueForNextCommand, target: target,
+                    playerMatches: expectedPlayer == ObjectIdentifier(player), numeric: time.isNumeric,
+                    lowerBoundMatches: target.map { $0 >= minimumTarget } ?? false,
+                    upperBoundMatches: target.map { $0 < maximumTarget } ?? false,
+                    armed: armed, intercepted: intercepted, eligible: eligible))
+            } else if traceDropped < Int.max { traceDropped += 1 }
+            else { traceSaturated = true }
+            issueForNextCommand = nil
             if armed, !intercepted, !eligible {
                 if rejectedCommands < 8 { rejectedCommands += 1 } else { overflow = true }
             }
@@ -4254,6 +4277,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         func acknowledgeDelivery() {
             deliveryObserved = nativeCallbacks == 1 && forwarded == 1 && callback == nil && !overflow
+        }
+        // Dump only after owned cleanup, including when the original setup throws.
+        // This is command metadata, not an additional SDK position/ownership read.
+        func dumpCommandTrace() {
+            print("NaturalSeekCompletionInjectionCoverage schema=1 retained=\(commandTrace.count) capacity=8 dropped=\(traceDropped) saturated=\(traceSaturated) minimumTarget=\(minimumTarget) maximumTarget=\(maximumTarget) setupGuards=unchanged playbackAcceptance=false")
+            for (index, command) in commandTrace.enumerated() {
+                let issue = command.issued
+                print("NaturalSeekCompletionInjection schema=1 index=\(index) issuePresent=\(issue != nil) issueReason=\(issue?.reason.rawValue ?? -1) issueRequest=\(issue?.request ?? -1) issueGeneration=\(issue?.generation ?? -1) issueSeekTicket=\(issue.map { String($0.nativeSeekTicket) } ?? "missing") issueTarget=\(issue.map { String($0.requestedPosition) } ?? "missing") issueForce=\(issue.map { String($0.force) } ?? "missing") issueCachedToken=\(issue.map { String($0.cachedAudioToken) } ?? "missing") issueCachedVisit=\(issue.map { String($0.cachedAudioVisit) } ?? "missing") nativeTarget=\(command.target.map { String($0) } ?? "missing") playerMatches=\(command.playerMatches) numeric=\(command.numeric) lowerBoundMatches=\(command.lowerBoundMatches) upperBoundMatches=\(command.upperBoundMatches) armed=\(command.armed) alreadyIntercepted=\(command.intercepted) eligible=\(command.eligible) playbackAcceptance=false")
+            }
         }
     }
     #endif
