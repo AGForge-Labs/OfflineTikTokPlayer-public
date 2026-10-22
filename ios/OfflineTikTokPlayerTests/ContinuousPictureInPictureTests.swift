@@ -114,6 +114,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         enum DecodeFailure: Error { case contract }
         func hex(_ digest: SHA256.Digest) -> String { digest.map { String(format: "%02x", $0) }.joined() }
         @MainActor func decode(_ composition: AVVideoComposition?) throws -> Summary {
+            let readerMode = composition == nil ? "native" : "composed"
             let reader = try AVAssetReader(asset: asset)
             let settings: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
@@ -145,6 +146,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                     let tick = CMTimeConvertScale(pts, timescale: 24, method: .default)
                     guard pts.isNumeric, tick.isNumeric, pts.epoch == 0, tick.epoch == 0,
                           CMTimeCompare(pts, tick) == 0, tick.value == Int64(count) else {
+                        print("NativeGeometryVideoPTSFailure schema=1 readerMode=\(readerMode) acceptedFrames=\(count) expectedPTSValue=\(count) expectedPTSTimescale=24 ptsValue=\(pts.value) ptsTimescale=\(pts.timescale) ptsFlags=\(pts.flags.rawValue) ptsEpoch=\(pts.epoch) ptsNumeric=\(pts.isNumeric) tickValue=\(tick.value) tickTimescale=\(tick.timescale) tickFlags=\(tick.flags.rawValue) tickEpoch=\(tick.epoch) tickNumeric=\(tick.isNumeric) firstAcceptedValue=\(first.value) firstAcceptedTimescale=\(first.timescale) firstAcceptedFlags=\(first.flags.rawValue) firstAcceptedEpoch=\(first.epoch) lastAcceptedValue=\(last.value) lastAcceptedTimescale=\(last.timescale) lastAcceptedFlags=\(last.flags.rawValue) lastAcceptedEpoch=\(last.epoch) frameCap=720 fullComparison=unavailable latencyEvidence=false")
                         XCTFail("Every actual PTS must cover the complete ordered 24fps source"); throw DecodeFailure.contract
                     }
                     let pixel = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
@@ -179,6 +181,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                 XCTFail("The entire source, including its last frame, must reach completed EOF")
                 throw reader.error ?? DecodeFailure.contract
             }
+            print("NativeGeometryVideoReaderCompleted schema=1 readerMode=\(readerMode) acceptedFrames=\(count) activeBytes=\(bytes) firstPTSValue=\(first.value) firstPTSTimescale=\(first.timescale) firstPTSFlags=\(first.flags.rawValue) firstPTSEpoch=\(first.epoch) lastPTSValue=\(last.value) lastPTSTimescale=\(last.timescale) lastPTSFlags=\(last.flags.rawValue) lastPTSEpoch=\(last.epoch) completeEOF=true fullComparison=pending xctestOutcome=external latencyEvidence=false")
             return Summary(count: count, bytes: bytes, first: first, last: last,
                 ptsHash: hex(ptsHash.finalize()), pixelHash: hex(pixelHash.finalize()),
                 firstFrameHash: firstFrameHash, lastFrameHash: lastFrameHash)
