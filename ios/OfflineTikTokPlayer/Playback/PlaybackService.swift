@@ -1283,8 +1283,13 @@ final class PlaybackService: NSObject {
             let seconds = time.seconds
             // A scheduled/starting native item can report "playing" while its
             // actual timebase is still stopped. Seeking that frozen clock keeps
-            // discarding its first frame. Explicit seeks bypass this reader.
-            guard !self.intent.canPlay || (effectiveRate.isFinite && effectiveRate > 0) else { return .nan }
+            // discarding its first frame. Forced seeks bypass this reader.
+            // A pre-install explicit seek can miss its visit correction before
+            // an item exists. Keep finite zero-clock correction eligible until
+            // that request becomes ready; ordinary owned starts still wait.
+            let explicitStart = self.readyGeneration == nil && self.explicitVideoSeekGeneration == self.generation
+            guard !self.intent.canPlay || (effectiveRate.isFinite
+                && (effectiveRate > 0 || (effectiveRate == 0 && explicitStart))) else { return .nan }
             return seconds.isFinite ? seconds : .nan
         }
         #if DEBUG
@@ -1324,6 +1329,7 @@ final class PlaybackService: NSObject {
         let expectedToken = selectedID.flatMap { continuousAudio.entry(for: $0)?.token }
         let initialSelectionPending = continuousAudio.isSelectionPending(in: visit)
         let canPlay = intent.canPlay
+        let readReadyGeneration = readyGeneration, readExplicitSeekGeneration = explicitVideoSeekGeneration
         var currentItemAfterRead = true
         #if DEBUG
         var ordinaryDriftVideoPositionSeconds: Double? = nil
@@ -1359,7 +1365,9 @@ final class PlaybackService: NSObject {
                   self.continuousAudio.selectedID == selectedID, self.queue.currentID == selectedID,
                   self.videoPresentation?.request == presentation?.request,
                   self.videoPresentation?.ticket == presentation?.ticket,
-                  self.intent.canPlay == canPlay else { return false }
+                  self.intent.canPlay == canPlay,
+                  force || (self.readyGeneration == readReadyGeneration
+                    && self.explicitVideoSeekGeneration == readExplicitSeekGeneration) else { return false }
             // A natural boundary can change the rendered source before service
             // adoption. Forced targets also need that owner; pending explicit
             // selections still own their unacknowledged target.
