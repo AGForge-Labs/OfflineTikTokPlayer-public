@@ -55,12 +55,24 @@ final class PlaybackService: NSObject {
     enum DebugVideoRateHandoffCause: Int, Sendable {
         case initialReady = 0, correctionCompletion = 1
     }
+    struct DebugInitialNativeStartControl: Sendable {
+        let request: Int
+        let usesCurrentItemTime: Bool
+    }
+    struct DebugInitialNativeStartArgument: Sendable {
+        let requestedCurrentItemTime: Bool
+        let historyQualifiedNearZero: Bool
+        let desiredAudioGoal: Double
+    }
+    // Isolated request only; nil preserves the original numeric argument.
+    @ObservationIgnored var debugInitialNativeStartControl: DebugInitialNativeStartControl?
     struct DebugVideoRateHandoff: Sendable {
         let cause: DebugVideoRateHandoffCause
         let request: Int, entryGeneration: Int, returnGeneration: Int
         let item: ObjectIdentifier
         let requestedRate: Float
         let anchorTime: CMTime, anchorHostTime: CMTime
+        let initialStartArgument: DebugInitialNativeStartArgument?
         let entryNs: UInt64, returnNs: UInt64
         let presentationRequest: Int?, returnPresentationRequest: Int?
         let presentationTicket: ContinuousPictureInPicture.PresentationTicket?
@@ -1046,8 +1058,32 @@ final class PlaybackService: NSObject {
                                 #if DEBUG
                                 self.debugTraceVideoStartup(.setRate, request: request, installed: installed,
                                     anchorHostSeconds: anchor.host.seconds, anchorPosition: anchor.position) {
-                                    self.debugSetVideoRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
-                                        atHostTime: anchor.host, item: playerItem, request: request, cause: .initialReady)
+                                    var argument: DebugInitialNativeStartArgument?
+                                    if let control = self.debugInitialNativeStartControl, control.request == request {
+                                        let seek = self.continuousPiP.debugNativeSeekState
+                                        let qualified = position == 0 && !rewind && waitsForClock
+                                            && self.statusHandledGeneration == request
+                                            && self.pendingAudioSeek == nil && self.explicitVideoSeekGeneration != request
+                                            && anchor.position.isFinite && anchor.position >= 0 && anchor.position <= 0.080
+                                            && seek.serial == 0 && seek.activeTicket == nil
+                                            && startBinding.map { binding in
+                                                binding.request == request && binding.ticket == ticket
+                                                    && binding.accepted && binding.issued && binding.nativeSeek == nil
+                                                    && self.pendingInitialClockBinding == binding
+                                                    && self.ownsInitialClockBinding(binding, item: playerItem)
+                                            } == true
+                                        argument = DebugInitialNativeStartArgument(
+                                            requestedCurrentItemTime: control.usesCurrentItemTime,
+                                            historyQualifiedNearZero: qualified, desiredAudioGoal: anchor.position)
+                                    }
+                                    // History qualifies intent/owner, not the native position at issue.
+                                    let useCurrent = argument.map {
+                                        $0.requestedCurrentItemTime && $0.historyQualifiedNearZero
+                                    } ?? false
+                                    self.debugSetVideoRate(1, time: useCurrent ? .invalid
+                                        : CMTime(seconds: anchor.position, preferredTimescale: 48_000),
+                                        atHostTime: anchor.host, item: playerItem, request: request, cause: .initialReady,
+                                        initialStartArgument: argument)
                                 }
                                 #else
                                 self.player.setRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
@@ -1613,7 +1649,8 @@ final class PlaybackService: NSObject {
 
     #if DEBUG
     private func debugSetVideoRate(_ rate: Float, time: CMTime, atHostTime host: CMTime,
-        item: AVPlayerItem, request: Int, cause: DebugVideoRateHandoffCause) {
+        item: AVPlayerItem, request: Int, cause: DebugVideoRateHandoffCause,
+        initialStartArgument: DebugInitialNativeStartArgument? = nil) {
         guard let observer = onDebugVideoRateHandoff else {
             player.setRate(rate, time: time, atHostTime: host)
             return
@@ -1628,6 +1665,7 @@ final class PlaybackService: NSObject {
         observer(DebugVideoRateHandoff(cause: cause, request: request,
             entryGeneration: enteredGeneration, returnGeneration: generation,
             item: ObjectIdentifier(item), requestedRate: rate, anchorTime: time, anchorHostTime: host,
+            initialStartArgument: initialStartArgument,
             entryNs: entered, returnNs: returned,
             presentationRequest: presentation?.request, returnPresentationRequest: returnedPresentation?.request,
             presentationTicket: presentation?.ticket, returnPresentationTicket: returnedPresentation?.ticket,
