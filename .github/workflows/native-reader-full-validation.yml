@@ -2,7 +2,7 @@ name: Native reader full validation
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh', 'scripts/ensure-simulator-booted.py', 'tests/validation-shell/test_simulator_boot_preflight.py', 'scripts/test-apple-buffer.sh', 'scripts/generate-apple-buffer-resources.py', 'tests/validation-shell/test_apple_buffer_projection.py', 'scripts/capture-simulator-test-frames.py', 'tests/validation-shell/test_simulator_destination_resolution.py', 'scripts/export-native-xcresult.py', 'tests/validation-shell/test_native_xcresult_export.py']
+    paths: ['.github/workflows/native-reader-full-validation.yml', 'scripts/check-native-reader-full-validation.sh', 'scripts/ensure-simulator-booted.py', 'tests/validation-shell/test_simulator_boot_preflight.py', 'scripts/test-apple-buffer.sh', 'scripts/generate-apple-buffer-resources.py', 'tests/validation-shell/test_apple_buffer_projection.py', 'scripts/capture-simulator-test-frames.py', 'tests/validation-shell/test_simulator_destination_resolution.py', 'scripts/export-native-xcresult.py', 'tests/validation-shell/test_native_xcresult_export.py', 'scripts/preroll-crash-excerpt.py', 'scripts/export-preroll-crash-evidence.py', 'tests/validation-shell/test_preroll_crash_evidence.py']
 permissions:
   contents: read
 concurrency:
@@ -33,6 +33,7 @@ jobs:
           python3 tests/validation-shell/test_apple_buffer_projection.py
           python3 tests/validation-shell/test_simulator_destination_resolution.py
           python3 tests/validation-shell/test_native_xcresult_export.py
+          python3 tests/validation-shell/test_preroll_crash_evidence.py
       - name: Resolve the Simulator then verify boot within a four minute budget
         id: simulator_boot
         if: ${{ !cancelled() && steps.harness.outcome == 'success' }}
@@ -47,9 +48,13 @@ jobs:
           SIMULATOR_DESTINATION: platform=iOS Simulator,id=${{ steps.simulator_boot.outputs.simulator_id }}
         run: bash scripts/check-native-reader-full-validation.sh
       - name: Export bounded structured test records after the native attempt
+        id: xcresult_export
         if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
         run: python3 scripts/export-native-xcresult.py
-      - name: Independently require all 138 native and one UI identities after the attempt
+      - name: Collect only bounded case-attributed preroll crash excerpts
+        if: ${{ !cancelled() && steps.xcresult_export.outcome == 'success' }}
+        run: python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
+      - name: Independently require all 141 native and one UI identities after the attempt
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -61,8 +66,8 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          if len(native) != 138 or len(ui) != 1 or native | ui != expected:
-              raise SystemExit(f'Pinned full manifest must equal native=138 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
+          if len(native) != 141 or len(ui) != 1 or native | ui != expected:
+              raise SystemExit(f'Pinned full manifest must equal native=141 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('FULL source-manifest evidence native=138 ui=1; original guards retained; physical-device acceptance remains separate')
+          print('FULL source-manifest evidence native=141 ui=1; original guards retained; physical-device acceptance remains separate')
           PY
