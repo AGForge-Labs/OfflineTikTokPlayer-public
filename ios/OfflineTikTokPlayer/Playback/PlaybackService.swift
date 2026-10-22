@@ -1160,6 +1160,7 @@ final class PlaybackService: NSObject {
     #endif
 
     private func sampleNativeVideoClock() {
+        guard !continuousAudio.isSelected else { return }
         guard let item = observedItem else { return }
         #if DEBUG
         onDebugPeriodicCurrentItemReadAttempt?(ObjectIdentifier(item))
@@ -1175,9 +1176,15 @@ final class PlaybackService: NSObject {
     }
 
     private func readOrdinaryVideoPosition(_ item: AVPlayerItem) -> Double {
-        @MainActor func read() -> Double { item.currentTime().seconds }
+        @MainActor func read() -> Double {
+            guard let timebase = item.timebase else { return .nan }
+            let time = CMTimebaseGetTime(timebase)
+            guard time.isNumeric else { return .nan }
+            let seconds = time.seconds
+            return seconds.isFinite ? seconds : .nan
+        }
         #if DEBUG
-        let kind: DebugVideoPositionReadKind = .legacyCurrentTime
+        let kind: DebugVideoPositionReadKind = .itemTimebase
         let observer = onDebugVideoPositionRead
         let request = generation, presentation = videoPresentation
         onDebugVideoPositionReadAttempt?(kind, ObjectIdentifier(item))

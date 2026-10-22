@@ -137,6 +137,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugPeriodicCurrentItemReadAttempt = { observed in XCTAssertEqual(observed, raw); attempts += 1 }
             service.debugSampleNativeVideoClock()
             service.onDebugPeriodicCurrentItemReadAttempt = nil
+            let pcmReads = attempts
             XCTAssertEqual(attempts, 0, "PCM-selected periodic callbacks must not query native ownership")
             XCTAssertEqual(service.clock.position, sentinel)
 
@@ -147,6 +148,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugPeriodicCurrentItemReadAttempt = { observed in XCTAssertEqual(observed, raw); attempts += 1 }
             service.debugSampleNativeVideoClock()
             service.onDebugPeriodicCurrentItemReadAttempt = nil
+            let legacyReads = attempts
             XCTAssertEqual(attempts, 1)
             XCTAssertEqual(service.clock.position, native, accuracy: 0.005,
                            "The non-PCM path must still sample the real paused item")
@@ -164,7 +166,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertTrue(service.player.currentItem === item)
             XCTAssertEqual(service.clock.position, sentinel,
                            "The retained late PCM guard must reject selection changed by SDK reentry")
-            print("PeriodicNativeClockContract pcmReads=0 legacyReads=1 reentrantReads=\(attempts) sameNativeItem=\(service.player.currentItem === item)")
+            print("PeriodicNativeClockContract pcmReads=\(pcmReads) legacyReads=\(legacyReads) reentrantReads=\(attempts) sameNativeItem=\(service.player.currentItem === item)")
         }
         #else
         XCTFail("Periodic clock contracts require DEBUG seams")
@@ -681,6 +683,31 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var readyNs: UInt64?, observedCallbackNs: UInt64?
         var helper: AVPlayer?
         let setupEntry = DispatchTime.now().uptimeNanoseconds
+        #if DEBUG
+        let diagnosticToken = owner.token, diagnosticOrder = owner.order
+        let diagnosticOrdinal = owner.ordinal, diagnosticEnabled = owner.enabled
+        // At most 46 stages per arm: five first attempts times eight stages plus six cleanup stages.
+        // Repeated native-preroll attempts keep their existing receipt but add no stage markers.
+        var diagnosticOperations: UInt8 = 0
+        @MainActor func claimDiagnosticBoundary(_ operation: String) -> Bool {
+            let bit: UInt8
+            switch operation {
+            case "remove-only-B": bit = 1
+            case "attach-same-B": bit = 2
+            case "native-preroll": bit = 4
+            case "can-insert-same-B": bit = 8
+            case "reinsert-same-B-after-same-A": bit = 16
+            default: return false
+            }
+            guard (diagnosticOperations & bit) == 0 else { return false }
+            diagnosticOperations |= bit
+            return true
+        }
+        @MainActor func diagnosticStage(_ operation: String, _ stage: String,
+                                       result: Bool? = nil, cachedNs: UInt64? = nil) {
+            print("PreparedNextPrerollStage schema=1 token=\(diagnosticToken) order=\(diagnosticOrder) ordinal=\(diagnosticOrdinal) enabled=\(diagnosticEnabled) operation=\(operation) stage=\(stage) result=\(result.map { String($0) } ?? "unobserved") cachedNs=\(cachedNs.map { String($0) } ?? "unobserved") scope=first-operation-attempt-or-single-cleanup latencyEvidence=false stdoutDelivery=unacknowledged")
+        }
+        #endif
         @MainActor func owns(_ queued: Bool, _ helperHasB: Bool) -> Bool {
             let items = buffer.player.items(), pcm = audio.renderer.snapshot, bTime = b.currentTime()
             let exactQueue = queued
@@ -722,13 +749,38 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         @MainActor func boundary(_ operation: String, beforeQueued: Bool, beforeHelper: Bool,
             afterQueued: Bool, afterHelper: Bool, _ action: @MainActor () -> Void) -> Bool {
+            #if DEBUG
+            let diagnose = claimDiagnosticBoundary(operation)
+            if diagnose { diagnosticStage(operation, "pre-owns-entry") }
+            #endif
             let before = owns(beforeQueued, beforeHelper)
+            #if DEBUG
+            if diagnose { diagnosticStage(operation, "pre-owns-result", result: before) }
+            #endif
             guard before else { return false }
+            #if DEBUG
+            if diagnose { diagnosticStage(operation, "action-entry") }
+            #endif
             let entry = DispatchTime.now().uptimeNanoseconds
             action()
             let returned = DispatchTime.now().uptimeNanoseconds
+            #if DEBUG
+            if diagnose {
+                diagnosticStage(operation, "action-raw-return", cachedNs: returned)
+                diagnosticStage(operation, "post-owns-entry")
+            }
+            #endif
             let after = owns(afterQueued, afterHelper)
+            #if DEBUG
+            if diagnose {
+                diagnosticStage(operation, "post-owns-result", result: after)
+                diagnosticStage(operation, "original-receipt-entry")
+            }
+            #endif
             print("PreparedNextPrerollBoundary schema=1 token=\(owner.token) operation=\(operation) entryNs=\(entry) returnNs=\(returned) ownerBefore=\(before) ownerAfter=\(after) helperPresent=\(helper != nil) helperRate=\(helper.map { String($0.rate) } ?? "released") helperMuted=\(helper.map { String($0.isMuted) } ?? "released") helperHasB=\(helper?.currentItem === b) latencyEvidence=false")
+            #if DEBUG
+            if diagnose { diagnosticStage(operation, "original-receipt-return") }
+            #endif
             return after
         }
         guard owns(true, false) else {
@@ -794,13 +846,31 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         valid = owns(false, true) && valid && dwellReturned >= deadline
             && dwellDelay <= 50_000_000 && readyNs != nil
         // Always clean the exact helper, even after a failed ownership observation.
+        #if DEBUG
+        diagnosticStage("cleanup-cancel", "entry")
+        #endif
         let cancelEntry = DispatchTime.now().uptimeNanoseconds
         created.cancelPendingPrerolls()
         let cancelReturn = DispatchTime.now().uptimeNanoseconds
+        #if DEBUG
+        diagnosticStage("cleanup-cancel", "raw-return", cachedNs: cancelReturn)
+        #endif
+        #if DEBUG
+        diagnosticStage("cleanup-owner", "entry")
+        #endif
         valid = owns(false, true) && valid
+        #if DEBUG
+        diagnosticStage("cleanup-owner", "combined-valid-result", result: valid)
+        #endif
+        #if DEBUG
+        diagnosticStage("cleanup-detach", "entry")
+        #endif
         let detachEntry = DispatchTime.now().uptimeNanoseconds
         created.replaceCurrentItem(with: nil)
         let detachReturn = DispatchTime.now().uptimeNanoseconds
+        #if DEBUG
+        diagnosticStage("cleanup-detach", "raw-return", cachedNs: detachReturn)
+        #endif
         let detachDelay = detachReturn > deadline ? detachReturn - deadline : 0
         let detached = created.currentItem == nil
         valid = owns(false, false) && valid && detachDelay <= 50_000_000
