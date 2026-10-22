@@ -2,6 +2,9 @@ import XCTest
 import AVFoundation
 import CoreVideo
 import CryptoKit
+#if DEBUG
+import CoreFoundation
+#endif
 import UIKit
 @testable import OfflineTikTokPlayer
 
@@ -214,7 +217,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             presentationTimes: times, endTime: end)
         defer { try? FileManager.default.removeItem(at: url) }
         let asset = AVURLAsset(url: url)
-        let (track, native, _) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end)
+        let (track, native, _) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end, fixtureID: "vfr")
         let item = AVPlayerItem(asset: asset), bridge = ContinuousPictureInPicture()
         var owned: ContinuousPictureInPicture.PreparedVideoResource?
         defer { bridge.invalidate(); owned?.retire(); XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition) }
@@ -250,7 +253,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             presentationTimes: times, endTime: end)
         defer { try? FileManager.default.removeItem(at: url) }
         let asset = AVURLAsset(url: url)
-        let (track, native, range) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end)
+        let (track, native, range) = try await qualifyTinyImportedVideo(asset, expectedTimes: times, end: end, fixtureID: "offset")
         guard CMTimeCompare(try XCTUnwrap(native.first).pts, .zero) > 0 else {
             XCTFail("The offset must survive actual import and complete native decode"); throw TinyVideoFailure.fixture
         }
@@ -272,7 +275,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
     private enum TinyVideoFailure: Error { case fixture, comparison, policy }
     private struct TinyVideoFrame { let pts: CMTime, duration: CMTime, pixels: String }
 
-    private func qualifyTinyImportedVideo(_ asset: AVURLAsset, expectedTimes: [CMTime], end: CMTime)
+    private func qualifyTinyImportedVideo(_ asset: AVURLAsset, expectedTimes: [CMTime], end: CMTime, fixtureID: String)
         async throws -> (AVAssetTrack, [TinyVideoFrame], CMTimeRange) {
         let tracks = try await asset.loadTracks(withMediaType: .video)
         guard tracks.count == 1, let track = tracks.first else {
@@ -289,6 +292,7 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             let mapping = segment.timeMapping
             print("TinyVideoSegmentObserved schema=1 index=\(index) isEmpty=\(segment.isEmpty) sourceStart=\(raw(mapping.source.start)) sourceDuration=\(raw(mapping.source.duration)) targetStart=\(raw(mapping.target.start)) targetDuration=\(raw(mapping.target.duration)) rawTimeFields=value/scale/flags/epoch fixtureQualification=pending latencyEvidence=false")
         }
+        observeTinyVideoBufferTiming(asset, track: track, fixtureID: fixtureID)
         let frames = try readTinyVideoFrames(asset, track: track, composition: nil, mode: "native")
         guard frames.count == expectedTimes.count, frames.count >= 3, frames.count <= 8,
               range.start.isNumeric, range.duration.isNumeric, duration.isNumeric,
@@ -313,6 +317,71 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         }
         print("TinyVideoImported schema=1 frames=\(frames.count) rangeStartValue=\(range.start.value) rangeStartScale=\(range.start.timescale) rangeDurationValue=\(range.duration.value) rangeDurationScale=\(range.duration.timescale) assetDurationValue=\(duration.value) assetDurationScale=\(duration.timescale) nonuniform=true allPixelsDistinct=true source=actual-import-and-native-EOF latencyEvidence=false")
         return (track, frames, range)
+    }
+
+    private func observeTinyVideoBufferTiming(_ asset: AVAsset, track: AVAssetTrack, fixtureID: String) {
+        func raw(_ time: CMTime) -> String {
+            "\(time.value)/\(time.timescale)/\(time.flags.rawValue)/\(time.epoch)"
+        }
+        for mode in ["compressed", "decoded"] {
+            if Task.isCancelled {
+                print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=task-cancelled returned=0 observedNil=false completedEOF=false diagnosticsOnly=true")
+                break
+            }
+            do {
+                let reader = try AVAssetReader(asset: asset)
+                defer { reader.cancelReading() }
+                let settings: [String: Any]? = mode == "decoded"
+                    ? [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA] : nil
+                let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+                output.alwaysCopiesSampleData = false
+                guard reader.canAdd(output) else {
+                    print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=output-rejected returned=0 observedNil=false completedEOF=false diagnosticsOnly=true")
+                    continue
+                }
+                reader.add(output) // Full asset; no timeRange, sample filtering or timing inference.
+                guard reader.startReading() else {
+                    print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=reader-start-failed status=\(reader.status.rawValue) errorPresent=\(reader.error != nil) errorCode=\((reader.error as NSError?)?.code ?? 0) returned=0 observedNil=false completedEOF=false diagnosticsOnly=true")
+                    continue
+                }
+                var returned = 0, observedNil = false
+                while returned < 32 && !Task.isCancelled {
+                    let found = autoreleasepool { () -> Bool in
+                        guard let sample = output.copyNextSampleBuffer() else { return false }
+                        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                        let duration = CMSampleBufferGetDuration(sample)
+                        let outputPTS = CMSampleBufferGetOutputPresentationTimeStamp(sample)
+                        let outputDuration = CMSampleBufferGetOutputDuration(sample)
+                        var timing = CMSampleTimingInfo(duration: .invalid,
+                            presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)
+                        let timingStatus = CMSampleBufferGetSampleTimingInfo(sample, at: 0, timingInfoOut: &timing)
+                        let emptyMedia: String
+                        if let value = CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_EmptyMedia,
+                            attachmentModeOut: nil) {
+                            emptyMedia = CFGetTypeID(value) == CFBooleanGetTypeID()
+                                ? (CFBooleanGetValue(value as! CFBoolean) ? "true" : "false") : "invalid-type"
+                        } else { emptyMedia = "absent-default-false" }
+                        let data = CMSampleBufferGetDataBuffer(sample)
+                        let dataBytes = data.map { CMBlockBufferGetDataLength($0) } ?? 0
+                        print("TinyVideoTimingBufferObserved schema=1 fixture=\(fixtureID) mode=\(mode) index=\(returned) numSamples=\(CMSampleBufferGetNumSamples(sample)) pts=\(raw(pts)) duration=\(raw(duration)) outputPTS=\(raw(outputPTS)) outputDuration=\(raw(outputDuration)) timingStatus=\(timingStatus) samplePTS=\(raw(timing.presentationTimeStamp)) sampleDTS=\(raw(timing.decodeTimeStamp)) sampleDuration=\(raw(timing.duration)) valid=\(CMSampleBufferIsValid(sample)) dataReady=\(CMSampleBufferDataIsReady(sample)) imagePresent=\(CMSampleBufferGetImageBuffer(sample) != nil) dataPresent=\(data != nil) dataBytes=\(dataBytes) totalSampleBytes=\(CMSampleBufferGetTotalSampleSize(sample)) emptyMedia=\(emptyMedia) rawTimeFields=value/scale/flags/epoch qualification=unavailable diagnosticsOnly=true")
+                        returned += 1
+                        return true
+                    }
+                    if !found { observedNil = true; break }
+                }
+                let status = reader.status
+                let completedEOF = observedNil && status == .completed
+                let capped = returned == 32 && !observedNil
+                let terminal = Task.isCancelled ? "task-cancelled" : capped ? "buffer-cap-no-EOF"
+                    : completedEOF ? "completed-EOF"
+                    : status == .failed ? "reader-error" : status == .cancelled ? "reader-cancelled"
+                    : observedNil ? "nil-without-completed" : "stopped-without-EOF"
+                print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=\(terminal) status=\(status.rawValue) errorPresent=\(reader.error != nil) errorCode=\((reader.error as NSError?)?.code ?? 0) returned=\(returned) observedNil=\(observedNil) completedEOF=\(completedEOF) bufferCap=32 qualification=unavailable diagnosticsOnly=true")
+                if capped { XCTFail("Metadata-only tiny timing scan reached its 32-buffer bound before EOF") }
+            } catch {
+                print("TinyVideoTimingScanTerminal schema=1 fixture=\(fixtureID) mode=\(mode) terminal=reader-init-error errorCode=\((error as NSError).code) returned=0 observedNil=false completedEOF=false qualification=unavailable diagnosticsOnly=true")
+            }
+        }
     }
 
     private func readTinyVideoFrames(_ asset: AVAsset, track: AVAssetTrack,

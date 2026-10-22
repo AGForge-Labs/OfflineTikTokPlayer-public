@@ -529,6 +529,40 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testPCMSourceCopyFailureTraceOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [false, true].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PCMSourceCopyFailureTraceArm schema=1 armID=\(armID) order=off-then-on ordinal=\(ordinal) enabled=\(enabled) targetVisit=3 nativeRefillTrace=\(enabled) videoSeekTrace=false monitor=current-default otherAlternatives=unset captures=unchanged output=after-cleanup independentDomains=true causalProof=false")
+            defer { print("PCMSourceCopyFailureTraceArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external noFailure=inconclusive") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                traceNativeRefill: enabled, traceFirstSourceFailure: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("First source-copy failure trace requires DEBUG")
+        #endif
+    }
+
+    func testPCMSourceCopyFailureTraceOnThenOff() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [true, false].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PCMSourceCopyFailureTraceArm schema=1 armID=\(armID) order=on-then-off ordinal=\(ordinal) enabled=\(enabled) targetVisit=3 nativeRefillTrace=\(enabled) videoSeekTrace=false monitor=current-default otherAlternatives=unset captures=unchanged output=after-cleanup independentDomains=true causalProof=false")
+            defer { print("PCMSourceCopyFailureTraceArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external noFailure=inconclusive") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                traceNativeRefill: enabled, traceFirstSourceFailure: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("First source-copy failure trace requires DEBUG")
+        #endif
+    }
+
     func testPreparedNativeGeometryOffThenOn() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -2035,9 +2069,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 traceClockHandoff: Bool? = nil,
                                                 freshPreviousBundle: Bool? = nil,
                                                 suppressNativePlayerRendering: Bool? = nil,
-                                                nativeVideoGeometry: Bool? = nil) async throws {
+                                                nativeVideoGeometry: Bool? = nil,
+                                                traceFirstSourceFailure: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if let enabled = traceFirstSourceFailure {
+            guard !traceVideoSeeks, frameMonitorAlternative == nil, traceNativeRefill == enabled,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
+                  traceClockHandoff == nil, freshPreviousBundle == nil,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  acceptedPCMOriginBenchmarkMode == nil else {
+                XCTFail("First-failure control requires its matched native bundle and otherwise unset default benchmark")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
         if suppressNativePlayerRendering != nil || nativeVideoGeometry != nil {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil,
@@ -2049,6 +2094,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if traceFirstSourceFailure != nil {
+            XCTFail("First-failure control is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if suppressNativePlayerRendering != nil || nativeVideoGeometry != nil {
             XCTFail("Suppression control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -2102,13 +2151,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
         #if DEBUG
         let nativeActivity = traceNativeRefill ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+        let firstFailure = traceFirstSourceFailure == true ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
         let acceptedPCMOrigin = acceptedPCMOriginBenchmarkMode
         let originRecorder = acceptedPCMOrigin == true ? DebugAcceptedPCMOriginRecorder() : nil
         let originReply = acceptedPCMOrigin == true ? ProductionPCMOriginReply() : nil
         let accounting = renderAccounting == true || acceptedPCMOrigin == true
             ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(capturePCMOrigin: acceptedPCMOrigin == true) : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity,
-                                          debugRenderAccounting: accounting, debugAcceptedPCMOrigin: originRecorder)
+                                          debugRenderAccounting: accounting, debugAcceptedPCMOrigin: originRecorder,
+                                          debugFirstFailure: firstFailure)
         if let enabled = acceptedPCMOrigin {
             print("AcceptedPCMOriginScope schema=1 enabled=\(enabled) prefixCapacity=3 ringEpochCapacity=12 minimumZeroRunFrames=480 normalizedRate=48000 channels=2 noRetainedPCM=true noWorkerClock=true receipt=existing-kernel-completion rendererSnapshotUnchanged=true nativeTrace=false defaultMonitor=true independentDomains=true originalGuards=unchanged")
             XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
@@ -2149,7 +2200,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
-        if suppressionControl != nil {
+        if suppressionControl != nil || traceFirstSourceFailure != nil {
             XCTAssertTrue(service.debugUsesCurrentCustomFrameForReadiness)
         }
         let remainingWitness = traceClockHandoff == true
@@ -2404,6 +2455,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         monitorReadTrace?.dumpAndAssert()
         cppNativePullTrace?.dumpAndAssert()
         nativeTrace?.dumpAfterCleanup()
+        dumpFirstSourceCopyFailure(firstFailure, enabled: traceFirstSourceFailure, cleanupAcknowledged: mayRemoveFixture)
         #endif
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
         XCTAssertTrue(mayRemoveFixture, "Queued decoder cleanup must return before removing only this synthetic fixture")
@@ -2577,6 +2629,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     #if DEBUG
+    private func dumpFirstSourceCopyFailure(_ recorder: ContinuousPCMRenderer.DebugFirstFailureRecorder?,
+                                           enabled: Bool?, cleanupAcknowledged: Bool) {
+        guard let recorder else {
+            print("PCMSourceCopyFailureSnapshot schema=1 mode=\(enabled.map { $0 ? "on" : "off" } ?? "nil") recorderPresent=false publication=unavailable capture=notCaptured configuredTargetVisit=3 actualTargetVisit=unavailable earlier=unavailable later=unavailable eventPresent=false cleanupAcknowledged=\(cleanupAcknowledged) independentDomains=true noCrossClock=true physicalProof=false causalProof=false")
+            return
+        }
+        let snapshot = recorder.snapshot() // One value read; never query the live sources for omitted operands.
+        print("PCMSourceCopyFailureSnapshot schema=1 mode=on recorderPresent=true publication=\(snapshot.publication.rawValue) configuredTargetVisit=3 actualTargetVisit=\(snapshot.targetVisit) earlier=\(snapshot.earlierVisitFailureObserved) later=\(snapshot.laterVisitFailureObserved) eventPresent=\(snapshot.event != nil) cleanupAcknowledged=\(cleanupAcknowledged) independentDomains=true noCrossClock=true physicalProof=false causalProof=false")
+        XCTAssertEqual(snapshot.targetVisit, 3)
+        XCTAssertEqual(snapshot.event != nil, snapshot.publication == .captured)
+        guard let event = snapshot.event else {
+            print("PCMSourceCopyFailureEvent schema=1 available=false capture=\(snapshot.publication == .publishing ? "publishing" : "notCaptured") operands=unavailable noFailure=inconclusive")
+            return
+        }
+        XCTAssertEqual(event.visit, snapshot.targetVisit)
+        print("PCMSourceCopyFailureEvent schema=1 available=true reason=\(event.reason.rawValue) token=\(event.token) visit=\(event.visit) cursor=\(event.cursor) observedFirstToken=\(event.observedFirstToken.map { String($0) } ?? "unread") observedSecondToken=\(event.observedSecondToken.map { String($0) } ?? "unread") observedThirdToken=\(event.observedThirdToken.map { String($0) } ?? "unread") observedAccess=\(event.observedAccess.map { String($0) } ?? "unread") observedReadyToken=\(event.observedReadyToken.map { String($0) } ?? "unread") prefixFrames=\(event.prefixFrames.map { String($0) } ?? "unread") expectedEpoch=\(event.expectedEpoch.map { String($0) } ?? "unread") observedEpoch=\(event.observedEpoch.map { String($0) } ?? "unread") observedReadPosition=\(event.observedReadPosition.map { String($0) } ?? "unread") observedWritePosition=\(event.observedWritePosition.map { String($0) } ?? "unread") operandScope=original-guard-actual-loads-only independentDomains=true noCrossClock=true physicalProof=false causalProof=false")
+    }
+
     private enum FullSourceReferenceFailure: Error {
         case quality(String)
     }

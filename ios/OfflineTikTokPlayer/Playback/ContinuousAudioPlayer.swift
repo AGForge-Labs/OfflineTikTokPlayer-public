@@ -43,8 +43,9 @@ final class ContinuousAudioPlayer {
     #if DEBUG
     init(debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil,
          debugRenderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil,
-         debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder? = nil) {
-        renderer = ContinuousPCMRenderer(debugRenderAccounting: debugRenderAccounting)
+         debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder? = nil,
+         debugFirstFailure: ContinuousPCMRenderer.DebugFirstFailureRecorder? = nil) {
+        renderer = ContinuousPCMRenderer(debugRenderAccounting: debugRenderAccounting, debugFirstFailure: debugFirstFailure)
         self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
         graph = ContinuousAudioGraph(renderer: renderer)
         decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder,

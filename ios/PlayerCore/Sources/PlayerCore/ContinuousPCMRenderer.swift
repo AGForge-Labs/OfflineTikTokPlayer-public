@@ -166,6 +166,28 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         return true
     }
 
+    #if DEBUG
+    // The observed CAS/load values are the original acceptance operands. This
+    // overload runs only with an explicitly installed immutable recorder.
+    fileprivate func acquire(token: Int, recorder: ContinuousPCMRenderer.DebugFirstFailureRecorder,
+                             visit: Int64, cursor: Int64) -> Bool {
+        let claim = access.compareExchange(expected: 0, desired: 1, ordering: .acquiringAndReleasing)
+        guard claim.exchanged else {
+            recorder.record(.init(reason: .sourceBusy, token: token, visit: visit, cursor: cursor,
+                observedAccess: claim.original))
+            return false
+        }
+        let observed = readyToken.load(ordering: .sequentiallyConsistent)
+        guard observed == token else {
+            release()
+            recorder.record(.init(reason: .sourceTokenChanged, token: token, visit: visit, cursor: cursor,
+                observedReadyToken: observed))
+            return false
+        }
+        return true
+    }
+    #endif
+
     fileprivate func release() { access.store(0, ordering: .releasing) }
 
     fileprivate func restart(token: Int, frame: Int64) {
@@ -211,6 +233,43 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         readPosition.store(frame + 1, ordering: .releasing)
         return true
     }
+
+    #if DEBUG
+    // Keep the original prefix/epoch/read/write order and short-circuit loads.
+    // Unreached operands stay nil; no request/availability accessor is queried.
+    fileprivate func copyFrame(_ frame: Int64, into output: UnsafeMutablePointer<Float>,
+                               recorder: ContinuousPCMRenderer.DebugFirstFailureRecorder,
+                               token: Int, visit: Int64) -> Bool {
+        let prefixFrames = prefixCount.load(ordering: .relaxed)
+        if frame < Int64(prefixFrames) {
+            output.update(from: prefix.advanced(by: Int(frame) * channels), count: channels)
+            return true
+        }
+        let epoch = committedEpoch.load(ordering: .acquiring)
+        guard epoch == renderedEpoch else {
+            recorder.record(.init(reason: .epochMismatch, token: token, visit: visit, cursor: frame,
+                prefixFrames: prefixFrames, expectedEpoch: renderedEpoch, observedEpoch: epoch))
+            return false
+        }
+        let read = readPosition.load(ordering: .relaxed)
+        guard read == frame else {
+            recorder.record(.init(reason: .positionMismatch, token: token, visit: visit, cursor: frame,
+                prefixFrames: prefixFrames, expectedEpoch: renderedEpoch, observedEpoch: epoch,
+                observedReadPosition: read))
+            return false
+        }
+        let written = writePosition.load(ordering: .acquiring)
+        guard written > frame else {
+            recorder.record(.init(reason: .unpublishedFrame, token: token, visit: visit, cursor: frame,
+                prefixFrames: prefixFrames, expectedEpoch: renderedEpoch, observedEpoch: epoch,
+                observedReadPosition: read, observedWritePosition: written))
+            return false
+        }
+        output.update(from: ring.advanced(by: Int(frame % Int64(ringCapacityFrames)) * channels), count: channels)
+        readPosition.store(frame + 1, ordering: .releasing)
+        return true
+    }
+    #endif
 }
 
 /// One permanent PCM timeline, independent of video readiness and UI callback timing.
@@ -218,6 +277,75 @@ public final class ContinuousPCMSource: @unchecked Sendable {
 /// caller. Decoder methods on sources have one serial producer. No storage is created,
 /// released, locked, decoded or dispatched from `render`.
 public final class ContinuousPCMRenderer: @unchecked Sendable {
+    #if DEBUG
+    public enum DebugFirstFailureReason: Int, Sendable, Equatable {
+        case sourceMissing = 1, sourceBusy = 2, sourceTokenChanged = 3
+        case epochMismatch = 4, positionMismatch = 5, unpublishedFrame = 6
+    }
+    public enum DebugFirstFailurePublication: Int, Sendable, Equatable {
+        case notCaptured = 0, publishing = 1, captured = 2
+    }
+    /// Nil operands were not reached by the original short-circuit guard.
+    public struct DebugFirstFailureEvent: Sendable, Equatable {
+        public let reason: DebugFirstFailureReason
+        public let token: Int
+        public let visit: Int64
+        public let cursor: Int64
+        public let observedFirstToken: Int?, observedSecondToken: Int?, observedThirdToken: Int?
+        public let observedAccess: Int?, observedReadyToken: Int?
+        public let prefixFrames: Int?, expectedEpoch: Int?, observedEpoch: Int?
+        public let observedReadPosition: Int64?, observedWritePosition: Int64?
+        fileprivate init(reason: DebugFirstFailureReason, token: Int, visit: Int64, cursor: Int64,
+                         observedFirstToken: Int? = nil, observedSecondToken: Int? = nil, observedThirdToken: Int? = nil,
+                         observedAccess: Int? = nil, observedReadyToken: Int? = nil,
+                         prefixFrames: Int? = nil, expectedEpoch: Int? = nil, observedEpoch: Int? = nil,
+                         observedReadPosition: Int64? = nil, observedWritePosition: Int64? = nil) {
+            self.reason = reason; self.token = token; self.visit = visit; self.cursor = cursor
+            self.observedFirstToken = observedFirstToken; self.observedSecondToken = observedSecondToken
+            self.observedThirdToken = observedThirdToken; self.observedAccess = observedAccess
+            self.observedReadyToken = observedReadyToken; self.prefixFrames = prefixFrames
+            self.expectedEpoch = expectedEpoch; self.observedEpoch = observedEpoch
+            self.observedReadPosition = observedReadPosition; self.observedWritePosition = observedWritePosition
+        }
+    }
+    public struct DebugFirstFailureSnapshot: Sendable {
+        public let targetVisit: Int64
+        public let publication: DebugFirstFailurePublication
+        public let earlierVisitFailureObserved: Bool, laterVisitFailureObserved: Bool
+        public let event: DebugFirstFailureEvent?
+    }
+    /// One preallocated publication for actual visit 3, regardless of source token.
+    /// No reset, retry, clock, allocation, SDK object or writer hook.
+    public final class DebugFirstFailureRecorder: @unchecked Sendable {
+        public let targetVisit: Int64 = 3
+        private let publication = Atomic<Int>(0)
+        private let earlierVisitFailure = Atomic<Bool>(false)
+        private let laterVisitFailure = Atomic<Bool>(false)
+        private var payload: DebugFirstFailureEvent?
+        public init() {}
+        fileprivate func record(_ event: DebugFirstFailureEvent) {
+            guard event.visit == targetVisit else {
+                if event.visit < targetVisit { earlierVisitFailure.store(true, ordering: .releasing) }
+                else { laterVisitFailure.store(true, ordering: .releasing) }
+                return
+            }
+            guard publication.compareExchange(expected: 0, desired: 1,
+                ordering: .acquiringAndReleasing).exchanged else { return }
+            payload = event
+            publication.store(2, ordering: .releasing)
+        }
+        /// Nonblocking observation. Publishing and notCaptured never expose a payload.
+        /// The earlier/later flags are independent monotonic observations.
+        public func snapshot() -> DebugFirstFailureSnapshot {
+            let value = publication.load(ordering: .acquiring)
+            return DebugFirstFailureSnapshot(targetVisit: targetVisit,
+                publication: DebugFirstFailurePublication(rawValue: value)!,
+                earlierVisitFailureObserved: earlierVisitFailure.load(ordering: .acquiring),
+                laterVisitFailureObserved: laterVisitFailure.load(ordering: .acquiring),
+                event: value == 2 ? payload : nil)
+        }
+    }
+    #endif
     public struct Snapshot: Sendable {
         public let token: Int
         public let frame: Int64
@@ -233,6 +361,7 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     public let retainedPCMMemoryBytes: Int
     #if DEBUG
     public let debugRenderAccounting: DebugRenderAccountingRecorder?
+    public let debugFirstFailure: DebugFirstFailureRecorder?
     #endif
     private let first: ContinuousPCMSource
     private let second: ContinuousPCMSource
@@ -265,10 +394,12 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     #if DEBUG
     public init(sampleRate: Double = 48_000, channels: Int = 2,
                 prefixFrames: Int = 96_000, ringFrames: Int = 192_000,
-                debugRenderAccounting: DebugRenderAccountingRecorder? = nil) {
+                debugRenderAccounting: DebugRenderAccountingRecorder? = nil,
+                debugFirstFailure: DebugFirstFailureRecorder? = nil) {
         precondition(sampleRate.isFinite && sampleRate > 0 && (1...8).contains(channels))
         precondition(prefixFrames > 0 && ringFrames > 0)
         self.debugRenderAccounting = debugRenderAccounting
+        self.debugFirstFailure = debugFirstFailure
         self.sampleRate = sampleRate; self.channels = channels
         retainedPCMMemoryBytes = 3 * (prefixFrames + ringFrames) * channels * MemoryLayout<Float>.stride
         first = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
@@ -416,12 +547,18 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
             let shouldEnhance = enhance.load(ordering: .acquiring)
             var outputFrame = 0
             while outputFrame < frameCount {
-                guard let source = find(activeToken), source.acquire(token: activeToken) else {
+                #if DEBUG
+                guard let source = acquireRenderSource(activeToken) else {
                     #if DEBUG
                     if debugRenderAccounting != nil { debugUnderrun = frameCount - outputFrame }
                     #endif
                     underrun += Int64(frameCount - outputFrame); break
                 }
+                #else
+                guard let source = find(activeToken), source.acquire(token: activeToken) else {
+                    underrun += Int64(frameCount - outputFrame); break
+                }
+                #endif
                 #if DEBUG
                 if debugRenderAccounting?.capturesPCMOrigin == true {
                     // Plain render-owned fields, read under the existing source claim.
@@ -466,7 +603,11 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                 // writes remain independent; retirement never races a live span.
                 while outputFrame < frameCount, cursor < total {
                     let destination = base.advanced(by: outputFrame * channels)
+                    #if DEBUG
+                    guard copyRenderFrame(source, into: destination) else { starved = true; break }
+                    #else
                     guard source.copyFrame(cursor, into: destination) else { starved = true; break }
+                    #endif
                     if shouldEnhance { speaker.process(UnsafeMutableBufferPointer(start: destination, count: channels)) }
                     cursor += 1; outputFrame += 1
                 }
@@ -499,6 +640,38 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                 epoch: debugOriginEpoch, firstFrame: debugOriginFirst, endFrame: debugOriginEnd) : nil)
         #endif
     }
+
+    #if DEBUG
+    private func acquireRenderSource(_ token: Int) -> ContinuousPCMSource? {
+        if let recorder = debugFirstFailure {
+            guard let source = findRenderSource(token, recorder: recorder),
+                  source.acquire(token: token, recorder: recorder, visit: visit, cursor: cursor) else { return nil }
+            return source
+        }
+        guard let source = find(token), source.acquire(token: token) else { return nil }
+        return source
+    }
+
+    private func copyRenderFrame(_ source: ContinuousPCMSource, into output: UnsafeMutablePointer<Float>) -> Bool {
+        if let recorder = debugFirstFailure {
+            return source.copyFrame(cursor, into: output, recorder: recorder, token: activeToken, visit: visit)
+        }
+        return source.copyFrame(cursor, into: output)
+    }
+
+    private func findRenderSource(_ token: Int, recorder: DebugFirstFailureRecorder) -> ContinuousPCMSource? {
+        guard token > 0 else { return nil }
+        let firstToken = first.token
+        if firstToken == token { return first }
+        let secondToken = second.token
+        if secondToken == token { return second }
+        let thirdToken = third.token
+        if thirdToken == token { return third }
+        recorder.record(.init(reason: .sourceMissing, token: token, visit: visit, cursor: cursor,
+            observedFirstToken: firstToken, observedSecondToken: secondToken, observedThirdToken: thirdToken))
+        return nil
+    }
+    #endif
 
     private func find(_ token: Int) -> ContinuousPCMSource? {
         guard token > 0 else { return nil }
