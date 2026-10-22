@@ -15,9 +15,15 @@ SOURCE = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_SOURCE",
                              ROOT / "scripts/check-native-frame-read-diagnostic.sh"))
 WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
-CASES = ("testDefaultFrameMonitorReadTimingUntracedThenTraced",
-         "testDefaultFrameMonitorReadTimingTracedThenUntraced",
-         "testDefaultProductionRenderAccountingEnabled")
+CASES = (
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionRenderAccountingEnabled",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn",
+    "OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff",
+    "OfflineTikTokPlayerTests/AcceptedPCMOriginTests/testAcceptedPCMOriginCoverageAndExactZeroCalibration",
+)
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
 
@@ -48,6 +54,12 @@ class NativeFrameReadDiagnosticTests(unittest.TestCase):
             for folder in (scripts, tools, native):
                 folder.mkdir(parents=True)
             source = SOURCE.read_text(encoding="utf-8")
+            # Pending review pins cannot authorize real native work. Only this
+            # disposable fake-git fixture substitutes deterministic test pins.
+            source = re.sub(r"^expected_code_source=PENDING$", "expected_code_source=" + "a" * 40,
+                            source, flags=re.MULTILINE)
+            source = re.sub(r"^expected_ios_tree=PENDING$", "expected_ios_tree=" + "b" * 40,
+                            source, flags=re.MULTILINE)
             tree = re.search(r"^expected_ios_tree=([0-9a-f]{40})$", source, re.MULTILINE).group(1)
             launcher = scripts / "check-native-frame-read-diagnostic.sh"
             write(launcher, source)
@@ -55,8 +67,15 @@ class NativeFrameReadDiagnosticTests(unittest.TestCase):
             unit = root / "ios/OfflineTikTokPlayerTests"
             ui = root / "ios/OfflineTikTokPlayerUITests"
             unit.mkdir(parents=True); ui.mkdir(parents=True)
-            write(unit / "SelectedTests.swift", "final class PlaybackSelectionVideoRegressionTests: XCTestCase {\n" +
-                  "\n".join(f"    func {case}() {{}}" for case in CASES) + "\n}\n")
+            owners = {}
+            for selector in CASES:
+                target, owner, method = selector.split("/")
+                self.assertEqual(target, "OfflineTikTokPlayerTests")
+                owners.setdefault(owner, []).append(method)
+            write(unit / "SelectedTests.swift", "\n".join(
+                f"final class {owner}: XCTestCase {{\n" +
+                "\n".join(f"    func {method}() {{}}" for method in methods) + "\n}"
+                for owner, methods in owners.items()) + "\n")
             write(ui / "ScreenTests.swift", "final class ScreenTests: XCTestCase { func testScreen() {} }\n")
             log = native / "native-frame-read.log"
             receipt = native / "native-frame-read-status.tsv"
@@ -65,10 +84,11 @@ class NativeFrameReadDiagnosticTests(unittest.TestCase):
             if scenario == "stale-bundle":
                 (native / "Tests-20261022-010000.xcresult").mkdir()
             lines = []
-            for number, case in enumerate(CASES):
+            for number, selector in enumerate(CASES):
                 if scenario == "missing" and number == 0:
                     continue
-                identity = f"-[OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests {case}]"
+                target, owner, method = selector.split("/")
+                identity = f"-[{target}.{owner} {method}]"
                 lines.append(f"Test Case '{identity}' started.")
                 status = "skipped" if scenario == "skipped" and number == 0 else "passed"
                 lines.append(f"Test Case '{identity}' {status} (0.001 seconds).")
@@ -157,14 +177,13 @@ exit "$FRAME_READ_TEE_EXIT"
             self.assertEqual(receipt.read_text(), "", result.stdout + result.stderr)
             return result, arguments, "", None
 
-    def test_exact_three_selectors_limits_and_cleanup(self):
+    def test_exact_seven_selectors_limits_and_cleanup(self):
         result, arguments, receipt, verified = self.exercise()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
         self.assertEqual(receipt, "0\t0\n")
         self.assertEqual([value for value in arguments if value.startswith("-only-testing:")],
-                         [f"-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/{case}"
-                          for case in CASES])
+                         [f"-only-testing:{selector}" for selector in CASES])
         for flag, value in (("-jobs", "1"), ("-parallel-testing-enabled", "NO"),
                             ("-test-timeouts-enabled", "YES"),
                             ("-default-test-execution-time-allowance", "120"),
@@ -195,7 +214,7 @@ exit "$FRAME_READ_TEE_EXIT"
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(receipt, "0\t0\n")
                 self.assertNotEqual(verified.returncode, 0)
-                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=3", result.stdout)
+                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=7", result.stdout)
 
     def test_failed_preflights_clear_stale_evidence_and_prevent_launch(self):
         for scenario, expected in (("core-failure", 19), ("driver-failure", 31), ("stale-bundle", 2)):

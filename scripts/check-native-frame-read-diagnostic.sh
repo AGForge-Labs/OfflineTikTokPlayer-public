@@ -2,14 +2,18 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=7dd59190a6a7d6f8db1a33b8027134595f933bbd
-expected_ios_tree=136b960ecd5ee23096d5ecb5a1095d5196660511
+expected_code_source=026b1820ae6a286f9870849f362058183554a8ed
+expected_ios_tree=b303362770f42dee2f882891873389b3a1d1cb36
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
-  testDefaultFrameMonitorReadTimingUntracedThenTraced
-  testDefaultFrameMonitorReadTimingTracedThenUntraced
-  testDefaultProductionRenderAccountingEnabled
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionRenderAccountingEnabled
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff
+  OfflineTikTokPlayerTests/AcceptedPCMOriginTests/testAcceptedPCMOriginCoverageAndExactZeroCalibration
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -34,13 +38,16 @@ root = Path.cwd()
 spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify-native-test-log.py')
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
-prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
-expected = {prefix + name for name in (
-    'testDefaultFrameMonitorReadTimingUntracedThenTraced',
-    'testDefaultFrameMonitorReadTimingTracedThenUntraced',
-    'testDefaultProductionRenderAccountingEnabled')}
-if len(expected) != 3 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly three diagnostic identities must exist in the pinned source')
+expected = {
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingUntracedThenTraced',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultFrameMonitorReadTimingTracedThenUntraced',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionRenderAccountingEnabled',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultAcceptedPCMOriginOnThenOff',
+    'OfflineTikTokPlayerTests.AcceptedPCMOriginTests/testAcceptedPCMOriginCoverageAndExactZeroCalibration'}
+if len(expected) != 7 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly seven diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -49,7 +56,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=3 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=7 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -98,9 +105,9 @@ python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifeti
 capture_pid=$!
 arguments=()
 for name in "${cases[@]}"; do
-  arguments+=("-only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/$name")
+  arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=7 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Invoke the single filtered native attempt.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e
