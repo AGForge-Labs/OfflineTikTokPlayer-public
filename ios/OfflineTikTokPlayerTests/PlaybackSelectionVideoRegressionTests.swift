@@ -529,6 +529,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testReturnedAProducerBoundaryTraceDisabled() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+            traceReturnedAProducerBoundary: false)
+        #else
+        XCTFail("Returned-A producer boundary requires DEBUG")
+        #endif
+    }
+
+    func testReturnedAProducerBoundaryTraceEnabled() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+            traceReturnedAProducerBoundary: true)
+        #else
+        XCTFail("Returned-A producer boundary requires DEBUG")
+        #endif
+    }
+
     func testPCMSourceCopyFailureTraceOffThenOn() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -2105,9 +2125,21 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 suppressNativePlayerRendering: Bool? = nil,
                                                 nativeVideoGeometry: Bool? = nil,
                                                 traceFirstSourceFailure: Bool? = nil,
-                                                queuedPreviousLead: Bool? = nil) async throws {
+                                                queuedPreviousLead: Bool? = nil,
+                                                traceReturnedAProducerBoundary: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if let enabled = traceReturnedAProducerBoundary {
+            guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
+                  traceClockHandoff == nil, freshPreviousBundle == nil, queuedPreviousLead == nil,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, acceptedPCMOriginBenchmarkMode == nil else {
+                XCTFail("Returned-A producer boundary requires the unchanged no-capture default benchmark")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("ReturnedAProducerBoundaryScope schema=1 enabled=\(enabled) singleton=true windows=3 secondsPerWindow=8 intervalMs=100 maximumSamplesPerWindow=128 failureRequestCapacity=1 failureTarget=returned-A-only nativeLaneBundle=\(enabled) firstFailureBundle=\(enabled) legacyNativeRefillFlag=false capture=false extraSampler=false extraSDKQueries=0 sourceStreamRequestReads=0 originalGuards=unchanged freshHost=external-requirement noFailure=inconclusive")
+        }
         if let enabled = traceFirstSourceFailure {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, traceNativeRefill == enabled,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
@@ -2129,6 +2161,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if traceReturnedAProducerBoundary != nil {
+            XCTFail("Returned-A producer boundary is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if traceFirstSourceFailure != nil {
             XCTFail("First-failure control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -2198,8 +2234,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #endif
         #if DEBUG
-        let nativeActivity = traceNativeRefill ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
-        let firstFailure = traceFirstSourceFailure == true ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
+        let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true
+            ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+        let firstFailure = traceFirstSourceFailure == true || traceReturnedAProducerBoundary == true
+            ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
         let acceptedPCMOrigin = acceptedPCMOriginBenchmarkMode
         let originRecorder = acceptedPCMOrigin == true ? DebugAcceptedPCMOriginRecorder() : nil
         let originReply = acceptedPCMOrigin == true ? ProductionPCMOriginReply() : nil
@@ -2219,7 +2257,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertFalse(traceNativeRefill); XCTAssertFalse(traceVideoSeeks)
             XCTAssertNil(frameMonitorAlternative)
         }
-        let nativeTrace = nativeActivity.map { ProductionNativeRefillTrace(recorder: $0, audio: audio) }
+        let nativeTrace = nativeActivity.map {
+            ProductionNativeRefillTrace(recorder: $0, audio: audio,
+                requestTarget: traceReturnedAProducerBoundary == true ? .returnedA : nil,
+                firstFailure: traceReturnedAProducerBoundary == true ? firstFailure : nil)
+        }
         #else
         let audio = ContinuousAudioPlayer()
         #endif
@@ -2428,6 +2470,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let baseline = audio.renderer.snapshot
             let before = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
             #if DEBUG
+            if traceReturnedAProducerBoundary == true, phase == 2 {
+                nativeTrace?.bindReturnedA(expectedToken: measurement.state.expectedToken,
+                    baseline: baseline, commandBefore: measurement.before,
+                    selectedOwner: measurement.state.selected && before.selected
+                        && before.expectedToken == measurement.state.expectedToken
+                        && measurement.state.audio.visit == baseline.visit
+                        && before.audio.token == baseline.token && before.audio.visit == baseline.visit)
+            }
             let probe = ProductionRendererProbe(renderer: audio.renderer, nativeTrace: nativeTrace,
                 nativePhase: phase, nativeExpectedToken: measurement.state.expectedToken,
                 nativeCommandUnderruns: measurement.before.underrunFrames, renderAccounting: accounting,
@@ -2474,6 +2524,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #endif
 
+        #if DEBUG
+        if traceReturnedAProducerBoundary == true { nativeTrace?.closeReturnedARequests() }
+        #endif
         // No dumps, spectral analysis or assertions interrupt any streaming window.
         tap.stop(); service.pause()
         audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
@@ -2490,8 +2543,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let cleanupReturned = await waitUntil(timeout: 3) {
             let acknowledged = shutdown.result != nil && preparation.result != nil
             #if DEBUG
-            // Same off-window deadline; only origin-ON also waits for its one
-            // already-queued numerical reply. Nil/OFF retains the original test.
+            // Same original shared deadline. The new ON target also closes its
+            // one queued/issued request; nil/OFF performs no extra observer read.
+            if traceReturnedAProducerBoundary == true {
+                return acknowledged && (nativeTrace?.returnedARequestsClosed ?? false)
+            }
             if let originReply { return acknowledged && originReply.read().received }
             #endif
             return acknowledged
@@ -2515,7 +2571,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         monitorReadTrace?.dumpAndAssert()
         cppNativePullTrace?.dumpAndAssert()
         nativeTrace?.dumpAfterCleanup()
-        dumpFirstSourceCopyFailure(firstFailure, enabled: traceFirstSourceFailure, cleanupAcknowledged: mayRemoveFixture)
+        if let enabled = traceReturnedAProducerBoundary {
+            if enabled {
+                XCTAssertNotNil(nativeTrace); XCTAssertNotNil(nativeActivity); XCTAssertNotNil(firstFailure)
+                nativeTrace?.dumpReturnedATarget(cleanupAcknowledged: mayRemoveFixture)
+            } else {
+                print("ReturnedAProducerBoundaryDisabled schema=1 enabled=false evidence=disabled-not-collected noFailure=inconclusive workerRequests=0 observerSourceReads=0")
+                XCTAssertNil(nativeTrace); XCTAssertNil(nativeActivity); XCTAssertNil(firstFailure)
+            }
+        }
+        dumpFirstSourceCopyFailure(firstFailure,
+            enabled: traceReturnedAProducerBoundary == nil ? traceFirstSourceFailure : traceReturnedAProducerBoundary,
+            cleanupAcknowledged: mayRemoveFixture)
         #endif
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
         XCTAssertTrue(mayRemoveFixture, "Queued decoder cleanup must return before removing only this synthetic fixture")
@@ -4262,6 +4329,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testPreparedABAChangesActualAssetAudioTokenAndCompositePixels() async throws {
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            return
+        }
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
         let service = fixture.service()
@@ -4294,6 +4365,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testReturnedForwardVideoReusesItsPreparedNativeItemAndOutput() async throws {
         #if DEBUG
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            throw SelectionVideoTestFailure.timeout
+        }
         let buffer = PlaybackBuffer()
         let tap = ProductionSelectionOutputTap()
         let seeks = ProductionSelectionSeekRecorder()
@@ -4426,6 +4501,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn() async throws {
         #if DEBUG
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            throw SelectionVideoTestFailure.timeout
+        }
         let farTarget = SelectionVideoFixture.duration - 2
         let completion = NaturalCompletionSeekHold(minimumTarget: farTarget, maximumTarget: SelectionVideoFixture.duration)
         let buffer = PlaybackBuffer()
@@ -4497,6 +4576,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption() async throws {
         #if DEBUG
+        guard !Self.targetedFixtureOwnershipLost else {
+            XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
+            throw SelectionVideoTestFailure.timeout
+        }
         let farTarget = SelectionVideoFixture.duration - 2
         let completion = NaturalCompletionSeekHold(minimumTarget: farTarget,
             maximumTarget: SelectionVideoFixture.duration)
@@ -7328,6 +7411,14 @@ private final class ProductionRendererProbe: @unchecked Sendable {
 /// One arm-owned failure request/response, shared by its three existing probes.
 /// No producer sampling task, native getter, media reference or per-call history.
 private final class ProductionNativeRefillTrace: @unchecked Sendable {
+    enum RequestTarget: Sendable, Equatable { case returnedA }
+    private let requestTarget: RequestTarget?
+    private let firstFailure: ContinuousPCMRenderer.DebugFirstFailureRecorder?
+    private var returnedFailureAtRequest: ContinuousPCMRenderer.DebugFirstFailureSnapshot?
+    private var returnedBound = false, returnedBindingOverflow = false, returnedQualified = false
+    private var returnedToken = 0
+    private var returnedVisit: Int64 = 0, returnedProbeUnderruns: Int64 = 0, returnedCommandUnderruns: Int64 = 0
+    private var closing = false, taskPending = false, workerOutstanding = false
     private struct SourceEndpoint: Sendable {
         let slot: Int, token: Int, tokenAfter: Int
         let prefixFrames: Int, availableRaw: Int, writableRaw: Int
@@ -7347,20 +7438,57 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
     private var sources: [SourceEndpoint] = [] // One fixed three-source endpoint, not a history.
     private var response: ContinuousPCMDecoder.DebugFailureState?
 
-    @MainActor init(recorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder, audio: ContinuousAudioPlayer) {
-        self.recorder = recorder
-        self.audio = audio
+    @MainActor init(recorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder, audio: ContinuousAudioPlayer,
+                    requestTarget: RequestTarget? = nil,
+                    firstFailure: ContinuousPCMRenderer.DebugFirstFailureRecorder? = nil) {
+        self.recorder = recorder; self.audio = audio
+        self.requestTarget = requestTarget; self.firstFailure = firstFailure
+    }
+
+    func bindReturnedA(expectedToken: Int, baseline: ContinuousPCMRenderer.Snapshot,
+                       commandBefore: ContinuousPCMRenderer.Snapshot, selectedOwner: Bool) {
+        guard requestTarget == .returnedA else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard !returnedBound else { returnedBindingOverflow = true; returnedQualified = false; return }
+        returnedBound = true; returnedToken = expectedToken; returnedVisit = baseline.visit
+        returnedProbeUnderruns = baseline.underrunFrames
+        returnedCommandUnderruns = commandBefore.underrunFrames
+        returnedQualified = !closing && selectedOwner && expectedToken > 0 && baseline.token == expectedToken
+            && !baseline.ended && baseline.visit > commandBefore.visit
+            && baseline.visit == (firstFailure?.targetVisit ?? -1)
+            && baseline.underrunFrames >= commandBefore.underrunFrames
+    }
+
+    func closeReturnedARequests() {
+        guard requestTarget == .returnedA else { return }
+        lock.lock(); closing = true; lock.unlock()
+    }
+
+    var returnedARequestsClosed: Bool {
+        guard requestTarget == .returnedA else { return true }
+        lock.lock(); defer { lock.unlock() }
+        return closing && !taskPending && !workerOutstanding
     }
 
     func observeFirstUnderrun(_ value: ContinuousPCMRenderer.Snapshot, renderer: ContinuousPCMRenderer,
                              phase: Int, expectedToken: Int,
                              commandUnderruns: Int64, firstWindowSample: Bool,
                              observationBegin: UInt64, observationEnd: UInt64) {
+        if requestTarget == .returnedA, phase != 2 { return }
         guard phase == 1 || phase == 2, expectedToken > 0, value.token == expectedToken,
               !value.ended, value.underrunFrames > commandUnderruns else { return }
         lock.lock()
+        if requestTarget == .returnedA {
+            guard !closing, returnedQualified, expectedToken == returnedToken,
+                  value.token == returnedToken, value.visit == returnedVisit,
+                  commandUnderruns == returnedCommandUnderruns else { lock.unlock(); return }
+        }
         guard !requested else { lock.unlock(); return }
         requested = true
+        if requestTarget == .returnedA {
+            taskPending = true
+            returnedFailureAtRequest = firstFailure?.snapshot() // Before enqueue; no later-event credit.
+        }
         self.observationBegin = observationBegin; self.observationEnd = observationEnd
         self.phase = phase; self.firstWindowSample = firstWindowSample
         token = value.token; visit = value.visit; frame = value.frame; underruns = value.underrunFrames
@@ -7381,12 +7509,16 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
         lock.unlock()
         // One task per arm, only after a real positive underrun. No wait in the
         // observation window; failure of main/worker delivery stays explicit.
-        Task { @MainActor [weak self] in
-            guard let self, let audio = self.audio else { return }
-            self.markIssued()
-            audio.debugDecoderFailureState { [weak self] state in
-                guard let self else { return }
-                self.storeResponse(state)
+        if requestTarget == .returnedA {
+            Task { @MainActor [self] in issueReturnedAIfOpen() }
+        } else {
+            Task { @MainActor [weak self] in
+                guard let self, let audio = self.audio else { return }
+                self.markIssued()
+                audio.debugDecoderFailureState { [weak self] state in
+                    guard let self else { return }
+                    self.storeResponse(state)
+                }
             }
         }
     }
@@ -7395,8 +7527,57 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
         lock.lock(); issued = true; issueNs = DispatchTime.now().uptimeNanoseconds; lock.unlock()
     }
 
+    @MainActor private func issueReturnedAIfOpen() {
+        let owner = audio
+        lock.lock()
+        taskPending = false
+        guard !closing, let owner else { lock.unlock(); return }
+        issued = true; workerOutstanding = true
+        issueNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+        owner.debugDecoderFailureState { [self] state in storeResponse(state) }
+    }
+
     private func storeResponse(_ state: ContinuousPCMDecoder.DebugFailureState) {
-        lock.lock(); response = state; replyNs = DispatchTime.now().uptimeNanoseconds; lock.unlock()
+        lock.lock(); response = state; replyNs = DispatchTime.now().uptimeNanoseconds
+        if requestTarget == .returnedA { workerOutstanding = false }
+        lock.unlock()
+    }
+
+    func dumpReturnedATarget(cleanupAcknowledged: Bool) {
+        guard requestTarget == .returnedA else { return }
+        lock.lock()
+        let bound = returnedBound, overflow = returnedBindingOverflow, qualified = returnedQualified
+        let expectedToken = returnedToken, expectedVisit = returnedVisit
+        let command = returnedCommandUnderruns, probe = returnedProbeUnderruns
+        let closed = closing, pending = taskPending, outstanding = workerOutstanding
+        let observed = requested, sent = issued, state = response
+        let triggerPhase = phase, triggerToken = token, triggerVisit = visit, triggerUnderruns = underruns
+        let failure = returnedFailureAtRequest
+        lock.unlock()
+        let postFailure = firstFailure?.snapshot() // Independent later publication; never retroactive credit.
+        let event = failure?.event
+        let failureMatched = failure?.publication == .captured
+            && event?.token == expectedToken && event?.visit == expectedVisit
+        let matchingSlots = state?.slots.filter {
+            $0.token == expectedToken && event?.expectedEpoch == $0.epoch
+        } ?? []
+        let slot = matchingSlots.count == 1 ? matchingSlots.first : nil
+        let leases = state?.leases.filter { $0.index == slot?.leaseIndex && $0.present } ?? []
+        let laterOwnerMatched = failureMatched && slot != nil && leases.count == 1
+        let attribution = !failureMatched ? "unavailable-first-failure-token-visit"
+            : state == nil ? "unavailable-worker-reply"
+            : !laterOwnerMatched ? "unavailable-later-token-epoch-lease"
+            : "boundary-only-internal-cause-unavailable"
+        print("ReturnedAProducerBoundaryTarget schema=1 enabled=true bound=\(bound) bindingOverflow=\(overflow) qualified=\(qualified) phase=2 expectedToken=\(expectedToken) expectedVisit=\(expectedVisit) firstFailureTargetVisit=\(postFailure?.targetVisit ?? -1) commandBaselineUnderruns=\(command) probeBaselineUnderruns=\(probe) positiveAtProbeEntry=\(probe > command) requestObserved=\(observed) requestIssued=\(sent) triggerPhase=\(triggerPhase) triggerToken=\(triggerToken) triggerVisit=\(triggerVisit) triggerUnderruns=\(triggerUnderruns) growthAfterProbeBaseline=\(observed && triggerUnderruns > probe) requestCapacity=1 workerResponseAvailable=\(state != nil) closed=\(closed) taskPending=\(pending) workerOutstanding=\(outstanding) fixtureCleanupAcknowledged=\(cleanupAcknowledged) cleanupBudget=shared-original-3s requestOnsetExact=false cumulativeUnderrunsPerVisit=false")
+        print("ReturnedAProducerBoundaryJoin schema=1 enabled=true requestPublication=\(failure?.publication.rawValue ?? -1) afterCleanupPublication=\(postFailure?.publication.rawValue ?? -1) eventPresentAtRequest=\(event != nil) eventToken=\(event?.token ?? 0) eventVisit=\(event?.visit ?? 0) eventCursor=\(event?.cursor ?? -1) eventReason=\(event?.reason.rawValue ?? 0) eventExpectedEpoch=\(event?.expectedEpoch ?? -1) firstFailureTokenVisitMatched=\(failureMatched) uniqueLaterOwnerMatched=\(laterOwnerMatched) laterWorkerSlot=\(slot?.index ?? -1) laterWorkerLease=\(slot?.leaseIndex ?? -1) attribution=\(attribution) firstFailureReadScope=request-candidate-before-enqueue laterPublicationRetroactiveCredit=false jointCoherence=false historicalLaneOwnership=unverified sourceTapFrameJoin=false onsetExact=false noFailure=inconclusive")
+        XCTAssertTrue(bound && qualified && !overflow, "Returned-A attribution requires its already-read exact phase-2 owner")
+        XCTAssertTrue(cleanupAcknowledged && closed && !pending && !outstanding,
+            "The one returned-A request must close inside the original shared cleanup deadline")
+        if observed {
+            XCTAssertEqual(triggerPhase, 2); XCTAssertEqual(triggerToken, expectedToken)
+            XCTAssertEqual(triggerVisit, expectedVisit); XCTAssertGreaterThan(triggerUnderruns, command)
+        }
     }
 
     func dumpAfterCleanup() {
@@ -7408,8 +7589,11 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
         let triggerUnderruns = underruns, commandBaseline = commandUnderruns, positiveAtFirstSample = firstWindowSample
         let sourceRecords = sources, sourcesBegin = sourceBeginNs, sourcesEnd = sourceEndNs
         lock.unlock()
-        print("ProductionNativeRefillScope schema=1 enabled=true lanes=3 windows=3 maximumSamplesPerWindow=128 intervalMs=100 windowSeconds=8 failureRequestsPerArm=1 failurePriority=B-then-A-fallback coldSubstitution=false snapshotWaitInsideWindow=false realtimeQueries=false")
-        print("ProductionNativeRefillFailure schema=1 enabled=true requested=\(requestObserved) requestIssued=\(requestIssued) workerResponseAvailable=\(state != nil) phase=\(triggerPhase) target=\(triggerPhase == 1 ? "B-priority" : triggerPhase == 2 ? "A-fallback" : "none") token=\(triggerToken) visit=\(triggerVisit) frame=\(triggerFrame) underrunFrames=\(triggerUnderruns) commandBaselineUnderruns=\(commandBaseline) positiveAtFirstWindowSample=\(positiveAtFirstSample) onsetBeforeFirstObservation=\(positiveAtFirstSample) observationBeginNs=\(begin) observationEndNs=\(end) requestEnqueueNs=\(requestEnqueueNs) requestIssueNs=\(requestIssueNs) workerReplyNs=\(workerReplyNs) requestCapacity=1 requestDeliveryOutsideAcquisition=true snapshotScope=worker-cached-state jointLaneRendererCoherence=false onsetExact=false coldSubstitution=false")
+        let failurePriority = requestTarget == .returnedA ? "returned-A-only" : "B-then-A-fallback"
+        let triggerTarget = triggerPhase == 1 ? "B-priority" : triggerPhase == 2
+            ? (requestTarget == .returnedA ? "A-returned-only" : "A-fallback") : "none"
+        print("ProductionNativeRefillScope schema=1 enabled=true lanes=3 windows=3 maximumSamplesPerWindow=128 intervalMs=100 windowSeconds=8 failureRequestsPerArm=1 failurePriority=\(failurePriority) coldSubstitution=false snapshotWaitInsideWindow=false realtimeQueries=false")
+        print("ProductionNativeRefillFailure schema=1 enabled=true requested=\(requestObserved) requestIssued=\(requestIssued) workerResponseAvailable=\(state != nil) phase=\(triggerPhase) target=\(triggerTarget) token=\(triggerToken) visit=\(triggerVisit) frame=\(triggerFrame) underrunFrames=\(triggerUnderruns) commandBaselineUnderruns=\(commandBaseline) positiveAtFirstWindowSample=\(positiveAtFirstSample) onsetBeforeFirstObservation=\(positiveAtFirstSample) observationBeginNs=\(begin) observationEndNs=\(end) requestEnqueueNs=\(requestEnqueueNs) requestIssueNs=\(requestIssueNs) workerReplyNs=\(workerReplyNs) requestCapacity=1 requestDeliveryOutsideAcquisition=true snapshotScope=worker-cached-state jointLaneRendererCoherence=false onsetExact=false coldSubstitution=false")
         print("ProductionNativeRefillSourceScope schema=1 available=\(sourceRecords.count == 3) count=\(sourceRecords.count) capacity=3 beginNs=\(sourcesBegin) endNs=\(sourcesEnd) epochQualified=false streamRequestReads=0 scope=first-observed-failure-after-renderer-acquisition")
         for source in sourceRecords.prefix(3) {
             print("ProductionNativeRefillSource schema=1 slot=\(source.slot) token=\(source.token) tokenAfter=\(source.tokenAfter) tokenStable=\(source.token == source.tokenAfter) prefixFrames=\(source.prefixFrames) totalFrames=\(source.totalFrames) rawAvailableFrames=\(source.availableRaw) rawWritableFrames=\(source.writableRaw) epochQualified=false coherence=individual-atomic-accessors")
