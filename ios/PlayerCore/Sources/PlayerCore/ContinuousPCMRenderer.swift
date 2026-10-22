@@ -336,6 +336,9 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
 
     /// Coherent source-frame cursor. Read off the audio thread.
     public var snapshot: Snapshot {
+        #if DEBUG
+        return debugReadSnapshot(captureReceipt: false).snapshot
+        #else
         while true {
             let version = stateVersion.load(ordering: .sequentiallyConsistent)
             if version & 1 != 0 { continue }
@@ -345,7 +348,56 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                                  selectionVersion: stateSelectionVersion.load(ordering: .sequentiallyConsistent))
             if version == stateVersion.load(ordering: .sequentiallyConsistent) { return value }
         }
+        #endif
     }
+    #if DEBUG
+    /// Reader-local diagnostics only. No clock, allocation, writer hook or retry limit.
+    public struct DebugSnapshotReadReceipt: Sendable {
+        public private(set) var attempts: UInt64 = 0
+        public private(set) var oddVersionRetries: UInt64 = 0
+        public private(set) var changedVersionRetries: UInt64 = 0
+        public private(set) var firstVersion: Int?
+        public private(set) var acceptedVersion: Int = 0
+        public private(set) var overflow = false
+        fileprivate init() {}
+        fileprivate mutating func attempted(_ version: Int) {
+            if firstVersion == nil { firstVersion = version }
+            if attempts == .max { overflow = true } else { attempts += 1 }
+        }
+        fileprivate mutating func odd() {
+            if oddVersionRetries == .max { overflow = true } else { oddVersionRetries += 1 }
+        }
+        fileprivate mutating func changed() {
+            if changedVersionRetries == .max { overflow = true } else { changedVersionRetries += 1 }
+        }
+        fileprivate mutating func accepted(_ version: Int) { acceptedVersion = version }
+    }
+
+    public func debugSnapshotWithReadReceipt() -> (snapshot: Snapshot, receipt: DebugSnapshotReadReceipt) {
+        let result = debugReadSnapshot(captureReceipt: true)
+        return (result.snapshot, result.receipt!)
+    }
+
+    // Both DEBUG entry points use this exact atomic sequence. Nil receipt does no counting.
+    private func debugReadSnapshot(captureReceipt: Bool) -> (snapshot: Snapshot, receipt: DebugSnapshotReadReceipt?) {
+        var receipt: DebugSnapshotReadReceipt? = captureReceipt ? DebugSnapshotReadReceipt() : nil
+        while true {
+            let version = stateVersion.load(ordering: .sequentiallyConsistent)
+            receipt?.attempted(version)
+            if version & 1 != 0 { receipt?.odd(); continue }
+            let value = Snapshot(token: stateToken.load(ordering: .sequentiallyConsistent), frame: stateFrame.load(ordering: .sequentiallyConsistent),
+                                 visit: stateVisit.load(ordering: .sequentiallyConsistent), ended: stateEnded.load(ordering: .sequentiallyConsistent),
+                                 underrunFrames: stateUnderrun.load(ordering: .sequentiallyConsistent),
+                                 selectionVersion: stateSelectionVersion.load(ordering: .sequentiallyConsistent))
+            let acceptedVersion = stateVersion.load(ordering: .sequentiallyConsistent)
+            if version == acceptedVersion {
+                receipt?.accepted(acceptedVersion)
+                return (value, receipt)
+            }
+            receipt?.changed()
+        }
+    }
+    #endif
 
     public func render(interleaved output: UnsafeMutableBufferPointer<Float>, frameCount: Int) {
         guard frameCount > 0, frameCount <= output.count / channels, let base = output.baseAddress else { return }

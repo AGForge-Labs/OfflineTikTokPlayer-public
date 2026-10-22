@@ -176,6 +176,65 @@ final class ContinuousPictureInPicture: NSObject {
         if debugImageEpoch == UInt64.max { debugImageEpochSaturated = true }
         else { debugImageEpoch += 1 }
     }
+    struct DebugAlignedPollState: Sendable {
+        let ticket: PresentationTicket?, output: ObjectIdentifier?
+        let seekSerial: UInt64, activeSeekTicket: UInt64?, imageEpoch: UInt64
+        let coherent: Bool
+    }
+    var debugAlignedPollState: DebugAlignedPollState {
+        let ticket = currentItem.map { PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0)) }
+        return DebugAlignedPollState(ticket: ticket, output: videoOutput.map { ObjectIdentifier($0) },
+            seekSerial: seekTicket, activeSeekTicket: activeSeekTicket, imageEpoch: debugImageEpoch,
+            coherent: !invalidated && presentationActive && frameFeedEnabled && !debugImageEpochSaturated
+                && ticket.map { owns($0) } == true && installedTimeline == ticket && activeSeekTicket == nil)
+    }
+    struct DebugAlignedEnqueueStamp: Sendable {
+        let ticket: PresentationTicket?, output: ObjectIdentifier
+        let seekSerial: UInt64, imageEpoch: UInt64
+        let renderEntryNs: UInt64, enqueuedNs: UInt64
+        let entryCoherent: Bool, afterCopyCoherent: Bool
+        let beforeEnqueueCoherent: Bool, afterEnqueueCoherent: Bool
+        let requestedSeconds: Double, sampleSeconds: Double, submittedCount: UInt64
+        var coherent: Bool { entryCoherent && afterCopyCoherent && beforeEnqueueCoherent && afterEnqueueCoherent }
+    }
+    var onDebugAlignedEnqueue: ((DebugAlignedEnqueueStamp) -> Void)? {
+        didSet { debugAlignedCreditedRevision = nil }
+    }
+    private var debugAlignedCreditedRevision: Int?
+    private struct DebugAlignedPullContext {
+        let ticket: PresentationTicket?, output: ObjectIdentifier
+        let seekSerial: UInt64, imageEpoch: UInt64, entryNs: UInt64
+        var coherent: Bool = false
+    }
+    private func debugAlignedOwnerMatches(_ value: DebugAlignedPullContext) -> Bool {
+        !invalidated && presentationActive && frameFeedEnabled && !debugImageEpochSaturated
+            && value.ticket.map { owns($0) } == true
+            && installedTimeline == value.ticket
+            && videoOutput.map { ObjectIdentifier($0) } == value.output
+            && activeSeekTicket == nil && seekTicket == value.seekSerial && debugImageEpoch == value.imageEpoch
+    }
+    private func debugAlignedPullContext(_ ticket: PresentationTicket?, output: AVPlayerItemVideoOutput) -> DebugAlignedPullContext? {
+        guard onDebugAlignedEnqueue != nil, debugAlignedCreditedRevision != presentationRevision else { return nil }
+        var result = DebugAlignedPullContext(ticket: ticket, output: ObjectIdentifier(output),
+            seekSerial: seekTicket, imageEpoch: debugImageEpoch, entryNs: DispatchTime.now().uptimeNanoseconds)
+        result.coherent = debugAlignedOwnerMatches(result)
+        return result
+    }
+    private func debugObserveAlignedEnqueue(_ value: DebugAlignedPullContext?, afterCopy: Bool,
+        beforeEnqueue: Bool, afterEnqueue: Bool, enqueuedNs: UInt64?, requested: CMTime, sample: CMTime) {
+        guard let value, let enqueuedNs, let observer = onDebugAlignedEnqueue else { return }
+        let requestedSeconds = CMTimeGetSeconds(requested), sampleSeconds = CMTimeGetSeconds(sample)
+        guard requestedSeconds.isFinite, sampleSeconds.isFinite, requestedSeconds >= 0, sampleSeconds >= 0,
+              abs(sampleSeconds - requestedSeconds) <= 0.080 else { return }
+        let coherent = value.coherent && afterCopy && beforeEnqueue && afterEnqueue
+        if coherent { debugAlignedCreditedRevision = value.ticket?.generation }
+        observer(DebugAlignedEnqueueStamp(ticket: value.ticket, output: value.output,
+            seekSerial: value.seekSerial, imageEpoch: value.imageEpoch,
+            renderEntryNs: value.entryNs, enqueuedNs: enqueuedNs,
+            entryCoherent: value.coherent, afterCopyCoherent: afterCopy,
+            beforeEnqueueCoherent: beforeEnqueue, afterEnqueueCoherent: afterEnqueue,
+            requestedSeconds: requestedSeconds, sampleSeconds: sampleSeconds, submittedCount: submittedFrameCount))
+    }
     enum DebugRenderStage: Int, Sendable {
         case attempt = 0, hasNewFalse = 1, hasNewTrue = 2, copied = 3, enqueued = 4
         case seekBegin = 5, compositionAssigned = 6, outputAttached = 7, seekBlocked = 8
@@ -619,6 +678,7 @@ final class ContinuousPictureInPicture: NSObject {
         let debugEnqueueTicket = currentItem.map {
             PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0))
         }
+        let debugAlignedContext = debugAlignedPullContext(debugEnqueueTicket, output: videoOutput)
         let debugPullSeekTicket = onDebugNativePullStamp == nil ? nil : seekTicket
         let debugSourceTicket = onDebugRenderStamp == nil ? nil : debugEnqueueTicket
         #endif
@@ -671,6 +731,7 @@ final class ContinuousPictureInPicture: NSObject {
             videoOutput.copyPixelBuffer(forItemTime: requestedTime, itemTimeForDisplay: &displayTime)
         }
         guard let pixel = copied else { return }
+        let debugAlignedAfterCopy = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #else
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
@@ -717,12 +778,15 @@ final class ContinuousPictureInPicture: NSObject {
         guard status == noErr, let sample else { reportFrameFailure(status); return }
         #if DEBUG
         let debugEnqueueEpoch = debugImageEpoch
+        let debugAlignedBeforeEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #endif
         #if DEBUG
         debugNativePull(.enqueue, sourceTicket: debugEnqueueTicket,
             sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
             displayLayer.enqueue(sample)
         }
+        let debugAlignedAfterEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
+        let debugAlignedEnqueuedNs = debugAlignedContext == nil ? nil : DispatchTime.now().uptimeNanoseconds
         #else
         displayLayer.enqueue(sample)
         #endif
@@ -734,6 +798,9 @@ final class ContinuousPictureInPicture: NSObject {
            !debugImageEpochSaturated, debugImageEpoch == debugEnqueueEpoch {
             debugEnqueuedImageEpoch = debugEnqueueEpoch
         }
+        debugObserveAlignedEnqueue(debugAlignedContext, afterCopy: debugAlignedAfterCopy,
+            beforeEnqueue: debugAlignedBeforeEnqueue, afterEnqueue: debugAlignedAfterEnqueue,
+            enqueuedNs: debugAlignedEnqueuedNs, requested: requestedTime, sample: displayTime)
         debugTraceRender(.enqueued, requested: requestedTime, sample: displayTime, sourceTicket: debugSourceTicket)
         #endif
     }

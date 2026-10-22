@@ -187,6 +187,36 @@ final class PlaybackService: NSObject {
             }
         }
     }
+    struct DebugAlignedVideoPollState: Sendable {
+        let frame: ContinuousPictureInPicture.DebugAlignedPollState
+        let generation: Int, request: Int?
+        let presentationMatches: Bool, observedItemMatches: Bool
+    }
+    var debugAlignedVideoPollState: DebugAlignedVideoPollState {
+        let frame = continuousPiP.debugAlignedPollState
+        return DebugAlignedVideoPollState(frame: frame, generation: generation, request: videoPresentation?.request,
+            presentationMatches: videoPresentation?.ticket == frame.ticket,
+            observedItemMatches: observedItem.map { ObjectIdentifier($0) } == frame.ticket?.item)
+    }
+    struct DebugAlignedVideoEnqueue: Sendable {
+        let frame: ContinuousPictureInPicture.DebugAlignedEnqueueStamp
+        let generation: Int, request: Int?
+        let presentationMatches: Bool, observedItemMatches: Bool
+        let audioToken: Int, audioVisit: Int64
+    }
+    @ObservationIgnored var onDebugAlignedVideoEnqueue: ((DebugAlignedVideoEnqueue) -> Void)? {
+        didSet {
+            guard onDebugAlignedVideoEnqueue != nil else { continuousPiP.onDebugAlignedEnqueue = nil; return }
+            continuousPiP.onDebugAlignedEnqueue = { [weak self] stamp in
+                guard let self, let observer = self.onDebugAlignedVideoEnqueue else { return }
+                observer(DebugAlignedVideoEnqueue(frame: stamp, generation: self.generation,
+                    request: self.videoPresentation?.request,
+                    presentationMatches: self.videoPresentation?.ticket == stamp.ticket,
+                    observedItemMatches: self.observedItem.map { ObjectIdentifier($0) } == stamp.ticket?.item,
+                    audioToken: self.audioToken, audioVisit: self.audioVisit))
+            }
+        }
+    }
     private func debugTraceVideoStartup(_ kind: DebugVideoStartupKind, request: Int,
         installed: Bool = false, anchorHostSeconds: Double? = nil, anchorPosition: Double? = nil,
         _ operation: () -> Void) {

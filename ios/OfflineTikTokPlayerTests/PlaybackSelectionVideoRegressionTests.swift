@@ -19,6 +19,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private static var unresolvedPreparedPrerollOwner: PreparedNextPrerollOwner?
     // One test-module nonce per app process, not an operating-system birth timestamp.
     private static let runtimeHostModuleNonce = UUID().uuidString.lowercased()
+    private var prerollCaseStartUTC: String?
     #if DEBUG
     // Test-only immutable per-arm input to the unchanged benchmark signature.
     private var acceptedPCMOriginBenchmarkMode: Bool?
@@ -26,11 +27,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     private func recordRuntimeHost() throws {
         let process = ProcessInfo.processInfo
-        let receipt: [String: Any] = ["schema": 1,
+        var receipt: [String: Any] = ["schema": 1,
             "simulatorUDID": process.environment["SIMULATOR_UDID"] ?? "unknown",
             "pid": Int(process.processIdentifier),
             "bundleIdentifier": Bundle.main.bundleIdentifier ?? "unknown",
             "moduleNonce": Self.runtimeHostModuleNonce, "testName": self.name]
+        if let prerollCaseStartUTC { receipt["caseStartUTC"] = prerollCaseStartUTC }
         let data = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
         print("NativeRuntimeHost " + String(decoding: data, as: UTF8.self))
     }
@@ -852,10 +854,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     /// Capability only; the sole consuming probe remains after the matched transfer.
     func testPreparedNextVideoPrerollCapabilityOffThenOn() async throws {
+        prerollCaseStartUTC = ISO8601DateFormatter.string(from: Date(), timeZone: TimeZone(secondsFromGMT: 0)!,
+            formatOptions: [.withInternetDateTime, .withFractionalSeconds])
+        defer { prerollCaseStartUTC = nil }
+        try recordRuntimeHost()
         try await runPreparedNextPrerollPair(order: "off-on", treatments: [false, true])
     }
 
     func testPreparedNextVideoPrerollCapabilityOnThenOff() async throws {
+        prerollCaseStartUTC = ISO8601DateFormatter.string(from: Date(), timeZone: TimeZone(secondsFromGMT: 0)!,
+            formatOptions: [.withInternetDateTime, .withFractionalSeconds])
+        defer { prerollCaseStartUTC = nil }
+        try recordRuntimeHost()
         try await runPreparedNextPrerollPair(order: "on-off", treatments: [true, false])
     }
 
@@ -1569,14 +1579,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        let remainingWitness = traceClockHandoff == true
+            ? RemainingLatencyWitness(baseRequest: service.debugInitialVideoReadyState.generation) : nil
+        startup.remainingLatencyWitness = remainingWitness
         let handoffTrace = traceClockHandoff.map {
             NativeClockHandoffTrace(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation)
         }
         if let enabled = traceClockHandoff {
+            print("NativeClockHandoffInstrumentationBundle schema=2 enabled=\(enabled) actualRateAndOrdinaryRead=true snapshotReadReceipt=\(enabled) firstAlignedEnqueue=\(enabled) compoundPollPair=\(enabled) observersBundled=true individualObserverAttribution=false acceptance=unchanged")
             XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
             XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(traceDefaultFrameMonitor)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
             if enabled {
+                service.onDebugAlignedVideoEnqueue = { [weak remainingWitness] value in remainingWitness?.record(value) }
                 service.onDebugVideoRateHandoff = { [weak handoffTrace] value in handoffTrace?.record(value) }
                 service.onDebugVideoPositionRead = { [weak handoffTrace] value in handoffTrace?.record(value) }
             }
@@ -1629,6 +1644,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         defer {
             if handoffTrace != nil {
                 service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
+                service.onDebugAlignedVideoEnqueue = nil
             }
             if nativePositionReadTrace != nil { service.onDebugVideoPositionRead = nil }
             if traceDefaultFrameMonitor != nil {
@@ -1694,7 +1710,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             #if DEBUG
             let probe = ProductionRendererProbe(renderer: audio.renderer, nativeTrace: nativeTrace,
                 nativePhase: phase, nativeExpectedToken: measurement.state.expectedToken,
-                nativeCommandUnderruns: measurement.before.underrunFrames, renderAccounting: accounting)
+                nativeCommandUnderruns: measurement.before.underrunFrames, renderAccounting: accounting,
+                captureSnapshotReadReceipt: traceClockHandoff == true)
             #else
             let probe = ProductionRendererProbe(renderer: audio.renderer)
             #endif
@@ -1737,8 +1754,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         if handoffTrace != nil {
             service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
+            service.onDebugAlignedVideoEnqueue = nil
         }
         handoffTrace?.dumpAndAssert()
+        remainingWitness?.dumpAndAssert()
         if traceDefaultFrameMonitor != nil {
             service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
         }
@@ -2217,6 +2236,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         seeks.phase = phase
         startup.phase = phase
         let origin = ProductionSelectionOutputTap.hostSeconds()
+        #if DEBUG
+        startup.remainingLatencyWitness?.beginPhase(phase, commandNs: DispatchTime.now().uptimeNanoseconds)
+        #endif
         command()
         let commandReturned = ProductionSelectionOutputTap.hostSeconds()
         #if DEBUG
@@ -2237,6 +2259,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var pollUptime = ProcessInfo.processInfo.systemUptime
         while pollUptime < deadline {
             #if DEBUG
+            let witnessPollEntryNs = startup.remainingLatencyWitness == nil ? nil : DispatchTime.now().uptimeNanoseconds
             pollSummary?.bodyEntered(phase: phase, at: DispatchTime.now().uptimeNanoseconds)
             pollSummary?.stageEntered(phase: phase, stage: .toneScan, at: DispatchTime.now().uptimeNanoseconds)
             #endif
@@ -2280,6 +2303,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             startup.recordPoll(uptime: pollUptime, readyLatched: ready != nil,
                 state: state, beforeVisit: before.visit, beforeSubmitted: submitted)
             #if DEBUG
+            startup.recordRemainingLatencyPoll(entryNs: witnessPollEntryNs, state: state, service: service)
             pollSummary?.bodyReturned(phase: phase, at: DispatchTime.now().uptimeNanoseconds)
             #endif
             if tone != nil && ready != nil { break }
@@ -2355,6 +2379,32 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }.max() ?? .infinity
         let tolerance = 2 * Double(max(1, value.quantum)) / 48_000 + 0.005
         print("ProductionSelectionStream phase=\(value.phase) seconds=8 samples=\(samples.count) rendererCoherentSamples=\(samples.count) firstMs=\((elapsed.first ?? .infinity) * 1_000) lastMs=\((elapsed.last ?? -1) * 1_000) maximumGapMs=\((gaps.max() ?? .infinity) * 1_000) maximumAcquisitionMs=\(acquisition * 1_000) wallSeconds=\(wall) pcmSeconds=\(pcm) maximumSkewMs=\(skew * 1_000) toleranceMs=\(tolerance * 1_000) quantum=\(value.quantum) dropped=\(result.dropped) acquisitionOutstanding=\(result.acquisitionOutstanding) baselineToken=\(value.baseline.token) finalToken=\(value.final.token) baselineVisit=\(value.baseline.visit) finalVisit=\(value.final.visit) baselineFrame=\(value.baseline.frame) finalFrame=\(value.final.frame) baselineUnderruns=\(value.baseline.underrunFrames) finalUnderruns=\(value.final.underrunFrames) retainedPCMBytes=\(value.memoryBytes) sameStorage=\(value.sameStorage) producerTracing=absent")
+        #if DEBUG
+        if result.snapshotReadWitnessEnabled {
+            var qualityFailures = 0, oddRetrySamples = 0, changedRetrySamples = 0
+            for sample in samples {
+                guard let read = sample.snapshotRead else { qualityFailures += 1; continue }
+                let receipt = read.receipt
+                let retries = receipt.oddVersionRetries.addingReportingOverflow(receipt.changedVersionRetries)
+                let attempts = retries.partialValue.addingReportingOverflow(1)
+                let valid = !receipt.overflow && !retries.overflow && !attempts.overflow
+                    && receipt.attempts == attempts.partialValue && receipt.firstVersion != nil
+                    && receipt.acceptedVersion & 1 == 0
+                    && sample.begin <= read.lockAcquiredNs && read.lockAcquiredNs <= read.snapshotEntryNs
+                    && read.snapshotEntryNs <= read.snapshotReturnNs && read.snapshotReturnNs <= sample.end
+                if !valid { qualityFailures += 1 }
+                if receipt.oddVersionRetries > 0 { oddRetrySamples += 1 }
+                if receipt.changedVersionRetries > 0 { changedRetrySamples += 1 }
+            }
+            print("SnapshotReadWitnessSummary schema=2 phase=\(value.phase) enabled=true samples=\(samples.count) capacity=128 oddRetrySamples=\(oddRetrySamples) changedRetrySamples=\(changedRetrySamples) qualityFailures=\(qualityFailures) writerChanges=false retryLimit=none schedulingAttribution=false")
+            XCTAssertEqual(qualityFailures, 0)
+            if let maximum = samples.max(by: { $0.end - $0.begin < $1.end - $1.begin }),
+               let read = maximum.snapshotRead {
+                let receipt = read.receipt
+                print("SnapshotReadMaxOuter schema=2 phase=\(value.phase) originNs=\(result.origin) beginNs=\(maximum.begin) lockAcquiredNs=\(read.lockAcquiredNs) snapshotEntryNs=\(read.snapshotEntryNs) snapshotReturnNs=\(read.snapshotReturnNs) endNs=\(maximum.end) outerSpanNs=\(maximum.end - maximum.begin) lockBracketSpanNs=\(read.lockAcquiredNs - maximum.begin) snapshotSpanNs=\(read.snapshotReturnNs - read.snapshotEntryNs) token=\(maximum.audio.token) visit=\(maximum.audio.visit) frame=\(maximum.audio.frame) selectionVersion=\(maximum.audio.selectionVersion) attempts=\(receipt.attempts) oddVersionRetries=\(receipt.oddVersionRetries) changedVersionRetries=\(receipt.changedVersionRetries) firstVersion=\(receipt.firstVersion.map { String($0) } ?? "unknown") acceptedVersion=\(receipt.acceptedVersion) overflow=\(receipt.overflow) pairedWith=maximum-outer-acquisition clock=DispatchTime nativeSDKQueries=0")
+            }
+        }
+        #endif
         for sample in samples {
             print("ProductionSelectionRenderSample phase=\(value.phase) originNs=\(result.origin) beginNs=\(sample.begin) endNs=\(sample.end) elapsedMs=\(Double(sample.end - result.origin) / 1_000_000) acquisitionMs=\(Double(sample.end - sample.begin) / 1_000_000) rendererCoherent=true token=\(sample.audio.token) visit=\(sample.audio.visit) frame=\(sample.audio.frame) ended=\(sample.audio.ended) underrunFrames=\(sample.audio.underrunFrames)")
             #if DEBUG
@@ -2813,8 +2863,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let wall = observations.first.flatMap { first in observations.last.map { Double($0.end - first.begin) / 1_000_000_000 } } ?? -1
             let pcm = observations.first.flatMap { first in observations.last.map { Double($0.after.frame - first.before.frame) / 48_000 } } ?? -1
             print("InitialReadyNativeClockControl schema=1 request=\(request) heldBeforeFrame=\(held.before.frame) heldAfterFrame=\(held.after.frame) heldNativePosition=\(held.nativePosition) heldAcquisitionMs=\(held.acquisitionSeconds * 1_000) heldSameIdentity=\(held.sameIdentity) heldOffsetErrorMs=\(held.alignmentErrorSeconds * 1_000) observations=\(observations.count) capacity=32 requestedIntervalMs=10 wallSeconds=\(wall) pcmSeconds=\(pcm) maximumGapMs=\((gaps.max() ?? .infinity) * 1_000) revealed=\(revealed) reasons=\(probe.reasons.map { String($0) }.joined(separator: ",")) nativeReadsPerObservation=1 rendererReadsPerObservation=2 latencyAcceptance=false physicalOutput=unverified")
+            held.dumpBoundaries(request: request, label: "held")
             XCTAssertTrue(revealed, "Ready binding must reveal a fresh selected custom frame with continuing aligned PCM")
             for value in observations {
+                value.dumpBoundaries(request: request, label: "released")
                 print("InitialReadyNativeClockObservation schema=1 request=\(request) beginNs=\(value.begin) endNs=\(value.end) acquisitionMs=\(value.acquisitionSeconds * 1_000) token=\(value.after.token) visit=\(value.after.visit) beforeFrame=\(value.before.frame) afterFrame=\(value.after.frame) nativePosition=\(value.nativePosition) alignmentErrorMs=\(value.alignmentErrorSeconds * 1_000) sameIdentity=\(value.sameIdentity) underrunFrames=\(value.after.underrunFrames)")
                 XCTAssertTrue(value.sameIdentity)
                 XCTAssertEqual(value.after.token, token); XCTAssertEqual(value.after.visit, held.after.visit)
@@ -2841,7 +2893,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     #if DEBUG
     private struct InitialReadyNativeClockObservation {
-        let begin: UInt64, end: UInt64
+        let begin: UInt64, beforeSnapshotReturnNs: UInt64, nativeReturnNs: UInt64, end: UInt64
+        func dumpBoundaries(request: Int, label: String) {
+            print("InitialReadyNativeClockBoundaries schema=2 label=\(label) request=\(request) beginNs=\(begin) beforeSnapshotReturnNs=\(beforeSnapshotReturnNs) nativeReturnNs=\(nativeReturnNs) endNs=\(end) beforeSnapshotSpanNs=\(beforeSnapshotReturnNs - begin) nativeBracketSpanNs=\(nativeReturnNs - beforeSnapshotReturnNs) afterSnapshotSpanNs=\(end - nativeReturnNs) nativeReads=1 snapshotReads=2 clock=DispatchTime spansIncludeMarkers=true")
+        }
         let before: ContinuousPCMRenderer.Snapshot, after: ContinuousPCMRenderer.Snapshot
         let nativePosition: Double
         var acquisitionSeconds: Double { Double(end - begin) / 1_000_000_000 }
@@ -2862,10 +2917,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private func captureInitialReadyNativeClock(_ service: PlaybackService) -> InitialReadyNativeClockObservation {
         let begin = DispatchTime.now().uptimeNanoseconds
         let before = service.audioSnapshot
+        let beforeSnapshotReturnNs = DispatchTime.now().uptimeNanoseconds
         let native = service.player.currentTime().seconds
+        let nativeReturnNs = DispatchTime.now().uptimeNanoseconds
         let after = service.audioSnapshot
         let end = DispatchTime.now().uptimeNanoseconds
-        return InitialReadyNativeClockObservation(begin: begin, end: end, before: before, after: after,
+        return InitialReadyNativeClockObservation(begin: begin, beforeSnapshotReturnNs: beforeSnapshotReturnNs,
+            nativeReturnNs: nativeReturnNs, end: end, before: before, after: after,
                                                   nativePosition: native)
     }
     #endif
@@ -4171,6 +4229,15 @@ private final class ProductionVideoStartupTrace {
     private var finalMasks = [UInt16?](repeating: nil, count: 3)
     private var badPhase = false
     #if DEBUG
+    var remainingLatencyWitness: RemainingLatencyWitness?
+    func recordRemainingLatencyPoll(entryNs: UInt64?, state: ProductionSelectionState, service: PlaybackService) {
+        guard let remainingLatencyWitness, let entryNs, lastPolls.indices.contains(phase),
+              let poll = lastPolls[phase] else { return }
+        let owner = service.debugAlignedVideoPollState // Cached fields only; no SDK getter.
+        remainingLatencyWitness.recordPoll(phase: phase, entryNs: entryNs,
+            observedNs: DispatchTime.now().uptimeNanoseconds, mask: poll.mask, evaluated: poll.evaluated,
+            state: state, owner: owner)
+    }
     var pollSummary: ProductionSelectionPollSummary?
     var didEvaluateLayerReady: Bool { layerReady != nil } // Cached optional-chain predicate result; no second SDK getter.
     private enum Event {
@@ -4780,11 +4847,18 @@ private struct ProductionSelectionStream {
 /// Independent serial observer of the unchanged renderer API. A read occurs outside the
 /// result lock: stop never waits for a seqlock acquisition, and an outstanding read fails coverage.
 private final class ProductionRendererProbe: @unchecked Sendable {
+    #if DEBUG
+    struct SnapshotReadWitness: Sendable {
+        let lockAcquiredNs: UInt64, snapshotEntryNs: UInt64, snapshotReturnNs: UInt64
+        let receipt: ContinuousPCMRenderer.DebugSnapshotReadReceipt
+    }
+    #endif
     struct Sample: Sendable {
         let begin: UInt64
         let end: UInt64
         let audio: ContinuousPCMRenderer.Snapshot
         #if DEBUG
+        let snapshotRead: SnapshotReadWitness?
         let nativeTraceEnabled: Bool
         let lane0: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
         let lane1: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
@@ -4797,6 +4871,9 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         let samples: [Sample]
         let dropped: Int
         let acquisitionOutstanding: Bool
+        #if DEBUG
+        let snapshotReadWitnessEnabled: Bool
+        #endif
     }
     private let renderer: ContinuousPCMRenderer
     private let origin = DispatchTime.now().uptimeNanoseconds
@@ -4808,6 +4885,7 @@ private final class ProductionRendererProbe: @unchecked Sendable {
     private var dropped = 0
 
     #if DEBUG
+    private let captureSnapshotReadReceipt: Bool
     private let nativeTrace: ProductionNativeRefillTrace?
     private let nativePhase: Int
     private let nativeExpectedToken: Int
@@ -4815,8 +4893,10 @@ private final class ProductionRendererProbe: @unchecked Sendable {
     private let renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder?
     init(renderer: ContinuousPCMRenderer, nativeTrace: ProductionNativeRefillTrace? = nil,
          nativePhase: Int = -1, nativeExpectedToken: Int = 0, nativeCommandUnderruns: Int64 = 0,
-         renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil) {
+         renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil,
+         captureSnapshotReadReceipt: Bool = false) {
         self.renderer = renderer
+        self.captureSnapshotReadReceipt = captureSnapshotReadReceipt
         self.nativeTrace = nativeTrace
         self.nativePhase = nativePhase; self.nativeExpectedToken = nativeExpectedToken
         self.nativeCommandUnderruns = nativeCommandUnderruns
@@ -4842,13 +4922,29 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         let begin = DispatchTime.now().uptimeNanoseconds
         guard begin >= origin, begin - origin < 8_000_000_000 else { return }
         lock.lock()
+        #if DEBUG
+        let lockAcquiredNs = captureSnapshotReadReceipt ? DispatchTime.now().uptimeNanoseconds : 0
+        #endif
         guard !stopped else { lock.unlock(); return }
         acquiring = true
         #if DEBUG
         let firstWindowSample = samples.isEmpty
         #endif
         lock.unlock()
+        #if DEBUG
+        let snapshotEntryNs = captureSnapshotReadReceipt ? DispatchTime.now().uptimeNanoseconds : 0
+        let audio: ContinuousPCMRenderer.Snapshot
+        let readReceipt: ContinuousPCMRenderer.DebugSnapshotReadReceipt?
+        if captureSnapshotReadReceipt {
+            let value = renderer.debugSnapshotWithReadReceipt()
+            audio = value.snapshot; readReceipt = value.receipt
+        } else {
+            audio = renderer.snapshot; readReceipt = nil
+        }
+        let snapshotReturnNs = captureSnapshotReadReceipt ? DispatchTime.now().uptimeNanoseconds : 0
+        #else
         let audio = renderer.snapshot
+        #endif
         #if DEBUG
         let lane0 = nativeTrace?.recorder.snapshot(at: 0)
         let lane1 = nativeTrace?.recorder.snapshot(at: 1)
@@ -4865,6 +4961,8 @@ private final class ProductionRendererProbe: @unchecked Sendable {
             if samples.count < 128 {
                 #if DEBUG
                 samples.append(Sample(begin: begin, end: end, audio: audio,
+                    snapshotRead: readReceipt.map { SnapshotReadWitness(lockAcquiredNs: lockAcquiredNs,
+                        snapshotEntryNs: snapshotEntryNs, snapshotReturnNs: snapshotReturnNs, receipt: $0) },
                     nativeTraceEnabled: nativeTrace != nil, lane0: lane0, lane1: lane1, lane2: lane2,
                     renderAccounting: accounting))
                 requestFromStoredWindowSample = end >= origin && end - origin < 8_000_000_000
@@ -4891,7 +4989,12 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         timer.cancel()
         lock.lock(); defer { lock.unlock() }
         stopped = true
+        #if DEBUG
+        return Result(origin: origin, samples: samples, dropped: dropped, acquisitionOutstanding: acquiring,
+                      snapshotReadWitnessEnabled: captureSnapshotReadReceipt)
+        #else
         return Result(origin: origin, samples: samples, dropped: dropped, acquisitionOutstanding: acquiring)
+        #endif
     }
 }
 
@@ -5971,6 +6074,93 @@ private final class PreparedNextPrerollCallback: @unchecked Sendable {
 }
 
 #if DEBUG
+/// Instrumentation bundle v2: three first owned aligned enqueues and one
+/// last-false/first-true custom-compound poll pair per phase. Scalar identities only.
+@MainActor
+private final class RemainingLatencyWitness {
+    private struct Poll {
+        let entryNs: UInt64, observedNs: UInt64
+        let mask: UInt16, evaluated: UInt16
+        let audio: ContinuousPCMRenderer.Snapshot
+        let requested: Double, copied: Double?, submittedPTS: Double?, submittedCount: UInt64
+        let owner: PlaybackService.DebugAlignedVideoPollState
+    }
+    private struct Phase {
+        var commandNs: UInt64 = 0
+        var enqueue: PlaybackService.DebugAlignedVideoEnqueue?
+        var lastFalse: Poll?, firstTrue: Poll?
+    }
+    private let baseRequest: Int
+    private var phases = Array(repeating: Phase(), count: 3)
+    private var uncredited: UInt64 = 0, orphans: UInt64 = 0
+    private var overflow = false
+    init(baseRequest: Int) { self.baseRequest = baseRequest }
+    private func increment(_ value: inout UInt64) {
+        if value == .max { overflow = true } else { value += 1 }
+    }
+    func beginPhase(_ phase: Int, commandNs: UInt64) {
+        guard phases.indices.contains(phase), phases[phase].commandNs == 0 else {
+            increment(&orphans); return
+        }
+        phases[phase].commandNs = commandNs
+    }
+    func record(_ value: PlaybackService.DebugAlignedVideoEnqueue) {
+        guard let request = value.request else { increment(&orphans); return }
+        let phase = request - baseRequest - 1
+        guard phases.indices.contains(phase) else { increment(&orphans); return }
+        let frame = value.frame
+        guard phases[phase].commandNs > 0, frame.renderEntryNs >= phases[phase].commandNs,
+              frame.enqueuedNs >= frame.renderEntryNs else { increment(&orphans); return }
+        guard value.generation == request, value.presentationMatches, value.observedItemMatches,
+              frame.coherent, frame.ticket != nil else { increment(&uncredited); return }
+        if phases[phase].enqueue == nil { phases[phase].enqueue = value }
+    }
+    func recordPoll(phase: Int, entryNs: UInt64, observedNs: UInt64, mask: UInt16, evaluated: UInt16,
+                    state: ProductionSelectionState, owner: PlaybackService.DebugAlignedVideoPollState) {
+        guard phases.indices.contains(phase), phases[phase].commandNs > 0,
+              entryNs >= phases[phase].commandNs, observedNs >= entryNs else {
+            increment(&orphans); return
+        }
+        guard phases[phase].firstTrue == nil else { return }
+        let poll = Poll(entryNs: entryNs, observedNs: observedNs, mask: mask, evaluated: evaluated,
+            audio: state.audio, requested: state.requested, copied: state.copied,
+            submittedPTS: state.frame, submittedCount: state.submitted, owner: owner)
+        // Mask127 is exactly the existing custom compound; videoReady/loading
+        // remain visible in mask511 and retain their original acceptance guards.
+        if mask & 127 == 127, evaluated == 511 { phases[phase].firstTrue = poll }
+        else { phases[phase].lastFalse = poll }
+    }
+    func dumpAndAssert() {
+        print("RemainingLatencyWitnessSummary schema=2 phases=3 alignedEnqueues=\(phases.compactMap(\.enqueue).count) pollPairsCapacity=3 uncredited=\(uncredited) orphans=\(orphans) overflow=\(overflow) extraSDKQueries=0 durableFrameProof=false output=after-cleanup")
+        XCTAssertFalse(overflow); XCTAssertEqual(orphans, 0); XCTAssertEqual(uncredited, 0)
+        for phase in phases.indices {
+            let value = phases[phase]
+            XCTAssertGreaterThan(value.commandNs, 0)
+            XCTAssertNotNil(value.enqueue); XCTAssertNotNil(value.firstTrue)
+            if let owner = value.enqueue {
+                let frame = owner.frame
+                print("FirstOwnedAlignedEnqueue schema=2 phase=\(phase) commandNs=\(value.commandNs) request=\(owner.request.map { String($0) } ?? "unknown") generation=\(owner.generation) item=\(frame.ticket.map { String(describing: $0.item) } ?? "unknown") ticketRevision=\(frame.ticket.map { String($0.generation) } ?? "unknown") output=\(frame.output) seekSerial=\(frame.seekSerial) imageEpoch=\(frame.imageEpoch) renderEntryNs=\(frame.renderEntryNs) enqueuedNs=\(frame.enqueuedNs) requested=\(frame.requestedSeconds) samplePTS=\(frame.sampleSeconds) submittedCount=\(frame.submittedCount) cachedAudioToken=\(owner.audioToken) cachedAudioVisit=\(owner.audioVisit) entryCoherent=\(frame.entryCoherent) afterCopyCoherent=\(frame.afterCopyCoherent) beforeEnqueueCoherent=\(frame.beforeEnqueueCoherent) afterEnqueueCoherent=\(frame.afterEnqueueCoherent) presentationMatches=\(owner.presentationMatches) observedItemMatches=\(owner.observedItemMatches) clock=DispatchTime sdkOperationDuration=false")
+            }
+            for (variant, poll) in [(0, value.lastFalse), (1, value.firstTrue)] {
+                guard let poll else {
+                    print("AlignedCompoundPoll schema=2 phase=\(phase) variant=\(variant) available=false qualifyingMask=127 fullAcceptanceMask=511")
+                    continue
+                }
+                let owner = poll.owner, frame = owner.frame
+                let joined = value.enqueue.map { enqueue in
+                    enqueue.request == owner.request && owner.generation == owner.request
+                        && owner.presentationMatches && owner.observedItemMatches && frame.coherent
+                        && frame.ticket == enqueue.frame.ticket && frame.output == enqueue.frame.output
+                        && frame.seekSerial == enqueue.frame.seekSerial && frame.activeSeekTicket == nil
+                        && frame.imageEpoch == enqueue.frame.imageEpoch
+                        && poll.entryNs >= enqueue.frame.enqueuedNs
+                } ?? false
+                print("AlignedCompoundPoll schema=2 phase=\(phase) variant=\(variant) available=true commandNs=\(value.commandNs) entryNs=\(poll.entryNs) observedNs=\(poll.observedNs) mask=\(poll.mask) evaluatedMask=\(poll.evaluated) qualifyingMask=127 fullAcceptanceMask=511 request=\(owner.request.map { String($0) } ?? "unknown") generation=\(owner.generation) item=\(frame.ticket.map { String(describing: $0.item) } ?? "unknown") ticketRevision=\(frame.ticket.map { String($0.generation) } ?? "unknown") output=\(frame.output.map { String(describing: $0) } ?? "unknown") seekSerial=\(frame.seekSerial) activeSeek=\(frame.activeSeekTicket.map { String($0) } ?? "none") imageEpoch=\(frame.imageEpoch) sameEnqueueEpoch=\(joined) token=\(poll.audio.token) visit=\(poll.audio.visit) audioFrame=\(poll.audio.frame) copiedPTS=\(poll.copied.map { String($0) } ?? "unknown") submittedPTS=\(poll.submittedPTS.map { String($0) } ?? "unknown") requested=\(poll.requested) submittedCount=\(poll.submittedCount) clock=DispatchTime stateOwnerJointCoherence=false")
+            }
+        }
+    }
+}
+
 /// Six scalar handoffs and their first returned ordinary reads. SDK state is
 /// sampled only by the original rate command/position operation, never here.
 @MainActor
