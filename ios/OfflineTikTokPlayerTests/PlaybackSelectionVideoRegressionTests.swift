@@ -529,6 +529,40 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testPreparedVideoRenderingSuppressionOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [false, true].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PreparedRenderingSuppressionArm schema=1 armID=\(armID) order=off-then-on ordinal=\(ordinal) suppressesPlayerRendering=\(enabled) immutableBufferPolicy=true currentCPPMonitor=true otherInstrumentation=unset fallback=reject-unprepared-comparison captures=post-each-stream design=ordered-fresh-fixture-not-causal-proof acceptance=unchanged")
+            defer { print("PreparedRenderingSuppressionArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                suppressNativePlayerRendering: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Prepared rendering suppression control requires DEBUG")
+        #endif
+    }
+
+    func testPreparedVideoRenderingSuppressionOnThenOff() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, enabled) in [true, false].enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            var helperReturned = false
+            print("PreparedRenderingSuppressionArm schema=1 armID=\(armID) order=on-then-off ordinal=\(ordinal) suppressesPlayerRendering=\(enabled) immutableBufferPolicy=true currentCPPMonitor=true otherInstrumentation=unset fallback=reject-unprepared-comparison captures=post-each-stream design=ordered-fresh-fixture-not-causal-proof acceptance=unchanged")
+            defer { print("PreparedRenderingSuppressionArmEnd schema=1 armID=\(armID) ordinal=\(ordinal) helperReturned=\(helperReturned) xctestOutcome=external causalBenefit=unproven") }
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                suppressNativePlayerRendering: enabled)
+            helperReturned = true
+        }
+        #else
+        XCTFail("Prepared rendering suppression control requires DEBUG")
+        #endif
+    }
+
     func testPreviousBundleRetainedThenFresh() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -1967,8 +2001,25 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 renderAccounting: Bool? = nil, traceDefaultFrameMonitor: Bool? = nil,
                                                 auditSavedAAfterCleanup: Bool = false,
                                                 traceClockHandoff: Bool? = nil,
-                                                freshPreviousBundle: Bool? = nil) async throws {
+                                                freshPreviousBundle: Bool? = nil,
+                                                suppressNativePlayerRendering: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
+        #if DEBUG
+        if suppressNativePlayerRendering != nil {
+            guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil,
+                  !auditSavedAAfterCleanup, traceClockHandoff == nil,
+                  freshPreviousBundle == nil, acceptedPCMOriginBenchmarkMode == nil else {
+                XCTFail("Suppression control requires the otherwise unset production benchmark")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
+        #else
+        if suppressNativePlayerRendering != nil {
+            XCTFail("Suppression control is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
+        #endif
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             return
@@ -1985,6 +2036,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             references.append((try await fixture.decodedTone(id: id), frequency))
         }
         #if DEBUG
+        let suppressionControl = suppressNativePlayerRendering.map {
+            PreparedRenderingSuppressionControl(enabled: $0, fixture: fixture)
+        }
         let previousBundleControl: SelectionPreviousBundleControl?
         if let fresh = freshPreviousBundle {
             guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
@@ -2043,7 +2097,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         // Read-timing ON/OFF remains an explicit comparison of the legacy native
         // monitor. Installing an observer must never choose a rendering path.
         let observedFrameMode = frameMonitorAlternative ?? traceDefaultFrameMonitor.map { _ in false }
-        let monitorBuffer = previousBundleControl?.buffer ?? observedFrameMode.map { _ in PlaybackBuffer() }
+        let monitorBuffer = suppressionControl?.buffer ?? previousBundleControl?.buffer
+            ?? observedFrameMode.map { _ in PlaybackBuffer() }
         #else
         let monitorBuffer = frameMonitorAlternative.map { _ in PlaybackBuffer() }
         #endif
@@ -2054,6 +2109,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        if suppressionControl != nil {
+            XCTAssertTrue(service.debugUsesCurrentCustomFrameForReadiness)
+        }
         let remainingWitness = traceClockHandoff == true
             ? RemainingLatencyWitness(baseRequest: service.debugInitialVideoReadyState.generation) : nil
         startup.remainingLatencyWitness = remainingWitness
@@ -2169,7 +2227,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             } else { preparedBefore = true }
             let qualification: (() throws -> Void)?
             #if DEBUG
-            if let control = previousBundleControl {
+            if let control = suppressionControl {
+                qualification = {
+                    try control.qualify(phase: phase, stage: 0, service: service, audio: audio)
+                }
+            } else if let control = previousBundleControl {
                 if phase == 2 {
                     // Same real B/old-A eligibility and fixed settling interval in
                     // both arms. No preparation task or second player is started.
@@ -2207,6 +2269,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
             }
             measurements.append(measurement)
+            #if DEBUG
+            try suppressionControl?.qualify(phase: phase, stage: 1, service: service, audio: audio)
+            #endif
             if phase == 2 {
                 returnedOrigin = ProductionSelectionOutputTap.hostSeconds()
                 returnedStart = tap.begin(auditChannels: true)
@@ -2231,6 +2296,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 sameStorage: originalSources == (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }))
             if phase == 2 { returnedEnd = tap.stop() }
             #if DEBUG
+            if let control = suppressionControl {
+                // The original measurement and eight-second sampler/tap endpoint
+                // have stopped. These matched captures change later framework
+                // history; they never stand in for the original timed evidence.
+                try control.qualify(phase: phase, stage: 2, service: service, audio: audio)
+                await assertMovingVisibleVideo(service, screen: screen, identity: phase == 1 ? .b : .a,
+                    label: "suppression-\(control.enabled ? "on" : "off")-phase-\(phase)")
+                try control.qualify(phase: phase, stage: 3, service: service, audio: audio)
+            }
             try previousBundleControl?.completedPhase(phase, service: service, audio: audio)
             #endif
         }
@@ -2296,11 +2370,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if !mayRemoveFixture { Self.targetedFixtureOwnershipLost = true; fixture.restorePreferences() }
         #if DEBUG
         previousBundleControl?.dump(setupCompleted: previousBundleBodyError == nil)
+        suppressionControl?.dumpAndAssert(setupCompleted: previousBundleBodyError == nil)
         #endif
         if let previousBundleBodyError {
             // Rejected setup is not a comparison. Never issue a displaced Previous
             // or skip the existing queued-cleanup acknowledgement to report it.
+            #if DEBUG
+            if suppressionControl != nil {
+                XCTFail("Prepared suppression setup/owner qualification failed: \(previousBundleBodyError)")
+            } else {
+                XCTFail("Previous-bundle setup/owner qualification failed: \(previousBundleBodyError)")
+            }
+            #else
             XCTFail("Previous-bundle setup/owner qualification failed: \(previousBundleBodyError)")
+            #endif
             throw previousBundleBodyError
         }
         #if DEBUG
@@ -5932,6 +6015,146 @@ private final class ProductionSelectionPollSummary {
 #endif
 
 #if DEBUG
+/// Boundary qualifications only. Owns the one injected buffer, no player/output
+/// beyond its normal window, no tasks and no strong history of selected resources.
+@MainActor
+private final class PreparedRenderingSuppressionControl {
+    enum Failure: Error { case qualification(Int, Int) }
+    let enabled: Bool
+    let buffer: PlaybackBuffer
+    private let aID: String, bID: String
+    private let urls: [String: URL]
+    private weak var aItem: AVPlayerItem?, bItem: AVPlayerItem?
+    private weak var aOutput: AVPlayerItemVideoOutput?, bOutput: AVPlayerItemVideoOutput?
+    private weak var aResource: ContinuousPictureInPicture.PreparedVideoResource?
+    private weak var bResource: ContinuousPictureInPicture.PreparedVideoResource?
+    private var visits: [Int64?] = [nil, nil, nil]
+    private struct Check {
+        var source = false, oneOutput = false, prepared = false, borrowed = false
+        var identity = false, cppOwner = false
+        var actualMode = -1, resourceMode = -1
+        func qualifies(mode: Bool, borrowed expectedBorrow: Bool) -> Bool {
+            source && oneOutput && prepared && borrowed == expectedBorrow && identity
+                && actualMode == (mode ? 1 : 0) && resourceMode == (mode ? 1 : 0)
+                && (!expectedBorrow || cppOwner)
+        }
+    }
+    private struct Row {
+        let phase: Int, stage: Int, retained: Int
+        let begin: UInt64, end: UInt64
+        let selectedRequired: Bool, targetRequired: Bool
+        let selected: Check, target: Check
+        let allRetainedPolicies: Bool, ownerStable: Bool, audioOwner: Bool, selectedReady: Bool, mode: Bool, qualified: Bool
+    }
+    private var rows: [Row] = []
+    private var overflow = false
+    init(enabled: Bool, fixture: SelectionVideoFixture) {
+        self.enabled = enabled
+        buffer = PlaybackBuffer(debugSuppressesPlayerRendering: enabled)
+        aID = fixture.aID; bID = fixture.bID
+        urls = fixture.savedURLs.mapValues { $0.standardizedFileURL }
+        rows.reserveCapacity(12)
+    }
+    private func rememberOrMatch(_ item: AVPlayerItem,
+        resource: ContinuousPictureInPicture.PreparedVideoResource, output: AVPlayerItemVideoOutput,
+        id: String, remember: Bool) -> Bool {
+        if id == aID {
+            if remember, aItem == nil, aResource == nil, aOutput == nil {
+                aItem = item; aResource = resource; aOutput = output
+            }
+            return aItem === item && aResource === resource && aOutput === output
+        }
+        if id == bID {
+            if remember, bItem == nil, bResource == nil, bOutput == nil {
+                bItem = item; bResource = resource; bOutput = output
+            }
+            return bItem === item && bResource === resource && bOutput === output
+        }
+        return false
+    }
+    private func inspect(_ item: AVPlayerItem?, id: String, remember: Bool,
+                         service: PlaybackService) -> Check {
+        var result = Check()
+        guard let item else { return result }
+        let actualURL = (item.asset as? AVURLAsset)?.url.standardizedFileURL
+        result.source = urls[id].map { actualURL == $0 } ?? false
+        let outputs = item.outputs
+        guard let resource = buffer.resource(for: item), let output = resource.output else { return result }
+        result.oneOutput = outputs.count == 1 && outputs.first === output
+        result.prepared = resource.item === item && resource.isAttached && !resource.isRetired
+        result.borrowed = resource.isBorrowed
+        result.actualMode = output.suppressesPlayerRendering ? 1 : 0
+        result.resourceMode = resource.debugSuppressesPlayerRendering ? 1 : 0
+        result.identity = rememberOrMatch(item, resource: resource, output: output, id: id, remember: remember)
+        let owner = service.debugAlignedVideoPollState
+        result.cppOwner = owner.presentationMatches && owner.observedItemMatches && owner.frame.coherent
+            && owner.frame.ticket?.debugItemIdentity == ObjectIdentifier(item)
+            && owner.frame.output == ObjectIdentifier(output)
+        return result
+    }
+    func qualify(phase: Int, stage: Int, service: PlaybackService, audio: ContinuousAudioPlayer) throws {
+        guard (0..<3).contains(phase), (0..<4).contains(stage), rows.count < 12 else {
+            overflow = true; throw Failure.qualification(phase, stage)
+        }
+        let begin = DispatchTime.now().uptimeNanoseconds
+        let initialAudio = audio.renderer.snapshot
+        let selectedItem = service.player.currentItem
+        let retained = buffer.retainedItems // Published app window, not an SDK/RSS inventory.
+        let selectedRequired = phase != 0 || stage != 0
+        let selectedID = stage == 0 ? (phase == 2 ? bID : aID) : (phase == 1 ? bID : aID)
+        let targetRequired = stage == 0 && phase > 0
+        let targetID = phase == 1 ? bID : aID
+        let selected = inspect(selectedItem, id: selectedID, remember: phase == 0 && stage == 1, service: service)
+        let candidates = targetRequired ? retained.filter {
+            ($0.asset as? AVURLAsset)?.url.standardizedFileURL == urls[targetID]
+        } : []
+        let target = inspect(candidates.count == 1 ? candidates.first : nil, id: targetID,
+                             remember: phase == 1 && stage == 0, service: service)
+        let allRetainedPolicies = retained.allSatisfy { item in
+            guard let resource = buffer.resource(for: item), let output = resource.output,
+                  resource.isAttached, !resource.isRetired else { return false }
+            let outputs = item.outputs
+            return outputs.count == 1 && outputs.first === output
+                && resource.debugSuppressesPlayerRendering == enabled
+                && output.suppressesPlayerRendering == enabled
+        }
+        let finalAudio = audio.renderer.snapshot
+        let ownerStable = service.player.currentItem === selectedItem
+            && finalAudio.token == initialAudio.token && finalAudio.visit == initialAudio.visit
+        let expectedToken = audio.entry(for: selectedID)?.token
+        let expectedVisit = stage == 0 && phase > 0 ? visits[phase - 1] : visits[phase]
+        let audioOwner = selectedRequired
+            ? service.queue.currentID == selectedID && service.current?.id == selectedID
+                && audio.selectedID == selectedID && expectedToken != nil && finalAudio.token == expectedToken
+                && !finalAudio.ended && (stage == 1 || finalAudio.visit == expectedVisit)
+            : selectedItem == nil && service.queue.currentID == nil && audio.selectedID == nil && retained.isEmpty
+        let mode = service.debugUsesCurrentCustomFrameForReadiness
+            && buffer.debugSuppressesPlayerRendering == enabled && service.player === buffer.player
+        let selectedReady = !selectedRequired || (service.isVideoReady && !service.isLoading)
+        let qualified = ownerStable && audioOwner && selectedReady && mode && retained.count <= 3 && allRetainedPolicies
+            && (!selectedRequired || selected.qualifies(mode: enabled, borrowed: true))
+            && (!targetRequired || (candidates.count == 1 && target.qualifies(mode: enabled, borrowed: false)))
+        if qualified, stage == 1 { visits[phase] = finalAudio.visit }
+        rows.append(Row(phase: phase, stage: stage, retained: retained.count,
+            begin: begin, end: DispatchTime.now().uptimeNanoseconds,
+            selectedRequired: selectedRequired, targetRequired: targetRequired,
+            selected: selected, target: target, allRetainedPolicies: allRetainedPolicies,
+            ownerStable: ownerStable, audioOwner: audioOwner, selectedReady: selectedReady, mode: mode, qualified: qualified))
+        guard qualified else { throw Failure.qualification(phase, stage) }
+    }
+    func dumpAndAssert(setupCompleted: Bool) {
+        print("PreparedRenderingSuppressionScope schema=1 suppressesPlayerRendering=\(enabled) rows=\(rows.count) capacity=12 overflow=\(overflow) setupCompleted=\(setupCompleted) currentCPPMonitor=true sdkReads=outside-original-windows fallback=unqualified retainedClaim=published-boundaries-only captures=post-each-stream originalCaptureFreeWorkload=false causalBenefit=unproven")
+        XCTAssertFalse(overflow); XCTAssertTrue(setupCompleted); XCTAssertEqual(rows.count, 12)
+        for (ordinal, row) in rows.enumerated() {
+            print("PreparedRenderingSuppressionQualification schema=1 ordinal=\(ordinal) phase=\(row.phase) stage=\(row.stage) beginNs=\(row.begin) endNs=\(row.end) retained=\(row.retained) selectedRequired=\(row.selectedRequired) selectedSource=\(row.selected.source) selectedOneOutput=\(row.selected.oneOutput) selectedPrepared=\(row.selected.prepared) selectedBorrowed=\(row.selected.borrowed) selectedIdentity=\(row.selected.identity) selectedCPPOwner=\(row.selected.cppOwner) selectedActualMode=\(row.selected.actualMode) selectedResourceMode=\(row.selected.resourceMode) targetRequired=\(row.targetRequired) targetSource=\(row.target.source) targetOneOutput=\(row.target.oneOutput) targetPrepared=\(row.target.prepared) targetBorrowed=\(row.target.borrowed) targetIdentity=\(row.target.identity) targetActualMode=\(row.target.actualMode) targetResourceMode=\(row.target.resourceMode) allRetainedPolicies=\(row.allRetainedPolicies) ownerStable=\(row.ownerStable) audioOwner=\(row.audioOwner) selectedReady=\(row.selectedReady) mode=\(row.mode) qualified=\(row.qualified)")
+            XCTAssertTrue(row.qualified)
+            XCTAssertLessThanOrEqual(row.retained, 3)
+            XCTAssertGreaterThanOrEqual(row.end, row.begin)
+            XCTAssertEqual(row.phase, ordinal / 4); XCTAssertEqual(row.stage, ordinal % 4)
+        }
+    }
+}
+
 /// Test-only treatment of the retained video's entire item/output/composition history.
 /// Owns no service/audio/task and creates no player other than the injected buffer.
 @MainActor

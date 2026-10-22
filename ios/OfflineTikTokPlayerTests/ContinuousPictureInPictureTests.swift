@@ -280,6 +280,132 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         #endif
     }
 
+    func testAbandonTimelineRequiresMatchingOwnerAndPreservesReentrantPresentation() async throws {
+        #if DEBUG
+        typealias Resource = ContinuousPictureInPicture.PreparedVideoResource
+        typealias Ticket = ContinuousPictureInPicture.PresentationTicket
+        let urlA = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let urlB = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-b", withExtension: "mp4"))
+        let itemA = AVPlayerItem(url: urlA), itemB = AVPlayerItem(url: urlB)
+        let bridge = ContinuousPictureInPicture()
+        var ownedA: Resource?, ownedB: Resource?
+        // Register before preparing/installing or unwrapping either real resource.
+        defer {
+            bridge.onCurrentFrameInvalidated = nil
+            bridge.invalidate()
+            ownedA?.retire(); ownedB?.retire()
+            XCTAssertTrue(itemA.outputs.isEmpty); XCTAssertTrue(itemB.outputs.isEmpty)
+        }
+        let planA = try await ContinuousPictureInPicture.prepareVideoResource(for: itemA)
+        ownedA = planA.install()
+        let resourceA = try XCTUnwrap(ownedA), outputA = try XCTUnwrap(resourceA.output)
+        let planB = try await ContinuousPictureInPicture.prepareVideoResource(for: itemB)
+        ownedB = planB.install()
+        let resourceB = try XCTUnwrap(ownedB), outputB = try XCTUnwrap(resourceB.output)
+        @MainActor func assertResources(selected: AVPlayerItem, feedSuspended: Bool = false) {
+            XCTAssertTrue(resourceA.item === itemA); XCTAssertTrue(resourceB.item === itemB)
+            XCTAssertTrue(resourceA.output === outputA); XCTAssertTrue(resourceB.output === outputB)
+            XCTAssertEqual(itemA.outputs.count, 1); XCTAssertEqual(itemB.outputs.count, 1)
+            XCTAssertTrue(itemA.outputs.first === outputA); XCTAssertTrue(itemB.outputs.first === outputB)
+            XCTAssertLessThanOrEqual(itemA.outputs.count + itemB.outputs.count, 3)
+            XCTAssertTrue(resourceA.isAttached); XCTAssertTrue(resourceB.isAttached)
+            XCTAssertFalse(resourceA.isRetired); XCTAssertFalse(resourceB.isRetired)
+            XCTAssertEqual(resourceA.isBorrowed, selected === itemA)
+            XCTAssertEqual(resourceB.isBorrowed, selected === itemB)
+            XCTAssertEqual(bridge.isFrameFeedSuspended, feedSuspended, "Abandonment must preserve the existing feed policy")
+        }
+        @MainActor func install(_ ticket: Ticket) {
+            XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0.5, durationSeconds: 30, isPlaying: false))
+        }
+        @MainActor func assertEligible(_ ticket: Ticket, output: AVPlayerItemVideoOutput) {
+            XCTAssertTrue(bridge.activate(ticket))
+            let state = bridge.debugAlignedPollState
+            XCTAssertEqual(state.ticket, ticket); XCTAssertEqual(state.output, ObjectIdentifier(output))
+            XCTAssertNil(state.activeSeekTicket); XCTAssertTrue(state.coherent)
+        }
+        // Coherent/activate below describe app-owned timeline eligibility only.
+        // No AVPlayer/window, fabricated receipt, frame or audibility proof is used.
+        let original = try XCTUnwrap(bridge.setCurrentItem(itemA, preparedVideo: resourceA))
+        install(original); assertEligible(original, output: outputA); assertResources(selected: itemA)
+        let oldSeek = bridge.beginSeek(), newerSeek = bridge.beginSeek()
+        install(original)
+        let active = bridge.debugAlignedPollState
+        bridge.abandonTimeline(original, for: itemA, afterSeek: oldSeek)
+        XCTAssertEqual(bridge.debugNativeSeekState.activeTicket, newerSeek)
+        XCTAssertEqual(bridge.debugAlignedPollState.imageEpoch, active.imageEpoch)
+        XCTAssertFalse(bridge.activate(original), "The newer seek barrier must remain active")
+        bridge.completeSeek(newerSeek)
+        assertEligible(original, output: outputA)
+        let completed = bridge.debugAlignedPollState
+        bridge.abandonTimeline(original, for: itemA, afterSeek: oldSeek)
+        XCTAssertEqual(bridge.debugNativeSeekState.serial, newerSeek)
+        XCTAssertNil(bridge.debugNativeSeekState.activeTicket)
+        XCTAssertEqual(bridge.debugAlignedPollState.imageEpoch, completed.imageEpoch)
+        assertEligible(original, output: outputA)
+        bridge.abandonTimeline(original, for: itemB, afterSeek: newerSeek)
+        XCTAssertEqual(bridge.debugAlignedPollState.imageEpoch, completed.imageEpoch)
+        assertEligible(original, output: outputA); assertResources(selected: itemA)
+
+        // Same-item re-adoption isolates the presentation revision from item identity.
+        let current = try XCTUnwrap(bridge.setCurrentItem(itemA, preparedVideo: resourceA))
+        XCTAssertNotEqual(current, original)
+        install(current); assertEligible(current, output: outputA)
+        let readopted = bridge.debugAlignedPollState
+        bridge.abandonTimeline(original, for: itemA, afterSeek: newerSeek)
+        XCTAssertEqual(bridge.debugAlignedPollState.imageEpoch, readopted.imageEpoch)
+        assertEligible(current, output: outputA); assertResources(selected: itemA)
+
+        // Both legal matching states (issued and already completed) must close.
+        for completeFirst in [false, true] {
+            let seek = bridge.beginSeek()
+            install(current)
+            if completeFirst { bridge.completeSeek(seek); assertEligible(current, output: outputA) }
+            if completeFirst { bridge.suspendFrameFeed() }
+            let before = bridge.debugAlignedPollState
+            bridge.abandonTimeline(current, for: itemA, afterSeek: seek)
+            XCTAssertEqual(bridge.debugNativeSeekState.serial, seek)
+            XCTAssertEqual(bridge.debugNativeSeekState.activeTicket, completeFirst ? nil : seek)
+            XCTAssertGreaterThan(bridge.debugAlignedPollState.imageEpoch, before.imageEpoch)
+            XCTAssertFalse(bridge.activate(current), "Exact abandonment must remove timeline eligibility")
+            bridge.completeSeek(seek)
+            XCTAssertNil(bridge.debugNativeSeekState.activeTicket)
+            XCTAssertFalse(bridge.activate(current), "The original completion cannot reopen an abandoned timeline")
+            XCTAssertFalse(bridge.debugAlignedPollState.coherent)
+            assertResources(selected: itemA, feedSuspended: completeFirst)
+            if completeFirst { bridge.resumeFrameFeed() }
+        }
+
+        // One synchronous invalidation callback replaces A with the real prepared B.
+        let reentrantSeek = bridge.beginSeek()
+        install(current)
+        var callbacks = 0, callbackOverflow = false
+        var replacement: Ticket?, replacementState: ContinuousPictureInPicture.DebugAlignedPollState?
+        bridge.onCurrentFrameInvalidated = { [weak bridge] in
+            guard let bridge else { return }
+            guard callbacks == 0 else { callbackOverflow = true; return }
+            callbacks = 1
+            bridge.onCurrentFrameInvalidated = nil
+            replacement = bridge.setCurrentItem(itemB, preparedVideo: resourceB)
+            if let replacement {
+                XCTAssertTrue(bridge.installTimeline(replacement, positionSeconds: 0.5, durationSeconds: 30, isPlaying: false))
+                XCTAssertTrue(bridge.activate(replacement))
+                replacementState = bridge.debugAlignedPollState
+            }
+        }
+        bridge.abandonTimeline(current, for: itemA, afterSeek: reentrantSeek)
+        bridge.onCurrentFrameInvalidated = nil
+        let replacementTicket = try XCTUnwrap(replacement), established = try XCTUnwrap(replacementState)
+        XCTAssertEqual(callbacks, 1); XCTAssertFalse(callbackOverflow)
+        XCTAssertTrue(established.coherent)
+        bridge.completeSeek(reentrantSeek)
+        XCTAssertEqual(bridge.debugAlignedPollState.imageEpoch, established.imageEpoch)
+        assertEligible(replacementTicket, output: outputB); assertResources(selected: itemB)
+        XCTAssertFalse(bridge.activate(current), "The replaced A presentation cannot reopen")
+        #else
+        XCTFail("The abandonment ownership contract requires DEBUG cached-state observations")
+        #endif
+    }
+
     func testSameItemSeekAfterSuccessfulCopyCannotEnqueueOrCreditTheOldFrame() async throws {
         #if DEBUG
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))

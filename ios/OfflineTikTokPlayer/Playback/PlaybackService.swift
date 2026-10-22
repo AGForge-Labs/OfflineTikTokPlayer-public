@@ -1408,6 +1408,17 @@ final class PlaybackService: NSObject {
         return continuousAudio.isSelectionPending(in: sample) || sample.token == token
     }
 
+    private func abandonVideoCorrectionAfterSourceChange(for item: AVPlayerItem, request: Int,
+                                                          selectedID: String?, seek: UInt64) {
+        guard generation == request, observedItem === item, videoAllowed, audioLoadingID == nil,
+              let selectedID, continuousAudio.isSelected, continuousAudio.selectedID == selectedID,
+              queue.currentID == selectedID, let token = continuousAudio.entry(for: selectedID)?.token,
+              token > 0, let presentation = videoPresentation, presentation.request == request else { return }
+        let sample = continuousAudio.snapshot
+        guard !continuousAudio.isSelectionPending(in: sample), sample.token > 0, sample.token != token else { return }
+        continuousPiP.abandonTimeline(presentation.ticket, for: item, afterSeek: seek)
+    }
+
     private func synchronizeVideoToAudio(force: Bool = false) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
@@ -1506,6 +1517,14 @@ final class PlaybackService: NSObject {
                 self.continuousPiP.beginReadinessUpdates()
                 defer { self.continuousPiP.endReadinessUpdates() }
                 defer { self.continuousPiP.completeSeek(videoSeek) }
+                // Runs before the matching barrier is released, including an
+                // owner refusal. Pending explicit selections keep their policy.
+                defer {
+                    if let item {
+                        self.abandonVideoCorrectionAfterSourceChange(for: item, request: request,
+                            selectedID: selectedID, seek: videoSeek)
+                    }
+                }
                 guard self.syncingVideoGeneration == request else { return }
                 self.syncingVideoGeneration = nil
                 guard finished, let item, self.generation == request,

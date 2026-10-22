@@ -23,6 +23,7 @@ final class PlaybackBuffer {
     var usesExternalClock = false { didSet { updateEndAction() } }
     var previousMediaID: String? { previous?.mediaID }
     #if DEBUG
+    let debugSuppressesPlayerRendering: Bool
     var debugPreviousNeedsRewind: Bool? { previous?.needsRewind }
     #endif
     var retainedItems: [AVPlayerItem] {
@@ -51,7 +52,19 @@ final class PlaybackBuffer {
         return next.mediaID == mediaID && next.item.status != .failed && player.items().dropFirst().first === next.item
     }
 
+    #if DEBUG
+    init(debugSuppressesPlayerRendering: Bool) {
+        self.debugSuppressesPlayerRendering = debugSuppressesPlayerRendering
+        player.actionAtItemEnd = .pause
+        observation = player.observe(\.currentItem, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in self?.synchronize() }
+        }
+    }
+    #endif
     init() {
+        #if DEBUG
+        debugSuppressesPlayerRendering = false
+        #endif
         player.actionAtItemEnd = .pause
         observation = player.observe(\.currentItem, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in self?.synchronize() }
@@ -139,7 +152,12 @@ final class PlaybackBuffer {
         player.removeAllItems()
         retireReleased(oldResources.filter { $0 !== incoming })
         guard ifEligible() else { updateEndAction(); return false }
+        #if DEBUG
+        let installed = videoPreparation?.install(debugSuppressesPlayerRendering: debugSuppressesPlayerRendering,
+                                                  ifEligible: ifEligible) ?? incoming
+        #else
         let installed = videoPreparation?.install(ifEligible: ifEligible) ?? incoming
+        #endif
         guard ifEligible() else { installed?.retire(); updateEndAction(); return false }
         active = item.flatMap { item in mediaID.map {
             Prepared(mediaID: $0, item: item, isLocal: isLocal, videoResource: installed)
@@ -175,7 +193,12 @@ final class PlaybackBuffer {
         retireReleased(candidates.filter { $0 !== prepared.videoResource })
         guard ifEligible() else { return false }
         var committed = prepared
+        #if DEBUG
+        committed.videoResource = videoPreparation?.install(debugSuppressesPlayerRendering: debugSuppressesPlayerRendering,
+                                                             ifEligible: ifEligible) ?? prepared.videoResource
+        #else
         committed.videoResource = videoPreparation?.install(ifEligible: ifEligible) ?? prepared.videoResource
+        #endif
         guard ifEligible() else { committed.videoResource?.retire(); return false }
         previous = committed
         return true
@@ -198,7 +221,12 @@ final class PlaybackBuffer {
         discardNext()
         guard ifEligible(), player.canInsert(prepared.item, after: current) else { return false }
         var committed = prepared
+        #if DEBUG
+        committed.videoResource = videoPreparation?.install(debugSuppressesPlayerRendering: debugSuppressesPlayerRendering,
+                                                             ifEligible: ifEligible) ?? prepared.videoResource
+        #else
         committed.videoResource = videoPreparation?.install(ifEligible: ifEligible) ?? prepared.videoResource
+        #endif
         guard ifEligible() else { committed.videoResource?.retire(); return false }
         player.insert(prepared.item, after: current)
         next = committed

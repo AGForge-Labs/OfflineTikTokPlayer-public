@@ -78,6 +78,9 @@ final class ContinuousPictureInPicture: NSObject {
     }
     /// One output per retained item. Retirement is explicit; no SDK work runs in deinit.
     @MainActor final class PreparedVideoResource {
+        #if DEBUG
+        fileprivate(set) var debugSuppressesPlayerRendering = false
+        #endif
         private(set) weak var item: AVPlayerItem?
         fileprivate(set) var output: AVPlayerItemVideoOutput?
         fileprivate(set) var isAttached = false
@@ -121,6 +124,14 @@ final class ContinuousPictureInPicture: NSObject {
         private var consumed = false
         #if DEBUG
         fileprivate weak var debugTraceOwner: ContinuousPictureInPicture?
+        private var debugSuppressesPlayerRendering = false
+        /// Select only before this one-shot plan attaches its output.
+        func install(debugSuppressesPlayerRendering: Bool,
+                     ifEligible: () -> Bool = { true }) -> PreparedVideoResource? {
+            guard !consumed else { return nil }
+            self.debugSuppressesPlayerRendering = debugSuppressesPlayerRendering
+            return install(ifEligible: ifEligible)
+        }
         #endif
         fileprivate init(item: AVPlayerItem, original: AVVideoComposition?, composition: AVVideoComposition) {
             self.item = item; self.original = original; self.composition = composition
@@ -154,7 +165,12 @@ final class ContinuousPictureInPicture: NSObject {
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ])
+            #if DEBUG
+            output.suppressesPlayerRendering = debugSuppressesPlayerRendering
+            resource.debugSuppressesPlayerRendering = debugSuppressesPlayerRendering
+            #else
             output.suppressesPlayerRendering = false
+            #endif
             guard ifEligible() else { resource.retire(); return nil }
             #if DEBUG
             if let owner = debugTraceOwner {
@@ -670,6 +686,21 @@ final class ContinuousPictureInPicture: NSObject {
         flushForSeek()
         #endif
         return ticket
+    }
+
+    /// A refused correction cannot leave its previous timeline eligible when
+    /// the matching seek barrier is released. Never withdraw a newer owner.
+    func abandonTimeline(_ ticket: PresentationTicket, for item: AVPlayerItem, afterSeek seek: UInt64) {
+        guard owns(ticket), currentItem === item, seekTicket == seek,
+              activeSeekTicket == nil || activeSeekTicket == seek else { return }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
+        presentationActive = false
+        installedTimeline = nil
+        stopFrameTimer()
+        // All state changes precede the invalidation callback, which may install
+        // another owner. flushForSeek revalidates its epoch before SDK flushing.
+        flushForSeek()
     }
 
     func completeSeek(_ ticket: UInt64) {
