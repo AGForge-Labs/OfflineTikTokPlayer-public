@@ -4,8 +4,8 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 # Require the reviewed final app/test commit and its exact ios tree.
-expected_code_source=9fd7ff44bd6859808d0099723d5160f775c5edf6
-expected_ios_tree=f539c40dc7f4a19349adbed1c8bec3530396ca6d
+expected_code_source=a9f596f6ebb7587494ae35f177eda22958de0f19
+expected_ios_tree=48e169b67baf898b380b375417d03c2426d54819
 verify_source() {
   case "$expected_code_source" in
     ''|PENDING|*[!0-9a-f]*) printf '%s\n' 'A final committed app/test source pin is required.' >&2; return 2 ;;
@@ -35,5 +35,5 @@ verify_source
 # including the traced benchmark previously run twice. This is one full-suite
 # invocation, not a fresh-host singleton comparison. Its native exit propagates
 # unchanged; the workflow separately verifies all identities after a failed run.
-printf '%s\n' "NativeReaderFullScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=141 expectedUI=1 expectedCore=97 maximumBuildJobs=1 fullApplicationAcceptance=pending physicalOutput=unverified"
+printf '%s\n' "NativeReaderFullScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=149 expectedUI=1 expectedCore=101 maximumBuildJobs=1 fullApplicationAcceptance=pending physicalOutput=unverified"
 exec bash scripts/check-ios.sh

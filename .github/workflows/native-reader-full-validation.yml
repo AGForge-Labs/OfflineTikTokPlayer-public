@@ -54,7 +54,8 @@ jobs:
       - name: Collect only bounded case-attributed preroll crash excerpts
         if: ${{ !cancelled() && steps.xcresult_export.outcome == 'success' }}
         run: python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
-      - name: Independently require all 141 native and one UI identities after the attempt
+      - name: Independently require all 149 native and one UI identities after the attempt
+        id: full_evidence
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -66,8 +67,23 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          if len(native) != 141 or len(ui) != 1 or native | ui != expected:
-              raise SystemExit(f'Pinned full manifest must equal native=141 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
+          if len(native) != 149 or len(ui) != 1 or native | ui != expected:
+              raise SystemExit(f'Pinned full manifest must equal native=149 ui=1; found native={len(native)} ui={len(ui)} total={len(expected)}')
           evidence.verify_log(Path('artifacts/native/xcodebuild-test.log').read_text(), expected)
-          print('FULL source-manifest evidence native=141 ui=1; original guards retained; physical-device acceptance remains separate')
+          print('FULL source-manifest evidence native=149 ui=1; original guards retained; physical-device acceptance remains separate')
           PY
+      - name: Compile the qualified full source as an unsigned Release app
+        if: ${{ !cancelled() && steps.native.outcome == 'success' && steps.full_evidence.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          SWIFTC_MAXIMUM_DETERMINISM: '1'
+        run: |
+          set -euo pipefail
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath artifacts/UnsignedReleaseDerivedData -jobs 1 \
+            SWIFTC_MAXIMUM_DETERMINISM=1 SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build \
+            2>&1 | tee artifacts/native/unsigned-release-build.log
+          grep -Fxq '** BUILD SUCCEEDED **' artifacts/native/unsigned-release-build.log
+          printf '%s\n' 'UnsignedReleaseBuildEvidence configuration=Release sdk=iphoneos action=build maximumBuildJobs=1 signed=false archived=false published=false'
