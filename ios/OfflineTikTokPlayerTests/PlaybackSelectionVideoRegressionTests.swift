@@ -491,6 +491,32 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
 
+    func testPreviousBundleRetainedThenFresh() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, fresh) in [false, true].enumerated() {
+            print("PreviousBundleArm schema=1 order=retained-then-fresh ordinal=\(ordinal) fresh=\(fresh) traceVideoSeeks=false treatment=bundle-history acceptance=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                                                       freshPreviousBundle: fresh)
+        }
+        #else
+        XCTFail("Previous-bundle controls require DEBUG test support")
+        #endif
+    }
+
+    func testPreviousBundleFreshThenRetained() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        for (ordinal, fresh) in [true, false].enumerated() {
+            print("PreviousBundleArm schema=1 order=fresh-then-retained ordinal=\(ordinal) fresh=\(fresh) traceVideoSeeks=false treatment=bundle-history acceptance=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: false, recordHost: false,
+                                                       freshPreviousBundle: fresh)
+        }
+        #else
+        XCTFail("Previous-bundle controls require DEBUG test support")
+        #endif
+    }
+
     func testNativeClockHandoffOffThenOn() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -660,7 +686,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
 
             // Match the untouched benchmark's cold A measurement and eight-second stream.
-            let cold = await self.measureProductionSelection(service, screen: screen, fixture: fixture,
+            let cold = try await self.measureProductionSelection(service, screen: screen, fixture: fixture,
                 audio: audio, tap: tap, seeks: seeks, startup: startup, phase: 0, id: fixture.aID,
                 frequency: 440, prepared: false, preparedBefore: true) {
                     service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -1575,7 +1601,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 recordHost: Bool = true, traceNativeRefill: Bool = false,
                                                 renderAccounting: Bool? = nil, traceDefaultFrameMonitor: Bool? = nil,
                                                 auditSavedAAfterCleanup: Bool = false,
-                                                traceClockHandoff: Bool? = nil) async throws {
+                                                traceClockHandoff: Bool? = nil,
+                                                freshPreviousBundle: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         guard !Self.targetedFixtureOwnershipLost else {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
@@ -1592,6 +1619,28 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         for (id, frequency) in [(fixture.aID, 440.0), (fixture.bID, 880.0)] {
             references.append((try await fixture.decodedTone(id: id), frequency))
         }
+        #if DEBUG
+        let previousBundleControl: SelectionPreviousBundleControl?
+        if let fresh = freshPreviousBundle {
+            guard !traceVideoSeeks, frameMonitorAlternative == nil, !traceNativeRefill,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
+                  traceClockHandoff == nil, acceptedPCMOriginBenchmarkMode == nil else {
+                XCTFail("Previous-bundle control must use the unchanged getter-free default benchmark")
+                throw SelectionVideoTestFailure.timeout
+            }
+            // Joined before the audio/service owners exist. Both arms do exactly
+            // this metadata work and hold one item with no installed output.
+            previousBundleControl = try await SelectionPreviousBundleControl(fresh: fresh,
+                aID: fixture.aID, bID: fixture.bID,
+                aURL: XCTUnwrap(fixture.savedURLs[fixture.aID]),
+                bURL: XCTUnwrap(fixture.savedURLs[fixture.bID]))
+        } else { previousBundleControl = nil }
+        #else
+        if freshPreviousBundle != nil {
+            XCTFail("Previous-bundle control is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
+        #endif
         #if DEBUG
         let nativeActivity = traceNativeRefill ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
         let acceptedPCMOrigin = acceptedPCMOriginBenchmarkMode
@@ -1625,7 +1674,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("ProductionSelectionPollScope schema=1 enabled=true originMode=\(acceptedPCMOrigin == true) phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only capture=unchanged publication=after-cleanup")
         }
         #endif
+        #if DEBUG
+        let monitorBuffer = previousBundleControl?.buffer ?? frameMonitorAlternative.map { _ in PlaybackBuffer() }
+        #else
         let monitorBuffer = frameMonitorAlternative.map { _ in PlaybackBuffer() }
+        #endif
         let service: PlaybackService
         if traceVideoSeeks {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio, seekVideo: seeks.seek)
@@ -1732,6 +1785,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var returnedStart: Int?
         var returnedEnd: Int?
         var returnedOrigin: Double?
+        var previousBundleBodyError: Error?
+        do {
         for phase in 0..<3 {
             let id = phase == 1 ? fixture.bID : fixture.aID
             let frequency = phase == 1 ? 880.0 : 440.0
@@ -1742,9 +1797,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     service.preparedAudioCount == 2 && audio.entry(for: id) != nil
                 }
             } else { preparedBefore = true }
-            let measurement = await measureProductionSelection(service, screen: screen, fixture: fixture,
+            let qualification: (() throws -> Void)?
+            #if DEBUG
+            if let control = previousBundleControl {
+                if phase == 2 {
+                    // Same real B/old-A eligibility and fixed settling interval in
+                    // both arms. No preparation task or second player is started.
+                    guard await waitUntil(timeout: 3, {
+                        control.canReplacePrevious(service: service, audio: audio, screen: screen)
+                    }) else { throw SelectionPreviousBundleControl.Failure.qualification(20) }
+                    try control.choosePrevious(service: service, audio: audio, screen: screen)
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+                qualification = {
+                    try control.qualifyBeforeCommand(phase: phase, service: service, audio: audio, screen: screen)
+                }
+            } else { qualification = nil }
+            #else
+            qualification = nil
+            #endif
+            let measurement = try await measureProductionSelection(service, screen: screen, fixture: fixture,
                 audio: audio, tap: tap, seeks: seeks, startup: startup, phase: phase, id: id,
-                frequency: frequency, prepared: prepared, preparedBefore: preparedBefore) {
+                frequency: frequency, prepared: prepared, preparedBefore: preparedBefore,
+                preCommandQualification: qualification) {
                 #if DEBUG
                 if let monitorReadTrace {
                     let commandNs = monitorReadTrace.beginPhase(phase)
@@ -1785,7 +1860,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 memoryBytes: audio.renderer.retainedPCMMemoryBytes,
                 sameStorage: originalSources == (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }))
             if phase == 2 { returnedEnd = tap.stop() }
+            #if DEBUG
+            try previousBundleControl?.completedPhase(phase, service: service, audio: audio)
+            #endif
         }
+        } catch { previousBundleBodyError = error }
+        #if DEBUG
+        if let control = previousBundleControl, previousBundleBodyError == nil {
+            do {
+                // The original returned eight-second tap and sampler have stopped.
+                // Actual pixels are additional post-window evidence, never a proxy
+                // for the original timed first-frame or PCM acceptance checks.
+                try control.qualifyReturnedA(service: service, audio: audio, stage: 8)
+                await assertMovingVisibleVideo(service, screen: screen, identity: .a,
+                    label: "previous-bundle-\(control.fresh ? "fresh" : "retained")-returned-A")
+                try control.qualifyReturnedA(service: service, audio: audio, stage: 9)
+            } catch { previousBundleBodyError = error }
+        }
+        #endif
 
         // No dumps, spectral analysis or assertions interrupt any streaming window.
         tap.stop(); service.pause()
@@ -1832,6 +1924,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
         XCTAssertTrue(mayRemoveFixture, "Queued decoder cleanup must return before removing only this synthetic fixture")
         if !mayRemoveFixture { Self.targetedFixtureOwnershipLost = true; fixture.restorePreferences() }
+        #if DEBUG
+        previousBundleControl?.dump(setupCompleted: previousBundleBodyError == nil)
+        #endif
+        if let previousBundleBodyError {
+            // Rejected setup is not a comparison. Never issue a displaced Previous
+            // or skip the existing queued-cleanup acknowledgement to report it.
+            XCTFail("Previous-bundle setup/owner qualification failed: \(previousBundleBodyError)")
+            throw previousBundleBodyError
+        }
         #if DEBUG
         if let alternative = frameMonitorAlternative {
             print("FrameMonitorBenchmarkOutputs schema=1 alternative=\(alternative) rows=\(monitorRows.count) capacity=8 overflow=\(monitorOverflow) originalGuardsRetained=true physicalPixels=unmeasured")
@@ -2289,9 +2390,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private func measureProductionSelection(_ service: PlaybackService, screen: SelectionVideoScreen,
         fixture: SelectionVideoFixture, audio: ContinuousAudioPlayer, tap: ProductionSelectionOutputTap,
         seeks: ProductionSelectionSeekRecorder, startup: ProductionVideoStartupTrace, phase: Int, id: String, frequency: Double,
-        prepared: Bool, preparedBefore: Bool, command: () -> Void) async -> ProductionSelectionMeasurement {
+        prepared: Bool, preparedBefore: Bool, preCommandQualification: (() throws -> Void)? = nil,
+        command: () -> Void) async throws -> ProductionSelectionMeasurement {
         let first = tap.begin()
         if prepared { try? await Task.sleep(for: .milliseconds(120)) }
+        // Nil preserves the original path. Qualification may query SDK ownership,
+        // so it must finish before the original baseline and command origin.
+        try preCommandQualification?()
         let before = audio.renderer.snapshot
         let expectedTokenBefore = audio.entry(for: id)?.token ?? 0
         let submitted = service.submittedVideoFrameCount
@@ -4977,6 +5082,253 @@ private final class ProductionSelectionPollSummary {
             let gap = value.largestGap
             print("ProductionSelectionPollGap schema=1 phase=\(phase) available=\(gap != nil) nextPoll=\(gap?.poll ?? 0) bodyReturnNs=\(gap?.begin ?? 0) nextEntryNs=\(gap?.end ?? 0) durationNs=\(gap?.duration ?? 0) includes=return-marker-sleep-and-scheduling finalGapWithoutNextEntryNs=\(trailing)")
         }
+    }
+}
+#endif
+
+#if DEBUG
+/// Test-only treatment of the retained video's entire item/output/composition history.
+/// Owns no service/audio/task and creates no player other than the injected buffer.
+@MainActor
+private final class SelectionPreviousBundleControl {
+    enum Failure: Error { case qualification(Int) }
+    let fresh: Bool
+    let buffer = PlaybackBuffer()
+    private let aID: String, bID: String, aURL: URL, bURL: URL
+    private let candidate: AVPlayerItem
+    private let preparation: ContinuousPictureInPicture.VideoResourcePreparation
+    private weak var originalA: AVPlayerItem?
+    private weak var originalResource: ContinuousPictureInPicture.PreparedVideoResource?
+    private weak var originalVideoOutput: AVPlayerItemVideoOutput?
+    private weak var preparedB: AVPlayerItem?
+    private weak var preparedBResource: ContinuousPictureInPicture.PreparedVideoResource?
+    private weak var chosenResource: ContinuousPictureInPicture.PreparedVideoResource?
+    private var originalOutput: ObjectIdentifier?
+    private var preparedBOutput: ObjectIdentifier?
+    private var chosenOutput: ObjectIdentifier?
+    private var aToken = 0, bToken = 0
+    private var bVisit: Int64?, bGeneration: Int?
+    private var returnedVisit: Int64?
+    private var oldDetachedBeforeInstall = false
+    private var chosePrevious = false
+    private struct Row {
+        let stage: Int, publishedUnionItems: Int
+        let candidateDetached: Bool, originalResourceAlive: Bool
+        let originalRetired: Bool, originalAttached: Bool, originalBorrowed: Bool
+        let oldDetachedBeforeInstall: Bool
+    }
+    private var rows: [Row] = []
+    private var overflow = false
+    private let metadataBegin: Double, metadataEnd: Double
+
+    init(fresh: Bool, aID: String, bID: String, aURL: URL, bURL: URL) async throws {
+        self.fresh = fresh; self.aID = aID; self.bID = bID
+        self.aURL = aURL.standardizedFileURL; self.bURL = bURL.standardizedFileURL
+        let item = AVPlayerItem(url: aURL)
+        item.preferredForwardBufferDuration = 8
+        let begin = ProcessInfo.processInfo.systemUptime
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+        candidate = item; preparation = plan
+        metadataBegin = begin; metadataEnd = ProcessInfo.processInfo.systemUptime
+        rows.reserveCapacity(12)
+        try check(candidate.outputs.isEmpty && candidate.videoComposition == nil, 1)
+        try check((candidate.asset as? AVURLAsset)?.url.standardizedFileURL == self.aURL, 2)
+        try append(stage: 0)
+    }
+
+    private func check(_ valid: Bool, _ code: Int) throws {
+        guard valid else { throw Failure.qualification(code) }
+    }
+    private func append(stage: Int) throws {
+        // This is explicitly a published-boundary union, not a count of SDK-held
+        // or unpublished service-local/in-flight items and not a process RSS bound.
+        let count = Set((buffer.retainedItems + [candidate]).map(ObjectIdentifier.init)).count
+        guard rows.count < 12 else { overflow = true; throw Failure.qualification(3) }
+        let old = originalResource
+        rows.append(Row(stage: stage, publishedUnionItems: count,
+            candidateDetached: candidate.outputs.isEmpty,
+            originalResourceAlive: old != nil, originalRetired: old?.isRetired == true,
+            originalAttached: old?.isAttached == true, originalBorrowed: old?.isBorrowed == true,
+            oldDetachedBeforeInstall: oldDetachedBeforeInstall))
+        try check(count > 0 && count <= 3, 4)
+    }
+    private func itemURLMatches(_ item: AVPlayerItem?, _ url: URL) -> Bool {
+        (item?.asset as? AVURLAsset)?.url.standardizedFileURL == url
+    }
+    private func candidateIsMetadataOnly() -> Bool {
+        candidate.outputs.isEmpty && candidate.videoComposition == nil
+    }
+    private func selectedOwner(_ service: PlaybackService, audio: ContinuousAudioPlayer,
+                               item: AVPlayerItem, id: String, url: URL, token: Int) -> Bool {
+        let sample = audio.renderer.snapshot
+        return service.player === buffer.player && service.player.currentItem === item
+            && service.queue.repeatMode == .off && service.queue.currentID == id && service.current?.id == id
+            && itemURLMatches(item, url) && audio.selectedID == id && audio.entry(for: id)?.token == token
+            && sample.token == token && token > 0 && !sample.ended && !audio.isSelectionPending(in: sample)
+            && service.preparedAudioCount == 2 && service.wantsToPlay && service.audioEngineRunning
+            && service.isVideoReady && !service.isLoading && sample.underrunFrames == 0
+    }
+    private func oldPreviousMatches() -> Bool {
+        guard let old = originalA, let resource = originalResource, let output = resource.output else { return false }
+        return old !== candidate && itemURLMatches(old, aURL)
+            && buffer.previousMediaID == aID && buffer.debugPreviousNeedsRewind == false
+            && buffer.resource(for: old) === resource && resource.item === old
+            && resource.isAttached && !resource.isBorrowed && !resource.isRetired
+            && ObjectIdentifier(output) == originalOutput && old.outputs.contains { $0 === output }
+    }
+    private func bOwnerMatches(_ service: PlaybackService, audio: ContinuousAudioPlayer,
+                               screen: SelectionVideoScreen, requireSnapshot: Bool) -> Bool {
+        guard let item = preparedB, let resource = preparedBResource,
+              let output = resource.output else { return false }
+        let state = service.debugInitialVideoReadyState, sample = audio.renderer.snapshot
+        let queue = buffer.player.items()
+        return selectedOwner(service, audio: audio, item: item, id: bID, url: bURL, token: bToken)
+            && buffer.resource(for: item) === resource && resource.item === item
+            && resource.isAttached && resource.isBorrowed && !resource.isRetired
+            && ObjectIdentifier(output) == preparedBOutput && item.outputs.contains { $0 === output }
+            && audio.entry(for: aID)?.token == aToken && aToken > 0 && aToken != bToken
+            && queue.count == 1 && queue.first === item && buffer.nextMediaID == nil
+            && !buffer.hasPrepared(aID) && !buffer.hasLoopReserve
+            && state.readyGeneration == state.generation && state.audioVisit == sample.visit
+            && state.syncingVideoGeneration == nil && screen.customVideoLayer?.isReadyForDisplay == true
+            && (!requireSnapshot || (state.generation == bGeneration && sample.visit == bVisit))
+    }
+
+    func canReplacePrevious(service: PlaybackService, audio: ContinuousAudioPlayer,
+                            screen: SelectionVideoScreen) -> Bool {
+        !chosePrevious && candidateIsMetadataOnly() && oldPreviousMatches()
+            && bOwnerMatches(service, audio: audio, screen: screen, requireSnapshot: false)
+    }
+
+    func choosePrevious(service: PlaybackService, audio: ContinuousAudioPlayer,
+                        screen: SelectionVideoScreen) throws {
+        try check(canReplacePrevious(service: service, audio: audio, screen: screen), 21)
+        bVisit = audio.renderer.snapshot.visit
+        bGeneration = service.debugInitialVideoReadyState.generation
+        try append(stage: 4)
+        if fresh {
+            // The only strong old references are scoped to this verification block;
+            // they end BEFORE the fresh resource is installed. SDK retention is
+            // neither observed nor claimed to have quiesced.
+            oldDetachedBeforeInstall = try {
+                let old = try XCTUnwrap(originalA), resource = try XCTUnwrap(originalResource)
+                let oldOutput = try XCTUnwrap(originalOutput)
+                buffer.discardPrevious()
+                try check(resource.isRetired && !resource.isAttached && !resource.isBorrowed
+                    && resource.output == nil && !old.outputs.contains { ObjectIdentifier($0) == oldOutput }
+                    && buffer.previousMediaID == nil, 22)
+                return true
+            }()
+            try check(oldDetachedBeforeInstall && candidateIsMetadataOnly(), 23)
+            let staged = buffer.stagePrevious(.init(mediaID: aID, item: candidate, isLocal: true),
+                videoPreparation: preparation, ifEligible: { [self] in
+                    bOwnerMatches(service, audio: audio, screen: screen, requireSnapshot: true)
+                        && buffer.previousMediaID == nil
+                })
+            try check(staged, 24)
+            let resource = try XCTUnwrap(buffer.resource(for: candidate))
+            let output = try XCTUnwrap(resource.output)
+            // A retired output's address may be reused after deallocation; compare
+            // live weak witnesses rather than treating an old address as unique.
+            try check(resource.item === candidate && resource.isAttached && !resource.isRetired
+                && !resource.isBorrowed && resource !== originalResource && output !== originalVideoOutput
+                && candidate.outputs.contains { $0 === output }, 25)
+            chosenResource = resource; chosenOutput = ObjectIdentifier(output)
+        } else {
+            try check(oldPreviousMatches() && candidateIsMetadataOnly(), 26)
+            chosenResource = originalResource; chosenOutput = originalOutput
+        }
+        chosePrevious = true
+        try append(stage: 5)
+    }
+
+    func qualifyBeforeCommand(phase: Int, service: PlaybackService, audio: ContinuousAudioPlayer,
+                              screen: SelectionVideoScreen) throws {
+        switch phase {
+        case 0:
+            try check(service.player === buffer.player && buffer.retainedItems.isEmpty
+                && candidateIsMetadataOnly() && !chosePrevious, 30)
+            try append(stage: 1)
+        case 1:
+            guard let old = originalA, let resource = originalResource, let queued = preparedB else {
+                throw Failure.qualification(31)
+            }
+            let items = buffer.player.items()
+            try check(selectedOwner(service, audio: audio, item: old, id: aID, url: aURL, token: aToken)
+                && buffer.resource(for: old) === resource && resource.isBorrowed
+                && resource.output.map(ObjectIdentifier.init) == originalOutput
+                && items.count == 2 && items.first === old && items.last === queued
+                && buffer.hasPrepared(bID) && buffer.nextMediaID == bID && !buffer.hasLoopReserve
+                && candidateIsMetadataOnly() && audio.entry(for: bID)?.token == bToken, 32)
+            try append(stage: 3)
+        case 2:
+            guard chosePrevious, let item = fresh ? candidate : originalA,
+                  let resource = chosenResource, let output = resource.output else {
+                throw Failure.qualification(33)
+            }
+            try check(bOwnerMatches(service, audio: audio, screen: screen, requireSnapshot: true)
+                && buffer.previousMediaID == aID && buffer.debugPreviousNeedsRewind == false
+                && buffer.resource(for: item) === resource && resource.item === item
+                && resource.isAttached && !resource.isBorrowed && !resource.isRetired
+                && ObjectIdentifier(output) == chosenOutput && item.outputs.contains { $0 === output }
+                && (fresh ? oldDetachedBeforeInstall : (oldPreviousMatches() && candidateIsMetadataOnly())), 34)
+            try append(stage: 6)
+        default: throw Failure.qualification(35)
+        }
+    }
+
+    func completedPhase(_ phase: Int, service: PlaybackService, audio: ContinuousAudioPlayer) throws {
+        if phase == 0 {
+            let items = buffer.player.items()
+            try check(items.count == 2 && buffer.hasPrepared(bID) && !buffer.hasLoopReserve, 40)
+            let old = try XCTUnwrap(items.first), queued = try XCTUnwrap(items.last)
+            let resource = try XCTUnwrap(buffer.resource(for: old))
+            let output = try XCTUnwrap(resource.output)
+            let queuedResource = try XCTUnwrap(buffer.resource(for: queued))
+            let queuedOutput = try XCTUnwrap(queuedResource.output)
+            aToken = try XCTUnwrap(audio.entry(for: aID)).token
+            bToken = try XCTUnwrap(audio.entry(for: bID)).token
+            try check(old !== candidate && old !== queued && itemURLMatches(old, aURL)
+                && itemURLMatches(queued, bURL) && resource.item === old && resource.isBorrowed
+                && resource.isAttached && !resource.isRetired && candidateIsMetadataOnly()
+                && queuedResource.item === queued && queuedResource.isAttached
+                && !queuedResource.isBorrowed && !queuedResource.isRetired
+                && selectedOwner(service, audio: audio, item: old, id: aID, url: aURL, token: aToken), 41)
+            originalA = old; originalResource = resource; originalOutput = ObjectIdentifier(output)
+            originalVideoOutput = output
+            preparedB = queued; preparedBResource = queuedResource
+            preparedBOutput = ObjectIdentifier(queuedOutput)
+            try append(stage: 2)
+        } else if phase == 2 {
+            try qualifyReturnedA(service: service, audio: audio, stage: 7)
+        }
+    }
+
+    func qualifyReturnedA(service: PlaybackService, audio: ContinuousAudioPlayer, stage: Int) throws {
+        guard chosePrevious, let item = fresh ? candidate : originalA,
+              let resource = chosenResource, let output = resource.output, let bVisit else {
+            throw Failure.qualification(50)
+        }
+        let sample = audio.renderer.snapshot
+        try check(selectedOwner(service, audio: audio, item: item, id: aID, url: aURL, token: aToken)
+            && sample.visit > bVisit && audio.entry(for: bID)?.token == bToken
+            && buffer.resource(for: item) === resource && resource.item === item
+            && resource.isBorrowed && resource.isAttached && !resource.isRetired
+            && ObjectIdentifier(output) == chosenOutput && item.outputs.contains { $0 === output }
+            && (fresh ? oldDetachedBeforeInstall : candidateIsMetadataOnly()), 51)
+        if let returnedVisit { try check(sample.visit == returnedVisit, 52) }
+        else { returnedVisit = sample.visit }
+        try append(stage: stage)
+    }
+
+    func dump(setupCompleted: Bool) {
+        print("PreviousBundleScope schema=1 fresh=\(fresh) setupCompleted=\(setupCompleted) metadataJoined=true metadataMs=\((metadataEnd - metadataBegin) * 1000) extraPlayers=0 customTasks=0 traceVideoSeeks=false fixedSetupLeadMs=250 existingPreparedLeadMs=120 aToken=\(aToken) bToken=\(bToken) bVisit=\(bVisit.map { String($0) } ?? "unavailable") bGeneration=\(bGeneration.map { String($0) } ?? "unavailable") returnedVisit=\(returnedVisit.map { String($0) } ?? "unavailable") rows=\(rows.count) capacity=12 overflow=\(overflow) ownershipScope=published-buffer-union-held-candidate sdkInternalQuiescence=unverified unobservedInflightItems=unknown maximumObservedItems=\(rows.map(\.publishedUnionItems).max() ?? 0) compositorScope=returned-A-after-original-PCM-tail treatment=bundle-history-not-individual-component originalAcceptance=unchanged")
+        for row in rows {
+            print("PreviousBundleBoundary schema=1 fresh=\(fresh) stage=\(row.stage) publishedUnionItems=\(row.publishedUnionItems) candidateDetached=\(row.candidateDetached) originalResourceAlive=\(row.originalResourceAlive) originalRetired=\(row.originalRetired) originalAttached=\(row.originalAttached) originalBorrowed=\(row.originalBorrowed) oldDetachedBeforeInstall=\(row.oldDetachedBeforeInstall)")
+        }
+        XCTAssertFalse(overflow); XCTAssertLessThanOrEqual(rows.count, 12)
+        XCTAssertTrue(rows.allSatisfy { $0.publishedUnionItems > 0 && $0.publishedUnionItems <= 3 })
+        if setupCompleted { XCTAssertEqual(rows.map(\.stage), Array(0..<10)) }
     }
 }
 #endif

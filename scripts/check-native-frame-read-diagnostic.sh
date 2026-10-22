@@ -2,15 +2,14 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=c8998e3dce80074c6b2cbf1af0681363cfca1c73
-expected_ios_tree=44c8ae1498b9d0039a01ecf5bcf5b799fe1c63dc
+expected_code_source=PENDING
+expected_ios_tree=PENDING
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreviousBundleFreshThenRetained
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -36,12 +35,11 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeClockHandoffOnThenOff',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedNextVideoPrerollCapabilityOnThenOff'}
-if len(expected) != 4 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly four diagnostic identities must exist in the pinned source')
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousBundleRetainedThenFresh',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreviousBundleFreshThenRetained'}
+if len(expected) != 3 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly three diagnostic identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -50,7 +48,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=4 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=3 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -101,7 +99,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=4 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Invoke the single filtered native attempt.
 if [ -n "${GITHUB_OUTPUT:-}" ]; then printf 'attempted=true\n' >> "$GITHUB_OUTPUT"; fi
 set +e

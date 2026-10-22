@@ -1,4 +1,4 @@
-name: Native attachment and full readiness handoff diagnostic
+name: Retained versus fresh Previous video bundle diagnostic
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -41,7 +41,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run only the four playback ownership and native boundary diagnostic identities
+      - name: Run the default benchmark and two counterbalanced Previous bundle controls
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
@@ -56,7 +56,7 @@ jobs:
         run: |
           cp artifacts/native/native-frame-read.log artifacts/native/xcodebuild-test.log
           python3 scripts/export-preroll-crash-evidence.py --simulator-udid "${{ steps.simulator_boot.outputs.simulator_id }}" --export-succeeded
-      - name: Independently require the four exact identities and zero native exit
+      - name: Independently require the three exact identities and zero native exit
         id: evidence
         if: ${{ !cancelled() && steps.native.outputs.attempted == 'true' }}
         run: bash scripts/check-native-frame-read-diagnostic.sh --verify-results
