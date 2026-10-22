@@ -1,4 +1,4 @@
-name: Native clock handoff diagnostic
+name: Native attachment and early frame handoff diagnostic
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -41,7 +41,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run only the eleven native clock ownership and harness diagnostic identities
+      - name: Run only the eleven playback ownership and native boundary diagnostic identities
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.harness.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
