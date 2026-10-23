@@ -399,6 +399,23 @@ class NativeControlHarnessTests(unittest.TestCase):
                     self.ns["runtime_host"]("NativeRuntimeHost " + json.dumps(changed),
                                             identity, observed["simulatorUDID"])
 
+    def test_probe_sdk_preflight_must_pass_before_any_native_work(self):
+        workflow = TARGETED_WORKFLOW.read_text(encoding="utf-8")
+        blocks = re.split(r'^      - name: ', workflow, flags=re.MULTILINE)
+        probe = [block for block in blocks if 'id: probe_sdk\n' in block]
+        self.assertEqual(len(probe), 1)
+        self.assertIn('run: python3 scripts/check-native-reader-probe-sdk.py', probe[0])
+        native = [block for block in blocks if any(block.startswith(name) for name in (
+            'Resolve within', 'Build one exact', 'Require the actual', 'Four context-only',
+            'Require all four', 'Export each exact'))]
+        self.assertEqual(len(native), 6)
+        for block in native:
+            condition = re.search(r'^        if: (.+)$', block, re.MULTILINE)
+            self.assertIsNotNone(condition)
+            self.assertIn("steps.source_pin.outcome == 'success'", condition.group(1))
+            self.assertIn("steps.probe_sdk.outcome == 'success'", condition.group(1))
+        self.assertLess(workflow.index('id: probe_sdk'), workflow.index('- name: Resolve within'))
+
     @unittest.skipUnless(os.name == "posix", "The launcher contract uses Bash")
     def test_benchmark_builds_one_immutable_plan_before_testing_and_fails_closed(self):
         shell = HARNESS.read_text(encoding="utf-8").replace("\r\n", "\n")

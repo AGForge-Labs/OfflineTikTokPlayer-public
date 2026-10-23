@@ -2,7 +2,7 @@ name: Owned reader wait at dropout with isolated playback controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh', 'scripts/export-native-control-results.py', 'tests/validation-shell/test_native_control_harness.py', 'tests/validation-shell/test_native_control_results.py']
+    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh', 'scripts/export-native-control-results.py', 'tests/validation-shell/test_native_control_harness.py', 'tests/validation-shell/test_native_control_results.py', 'scripts/check-native-reader-probe-sdk.py']
 concurrency:
   group: offline-player-native-validation
   cancel-in-progress: true
@@ -21,6 +21,10 @@ jobs:
       - name: Require exact committed source before native work
         id: source_pin
         run: bash scripts/check-native-playback-targeted.sh --verify-source
+      - name: Compile the exact probe against public Simulator headers before the expensive build
+        id: probe_sdk
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        run: python3 scripts/check-native-reader-probe-sdk.py
       - name: Portable Core regressions
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/test-core.sh
@@ -36,15 +40,15 @@ jobs:
           python3 tests/validation-shell/test_native_xcresult_export.py
       - name: Resolve within sixty seconds and boot within four minutes
         id: simulator_boot
-        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: |
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
       - name: Build one exact test plan and calibrate owned thread and actual close ordering
-        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
       - name: Require the actual held-reader and own-thread calibration identity
-        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import importlib.util
@@ -60,11 +64,11 @@ jobs:
           print('Held-reader and own-thread calibration identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
       - name: Four context-only and sampled arms OFF ON ON OFF in fresh exact owned hosts
-        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh controls
       - name: Require all four singleton identities and native exit and host-boundary receipts
-        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh --verify-controls
       - name: Export each exact attempted structured result independently
-        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: python3 scripts/export-native-control-results.py

@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=1b26a83c4ac0ec99e63a5bba58cf3a77603ef374
-expected_ios_tree=b2ae7c27d8efcd769f4728dd5d5bb2b5f9c6a922
+expected_code_source=0d9171fe049f054741905684a7179bb594d49ba8
+expected_ios_tree=3a3798418dfd6dbc489a6e4a9cf1a8766d17b4f2
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
