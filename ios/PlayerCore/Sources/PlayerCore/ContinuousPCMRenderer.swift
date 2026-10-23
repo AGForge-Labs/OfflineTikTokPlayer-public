@@ -808,6 +808,7 @@ extension ContinuousPCMRenderer {
         public struct Run: Sendable { public var first: UInt32 = 0, end: UInt32 = 0 }
         public struct Source: Sendable {
             public var stamp = Stamp(), ordinal: UInt64 = 0
+            public var executionEntryHost: UInt64 = 0, executionEndHost: UInt64 = 0
             public var frames: UInt32 = 0, buffers: UInt32 = 0, channels0: UInt32 = 0, channels1: UInt32 = 0
             public var bytes0: UInt32 = 0, bytes1: UInt32 = 0
             public var result: Int32 = 0
@@ -841,6 +842,7 @@ extension ContinuousPCMRenderer {
             public var coverageClosed: Bool { false } // No callback-acknowledged closure protocol.
         }
         public let sourceCapacity: Int, tapCapacity: Int
+        public let capturesExecutionTime: Bool
         public var reservedPayloadBytes: Int {
             sourceCapacity * MemoryLayout<Source>.stride + tapCapacity * MemoryLayout<Tap>.stride
         }
@@ -850,8 +852,10 @@ extension ContinuousPCMRenderer {
         private var pending = Source(), before = DebugRenderAccountingSnapshot()
         private var open = false, pendingRun: UInt32?, identitySeen = false
         private var enteredValue: UInt64 = 0 // Source writer only.
-        public init(sourceCapacity: Int = 4096, tapCapacity: Int = 2048) {
+        private var previousExecutionEndHost: UInt64 = 0 // Same source writer; zero when timing is disabled.
+        public init(sourceCapacity: Int = 4096, tapCapacity: Int = 2048, capturesExecutionTime: Bool = false) {
             precondition(sourceCapacity > 0 && tapCapacity > 0)
+            self.capturesExecutionTime = capturesExecutionTime
             self.sourceCapacity = sourceCapacity; self.tapCapacity = tapCapacity
             source = .allocate(capacity: sourceCapacity); tap = .allocate(capacity: tapCapacity)
             source.initialize(repeating: Source(), count: sourceCapacity)
@@ -868,11 +872,13 @@ extension ContinuousPCMRenderer {
         private func delta(_ end: UInt64, _ start: UInt64) -> UInt32 {
             guard end >= start else { fail(); return .max }; return u32(end - start)
         }
-        public func beginSource(stamp: Stamp, frames: UInt32, counters: DebugRenderAccountingSnapshot) {
+        public func beginSource(stamp: Stamp, frames: UInt32, counters: DebugRenderAccountingSnapshot,
+                                executionEntryHost: UInt64 = 0) {
             if open { fail() }
             if enteredValue == .max { fail() } else { enteredValue += 1 }
             entered.store(enteredValue, ordering: .releasing)
             pending = Source(); pending.ordinal = enteredValue; pending.stamp = stamp; pending.frames = frames
+            pending.executionEntryHost = executionEntryHost
             before = counters; open = true; pendingRun = nil; identitySeen = false
         }
         public func layout(buffers: UInt32, channels0: UInt32, channels1: UInt32,
@@ -912,8 +918,17 @@ extension ContinuousPCMRenderer {
             } else { finishRun() }
             pending.pairs += 1
         }
-        public func endSource(result: Int32, counters end: DebugRenderAccountingSnapshot) {
+        public func endSource(result: Int32, counters end: DebugRenderAccountingSnapshot,
+                              executionEndHost: UInt64 = 0) {
             guard open else { fail(); return }; finishRun(); open = false
+            pending.executionEndHost = executionEndHost
+            if capturesExecutionTime {
+                if pending.executionEntryHost == 0 || executionEndHost < pending.executionEntryHost
+                    || pending.executionEntryHost < previousExecutionEndHost {
+                    pending.flags |= 4; fail()
+                }
+                previousExecutionEndHost = max(previousExecutionEndHost, executionEndHost)
+            } else if pending.executionEntryHost != 0 || executionEndHost != 0 { pending.flags |= 4; fail() }
             pending.result = result; pending.flags |= 1
             pending.entered = delta(end.kernelCallsEntered, before.kernelCallsEntered)
             pending.completed = delta(end.kernelCallsCompleted, before.kernelCallsCompleted)
@@ -996,10 +1011,10 @@ extension ContinuousPCMRenderer {
         }
 
         public init(capturePCMOrigin: Bool = false, captureSourceOutput: Bool = false,
-                    captureCallbackLedger: Bool = false) {
+                    captureCallbackLedger: Bool = false, captureCallbackExecutionTime: Bool = false) {
             capturesPCMOrigin = capturePCMOrigin
             capturesSourceOutput = captureSourceOutput || captureCallbackLedger; testHooks = nil
-            callbackLedger = captureCallbackLedger ? DebugSourceCallbackLedger() : nil
+            callbackLedger = captureCallbackLedger ? DebugSourceCallbackLedger(capturesExecutionTime: captureCallbackExecutionTime) : nil
             state.sourceOutput.enabled = capturesSourceOutput
             if capturePCMOrigin {
                 state.pcmOrigin = DebugPCMOriginReceipt(valid: false, completion: 0,

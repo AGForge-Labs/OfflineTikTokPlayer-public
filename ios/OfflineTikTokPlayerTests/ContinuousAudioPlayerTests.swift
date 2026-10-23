@@ -1,10 +1,185 @@
 import XCTest
 import AVFoundation
 import Synchronization
+import PlayerCore
 @testable import OfflineTikTokPlayer
 
 @MainActor
 final class ContinuousAudioPlayerTests: XCTestCase {
+    func testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume() async throws {
+        #if DEBUG
+        guard Self.unresolvedRenderAnchorCalibrationOwner == nil else {
+            print("RenderAnchorPauseResumeCalibrationRefusal schema=1 ownerSlotOccupied=true newOwnerCreated=false")
+            XCTFail("The previous calibration owner has not acknowledged close; no new owner may start")
+            throw RenderAnchorCalibrationSetupError.ownerNotClosed
+        }
+        let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+        let audio = ContinuousAudioPlayer(debugRenderAccounting: accounting)
+        // Reserve the one slot before the first await; only an acknowledged close releases it.
+        Self.unresolvedRenderAnchorCalibrationOwner = audio
+        XCTAssertFalse(accounting.capturesPCMOrigin); XCTAssertFalse(accounting.capturesSourceOutput)
+        XCTAssertNil(accounting.callbackLedger)
+        let closed = Mutex<Bool?>(nil)
+        var shutdownRequested = false, originalError: Error?
+        var qualified = false, freshBefore = false, freshAfter = false, wrongTokenRejected = false
+        var explicitPauseCorrect = false, freshWrongTokenRejected = false
+        var sequenceAtSeed = 0, sequenceBeforeQuery = 0, sequenceAfterQuery = 0
+        var resumedAnchor: Double?, resumedPosition: Double?, expectedCursor: Double?
+        var callbackBeforeEntered: UInt64 = 0, callbackBeforeCompleted: UInt64 = 0
+        var callbackAfterEntered: UInt64 = 0, callbackAfterCompleted: UInt64 = 0
+        var callbackCountsQualified = false
+        defer {
+            if !shutdownRequested {
+                qualified = false
+                audio.suspend(); audio.graph.engine.stop()
+                // The reserved exact owner stays retained; this fallback is never a close ACK.
+                audio.debugShutdown { _ in }
+            }
+        }
+        do {
+            let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+            audio.setWindow(["a"])
+            let entry = try await audio.prepare(id: "a", url: url, currentPriority: true)
+            try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+            guard entry.token > 0, entry.token < Int.max, entry.frames > 4_832,
+                  audio.select(id: "a", position: 0.1) else {
+                XCTFail("A complete real source and selected .1 position must qualify the store calibration")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            try audio.setPlaying(true)
+            let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+            guard try audio.graph.engine.renderOffline(32, to: output) == .success else {
+                XCTFail("The real source callback must acknowledge the selected PCM before anchor calibration")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            let before = audio.snapshot
+            guard before.token == entry.token, before.visit > 0, before.frame >= 4_832,
+                  !before.ended, before.underrunFrames == 0, !audio.isSelectionPending(in: before),
+                  audio.graph.engine.isRunning else {
+                XCTFail("Actual acknowledged positive-token PCM and a running manual engine are required")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            // Explicitly synthetic host time enters the actual private publisher.
+            // It is not a claimed SDK render timestamp, source callback or measured pause length.
+            let seedHost = 1_000.0
+            let afterPauseHost = CMTime(seconds: seedHost + 10, preferredTimescale: 1_000_000)
+            guard audio.graph.debugPublishSyntheticRenderAnchor(before, hostEnd: seedHost) else {
+                XCTFail("Only the sole offline manual-render owner may seed the actual anchor store")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            sequenceAtSeed = audio.graph.debugRenderAnchorPublicationSequence
+            let current = audio.graph.presentationPosition(token: entry.token,
+                at: CMTime(seconds: seedHost, preferredTimescale: 1_000_000))
+            freshBefore = current?.isFinite == true
+            wrongTokenRejected = audio.graph.presentationPosition(token: entry.token + 1, at: afterPauseHost) == nil
+            guard sequenceAtSeed > 0, sequenceAtSeed & 1 == 0, freshBefore, wrongTokenRejected else {
+                XCTFail("The real query must accept a coherent fresh publication and reject a different token")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+
+            let callbacksBefore = try XCTUnwrap(accounting.snapshot(), "Source callback accounting must be available before pause")
+            callbackBeforeEntered = callbacksBefore.sourceCallbacksEntered
+            callbackBeforeCompleted = callbacksBefore.sourceCallbacksCompleted
+            guard !callbacksBefore.overflowed, callbackBeforeEntered > 0,
+                  callbackBeforeEntered == callbackBeforeCompleted else {
+                XCTFail("A completed actual source callback must qualify the pre-pause accounting prefix")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            audio.suspend() // Real intent changes; the engine is not yet paused by settlePausedState.
+            guard audio.graph.engine.isRunning else {
+                XCTFail("The explicit-Pause fallback must qualify before the engine stops")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            let cursor = Double(before.frame) / 48_000
+            expectedCursor = cursor
+            let explicitPausePosition = audio.presentationPosition(at: afterPauseHost)
+            explicitPauseCorrect = abs(explicitPausePosition - cursor) <= 0.5 / 48_000
+            XCTAssertEqual(explicitPausePosition, cursor, accuracy: 0.5 / 48_000,
+                "Explicit Pause must use the exact cursor even while the graph remains running")
+            audio.settlePausedState()
+            guard !audio.graph.engine.isRunning else {
+                XCTFail("Real paused selection acknowledgment must permit the normal engine pause")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            try audio.setPlaying(true)
+            // No renderOffline call occurs between suspend and these queries. A new
+            // publication nevertheless observed here makes setup unavailable, never a RED.
+            sequenceBeforeQuery = audio.graph.debugRenderAnchorPublicationSequence
+            resumedAnchor = audio.graph.presentationPosition(token: entry.token, at: afterPauseHost)
+            resumedPosition = audio.presentationPosition(at: afterPauseHost)
+            sequenceAfterQuery = audio.graph.debugRenderAnchorPublicationSequence
+            let callbacksAfter = try XCTUnwrap(accounting.snapshot(), "Source callback accounting must remain available after resume queries")
+            callbackAfterEntered = callbacksAfter.sourceCallbacksEntered
+            callbackAfterCompleted = callbacksAfter.sourceCallbacksCompleted
+            callbackCountsQualified = !callbacksAfter.overflowed
+                && callbackAfterEntered == callbackBeforeEntered && callbackAfterCompleted == callbackBeforeCompleted
+                && callbackAfterEntered == callbackAfterCompleted
+            let resumed = audio.snapshot
+            qualified = explicitPauseCorrect && callbackCountsQualified && audio.graph.engine.isRunning && sequenceBeforeQuery == sequenceAtSeed
+                && sequenceAfterQuery == sequenceAtSeed && resumed.token == before.token
+                && resumed.visit == before.visit && resumed.selectionVersion == before.selectionVersion
+                && resumed.frame == before.frame && resumed.underrunFrames == before.underrunFrames
+                && !resumed.ended && !audio.isSelectionPending(in: resumed)
+                && (resumedAnchor == nil || resumedAnchor?.isFinite == true) && resumedPosition?.isFinite == true
+            guard qualified else {
+                XCTFail("Same source/visit/version/cursor, unchanged completed callback counts and no fresh anchor publication must qualify resume")
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            // Intended RED on the unchanged implementation: same token alone grants
+            // the old anchor permission to extrapolate through the synthetic host gap.
+            XCTAssertNil(resumedAnchor, "A new playing interval must await its own anchor publication")
+            XCTAssertEqual(try XCTUnwrap(resumedPosition), cursor, accuracy: 0.5 / 48_000,
+                "Before a fresh publication, resumed presentation must fall back to the real cursor")
+
+            // Positive recovery: the same actual publisher/query remains usable after
+            // a fresh current-interval synthetic publication. No SDK callback is fabricated.
+            XCTAssertTrue(audio.graph.debugPublishSyntheticRenderAnchor(resumed, hostEnd: seedHost + 10))
+            let fresh = audio.graph.presentationPosition(token: entry.token, at: afterPauseHost)
+            freshAfter = fresh?.isFinite == true
+            XCTAssertTrue(freshAfter)
+            freshWrongTokenRejected = audio.graph.presentationPosition(token: entry.token + 1, at: afterPauseHost) == nil
+            XCTAssertTrue(freshWrongTokenRejected)
+            XCTAssertGreaterThan(audio.graph.debugRenderAnchorPublicationSequence, sequenceAtSeed)
+            XCTAssertEqual(audio.snapshot.underrunFrames, 0)
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, 6_912_000)
+            XCTAssertEqual(audio.preparedCount, 1)
+            qualified = qualified && freshBefore && freshAfter && wrongTokenRejected && freshWrongTokenRejected
+                && audio.graph.debugRenderAnchorPublicationSequence > sequenceAtSeed
+                && audio.snapshot.underrunFrames == 0 && audio.renderer.retainedPCMMemoryBytes == 6_912_000
+                && audio.preparedCount == 1
+        } catch { originalError = error }
+        audio.suspend(); audio.graph.engine.stop()
+        shutdownRequested = true
+        audio.debugShutdown { value in closed.withLock { $0 = value } }
+        let returned = await Self.capCancellationWait(.seconds(3)) { closed.withLock { $0 != nil } }
+        let closeAcknowledged = returned && closed.withLock { $0 == true }
+        if closeAcknowledged {
+            if Self.unresolvedRenderAnchorCalibrationOwner === audio {
+                Self.unresolvedRenderAnchorCalibrationOwner = nil
+            } else {
+                qualified = false
+                if originalError == nil { originalError = RenderAnchorCalibrationSetupError.ownerChanged }
+                XCTFail("An acknowledged close cannot release a different calibration owner")
+            }
+        } else {
+            qualified = false // The reserved exact audio owner remains retained in the sole static slot.
+            if originalError == nil { originalError = RenderAnchorCalibrationSetupError.closeUnacknowledged }
+        }
+        XCTAssertTrue(closeAcknowledged, "The owned decoder close must acknowledge within the existing three-second bound; otherwise retain the exact owner and disqualify the RED")
+        print("RenderAnchorPauseResumeCalibration schema=1 qualified=\(qualified) freshBefore=\(freshBefore) freshAfter=\(freshAfter) wrongTokenRejected=\(wrongTokenRejected) callbackCountsQualified=\(callbackCountsQualified) callbackBeforeEntered=\(callbackBeforeEntered) callbackBeforeCompleted=\(callbackBeforeCompleted) callbackAfterEntered=\(callbackAfterEntered) callbackAfterCompleted=\(callbackAfterCompleted) ownerRetained=\(Self.unresolvedRenderAnchorCalibrationOwner === audio) seedSequence=\(sequenceAtSeed) beforeQuerySequence=\(sequenceBeforeQuery) afterQuerySequence=\(sequenceAfterQuery) resumedAnchor=\(resumedAnchor.map { String($0) } ?? "nil") resumedPosition=\(resumedPosition.map { String($0) } ?? "unavailable") expectedCursor=\(expectedCursor.map { String($0) } ?? "unavailable") decoderCloseAcknowledged=\(closed.withLock { $0 } == true) originalErrorRetained=\(originalError != nil) syntheticHostSeed=true sdkRenderTimestampProof=false sdkCallbackProof=false physicalPauseDuration=unmeasured latencyAcceptance=false xctestOutcome=external")
+        print("RenderAnchorPauseResumeControls schema=1 explicitPauseCorrect=\(explicitPauseCorrect) freshWrongTokenRejected=\(freshWrongTokenRejected) qualifiedIncludesControls=true")
+        if let originalError { throw originalError }
+        #else
+        XCTFail("Render-anchor store calibration requires the DEBUG publisher inspection seam")
+        #endif
+    }
+
+    #if DEBUG
+    // One bounded actor-owned retention slot. No automatic late-ACK retry or new owner starts while occupied.
+    private static var unresolvedRenderAnchorCalibrationOwner: ContinuousAudioPlayer?
+    private enum RenderAnchorCalibrationSetupError: Error { case unqualified, ownerNotClosed, ownerChanged, closeUnacknowledged }
+    #endif
+
     func testCancelledCoalescedPreparationCallersReleaseWhileLegitimateNativeReadIsHeld() async throws {
         #if DEBUG
         try await assertSharedPreparationCancellation(creatorIsCancelled: false)

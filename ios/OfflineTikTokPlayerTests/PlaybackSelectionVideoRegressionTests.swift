@@ -25,6 +25,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private var acceptedPCMOriginBenchmarkMode: Bool?
     private var sourceOutputBenchmarkMode: Bool?
     private var sourceCallbackLedgerBenchmarkMode: Bool?
+    private var sourceCallbackExecutionTimingBenchmarkMode: Bool?
     private var sourceCallbackLedgerArmID: String?
     #endif
 
@@ -754,6 +755,27 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #else
         XCTFail("Native start argument comparison requires DEBUG")
+        #endif
+    }
+
+    func testSourceCallbackExecutionTimingOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        defer {
+            sourceCallbackExecutionTimingBenchmarkMode = nil
+            sourceCallbackLedgerBenchmarkMode = nil; sourceCallbackLedgerArmID = nil
+        }
+        for (ordinal, timed) in [false, true].enumerated() {
+            sourceCallbackLedgerBenchmarkMode = true
+            sourceCallbackExecutionTimingBenchmarkMode = timed
+            let armID = UUID().uuidString.lowercased()
+            sourceCallbackLedgerArmID = armID
+            print("SourceCallbackExecutionArm schema=1 armID=\(armID) ordinal=\(ordinal) ledger=true executionTiming=\(timed) clocksPerSourceCallback=\(timed ? 2 : 0) clock=mach_absolute_time endScope=before-final-ledger-publication numericDefault=true traceVideoSeeks=true traceClockHandoff=true acceptance=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false, traceClockHandoff: true)
+            print("SourceCallbackExecutionArmEnd schema=1 armID=\(armID) helperReturned=true")
+        }
+        #else
+        XCTFail("Source callback execution timing requires DEBUG")
         #endif
     }
 
@@ -2408,7 +2430,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let accounting = renderAccounting == true || acceptedPCMOrigin == true || sourceCallbackLedgerBenchmarkMode == true
             ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(capturePCMOrigin: acceptedPCMOrigin == true,
                 captureSourceOutput: sourceOutputBenchmarkMode == true,
-                captureCallbackLedger: sourceCallbackLedgerBenchmarkMode == true) : nil
+                captureCallbackLedger: sourceCallbackLedgerBenchmarkMode == true,
+                captureCallbackExecutionTime: sourceCallbackExecutionTimingBenchmarkMode == true) : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity,
                                           debugRenderAccounting: accounting, debugAcceptedPCMOrigin: originRecorder,
                                           debugFirstFailure: firstFailure)
@@ -2783,8 +2806,23 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertTrue(zip(prefix.tap, prefix.tap.dropFirst()).allSatisfy { before, after in before.end == after.first })
             XCTAssertFalse(prefix.failed); XCTAssertTrue(prefix.stableObservedPrefix)
             XCTAssertEqual(prefix.enteredBefore, UInt64(prefix.completedBefore))
+            let timingExpected = sourceCallbackExecutionTimingBenchmarkMode == true
+            XCTAssertEqual(ledger.capturesExecutionTime, timingExpected)
+            XCTAssertTrue(prefix.source.allSatisfy {
+                timingExpected ? $0.executionEntryHost > 0 && $0.executionEndHost >= $0.executionEntryHost
+                    : $0.executionEntryHost == 0 && $0.executionEndHost == 0
+            }, "Timing is qualified separately from supplied scheduled timestamps")
+            if timingExpected {
+                XCTAssertTrue(zip(prefix.source, prefix.source.dropFirst()).allSatisfy {
+                    before, after in before.executionEndHost <= after.executionEntryHost
+                }, "The sole source writer must retain nonoverlapping execution markers")
+            }
+            print("SourceCallbackExecutionSummary schema=1 armID=\(arm) enabled=\(ledger.capturesExecutionTime) records=\(prefix.source.count) endScope=before-final-ledger-publication excludesFinalLedgerAndSDKReturn=true clocksPerCallback=\(timingExpected ? 2 : 0) publication=after-cleanup durationIncludesPreemption=true physicalOutput=false acceptance=unchanged")
             // Fixed scalar fields; no reflection/type-name expansion or PCM dump.
             for s in prefix.source {
+                if timingExpected {
+                    print("SourceCallbackExecutionReceipt schema=1 armID=\(arm) ordinal=\(s.ordinal) entryHost=\(s.executionEntryHost) endHost=\(s.executionEndHost) entrySeconds=\(AVAudioTime.seconds(forHostTime: s.executionEntryHost)) endSeconds=\(AVAudioTime.seconds(forHostTime: s.executionEndHost)) scheduledHost=\(s.stamp.host) scheduledSeconds=\(AVAudioTime.seconds(forHostTime: s.stamp.host)) frames=\(s.frames) rate=\(s.stamp.rate)")
+                }
                 print("SourceCallbackReceipt schema=1 armID=\(arm) ordinal=\(s.ordinal) host=\(s.stamp.host) hostSeconds=\(AVAudioTime.seconds(forHostTime: s.stamp.host)) sample=\(s.stamp.sample) rate=\(s.stamp.rate) nativeFlags=\(s.stamp.nativeFlags) valid=\(s.stamp.valid) frames=\(s.frames) layout=\(s.buffers),\(s.channels0),\(s.channels1),\(s.bytes0),\(s.bytes1) result=\(s.result) kernel=\(s.entered),\(s.completed),\(s.requested),\(s.classified) disposition=\(s.copied),\(s.paused),\(s.inactive),\(s.eof),\(s.underrun) pairs=\(s.pairs) zeros=\(s.zeros) nonfinite=\(s.nonfinite) runCount=\(s.runCount) runs=\(s.first.first),\(s.first.end);\(s.second.first),\(s.second.end);\(s.third.first),\(s.third.end);\(s.fourth.first),\(s.fourth.end) flags=\(s.flags) token=\(s.token) visit=\(s.visit)")
             }
             for (ordinal, t) in prefix.tap.enumerated() {

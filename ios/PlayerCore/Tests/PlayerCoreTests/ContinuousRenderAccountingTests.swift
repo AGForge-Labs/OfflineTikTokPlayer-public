@@ -8,6 +8,77 @@ import Synchronization
 
 /// Actual kernel branches, not a PCM-energy classifier or mocked render result.
 final class ContinuousRenderAccountingTests: XCTestCase {
+    func testCallbackExecutionTicksRejectOverlappingAdjacentReceipts() throws {
+        #if DEBUG
+        for nextEntry in [UInt64(200), 199] {
+            let ledger = ContinuousPCMRenderer.DebugSourceCallbackLedger(sourceCapacity: 2, tapCapacity: 1,
+                capturesExecutionTime: true)
+            let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+            let renderer = ContinuousPCMRenderer(channels: 2, prefixFrames: 2, ringFrames: 1,
+                debugRenderAccounting: accounting)
+            XCTAssertTrue([Float(0.5), -0.5, 0.25, -0.25].withUnsafeBufferPointer {
+                renderer.source(at: 0).prepare(token: 7, totalFrames: 2, prefix: $0)
+            })
+            renderer.select(token: 7); renderer.setPlaying(true)
+            for (entry, exit) in [(UInt64(100), UInt64(200)), (nextEntry, 300)] {
+                ledger.beginSource(stamp: .init(host: 999, rate: 48_000, valid: 1), frames: 1,
+                    counters: accounting.renderWriterCounters(), executionEntryHost: entry)
+                accounting.sourceCallbackEntered(frames: 1, hostTimeValid: true, hostTime: 999)
+                ledger.layout(buffers: 2, channels0: 1, channels1: 1, bytes0: 4, bytes1: 4, dataPresent: true)
+                var output = [Float](repeating: -1, count: 2)
+                output.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+                ledger.observeChunk(accounting.renderWriterCounters())
+                ledger.writtenPair(left: output[0], right: output[1])
+                accounting.sourceCallbackCompleted(frames: 1, invalidLayout: false)
+                ledger.endSource(result: 0, counters: accounting.renderWriterCounters(), executionEndHost: exit)
+            }
+            XCTAssertEqual(ledger.prefix().failed, nextEntry < 200)
+            XCTAssertEqual(ledger.prefix().source.count, 2)
+            XCTAssertEqual(renderer.snapshot.frame, 2)
+        }
+        #else
+        XCTFail("Callback timing calibration requires DEBUG")
+        #endif
+    }
+
+    func testCallbackExecutionTicksRequireQualifiedMonotonicEnabledPairs() throws {
+        #if DEBUG
+        for (enabled, entry, exit, rejected) in [
+            (false, UInt64(0), UInt64(0), false), (true, 100, 200, false),
+            (true, 0, 200, true), (true, 200, 100, true), (false, 100, 200, true)
+        ] {
+            let ledger = ContinuousPCMRenderer.DebugSourceCallbackLedger(sourceCapacity: 1, tapCapacity: 1,
+                capturesExecutionTime: enabled)
+            let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+            let renderer = ContinuousPCMRenderer(channels: 2, prefixFrames: 1, ringFrames: 1,
+                debugRenderAccounting: accounting)
+            XCTAssertTrue([Float(0.5), -0.5].withUnsafeBufferPointer {
+                renderer.source(at: 0).prepare(token: 7, totalFrames: 1, prefix: $0)
+            })
+            renderer.select(token: 7); renderer.setPlaying(true)
+            ledger.beginSource(stamp: .init(host: 999, sample: 123, rate: 48_000, valid: 3), frames: 1,
+                counters: accounting.renderWriterCounters(), executionEntryHost: entry)
+            accounting.sourceCallbackEntered(frames: 1, hostTimeValid: true, hostTime: 999)
+            ledger.layout(buffers: 2, channels0: 1, channels1: 1, bytes0: 4, bytes1: 4, dataPresent: true)
+            var output = [Float](repeating: -1, count: 2)
+            output.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 1) }
+            ledger.observeChunk(accounting.renderWriterCounters())
+            ledger.writtenPair(left: output[0], right: output[1])
+            accounting.sourceCallbackCompleted(frames: 1, invalidLayout: false)
+            ledger.endSource(result: 0, counters: accounting.renderWriterCounters(), executionEndHost: exit)
+            XCTAssertEqual(output, [0.5, -0.5], "Observation must preserve actual copied samples")
+            let prefix = ledger.prefix(), receipt = try XCTUnwrap(prefix.source.first)
+            XCTAssertEqual(prefix.failed, rejected); XCTAssertEqual(prefix.source.count, 1)
+            XCTAssertEqual(receipt.executionEntryHost, entry); XCTAssertEqual(receipt.executionEndHost, exit)
+            XCTAssertEqual(receipt.stamp.host, 999, "Scheduled time remains separate from execution time")
+            XCTAssertEqual(receipt.zeros, 0); XCTAssertEqual(receipt.copied, 1)
+            XCTAssertEqual(renderer.snapshot.frame, 1)
+        }
+        #else
+        XCTFail("Callback timing calibration requires DEBUG")
+        #endif
+    }
+
     func testCallbackLedgerDistinguishesCopiedZeroPauseAndUnavailablePrefixes() throws {
         #if DEBUG
         let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder(captureCallbackLedger: true)

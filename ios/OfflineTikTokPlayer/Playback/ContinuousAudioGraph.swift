@@ -1,6 +1,9 @@
 import AVFoundation
 import PlayerCore
 import Synchronization
+#if DEBUG
+import Darwin
+#endif
 
 /// The graph survives item, loop and presentation changes. Only the kernel's
 /// cursor changes at a prepared boundary. No AVPlayerItem carries audible audio.
@@ -45,6 +48,21 @@ final class ContinuousAudioGraph {
         return max(0, Double(anchor.frame) / 48_000 + hostTime.seconds - anchor.hostEnd - source.outputPresentationLatency)
     }
 
+    #if DEBUG
+    // Store-level calibration only: the caller is the sole offline manual-render owner
+    // and must not overlap this publication with renderOffline. No SDK callback is replaced.
+    @MainActor func debugPublishSyntheticRenderAnchor(_ sample: ContinuousPCMRenderer.Snapshot,
+        hostEnd: Double) -> Bool {
+        guard engine.isInManualRenderingMode, engine.manualRenderingMode == .offline,
+              sample.token > 0, sample.visit > 0, sample.frame >= 0, hostEnd.isFinite else { return false }
+        anchor.publish(sample, hostEnd: hostEnd)
+        return true
+    }
+    @MainActor var debugRenderAnchorPublicationSequence: Int {
+        anchor.sequence.load(ordering: .sequentiallyConsistent)
+    }
+    #endif
+
     private final class RenderStorage: @unchecked Sendable {
         let renderer: ContinuousPCMRenderer
         #if DEBUG
@@ -70,12 +88,15 @@ final class ContinuousAudioGraph {
         source = AVAudioSourceNode(format: format) { isSilence, timestamp, count, audioBufferList in
             #if DEBUG
             let receipts = storage.debugRenderAccounting?.callbackLedger
+            // Optional diagnostic clocks only. End is before final ledger publication,
+            // not an assertion that the SDK has returned from this closure.
+            let executionEntryHost = receipts?.capturesExecutionTime == true ? mach_absolute_time() : 0
             if let receipts, let accounting = storage.debugRenderAccounting {
                 let value = timestamp.pointee
                 receipts.beginSource(stamp: .init(host: value.mHostTime, sample: value.mSampleTime, rate: 48_000,
                     nativeFlags: value.mFlags.rawValue,
                     valid: (value.mFlags.contains(.hostTimeValid) ? 1 : 0) | (value.mFlags.contains(.sampleTimeValid) ? 2 : 0)),
-                    frames: count, counters: accounting.renderWriterCounters())
+                    frames: count, counters: accounting.renderWriterCounters(), executionEntryHost: executionEntryHost)
             }
             storage.debugRenderAccounting?.sourceCallbackEntered(frames: Int(count),
                 hostTimeValid: timestamp.pointee.mFlags.contains(.hostTimeValid),
@@ -102,7 +123,8 @@ final class ContinuousAudioGraph {
                 #if DEBUG
                 storage.debugRenderAccounting?.sourceCallbackCompleted(frames: Int(count), invalidLayout: true)
                 if let accounting = storage.debugRenderAccounting {
-                    receipts?.endSource(result: kAudio_ParamError, counters: accounting.renderWriterCounters())
+                    receipts?.endSource(result: kAudio_ParamError, counters: accounting.renderWriterCounters(),
+                        executionEndHost: receipts?.capturesExecutionTime == true ? mach_absolute_time() : 0)
                 }
                 #endif
                 return kAudio_ParamError
@@ -144,7 +166,8 @@ final class ContinuousAudioGraph {
             #if DEBUG
             storage.debugRenderAccounting?.sourceCallbackCompleted(frames: Int(count), invalidLayout: false)
             if let accounting = storage.debugRenderAccounting {
-                receipts?.endSource(result: noErr, counters: accounting.renderWriterCounters())
+                receipts?.endSource(result: noErr, counters: accounting.renderWriterCounters(),
+                    executionEndHost: receipts?.capturesExecutionTime == true ? mach_absolute_time() : 0)
             }
             #endif
             return noErr
