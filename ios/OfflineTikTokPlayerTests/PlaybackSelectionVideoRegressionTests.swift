@@ -573,12 +573,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback() async throws {
-        try recordRuntimeHost()
         try await assertDefaultRetainedPreviousStart(priorExplicitSeek: true, unsynchronizedHostControl: true)
     }
 
     func testRetainedNativeHostControlStaleRequestKeepsProductionArgument() async throws {
-        try recordRuntimeHost()
         try await assertDefaultRetainedPreviousStart(priorExplicitSeek: false,
             unsynchronizedHostControl: true, mismatchedControlRequest: true)
     }
