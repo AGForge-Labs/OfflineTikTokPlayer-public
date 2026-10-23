@@ -34,6 +34,69 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private static var unresolvedFirstZeroCalibrationAudio: ContinuousAudioPlayer?
     #endif
 
+    func testFirstZeroCallbackRangeUsesActualStorageAcrossTapBuffers() throws {
+        #if DEBUG
+        let ledger = ContinuousPCMRenderer.DebugSourceCallbackLedger(sourceCapacity: 1, tapCapacity: 4)
+        let tap = ProductionSelectionOutputTap()
+        tap.callbackLedger = ledger
+        tap.begin()
+        tap.append(try firstZeroCalibrationBuffer(frames: 37, left: 0.2, right: -0.2),
+                   time: firstZeroCalibrationTime(0))
+        XCTAssertEqual(tap.stop(), 37)
+        let event = ProductionFirstStereoZeroEvent(window: 9, commandToken: 11, commandVisit: 3,
+            commandVersion: 8, enabled: true, recorder: .init())
+        XCTAssertTrue(tap.armFirstStereoZero(event))
+        let start = tap.begin(auditChannels: true)
+        tap.append(try firstZeroCalibrationBuffer(frames: 240), time: firstZeroCalibrationTime(37))
+        XCTAssertNil(event.snapshot(for: 9))
+        tap.append(try firstZeroCalibrationBuffer(frames: 240), time: firstZeroCalibrationTime(277))
+        let end = tap.stop(), frozen = try XCTUnwrap(event.snapshot(for: 9))
+        let audit = tap.channelAudit(), prefix = ledger.prefix()
+        XCTAssertEqual(start, 37); XCTAssertEqual(end, 517)
+        XCTAssertEqual(frozen.firstFrame, start); XCTAssertEqual(frozen.endFrame, end)
+        XCTAssertEqual(audit.firstFrame, start); XCTAssertEqual(audit.first?.frames, 480)
+        XCTAssertTrue(audit.stereoZeroEvidenceQualified); XCTAssertTrue(frozen.timelineContinuous)
+        XCTAssertFalse(prefix.failed); XCTAssertEqual(prefix.tap.count, 3)
+        XCTAssertEqual(prefix.tap.map(\.first), [0, 37, 277])
+        XCTAssertEqual(prefix.tap.map(\.end), [37, 277, 517])
+        XCTAssertTrue(prefix.tap.allSatisfy { $0.flags & 1 != 0 && $0.channels == 2 })
+        let crossing = prefix.tap.filter { Int($0.first) < frozen.endFrame && Int($0.end) > frozen.firstFrame }
+        XCTAssertEqual(crossing.count, 2)
+        XCTAssertEqual(crossing.first?.first, UInt32(start)); XCTAssertEqual(crossing.last?.end, UInt32(end))
+        print("FirstZeroCallbackRangeCalibration schema=1 actualTapAppend=true prefixFrames=37 eventFirst=37 eventEnd=517 crossingBuffers=2 relativeReturnedFirst=0 sampleOriginJoin=false sourcePlanesCalibrated=false playbackAcceptance=false")
+        #endif
+    }
+
+    func testFirstZeroSourceCallbacksOffThenOn() async throws {
+        try await runFirstZeroSourceCallbackComparison([false, true], order: "off-then-on")
+    }
+
+    func testFirstZeroSourceCallbacksOnThenOff() async throws {
+        try await runFirstZeroSourceCallbackComparison([true, false], order: "on-then-off")
+    }
+
+    private func runFirstZeroSourceCallbackComparison(_ modes: [Bool], order: String) async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        defer {
+            sourceCallbackExecutionTimingBenchmarkMode = nil
+            sourceCallbackLedgerBenchmarkMode = nil; sourceCallbackLedgerArmID = nil
+        }
+        for (ordinal, enabled) in modes.enumerated() {
+            sourceCallbackLedgerBenchmarkMode = enabled
+            sourceCallbackExecutionTimingBenchmarkMode = enabled
+            let armID = UUID().uuidString.lowercased()
+            sourceCallbackLedgerArmID = armID
+            print("FirstZeroSourceCallbackArm schema=1 armID=\(armID) order=\(order) ordinal=\(ordinal) enabled=\(enabled) actualZeroProbe=constant-on earlyAcquisition=nil pixelScans=0 sourceTapLedger=\(enabled) executionTiming=\(enabled) addedSampler=false observationPerturbation=measured-control originalGuards=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, firstZeroSourceCallbacks: enabled)
+            print("FirstZeroSourceCallbackArmEnd schema=1 armID=\(armID) helperReturned=true")
+        }
+        #else
+        XCTFail("Source callback/first-zero comparison requires DEBUG")
+        #endif
+    }
+
     private func recordRuntimeHost() throws {
         let process = ProcessInfo.processInfo
         var receipt: [String: Any] = ["schema": 1,
@@ -2817,12 +2880,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 initialNativeStartCurrentItemTime: Bool? = nil,
                                                 traceReturnedAStereoZero: Bool? = nil,
                                                 earlyClockAcquisition: Bool? = nil,
-                                                wholeFrameClockAcquisition: Bool? = nil) async throws {
+                                                wholeFrameClockAcquisition: Bool? = nil,
+                                                firstZeroSourceCallbacks: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
-        let returnedZeroEventMode: Bool? = traceReturnedAStereoZero ?? (wholeFrameClockAcquisition == nil ? nil : true)
-        if let enabled = wholeFrameClockAcquisition {
+        let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
+            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil ? nil : true)
+        if let enabled = firstZeroSourceCallbacks {
             guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
+                  wholeFrameClockAcquisition == nil, traceReturnedAStereoZero == nil,
+                  frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
+                  traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup, freshPreviousBundle == nil,
+                  queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == enabled,
+                  sourceCallbackExecutionTimingBenchmarkMode == enabled, sourceCallbackLedgerArmID != nil else {
+                XCTFail("Source callback observation varies only its existing ledger/timing bundle with a constant actual-zero probe")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("FirstZeroSourceCallbackScope schema=1 enabled=\(enabled) event=constant-on callbackReceipts=unconditional-before-event sourceCapacity=4096 tapCapacity=2048 sourceClockReads=\(enabled ? 2 : 0) tapClockReads=\(enabled ? 3 : 0) frameJoin=unqualified syntheticSilence=false playbackPolicy=unchanged")
+        }
+        if let enabled = wholeFrameClockAcquisition {
+            guard firstZeroSourceCallbacks == nil, traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
                   frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
                   traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup, freshPreviousBundle == nil,
                   queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
@@ -2836,7 +2916,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("WholeReturnedFrameBenchmark schema=1 acquisitionEnabled=\(enabled) targetPhase=2 captures=0 wholeFrameTrace=constant-on firstStereoZeroEvent=constant-on pixelScans=0 originalGuards=unchanged")
         }
         if let enabled = earlyClockAcquisition {
-            guard wholeFrameClockAcquisition == nil, traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
+            guard firstZeroSourceCallbacks == nil, wholeFrameClockAcquisition == nil, traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
                   !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
                   !auditSavedAAfterCleanup, freshPreviousBundle == nil, queuedPreviousLead == nil,
                   suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
@@ -2850,7 +2930,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("EarlyInitialAcquisitionBenchmark schema=1 enabled=\(enabled) targetPhase=2 captures=0 loadingAndClockPolicy=unchanged pixelScan=calibrated-full160x96 nativeReads=existing-only originalGuards=unchanged")
         }
         if let enabled = traceReturnedAStereoZero {
-            guard wholeFrameClockAcquisition == nil, traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
+            guard firstZeroSourceCallbacks == nil, wholeFrameClockAcquisition == nil, traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
                   !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
                   !auditSavedAAfterCleanup, freshPreviousBundle == nil, queuedPreviousLead == nil,
                   suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
@@ -2874,6 +2954,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if firstZeroSourceCallbacks != nil {
+            XCTFail("Source callback/first-zero comparison is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if wholeFrameClockAcquisition != nil {
             XCTFail("Whole-frame boundary control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3629,6 +3713,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 && returned.rate == 48_000 && returnedHole <= 0.5 / 48_000
                 && channelAudit.stereoZeroEvidenceQualified && !channelAudit.layout.changed
                 && channelAudit.nonfiniteFrames == 0 && channelAudit.observedFrames == returned.values.count)
+        if let enabled = firstZeroSourceCallbacks {
+            let event = firstZeroProbe?.event
+            let frozen = event.flatMap { $0.snapshot(for: $0.window) }
+            print("FirstZeroSourceCallbackRange schema=1 armID=\(sourceCallbackLedgerArmID ?? "missing") enabled=\(enabled) returnedStart=\(returnedStart.map(String.init) ?? "unavailable") returnedEnd=\(returnedEnd.map(String.init) ?? "unavailable") auditFirst=\(channelAudit.firstFrame) retainedCount=\(tap.count) eventFirst=\(frozen?.firstFrame ?? -1) eventEnd=\(frozen?.endFrame ?? -1) eventRelativeFirst=\(frozen.flatMap { e in returnedStart.map { e.firstFrame - $0 } }.map(String.init) ?? "unavailable") rangeOrigin=actual-tap-storage nodeSampleOriginJoin=false sourceToTapFrameJoin=false cleanupAcknowledged=\(mayRemoveFixture)")
+            if let start = returnedStart, let end = returnedEnd {
+                XCTAssertEqual(channelAudit.firstFrame, start)
+                XCTAssertEqual(end - start, channelAudit.observedFrames)
+            } else { XCTFail("Actual returned tap-storage endpoints are required for callback index attribution") }
+        }
         #endif
         print("ProductionSelectionReturnedChannelAudit schema=1 minimumRunFrames=\(channelAudit.minimumRunFrames) observedFrames=\(channelAudit.observedFrames) monoZeroFrames=\(channelAudit.monoZeroFrames) stereoZeroFrames=\(channelAudit.stereoZeroFrames) leftSquareSum=\(channelAudit.leftSquareSum) rightSquareSum=\(channelAudit.rightSquareSum) nonfiniteFrames=\(channelAudit.nonfiniteFrames) qualifiedRuns=\(channelAudit.qualifiedRuns) retainedRuns=\(channelAudit.retainedRuns) capacity=4 droppedRuns=\(channelAudit.droppedRuns) overflow=\(channelAudit.overflow) layoutObserved=\(channelAudit.layout.buffers > 0) layoutBuffers=\(channelAudit.layout.buffers) layoutFrames=\(channelAudit.layout.frames) firstChannelCount=\(channelAudit.layout.firstChannelCount) lastChannelCount=\(channelAudit.layout.lastChannelCount) firstInterleaved=\(channelAudit.layout.firstInterleaved) lastInterleaved=\(channelAudit.layout.lastInterleaved) firstSampleRate=\(channelAudit.layout.firstRate) lastSampleRate=\(channelAudit.layout.lastRate) layoutChanged=\(channelAudit.layout.changed) monoDuplicatedFrames=\(channelAudit.layout.monoDuplicatedFrames) stereoInputFrames=\(channelAudit.layout.stereoInputFrames) otherInputFrames=\(channelAudit.layout.otherInputFrames) stereoZeroEvidenceQualified=\(channelAudit.stereoZeroEvidenceQualified) layoutScope=retained-audited-buffers interleavedScope=first-existing-left-index-read exactMonoZero=true playbackAcceptance=unchanged")
         XCTAssertEqual(channelAudit.observedFrames, returned.values.count)
