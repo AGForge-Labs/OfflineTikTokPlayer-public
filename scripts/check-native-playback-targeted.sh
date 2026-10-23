@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=cd512041f670a0d54c386751d4cb9e9f4a441518
-expected_ios_tree=b3d5b085e50e8ef5c77a54d77e2d69d9c2115071
+expected_code_source=4a16da292318299e7063701156cb349526eb7ea0
+expected_ios_tree=7607fab90104204c52cceb16185d041aaa470538
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testSourceCallbackExecutionTimingOffThenOn',
-    'testSourceAndTapExecutionTimingOnThenOff',
-    'testFirstZeroSourceCallbacksOffThenOn',
-    'testFirstZeroSourceCallbacksOnThenOff',
+    'testSourceAndPresentationClockBoundariesOffThenOn',
+    'testSourceAndPresentationClockBoundariesOnThenOff',
+    'testCAPClockBoundaryOffThenOn',
+    'testCAPClockBoundaryOnThenOff',
 )
 
 def require(condition, message):
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testSourceCallbackExecutionTimingOffThenOn testSourceAndTapExecutionTimingOnThenOff testFirstZeroSourceCallbacksOffThenOn testFirstZeroSourceCallbacksOnThenOff) ;;
+  controls) cases=(testSourceAndPresentationClockBoundariesOffThenOn testSourceAndPresentationClockBoundariesOnThenOff testCAPClockBoundaryOffThenOn testCAPClockBoundaryOnThenOff) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
