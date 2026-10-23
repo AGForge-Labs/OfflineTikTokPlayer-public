@@ -66,6 +66,28 @@ final class PlaybackService: NSObject {
     }
     // Isolated request only; nil preserves the original numeric argument.
     @ObservationIgnored var debugInitialNativeStartControl: DebugInitialNativeStartControl?
+    struct DebugEarlyClockAcquisitionControl: Sendable {
+        let request: Int
+        let enabled: Bool
+    }
+    struct DebugEarlyClockAcquisitionAttempt: Sendable {
+        let request: Int, enabled: Bool
+        let ticket: ContinuousPictureInPicture.PresentationTicket
+        let sample: ContinuousPCMRenderer.Snapshot
+        let before: DebugAlignedVideoPollState, after: DebugAlignedVideoPollState
+        let entryNs: UInt64, returnNs: UInt64
+        let stoppedReadEntryNs: UInt64, stoppedReadReturnNs: UInt64
+        let stoppedRawPosition: Double?, stoppedEffectiveRate: Double?
+        let activated: Bool, ownerStillCurrent: Bool, bindingStillPending: Bool
+        let readyBefore: Int?, readyAfter: Int?
+        let loadingBefore: Bool, loadingAfter: Bool
+    }
+    @ObservationIgnored var debugEarlyClockAcquisitionControl: DebugEarlyClockAcquisitionControl? {
+        didSet { debugEarlyClockAcquisitionAttemptedRequest = nil; debugLastOrdinaryPositionRead = nil }
+    }
+    @ObservationIgnored private var debugEarlyClockAcquisitionAttemptedRequest: Int?
+    @ObservationIgnored private var debugLastOrdinaryPositionRead: DebugVideoPositionRead?
+    @ObservationIgnored var onDebugEarlyClockAcquisition: ((DebugEarlyClockAcquisitionAttempt) -> Void)?
     struct DebugVideoRateHandoff: Sendable {
         let cause: DebugVideoRateHandoffCause
         let request: Int, entryGeneration: Int, returnGeneration: Int
@@ -1720,7 +1742,7 @@ final class PlaybackService: NSObject {
             let position = read()
             let returned = DispatchTime.now().uptimeNanoseconds
             let returnedPresentation = videoPresentation
-            observer(DebugVideoPositionRead(kind: kind, item: ObjectIdentifier(item),
+            let stamp = DebugVideoPositionRead(kind: kind, item: ObjectIdentifier(item),
                 request: request, returnGeneration: generation, entryNs: entered, returnNs: returned,
                 position: position, observedItemMatches: observedItem === item,
                 presentationUnchanged: presentation != nil
@@ -1730,7 +1752,13 @@ final class PlaybackService: NSObject {
                 presentationTicket: presentation?.ticket, returnPresentationTicket: returnedPresentation?.ticket,
                 entrySeekState: enteredSeek, returnSeekState: continuousPiP.debugNativeSeekState,
                 itemTimebaseEffectiveRate: sampledEffectiveRate,
-                rawItemTimebasePosition: sampledRawPosition))
+                rawItemTimebasePosition: sampledRawPosition)
+            observer(stamp)
+            // An observer can make a nested read. Cache this outer result only
+            // after delivery so that the decision never adopts a nested stamp.
+            if debugEarlyClockAcquisitionControl?.request == request, generation == request {
+                debugLastOrdinaryPositionRead = stamp
+            }
             return position
         }
         #endif
@@ -1843,6 +1871,52 @@ final class PlaybackService: NSObject {
            initialClockSnapshotMatches(binding, sample) {
             binding.selectionVersion = sample.selectionVersion
             pendingInitialClockBinding = binding
+            #if DEBUG
+            if let control = debugEarlyClockAcquisitionControl, control.request == request,
+               debugEarlyClockAcquisitionAttemptedRequest != request,
+               binding.accepted, binding.nativeSeek == nil, readyGeneration == nil, isLoading,
+               let read = debugLastOrdinaryPositionRead,
+               let readBracketEntry = ordinaryDriftReadEntryNs, let readBracketReturn = ordinaryDriftReadReturnNs,
+               read.entryNs >= readBracketEntry, read.returnNs <= readBracketReturn,
+               read.request == request, read.returnGeneration == request, read.item == ObjectIdentifier(item),
+               read.rawItemTimebasePosition == 0, read.itemTimebaseEffectiveRate == 0, read.position.isNaN,
+               sampledNativePosition?.isNaN == true,
+               read.observedItemMatches, read.presentationUnchanged,
+               read.presentationTicket == binding.ticket, read.returnPresentationTicket == binding.ticket,
+               read.entrySeekState.serial == 0, read.returnSeekState.serial == 0,
+               read.entrySeekState.activeTicket == nil, read.returnSeekState.activeTicket == nil,
+               intent.canPlay, videoAllowed {
+                // Acquisition-only experiment. The existing decision has already
+                // revalidated the SDK item and exact consumed PCM owner. Neither
+                // arm transfers loading/readiness or changes native start/seek policy.
+                debugEarlyClockAcquisitionAttemptedRequest = request
+                let before = debugAlignedVideoPollState
+                let readyBefore = readyGeneration, loadingBefore = isLoading
+                let entered = DispatchTime.now().uptimeNanoseconds
+                let activated = control.enabled ? continuousPiP.activate(binding.ticket) : false
+                let returned = DispatchTime.now().uptimeNanoseconds
+                let fresh = continuousAudio.snapshot // Matched additional read in OFF and ON.
+                let ownerStillCurrent = pendingInitialClockBinding == binding
+                    && ownsInitialClockBinding(binding, item: item)
+                    && initialClockSnapshotMatches(binding, fresh) && intent.canPlay && videoAllowed
+                let after = debugAlignedVideoPollState
+                onDebugEarlyClockAcquisition?(DebugEarlyClockAcquisitionAttempt(
+                    request: request, enabled: control.enabled, ticket: binding.ticket, sample: sample,
+                    before: before, after: after, entryNs: entered, returnNs: returned,
+                    stoppedReadEntryNs: read.entryNs, stoppedReadReturnNs: read.returnNs,
+                    stoppedRawPosition: read.rawItemTimebasePosition, stoppedEffectiveRate: read.itemTimebaseEffectiveRate,
+                    activated: activated, ownerStillCurrent: ownerStillCurrent,
+                    bindingStillPending: pendingInitialClockBinding == binding,
+                    readyBefore: readyBefore, readyAfter: readyGeneration,
+                    loadingBefore: loadingBefore, loadingAfter: isLoading))
+                // Activation and the optional observer can reenter. Never revive
+                // this binding over pause, explicit seek or a newer source/visit.
+                let afterObserver = continuousAudio.snapshot
+                guard ownerStillCurrent, pendingInitialClockBinding == binding,
+                      ownsInitialClockBinding(binding, item: item), intent.canPlay, videoAllowed,
+                      initialClockSnapshotMatches(binding, afterObserver) else { return }
+            }
+            #endif
             if let native = sampledNativePosition, let goal = sampledAudioGoal,
                native.isFinite, goal.isFinite, abs(native - goal) <= 0.080 {
                 // The existing read proved application; command return never did.

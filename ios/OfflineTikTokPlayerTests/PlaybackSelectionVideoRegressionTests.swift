@@ -856,6 +856,187 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testEarlyInitialClockAcquisitionOffThenOn() async throws {
+        try recordRuntimeHost()
+        for (ordinal, enabled) in [false, true].enumerated() {
+            print("EarlyInitialAcquisitionArm schema=1 order=off-then-on ordinal=\(ordinal) enabled=\(enabled) target=returned-A readinessAndClockConvergence=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, earlyClockAcquisition: enabled)
+        }
+    }
+
+    func testEarlyInitialClockAcquisitionOnThenOff() async throws {
+        try recordRuntimeHost()
+        for (ordinal, enabled) in [true, false].enumerated() {
+            print("EarlyInitialAcquisitionArm schema=1 order=on-then-off ordinal=\(ordinal) enabled=\(enabled) target=returned-A readinessAndClockConvergence=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, earlyClockAcquisition: enabled)
+        }
+    }
+
+    #if DEBUG
+    /// Scalars from the sole actual copy and a later normal acquisition entry.
+    /// Joining cached submitted credit never asks the output for another image.
+    @MainActor private final class EarlyInitialAcquisitionTrace {
+        struct Pixel {
+            let context: ContinuousPictureInPicture.DebugCopiedPixelContext
+            let before: ContinuousPCMRenderer.Snapshot, after: ContinuousPCMRenderer.Snapshot
+            let beforeCount: UInt64, enteredNs: UInt64, returnedNs: UInt64, auditNs: UInt64
+            let copyOrdinal: UInt64
+            let ownerQualified: Bool, bin: Int, colors: PausedFirstFrameTrace.PixelColors?
+            var joinedNs: UInt64 = 0
+            var joinedCopyOrdinal: UInt64 = 0
+            var joinedSample: ContinuousPCMRenderer.Snapshot?
+        }
+        let request: Int, enabled: Bool
+        let mediaID: String
+        private var attempted: PlaybackService.DebugEarlyClockAcquisitionAttempt?
+        private var attempts = 0, overflow = false, stopped = false, copyWindowClosed = false
+        private var anchorNs: UInt64?, positive: PlaybackService.DebugVideoPositionRead?
+        private var lastStopped: PlaybackService.DebugVideoPositionRead?
+        private var pixels: [Pixel] = []
+        private var bins: UInt16 = 0
+        private var actualCopyOrdinal: UInt64 = 0
+        init(request: Int, enabled: Bool, mediaID: String) {
+            self.request = request; self.enabled = enabled; self.mediaID = mediaID
+            pixels.reserveCapacity(9)
+        }
+        func recordAttempt(_ value: PlaybackService.DebugEarlyClockAcquisitionAttempt) {
+            guard !stopped, value.request == request else { return }
+            attempts += 1
+            if attempted == nil { attempted = value } else { overflow = true }
+        }
+        func recordNative(_ value: PlaybackService.DebugVideoPositionRead) {
+            guard !stopped, value.request == request, value.returnGeneration == request,
+                  value.kind == .itemTimebase, value.observedItemMatches, value.presentationUnchanged,
+                  value.presentationRequest == request, value.returnPresentationRequest == request,
+                  value.entrySeekState.serial == 0, value.returnSeekState.serial == 0,
+                  value.entrySeekState.activeTicket == nil, value.returnSeekState.activeTicket == nil else { return }
+            if anchorNs == nil { anchorNs = value.entryNs }
+            if value.position.isFinite, value.position > 0,
+               let raw = value.rawItemTimebasePosition, raw.isFinite, raw > 0,
+               let rate = value.itemTimebaseEffectiveRate, rate.isFinite, rate > 0 {
+                if positive == nil { positive = value }
+            } else if positive == nil, value.rawItemTimebasePosition == 0,
+                      value.itemTimebaseEffectiveRate == 0, value.position.isNaN { lastStopped = value }
+        }
+        private func owns(_ value: PlaybackService.DebugAlignedVideoPollState,
+                          _ receipt: ContinuousPictureInPicture.CurrentFrameReceipt) -> Bool {
+            let frame = value.frame
+            return value.generation == request && value.request == request && value.presentationMatches
+                && value.observedItemMatches && frame.coherent && frame.ticket == receipt.ticket
+                && frame.output == receipt.output && frame.seekSerial == receipt.seekSerial
+                && frame.activeSeekTicket == nil && frame.imageEpoch == receipt.imageEpoch
+        }
+        func recordCopy(_ pixel: CVPixelBuffer, context: ContinuousPictureInPicture.DebugCopiedPixelContext,
+                        service: PlaybackService) {
+            guard !stopped else { return }
+            let ownerBefore = service.debugAlignedVideoPollState
+            guard service.queue.currentID == mediaID, ownerBefore.request == request else { return }
+            // EVERY target actual copy invalidates an older uncredited sample,
+            // even when this copy is outside the window or in an already-audited bin.
+            guard actualCopyOrdinal < .max else { overflow = true; return }
+            actualCopyOrdinal += 1
+            guard !copyWindowClosed, let anchorNs else { return }
+            let entered = DispatchTime.now().uptimeNanoseconds
+            guard entered >= anchorNs, entered - anchorNs <= 750_000_000 else { copyWindowClosed = true; return }
+            let raw = context.rawDisplayTime
+            let bin = raw.isNumeric && raw.seconds >= 0 && raw.seconds < 1 ? Int(floor(raw.seconds * 8 + 1e-9)) : -1
+            let bit: UInt16 = 1 << (bin >= 0 && bin < 8 ? bin : 8)
+            guard bins & bit == 0 else { return }
+            bins |= bit
+            guard pixels.count < 9 else { overflow = true; return }
+            let before = service.audioSnapshot, count = service.submittedVideoFrameCount
+            let began = DispatchTime.now().uptimeNanoseconds
+            let colors = PausedFirstFrameTrace.pixelColors(pixel) // Same calibrated full160x96 scan.
+            let audit = DispatchTime.now().uptimeNanoseconds - began
+            let after = service.audioSnapshot
+            let ownerAfter = service.debugAlignedVideoPollState
+            pixels.append(Pixel(context: context, before: before, after: after,
+                beforeCount: count, enteredNs: entered, returnedNs: DispatchTime.now().uptimeNanoseconds,
+                auditNs: audit, copyOrdinal: actualCopyOrdinal,
+                ownerQualified: owns(ownerBefore, context.pull) && owns(ownerAfter, context.pull)
+                    && service.queue.currentID == mediaID,
+                bin: bin, colors: colors))
+        }
+        func observePriorCredit(_ receipt: ContinuousPictureInPicture.CurrentFrameReceipt,
+                                service: PlaybackService) {
+            guard !stopped, pixels.contains(where: { $0.joinedNs == 0 }) else { return }
+            let owner = service.debugAlignedVideoPollState
+            guard owns(owner, receipt), service.queue.currentID == mediaID else { return }
+            let count = service.submittedVideoFrameCount, pts = service.videoFramePositionSeconds
+            let sample = service.audioSnapshot
+            for index in pixels.indices {
+                let row = pixels[index], raw = row.context.rawDisplayTime
+                guard row.joinedNs == 0, row.copyOrdinal == actualCopyOrdinal,
+                      row.context.pull == receipt, raw.isNumeric,
+                      row.beforeCount < .max, count == row.beforeCount + 1,
+                      let pts, pts.isFinite, abs(pts - raw.seconds) <= 1 / 48_000,
+                      sample.token == row.after.token, sample.visit == row.after.visit,
+                      sample.selectionVersion == row.after.selectionVersion, sample.frame >= row.after.frame,
+                      !sample.ended else { continue }
+                pixels[index].joinedSample = sample
+                pixels[index].joinedCopyOrdinal = actualCopyOrdinal
+                pixels[index].joinedNs = DispatchTime.now().uptimeNanoseconds
+            }
+        }
+        func stop() { stopped = true }
+        func dumpAndAssert(cleanupAcknowledged: Bool) {
+            print("EarlyInitialAcquisitionScope schema=1 enabled=\(enabled) request=\(request) attempts=\(attempts) capacity=9 retained=\(pixels.count) overflow=\(overflow) nativeAnchorNs=\(anchorNs ?? 0) positiveEntryNs=\(positive?.entryNs ?? 0) lastStoppedEntryNs=\(lastStopped?.entryNs ?? 0) windowNs=750000000 maximumScans=9 copiedPixelsBorrowed=true extraConsumingCopies=0 nativeClockAtomic=false compositorProof=false cleanupAcknowledged=\(cleanupAcknowledged) acquisitionOnly=true readinessPolicy=unchanged")
+            XCTAssertTrue(stopped && cleanupAcknowledged); XCTAssertFalse(overflow)
+            XCTAssertEqual(attempts, 1); XCTAssertNotNil(attempted); XCTAssertNotNil(positive)
+            guard let attempt = attempted else { return }
+            XCTAssertEqual(attempt.enabled, enabled); XCTAssertEqual(attempt.activated, enabled)
+            XCTAssertTrue(attempt.ownerStillCurrent && attempt.bindingStillPending)
+            XCTAssertNil(attempt.readyBefore); XCTAssertEqual(attempt.readyBefore, attempt.readyAfter)
+            XCTAssertTrue(attempt.loadingBefore); XCTAssertEqual(attempt.loadingBefore, attempt.loadingAfter)
+            XCTAssertEqual(attempt.stoppedRawPosition, 0); XCTAssertEqual(attempt.stoppedEffectiveRate, 0)
+            XCTAssertGreaterThan(attempt.stoppedReadEntryNs, 0)
+            XCTAssertLessThanOrEqual(attempt.stoppedReadReturnNs, attempt.entryNs)
+            XCTAssertFalse(attempt.before.frame.coherent)
+            XCTAssertEqual(attempt.after.frame.coherent, enabled)
+            print("EarlyInitialAcquisitionAttempt schema=1 enabled=\(enabled) request=\(request) entryNs=\(attempt.entryNs) returnNs=\(attempt.returnNs) stoppedReadEntryNs=\(attempt.stoppedReadEntryNs) stoppedReadReturnNs=\(attempt.stoppedReadReturnNs) stoppedRaw=\(attempt.stoppedRawPosition ?? -1) stoppedRate=\(attempt.stoppedEffectiveRate ?? -1) activated=\(attempt.activated) ownerStillCurrent=\(attempt.ownerStillCurrent) bindingStillPending=\(attempt.bindingStillPending) token=\(attempt.sample.token) visit=\(attempt.sample.visit) selectionVersion=\(attempt.sample.selectionVersion) readyBefore=\(attempt.readyBefore ?? -1) readyAfter=\(attempt.readyAfter ?? -1) loadingBefore=\(attempt.loadingBefore) loadingAfter=\(attempt.loadingAfter) epochBefore=\(attempt.before.frame.imageEpoch) epochAfter=\(attempt.after.frame.imageEpoch) outputBefore=\(String(describing: attempt.before.frame.output)) outputAfter=\(String(describing: attempt.after.frame.output))")
+            var early: [Pixel] = []
+            for (index, row) in pixels.enumerated() {
+                let colors = row.colors, raw = row.context.rawDisplayTime
+                let pixelMatches = row.bin >= 0 && row.bin < 8 && colors?.backgroundRed == true
+                    && colors?.blueCount == 384 && colors?.minX == row.bin * 10
+                    && colors?.maxX == row.bin * 10 + 15 && colors?.minY == 0 && colors?.maxY == 23
+                let owner = row.ownerQualified && row.context.pull.ticket == attempt.ticket
+                    && row.before.token == attempt.sample.token && row.after.token == attempt.sample.token
+                    && row.before.visit == attempt.sample.visit && row.after.visit == attempt.sample.visit
+                    && row.before.selectionVersion == attempt.sample.selectionVersion
+                    && row.after.selectionVersion == attempt.sample.selectionVersion && row.after.frame >= row.before.frame
+                    && !row.before.ended && !row.after.ended
+                let beforePositive = row.joinedNs > 0 && positive.map { row.joinedNs < $0.entryNs
+                    && $0.item == attempt.ticket.debugItemIdentity
+                    && $0.presentationTicket == attempt.ticket && $0.returnPresentationTicket == attempt.ticket } == true
+                let laterStopped = row.joinedNs > 0 && lastStopped.map { row.joinedNs < $0.entryNs
+                    && $0.item == attempt.ticket.debugItemIdentity
+                    && $0.presentationTicket == attempt.ticket && $0.returnPresentationTicket == attempt.ticket } == true
+                let requested = row.context.requestedTime
+                let aligned = raw.isNumeric && requested.isNumeric && raw.epoch == 0 && requested.epoch == 0 && raw.seconds.isFinite
+                    && requested.seconds.isFinite && abs(raw.seconds - requested.seconds) <= 0.080
+                print("EarlyInitialAcquisitionPixel schema=1 enabled=\(enabled) ordinal=\(index) copyOrdinal=\(row.copyOrdinal) joinedCopyOrdinal=\(row.joinedCopyOrdinal) bin=\(row.bin) rawNumeric=\(raw.isNumeric) rawEpoch=\(raw.epoch) requestedEpoch=\(requested.epoch) rawPTS=\(raw.isNumeric ? raw.seconds : -1) requestedPTS=\(requested.seconds) alignmentQualified=\(aligned) auditNs=\(row.auditNs) enteredNs=\(row.enteredNs) returnedNs=\(row.returnedNs) joinedNs=\(row.joinedNs) pixelMatches=\(pixelMatches) sourceOwnerQualified=\(owner) beforeFirstObservedPositive=\(beforePositive) followedByStoppedRead=\(laterStopped) minX=\(colors?.minX ?? -1) maxX=\(colors?.maxX ?? -1) minY=\(colors?.minY ?? -1) maxY=\(colors?.maxY ?? -1) blueCount=\(colors?.blueCount ?? 0) frameBefore=\(row.before.frame) frameAfter=\(row.after.frame) beforeSubmittedCount=\(row.beforeCount) epoch=\(row.context.pull.imageEpoch) seekSerial=\(row.context.pull.seekSerial) ticket=\(row.context.pull.ticket.debugGeneration) output=\(row.context.pull.output) creditScope=later-normal-acquisition-entry actualEnqueueTime=bracketed-not-measured sourceObservations=separate copiedPixelRetained=false")
+                if row.joinedNs > 0 {
+                    XCTAssertNotNil(colors); XCTAssertTrue(owner)
+                    XCTAssertEqual(row.copyOrdinal, row.joinedCopyOrdinal)
+                    if raw.isNumeric { XCTAssertTrue(pixelMatches, "Actual credited fixture pixels must match their raw decoded time, not a timestamp fallback") }
+                }
+                if owner && pixelMatches && aligned && beforePositive && laterStopped { early.append(row) }
+            }
+            let useful = early.indices.contains { i in early.indices.contains { j in
+                j > i && early[j].context.rawDisplayTime.seconds > early[i].context.rawDisplayTime.seconds
+                    && early[j].bin != early[i].bin
+                    && early[j].context.pull == early[i].context.pull
+            } }
+            print("EarlyInitialAcquisitionResult schema=1 enabled=\(enabled) qualifiedEarlyFrames=\(early.count) usefulMovingPair=\(useful) completeReadinessBenefit=unproven nativeClockAtCopy=unverified speakerOutput=unverified")
+            if enabled { XCTAssertTrue(useful, "The intervention must demonstrate actual changing aligned pixels credited before the first observed positive clock read") }
+            else { XCTAssertEqual(early.count, 0, "The unchanged activation gate is the control") }
+        }
+    }
+    #endif
+
     func testFirstStereoZeroEventOffThenOn() async throws {
         try recordRuntimeHost()
         for (ordinal, enabled) in [false, true].enumerated() {
@@ -2506,9 +2687,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 queuedPreviousLead: Bool? = nil,
                                                 traceReturnedAProducerBoundary: Bool? = nil,
                                                 initialNativeStartCurrentItemTime: Bool? = nil,
-                                                traceReturnedAStereoZero: Bool? = nil) async throws {
+                                                traceReturnedAStereoZero: Bool? = nil,
+                                                earlyClockAcquisition: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if let enabled = earlyClockAcquisition {
+            guard traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
+                  !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
+                  !auditSavedAAfterCleanup, freshPreviousBundle == nil, queuedPreviousLead == nil,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, traceReturnedAStereoZero == nil,
+                  acceptedPCMOriginBenchmarkMode == nil, sourceOutputBenchmarkMode == nil,
+                  sourceCallbackLedgerBenchmarkMode == nil else {
+                XCTFail("Early acquisition varies only request-scoped activation with constant startup/clock/pixel observations")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("EarlyInitialAcquisitionBenchmark schema=1 enabled=\(enabled) targetPhase=2 captures=0 loadingAndClockPolicy=unchanged pixelScan=calibrated-full160x96 nativeReads=existing-only originalGuards=unchanged")
+        }
         if let enabled = traceReturnedAStereoZero {
             guard traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
                   !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
@@ -2534,6 +2730,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if earlyClockAcquisition != nil {
+            XCTFail("Early acquisition control is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if traceReturnedAStereoZero != nil {
             XCTFail("First-zero control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -2776,6 +2976,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 service.onDebugVideoPositionRead = { [weak handoffTrace] value in handoffTrace?.record(value) }
             }
         }
+        let earlyAcquisitionTrace = earlyClockAcquisition.map {
+            EarlyInitialAcquisitionTrace(request: service.debugInitialVideoReadyState.generation + 3,
+                enabled: $0, mediaID: fixture.aID)
+        }
+        if let earlyAcquisitionTrace {
+            service.debugEarlyClockAcquisitionControl = .init(request: earlyAcquisitionTrace.request,
+                enabled: earlyAcquisitionTrace.enabled)
+            service.onDebugEarlyClockAcquisition = { [weak earlyAcquisitionTrace] value in
+                earlyAcquisitionTrace?.recordAttempt(value)
+            }
+            let originalReadObserver = service.onDebugVideoPositionRead
+            service.onDebugVideoPositionRead = { [weak earlyAcquisitionTrace] value in
+                originalReadObserver?(value); earlyAcquisitionTrace?.recordNative(value)
+            }
+            service.onDebugCopiedVideoPixel = { [weak earlyAcquisitionTrace, weak service] pixel, context in
+                guard let service else { return }
+                earlyAcquisitionTrace?.recordCopy(pixel, context: context, service: service)
+            }
+            service.shouldDebugAcquireVideoFrame = { [weak earlyAcquisitionTrace, weak service] receipt in
+                if let service { earlyAcquisitionTrace?.observePriorCredit(receipt, service: service) }
+                return true
+            }
+        }
         let nativePositionReadTrace = acceptedPCMOriginBenchmarkMode.map {
             NativePositionReadDurationTrace(originEnabled: $0, baseRequest: service.debugInitialVideoReadyState.generation)
         }
@@ -2824,6 +3047,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugVideoRenderStamp = { [weak startup] stamp in startup?.recordRender(stamp) }
         }
         defer {
+            service.debugEarlyClockAcquisitionControl = nil
+            service.onDebugEarlyClockAcquisition = nil; service.onDebugCopiedVideoPixel = nil
+            service.shouldDebugAcquireVideoFrame = nil
             if handoffTrace != nil {
                 service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
                 service.onDebugAlignedVideoEnqueue = nil
@@ -3024,6 +3250,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         if traceReturnedAProducerBoundary == true { nativeTrace?.closeReturnedARequests() }
         firstZeroProbe?.close()
+        earlyAcquisitionTrace?.stop()
         #endif
         // No dumps, spectral analysis or assertions interrupt any streaming window.
         tap.stop(); service.pause()
@@ -3136,6 +3363,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         monitorReadTrace?.dumpAndAssert()
         cppNativePullTrace?.dumpAndAssert()
         nativeTrace?.dumpAfterCleanup()
+        earlyAcquisitionTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         if let enabled = traceReturnedAProducerBoundary {
             if enabled {
                 XCTAssertNotNil(nativeTrace); XCTAssertNotNil(nativeActivity); XCTAssertNotNil(firstFailure)
