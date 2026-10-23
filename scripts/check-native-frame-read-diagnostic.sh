@@ -2,15 +2,22 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Same-ledger execution clocks OFF/ON and qualified stale-resume RED; production4119 preserved.
-expected_code_source=1af098e19ef14ab646f3ada784a25fcc68516850
-expected_ios_tree=6e3960c3dacc840d43cfc7699dce03dbd7312a31
+# Validate playing-interval repair, unchanged playback gates and all-tap timing OFF/ON.
+expected_code_source=0fb3a74c543b9ef42e8362fc1ee5cd520966b7a6
+expected_ios_tree=6e674bc45616c2a2654ee6391d87fa0ea79a1f36
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
   OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testRenderAnchorRejectsOldAndInactivePublicationsAfterResume
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testExplicitPauseDuringActualLatencyReadRejectsTheOldClock
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testReentrantPlaybackControlPreservesNewerPauseResumeAndGraphOwner
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testPlaybackClockAuthorityExhaustionCannotReuseAnOldInterval
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testTapExecutionTraceRejectsMalformedClockOrderAndOverflow
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn
 )
 verify_source() {
@@ -38,10 +45,17 @@ evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
     'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testRenderAnchorRejectsOldAndInactivePublicationsAfterResume',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testExplicitPauseDuringActualLatencyReadRejectsTheOldClock',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testReentrantPlaybackControlPreservesNewerPauseResumeAndGraphOwner',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testPlaybackClockAuthorityExhaustionCannotReuseAnOldInterval',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testTapExecutionTraceRejectsMalformedClockOrderAndOverflow',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn',
 }
-if len(expected) != 2 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly two execution-timing and stale-resume identities must exist in the pinned source')
+if len(expected) != 9 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly nine lifecycle, tap-timing and production playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -50,7 +64,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=2 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=9 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -151,7 +165,7 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=2 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=9 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
 # Only these two exact identities are selected in a fresh hosted job/test process.
 # Its original lost-fixture, paused-seek and cleanup assertions stay intact.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
