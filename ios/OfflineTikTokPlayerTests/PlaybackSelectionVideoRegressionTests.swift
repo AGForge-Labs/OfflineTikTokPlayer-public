@@ -4518,6 +4518,41 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testDownloadFixtureOwnerIsReleasedAfterRemoval() async throws {
+        weak var owner: OfflineDownloads?
+        var fixture: SelectionVideoFixture? = try await SelectionVideoFixture()
+        defer { fixture?.remove() }
+        owner = fixture?.downloads
+        XCTAssertNotNil(owner)
+        let directory = try XCTUnwrap(fixture?.temporary)
+        fixture?.remove()
+        fixture = nil
+        let filesRemoved = !FileManager.default.fileExists(atPath: directory.path)
+        XCTAssertTrue(filesRemoved)
+        let released = await waitUntil(timeout: 3) { owner == nil }
+        print("SelectionDownloadOwnerLifetime schema=1 ownerReleased=\(released) maximumSeconds=3 additionalAudioOwnersCreated=0 fixtureFilesRemoved=\(filesRemoved) syntheticOnly=true transferSessionInvalidation=unavailable playbackAcceptance=false")
+        XCTAssertTrue(released, "Removing an owned local fixture must not leave its download manager retained by a session")
+    }
+
+    func testDownloadFixturesKeepIndependentSourceFilesAndRecords() async throws {
+        let first = try await SelectionVideoFixture()
+        defer { first.remove() }
+        let second = try await SelectionVideoFixture()
+        defer { second.remove() }
+        let firstA = try XCTUnwrap(first.savedURLs[first.aID])
+        let secondA = try XCTUnwrap(second.savedURLs[second.aID])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstA.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondA.path))
+        let independentFiles = firstA.standardizedFileURL != secondA.standardizedFileURL
+        let independentRecords = Set(second.downloads.records.keys) == Set(second.ids)
+        XCTAssertTrue(independentFiles, "Independent fixtures must own separate copies even for the same generated source hash")
+        XCTAssertTrue(independentRecords, "A fixture must not restore another manager's download records")
+        first.remove()
+        let secondSurvived = FileManager.default.fileExists(atPath: secondA.path)
+        print("SelectionDownloadStorageIsolation schema=1 independentFiles=\(independentFiles) independentRecords=\(independentRecords) secondFileSurvivedFirstRemoval=\(secondSurvived) fixtureManagersCreated=2 additionalAudioOwnersCreated=0 syntheticOnly=true playbackAcceptance=false")
+        XCTAssertTrue(secondSurvived, "Removing the first owner must preserve the second owner's actual saved video")
+    }
+
     func testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins() async throws {
         #if DEBUG
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
