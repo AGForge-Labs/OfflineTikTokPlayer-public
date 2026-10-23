@@ -285,6 +285,42 @@ class NativeControlHarnessTests(unittest.TestCase):
                 self.assertRegex(output.getvalue(), r"NativeControlOwnership deviceLookupRC=0 stateCode=[0-9]+ psRC=0 categoryCode=[0-9]+")
 
     @unittest.skipUnless(os.name == "posix", "Simulator executable inventory uses POSIX absolute paths")
+    def test_confirmation_allows_two_slow_verified_absences_and_never_accepts_a_present_host(self):
+        bundle = self.app()
+        present = "11 %s/OfflineTikTokPlayer\n" % bundle
+        for occupied in (False, True):
+            with self.subTest(occupied=occupied):
+                output = io.StringIO()
+                inventory = present if occupied else ""
+                with self.fake_sdk(bundle, [inventory], fallback=inventory) as calls, \
+                        contextlib.redirect_stdout(output):
+                    sdk_run = subprocess.run
+                    clock = self.ns["time"]
+                    def slow_verified_query(arguments, **kwargs):
+                        # Legal per-command costs: each complete device/ps
+                        # observation takes2.7s. No process/SDK command runs.
+                        delay = 2.5 if arguments[:4] == ["xcrun", "simctl", "list", "devices"] else (0.2 if arguments[0] == "/bin/ps" else 0)
+                        timeout = kwargs["timeout"]
+                        if delay > timeout:
+                            clock.now += timeout
+                            raise subprocess.TimeoutExpired(arguments, timeout)
+                        clock.now += delay
+                        return sdk_run(arguments, **kwargs)
+                    with mock.patch("subprocess.run", side_effect=slow_verified_query):
+                        if occupied:
+                            with self.assertRaises(ValueError):
+                                self.ns["boundary"](SIMULATOR, "before-01")
+                        else:
+                            self.ns["boundary"](SIMULATOR, "before-01")
+                            self.assertEqual(sum(call[0] == "/bin/ps" for call in calls), 3,
+                                             "Keep the initial lookup and two complete post-initial absence proofs")
+                            self.assertIn("NativeControlBoundary label=before-01 before=0 after=0", output.getvalue())
+                    self.assertLessEqual(clock.now, 22.1, "Confirmation and initial lookup remain bounded")
+                self.assertEqual(sum("terminate" in call for call in calls), int(occupied))
+                if occupied:
+                    self.assertNotIn("NativeControlBoundary label=", output.getvalue())
+
+    @unittest.skipUnless(os.name == "posix", "Simulator executable inventory uses POSIX absolute paths")
     def test_unknown_device_family_or_candidate_never_authorizes_termination(self):
         bundle = self.app()
         data = bundle.parents[4]

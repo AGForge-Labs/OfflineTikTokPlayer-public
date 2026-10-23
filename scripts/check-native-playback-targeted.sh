@@ -220,7 +220,9 @@ def boundary(simulator, label):
         result = command(['xcrun', 'simctl', 'terminate', simulator, BUNDLE], 5)
         terminate_rc = result.returncode
     # Two adjacent absent observations; no claim about SDK/service quiescence.
-    deadline, absent_count, after = time.monotonic() + 3, 0, before
+    # Each verified device/ps observation can consume5+2seconds. Preserve two
+    # post-initial absences while allowing both to finish within a fixed bound.
+    deadline, absent_count, after = time.monotonic() + 15, 0, before
     while time.monotonic() < deadline:
         after = owned_processes(simulator, deadline)
         absent_count = absent_count + 1 if not after else 0
@@ -228,7 +230,7 @@ def boundary(simulator, label):
             print('NativeControlBoundary label=%s before=%d after=0 terminateRequested=%d terminateRC=%d gracefulCleanupClaim=false' %
                   (label, len(before), requested, terminate_rc))
             return
-        time.sleep(0.1)
+        time.sleep(0.25)
     raise ValueError('Exact own app host remains or absence is unconfirmed; later controls must not run')
 
 try:
