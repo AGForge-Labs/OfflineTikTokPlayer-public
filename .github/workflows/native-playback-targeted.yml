@@ -2,7 +2,7 @@ name: Owned reader wait at dropout with isolated playback controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh', 'scripts/export-native-control-results.py', 'tests/validation-shell/test_native_control_harness.py', 'tests/validation-shell/test_native_control_results.py', 'scripts/check-native-reader-probe-sdk.py']
+    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh', 'scripts/export-native-control-results.py', 'tests/validation-shell/test_native_control_harness.py', 'tests/validation-shell/test_native_control_results.py', 'scripts/check-native-reader-probe-sdk.py', 'tests/validation-shell/test_native_reader_probe_sdk.py']
 concurrency:
   group: offline-player-native-validation
   cancel-in-progress: true
@@ -34,6 +34,7 @@ jobs:
           python3 tests/validation-shell/test_check_ios_shell.py
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_native_control_harness.py
+          python3 tests/validation-shell/test_native_reader_probe_sdk.py
           python3 tests/validation-shell/test_native_control_results.py
           python3 tests/validation-shell/test_simulator_boot_preflight.py
           python3 tests/validation-shell/test_simulator_destination_resolution.py
