@@ -2,16 +2,16 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Run the unchanged copied-pixel control first in a fresh host, before any earlier compositor recovery.
-expected_code_source=89ff55cbb4df0988c125eb6c332d1e8338c3b45d
-expected_ios_tree=d842402888c78aa8d9a7d17a65c8854c45498c7e
+# Require direct fixture lifetime/storage contracts in a disposable host; no playback follows this RED route.
+expected_code_source=3714083c4aed22a52e7dd04b36dadedd0f5942a1
+expected_ios_tree=d703e9c3accc568edea80a88f314f1dea592a1b4
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -37,11 +37,11 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords',
 }
 if len(expected) != 2 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly two unchanged copied-pixel and complete encoded-calibration identities must exist in the pinned source')
+    raise SystemExit('Exactly two direct download fixture lifetime and storage identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -152,8 +152,8 @@ for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
 printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=2 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# These two exact identities execute in one fresh hosted job/test process.
-# Its original lost-fixture, paused-seek and cleanup assertions stay intact.
+# These two exact fixture identities execute in one fresh disposable process; no playback follows.
+# Both cases retain their actual owner, record and saved-file assertions.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
 # There is no promotion prefix. Actual XCTest start/result records determine
 # execution history; selected-list order is not a matched-history guarantee.

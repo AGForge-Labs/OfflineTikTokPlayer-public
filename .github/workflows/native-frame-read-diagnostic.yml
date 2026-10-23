@@ -1,4 +1,4 @@
-name: Fresh host paused copied pixel validation
+name: Local download fixture ownership baseline
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-          fetch-depth: 3
+          fetch-depth: 2
       - name: Require the exact committed app and tests before diagnostic work
         id: source_pin
         run: |
@@ -45,7 +45,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run unchanged copied pixel first and full encoded calibration
+      - name: Run isolated fixture owner lifetime and actual saved file contracts
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:

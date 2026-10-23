@@ -16,8 +16,8 @@ SOURCE = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_SOURCE",
 WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
 CASES = (
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace',
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins',
+    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval',
+    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords',
 )
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
@@ -352,7 +352,7 @@ exit "$FRAME_READ_TEE_EXIT"
         self.assertEqual(len(CASES), 2)
         self.assertEqual(tuple(shlex.split(declaration.group(1))), CASES)
         workflow = WORKFLOW.read_text(encoding="utf-8").replace("\r\n", "\n")
-        self.assertIn("fetch-depth: 3", workflow)
+        self.assertIn("fetch-depth: 2", workflow)
         self.assertEqual(re.findall(r"^    runs-on: (.+)$", workflow, re.MULTILINE), ["macos-26"])
         self.assertEqual(re.findall(r"^    timeout-minutes: (\d+)$", workflow, re.MULTILINE), ["30"])
         self.assertEqual(re.findall(r"^  ([a-z][a-z-]*):\s*$", workflow.split("jobs:\n", 1)[1],
