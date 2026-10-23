@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=379153d69c88df998f4112631fba3e44d4b1872c
-expected_ios_tree=e6844f22469ac97f2d4a4fa83e64f38df6c3d28d
+expected_code_source=b786cc9c2d755c5721a029e5b88cd5644819d412
+expected_ios_tree=4f9f7b0cec197473b6c2861161f2aeb3a7729ee2
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testInitialVideoPollingOffFirst',
-    'testInitialVideoPollingOnFirst',
-    'testInitialVideoPollingOnSecond',
-    'testInitialVideoPollingOffSecond',
+    'testQueuedPreviousAdvanceOffFirst',
+    'testQueuedPreviousAdvanceOnFirst',
+    'testQueuedPreviousAdvanceOnSecond',
+    'testQueuedPreviousAdvanceOffSecond',
 )
 
 def require(condition, message):
@@ -319,8 +319,15 @@ mode="$1"
 case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+    OfflineTikTokPlayerTests/NativeMediaTests/testExternalClockPreviousUsesQueuedAdvanceAndPreservesItsExactResource
+    OfflineTikTokPlayerTests/NativeMediaTests/testPreviousQueuedAdvancePreservesNewOwnerDuringEvictionAndInsertion
+    OfflineTikTokPlayerTests/NativeMediaTests/testPreviousQueuedAdvanceRevalidatesSavedEligibilityAndLiveMetadata
+    OfflineTikTokPlayerTests/NativeMediaTests/testAdvanceDoesNotSkipAnItemAlreadyMadeCurrentDuringRetention
+    OfflineTikTokPlayerTests/NativeMediaTests/testStandalonePreviousAndOrdinaryNextRetainTheirAdvanceRoutes
+    OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousToNextPreservesExactPreparationAndPlayerPolicy
+    OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRevalidatesLiveLocalityBeforeCommit
   ) ;;
-  controls) cases=(testInitialVideoPollingOffFirst testInitialVideoPollingOnFirst testInitialVideoPollingOnSecond testInitialVideoPollingOffSecond) ;;
+  controls) cases=(testQueuedPreviousAdvanceOffFirst testQueuedPreviousAdvanceOnFirst testQueuedPreviousAdvanceOnSecond testQueuedPreviousAdvanceOffSecond) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
