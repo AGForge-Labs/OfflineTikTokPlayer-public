@@ -2,23 +2,18 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Counterbalance acquisition-only activation and retain original playback, stopped-clock, explicit-seek and pixel guards.
-expected_code_source=cbc58e79f473ce90be010517c545112cf3fe8a77
-expected_ios_tree=d673d17668b1f386d1fcba2cc024d55f3a0c5023
+# Calibrate whole-frame coverage, then counterbalance acquisition with constant scalar tracing/zero probe and no pixel scans.
+expected_code_source=76a9b36ee3d2a5789c8393e20e8fdfe9baeb1d76
+expected_ios_tree=db95d51459c374d1a760fa559add6b396ec358a1
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
+  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testWholeFrameBoundaryTraceCoversActualObserverAndRejectsReentrantOwner
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testEarlyInitialClockAcquisitionOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testEarlyInitialClockAcquisitionOnThenOff
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -44,18 +39,13 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
+    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testWholeFrameBoundaryTraceCoversActualObserverAndRejectsReentrantOwner',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testEarlyInitialClockAcquisitionOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testEarlyInitialClockAcquisitionOnThenOff',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOnThenOff',
 }
-if len(expected) != 9 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly nine early acquisition, original playback and ownership identities must exist in the pinned source')
+if len(expected) != 4 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly four whole-frame calibration and original guarded playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -64,7 +54,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=9 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=4 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -165,8 +155,8 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=9 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# These nine exact identities execute in a fresh disposable process; actual XCTest records establish order.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=4 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# These four exact identities execute in a fresh disposable process; actual XCTest records establish order.
 # Original timing, continuity, capture, identity and cleanup assertions remain unchanged.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
 # There is no promotion prefix. Actual XCTest start/result records determine
