@@ -1037,6 +1037,134 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
     #endif
 
+    func testWholeFrameBoundaryWithoutPixelScanOffThenOn() async throws {
+        try recordRuntimeHost()
+        for enabled in [false, true] {
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, wholeFrameClockAcquisition: enabled)
+        }
+    }
+
+    func testWholeFrameBoundaryWithoutPixelScanOnThenOff() async throws {
+        try recordRuntimeHost()
+        for enabled in [true, false] {
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, wholeFrameClockAcquisition: enabled)
+        }
+    }
+
+    #if DEBUG
+    private final class WholeReturnedFrameTrace {
+        struct Record {
+            let entry: ContinuousPictureInPicture.DebugWholeFrameEntry
+            let serviceEntry: PlaybackService.DebugCPPWholeFrameStamp
+            var returned: ContinuousPictureInPicture.DebugWholeFrameSpan?
+            var serviceReturn: PlaybackService.DebugCPPWholeFrameStamp?
+        }
+        let request: Int, enabled: Bool
+        private var records: [Record] = []
+        private var anchorNs: UInt64?, attempts: [PlaybackService.DebugEarlyClockAcquisitionAttempt] = []
+        private var stopped = false, overflow = false
+        private var outsideEntries = 0, outsideReturns = 0, orphans = 0
+        private var observerCalls = 0, maximumObserverNs: UInt64 = 0, totalObserverNs: UInt64 = 0
+        init(request: Int, enabled: Bool) {
+            self.request = request; self.enabled = enabled
+            records.reserveCapacity(1024); attempts.reserveCapacity(1)
+        }
+        func recordAttempt(_ value: PlaybackService.DebugEarlyClockAcquisitionAttempt) {
+            guard !stopped, value.request == request else { return }
+            if attempts.isEmpty { attempts.append(value) } else { overflow = true }
+        }
+        func record(_ stamp: PlaybackService.DebugCPPWholeFrameStamp) {
+            guard !stopped else { return }
+            let began = DispatchTime.now().uptimeNanoseconds
+            defer {
+                let duration = DispatchTime.now().uptimeNanoseconds - began
+                observerCalls += 1; maximumObserverNs = max(maximumObserverNs, duration)
+                let sum = totalObserverNs.addingReportingOverflow(duration)
+                if sum.overflow { overflow = true } else { totalObserverNs = sum.partialValue }
+            }
+            switch stamp.event {
+            case .entered(let value):
+                guard stamp.request == request, stamp.generation == request,
+                      let ticket = stamp.presentationTicket, ticket == value.state.ticket,
+                      stamp.observedItem == ticket.debugItemIdentity else { return }
+                if anchorNs == nil { anchorNs = value.entryNs }
+                guard let anchorNs, value.entryNs >= anchorNs,
+                      value.entryNs - anchorNs <= 10_000_000_000 else { outsideEntries += 1; return }
+                guard records.count < 1024 else { overflow = true; return }
+                if records.contains(where: { $0.entry.ordinal == value.ordinal }) { overflow = true; return }
+                records.append(Record(entry: value, serviceEntry: stamp))
+            case .returned(let value):
+                guard let index = records.lastIndex(where: { $0.entry.ordinal == value.entry.ordinal }) else {
+                    guard stamp.request == request, stamp.generation == request,
+                          stamp.presentationTicket == value.entry.state.ticket else { return }
+                    if let anchorNs, value.entry.entryNs >= anchorNs,
+                       value.entry.entryNs - anchorNs > 10_000_000_000 { outsideReturns += 1 }
+                    else { orphans += 1 }
+                    return
+                }
+                guard records[index].returned == nil,
+                      records[index].entry.entryNs == value.entry.entryNs else { overflow = true; return }
+                records[index].returned = value
+                records[index].serviceReturn = stamp
+            }
+        }
+        func stop() { stopped = true }
+        func dumpAndAssert(cleanupAcknowledged: Bool) {
+            let spans = records.compactMap(\.returned)
+            print("WholeReturnedFrameScope schema=1 request=\(request) acquisitionEnabled=\(enabled) entries=\(records.count) returns=\(spans.count) capacity=1024 windowNs=10000000000 outsideEntries=\(outsideEntries) outsideReturns=\(outsideReturns) orphans=\(orphans) overflow=\(overflow) observerCalls=\(observerCalls) maximumCollectorBodyNs=\(maximumObserverNs) totalCollectorBodyNs=\(totalObserverNs) collectorMetricExcludes=routing-and-post-clock-statistics returnMarker=before-exit-observer-delivery entryObserverDelivery=measured exitObserverDelivery=unmeasured pixelScans=0 newNativeQueries=0 firstStereoZeroEvent=constant-on cleanupAcknowledged=\(cleanupAcknowledged) physicalOutput=unverified")
+            XCTAssertTrue(stopped && cleanupAcknowledged); XCTAssertFalse(overflow)
+            XCTAssertEqual(orphans, 0); XCTAssertGreaterThan(records.count, 0)
+            XCTAssertEqual(spans.count, records.count)
+            XCTAssertEqual(outsideEntries, outsideReturns)
+            XCTAssertEqual(attempts.count, 1)
+            if let attempt = attempts.first {
+                XCTAssertEqual(attempt.enabled, enabled); XCTAssertEqual(attempt.activated, enabled)
+                XCTAssertTrue(attempt.ownerStillCurrent && attempt.bindingStillPending)
+                XCTAssertNil(attempt.readyBefore); XCTAssertNil(attempt.readyAfter)
+                XCTAssertTrue(attempt.loadingBefore && attempt.loadingAfter)
+                XCTAssertEqual(attempt.stoppedRawPosition, 0); XCTAssertEqual(attempt.stoppedEffectiveRate, 0)
+                print("WholeReturnedFrameActivation schema=1 request=\(request) enabled=\(enabled) entryNs=\(attempt.entryNs) returnNs=\(attempt.returnNs) stoppedReadEntryNs=\(attempt.stoppedReadEntryNs) stoppedReadReturnNs=\(attempt.stoppedReadReturnNs) activated=\(attempt.activated) ownerStillCurrent=\(attempt.ownerStillCurrent) pending=\(attempt.bindingStillPending)")
+            }
+            var precedingCompletedEnvelope: UInt64?, precedingOpen = false
+            for row in records {
+                let entry = row.entry
+                XCTAssertFalse(entry.ordinalSaturated)
+                guard let span = row.returned else {
+                    precedingOpen = true
+                    print("WholeReturnedFrameOpen schema=1 request=\(request) ordinal=\(entry.ordinal) entryNs=\(entry.entryNs) exit=unavailable")
+                    continue
+                }
+                XCTAssertGreaterThanOrEqual(span.returnNs, entry.entryNs)
+                let state = entry.state, returned = span.returnedState
+                XCTAssertEqual(row.serviceEntry.request, request); XCTAssertEqual(row.serviceEntry.generation, request)
+                XCTAssertEqual(row.serviceEntry.presentationTicket, state.ticket)
+                XCTAssertEqual(state.ticket, attempts.first?.ticket)
+                let returnServiceOwner = row.serviceReturn.map {
+                    $0.request == request && $0.generation == request && $0.presentationTicket == state.ticket
+                        && $0.observedItem == state.ticket?.debugItemIdentity
+                } == true
+                let sameOwner = state.ticket == returned.ticket && state.output == returned.output
+                    && state.imageEpoch == returned.imageEpoch && state.seekSerial == returned.seekSerial
+                    && state.activeSeekTicket == returned.activeSeekTicket
+                let gap = precedingOpen ? nil : precedingCompletedEnvelope.flatMap { entry.entryNs >= $0 ? entry.entryNs - $0 : nil }
+                print("WholeReturnedFrameSpan schema=1 request=\(request) acquisitionEnabled=\(enabled) ordinal=\(entry.ordinal) entryNs=\(entry.entryNs) returnNs=\(span.returnNs) durationNs=\(span.returnNs - entry.entryNs) precedingCompletedEnvelopeNs=\(precedingCompletedEnvelope.map { String($0) } ?? "unavailable") precedingReturnGapNs=\(gap.map { String($0) } ?? "unavailable") gapIncludes=prior-exit-observer-caller-tail-and-scheduling terminalStage=\(span.stage.rawValue) sameCachedOwner=\(sameOwner) returnServiceOwner=\(returnServiceOwner) entryActive=\(state.coherent) returnActive=\(returned.coherent) ticket=\(state.ticket?.debugGeneration ?? -1) output=\(String(describing: state.output)) imageEpoch=\(state.imageEpoch) seekSerial=\(state.seekSerial) activeSeek=\(state.activeSeekTicket.map { String($0) } ?? "none") layerFailed=\(span.layerFailed.map { String($0) } ?? "not-read") readyForMore=\(span.readyForMore.map { String($0) } ?? "not-read") requestedNumeric=\(span.requestedNumeric.map { String($0) } ?? "not-read") availability=\(span.availability.map { String($0) } ?? "not-called") copied=\(span.copied.map { String($0) } ?? "not-called") rawEnqueueCalled=\(span.enqueueCalled) fullFrameScope=through-readiness-commit wholeCallerScope=false clock=DispatchTime")
+                for (stage, read) in [(0, span.layerStatus), (1, span.backpressure), (2, span.timebase),
+                                      (3, span.acquisitionObserver), (4, span.readinessCommit), (5, span.entryObserverDelivery)] {
+                    guard let read else { continue }
+                    XCTAssertGreaterThanOrEqual(read.entryNs, entry.entryNs)
+                    XCTAssertGreaterThanOrEqual(read.returnNs, read.entryNs)
+                    XCTAssertLessThanOrEqual(read.returnNs, span.returnNs)
+                    print("WholeReturnedFrameRead schema=1 request=\(request) ordinal=\(entry.ordinal) stage=\(stage) entryNs=\(read.entryNs) returnNs=\(read.returnNs) durationNs=\(read.returnNs - read.entryNs) stageCodes=status0-backpressure1-timebase2-observer3-readinessCommit4-entryDelivery5 clock=DispatchTime")
+                }
+                precedingCompletedEnvelope = max(precedingCompletedEnvelope ?? 0, span.returnNs)
+            }
+            print("WholeReturnedFrameConclusion schema=1 request=\(request) acquisitionEnabled=\(enabled) interpretation=external-same-arm-span-join requiredReadinessMs=250 originalPlaybackGuards=unchanged releaseActivation=false")
+        }
+    }
+    #endif
+
     func testFirstStereoZeroEventOffThenOn() async throws {
         try recordRuntimeHost()
         for (ordinal, enabled) in [false, true].enumerated() {
@@ -2688,11 +2816,27 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 traceReturnedAProducerBoundary: Bool? = nil,
                                                 initialNativeStartCurrentItemTime: Bool? = nil,
                                                 traceReturnedAStereoZero: Bool? = nil,
-                                                earlyClockAcquisition: Bool? = nil) async throws {
+                                                earlyClockAcquisition: Bool? = nil,
+                                                wholeFrameClockAcquisition: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        let returnedZeroEventMode: Bool? = traceReturnedAStereoZero ?? (wholeFrameClockAcquisition == nil ? nil : true)
+        if let enabled = wholeFrameClockAcquisition {
+            guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
+                  frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
+                  traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup, freshPreviousBundle == nil,
+                  queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, traceReturnedAStereoZero == nil,
+                  acceptedPCMOriginBenchmarkMode == nil, sourceOutputBenchmarkMode == nil,
+                  sourceCallbackLedgerBenchmarkMode == nil else {
+                XCTFail("Whole-frame timing varies only acquisition; scalar trace and first-zero probe match across both arms")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("WholeReturnedFrameBenchmark schema=1 acquisitionEnabled=\(enabled) targetPhase=2 captures=0 wholeFrameTrace=constant-on firstStereoZeroEvent=constant-on pixelScans=0 originalGuards=unchanged")
+        }
         if let enabled = earlyClockAcquisition {
-            guard traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
+            guard wholeFrameClockAcquisition == nil, traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
                   !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
                   !auditSavedAAfterCleanup, freshPreviousBundle == nil, queuedPreviousLead == nil,
                   suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
@@ -2706,7 +2850,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("EarlyInitialAcquisitionBenchmark schema=1 enabled=\(enabled) targetPhase=2 captures=0 loadingAndClockPolicy=unchanged pixelScan=calibrated-full160x96 nativeReads=existing-only originalGuards=unchanged")
         }
         if let enabled = traceReturnedAStereoZero {
-            guard traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
+            guard wholeFrameClockAcquisition == nil, traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
                   !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
                   !auditSavedAAfterCleanup, freshPreviousBundle == nil, queuedPreviousLead == nil,
                   suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
@@ -2730,6 +2874,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if wholeFrameClockAcquisition != nil {
+            XCTFail("Whole-frame boundary control is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if earlyClockAcquisition != nil {
             XCTFail("Early acquisition control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -2860,7 +3008,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #endif
         #if DEBUG
-        let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true || traceReturnedAStereoZero != nil
+        let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true || returnedZeroEventMode != nil
             ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
         let firstFailure = traceFirstSourceFailure == true || traceReturnedAProducerBoundary == true
             ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
@@ -2886,7 +3034,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertFalse(traceNativeRefill); XCTAssertFalse(traceVideoSeeks)
             XCTAssertNil(frameMonitorAlternative)
         }
-        let nativeTrace = traceReturnedAStereoZero == nil ? nativeActivity.map {
+        let nativeTrace = returnedZeroEventMode == nil ? nativeActivity.map {
             ProductionNativeRefillTrace(recorder: $0, audio: audio,
                 requestTarget: traceReturnedAProducerBoundary == true ? .returnedA : nil,
                 firstFailure: traceReturnedAProducerBoundary == true ? firstFailure : nil)
@@ -2919,7 +3067,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             startup.pollSummary = ProductionSelectionPollSummary()
             print("ProductionSelectionPollScope schema=1 enabled=true originMode=\(acceptedPCMOrigin == true) phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only capture=unchanged publication=after-cleanup")
         }
-        if let enabled = traceReturnedAStereoZero {
+        if let enabled = returnedZeroEventMode {
             print("FirstStereoZeroPollScope schema=1 zeroEventEnabled=\(enabled) pollSummaryBothArms=true phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only capture=false publication=after-cleanup")
         }
         #endif
@@ -2999,6 +3147,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 return true
             }
         }
+        let wholeFrameTrace = wholeFrameClockAcquisition.map {
+            WholeReturnedFrameTrace(request: service.debugInitialVideoReadyState.generation + 3, enabled: $0)
+        }
+        if let wholeFrameTrace {
+            service.debugEarlyClockAcquisitionControl = .init(request: wholeFrameTrace.request, enabled: wholeFrameTrace.enabled)
+            service.onDebugEarlyClockAcquisition = { [weak wholeFrameTrace] value in wholeFrameTrace?.recordAttempt(value) }
+            service.onDebugCPPWholeFrame = { [weak wholeFrameTrace] event in wholeFrameTrace?.record(event) }
+        }
         let nativePositionReadTrace = acceptedPCMOriginBenchmarkMode.map {
             NativePositionReadDurationTrace(originEnabled: $0, baseRequest: service.debugInitialVideoReadyState.generation)
         }
@@ -3047,6 +3203,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.onDebugVideoRenderStamp = { [weak startup] stamp in startup?.recordRender(stamp) }
         }
         defer {
+            service.onDebugCPPWholeFrame = nil
             service.debugEarlyClockAcquisitionControl = nil
             service.onDebugEarlyClockAcquisition = nil; service.onDebugCopiedVideoPixel = nil
             service.shouldDebugAcquireVideoFrame = nil
@@ -3167,7 +3324,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             #endif
             if phase == 2 {
                 #if DEBUG
-                if let enabled = traceReturnedAStereoZero {
+                if let enabled = returnedZeroEventMode {
                     let owner = measurement.state.audio
                     guard measurement.state.selected, owner.token == measurement.state.expectedToken,
                           owner.token > 0, owner.visit > 0, owner.selectionVersion > 0 else {
@@ -3251,6 +3408,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if traceReturnedAProducerBoundary == true { nativeTrace?.closeReturnedARequests() }
         firstZeroProbe?.close()
         earlyAcquisitionTrace?.stop()
+        wholeFrameTrace?.stop()
         #endif
         // No dumps, spectral analysis or assertions interrupt any streaming window.
         tap.stop(); service.pause()
@@ -3364,6 +3522,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         cppNativePullTrace?.dumpAndAssert()
         nativeTrace?.dumpAfterCleanup()
         earlyAcquisitionTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
+        wholeFrameTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         if let enabled = traceReturnedAProducerBoundary {
             if enabled {
                 XCTAssertNotNil(nativeTrace); XCTAssertNotNil(nativeActivity); XCTAssertNotNil(firstFailure)

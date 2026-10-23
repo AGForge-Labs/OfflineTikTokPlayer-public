@@ -388,6 +388,39 @@ final class ContinuousPictureInPicture: NSObject {
     }
     // Separate from legacy point stamps and their capacity/masks.
     var onDebugNativePullStamp: (@MainActor (DebugNativePullStamp) -> Void)?
+    enum DebugWholeFrameStage: Int, Sendable {
+        case resourceGuard, seekGuard, activeGuard, itemGuard, ownerGuard, acquisitionGuard
+        case layerStatus, ownerAfterStatus, failedLayerRecovery, backpressure, ownerAfterBackpressure
+        case timebase, numericTimeGuard, acquisitionObserver, ownerAfterAcquisitionObserver
+        case availability, availabilityGuard, ownerBeforeCopy, copy, copyGuard, ownerAfterCopy
+        case copiedPixelObserver, ownerAfterCopiedPixelObserver, timestampCredit, pausedFutureGuard
+        case increasingTimeGuard, leadGuard, formatCreation, formatGuard, sampleCreation
+        case sampleGuard, ownerBeforeEnqueue, enqueue, ownerAfterEnqueue, imageCredit, enqueued
+    }
+    struct DebugWholeFrameInterval: Sendable {
+        let entryNs: UInt64, returnNs: UInt64
+    }
+    struct DebugWholeFrameEntry: Sendable {
+        let ordinal: UInt64, entryNs: UInt64
+        let state: DebugAlignedPollState
+        let ordinalSaturated: Bool
+    }
+    struct DebugWholeFrameSpan: Sendable {
+        let entry: DebugWholeFrameEntry
+        let returnNs: UInt64, returnedState: DebugAlignedPollState
+        let stage: DebugWholeFrameStage
+        let layerStatus: DebugWholeFrameInterval?, backpressure: DebugWholeFrameInterval?
+        let timebase: DebugWholeFrameInterval?, acquisitionObserver: DebugWholeFrameInterval?
+        let readinessCommit: DebugWholeFrameInterval?, entryObserverDelivery: DebugWholeFrameInterval?
+        let layerFailed: Bool?, readyForMore: Bool?, requestedNumeric: Bool?
+        let availability: Bool?, copied: Bool?, enqueueCalled: Bool
+    }
+    enum DebugWholeFrameEvent: Sendable {
+        case entered(DebugWholeFrameEntry), returned(DebugWholeFrameSpan)
+    }
+    // Optional scalar observations only. No history, task, output or SDK query.
+    var onDebugWholeFrame: (@MainActor (DebugWholeFrameEvent) -> Void)?
+    private var debugWholeFrameOrdinal: UInt64 = 0
     private func debugNativePull<T>(_ stage: DebugNativePullStage,
         sourceTicket: PresentationTicket?, sourceNativeSeekTicket: UInt64?, output: AVPlayerItemVideoOutput,
         _ operation: @MainActor () -> T) -> T {
@@ -994,10 +1027,58 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     private func renderFrame() {
+        #if DEBUG
+        let debugWholeObserver = onDebugWholeFrame
+        var debugWholeEntry: DebugWholeFrameEntry?
+        var debugWholeEntryDelivery: DebugWholeFrameInterval?
+        if let debugWholeObserver {
+            if debugWholeFrameOrdinal < .max { debugWholeFrameOrdinal += 1 }
+            let entry = DebugWholeFrameEntry(ordinal: debugWholeFrameOrdinal,
+                entryNs: DispatchTime.now().uptimeNanoseconds, state: debugAlignedPollState,
+                ordinalSaturated: debugWholeFrameOrdinal == .max)
+            debugWholeEntry = entry
+            let deliveryEntry = DispatchTime.now().uptimeNanoseconds
+            debugWholeObserver(.entered(entry))
+            debugWholeEntryDelivery = .init(entryNs: deliveryEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
+        }
+        var debugWholeStage = DebugWholeFrameStage.resourceGuard
+        var debugWholeReadEntry: UInt64 = 0
+        var debugWholeStatus: DebugWholeFrameInterval?, debugWholeBackpressure: DebugWholeFrameInterval?
+        var debugWholeTimebase: DebugWholeFrameInterval?, debugWholeAcquisition: DebugWholeFrameInterval?
+        var debugWholeCommit: DebugWholeFrameInterval?
+        var debugWholeLayerFailed: Bool?, debugWholeReadyForMore: Bool?, debugWholeRequestedNumeric: Bool?
+        var debugWholeAvailability: Bool?, debugWholeCopied: Bool?, debugWholeEnqueueCalled = false
+        defer {
+            if let debugWholeEntry, let debugWholeObserver {
+                let returnedState = debugAlignedPollState
+                let returned = DispatchTime.now().uptimeNanoseconds
+                debugWholeObserver(.returned(DebugWholeFrameSpan(entry: debugWholeEntry,
+                    returnNs: returned, returnedState: returnedState, stage: debugWholeStage,
+                    layerStatus: debugWholeStatus, backpressure: debugWholeBackpressure,
+                    timebase: debugWholeTimebase, acquisitionObserver: debugWholeAcquisition,
+                    readinessCommit: debugWholeCommit, entryObserverDelivery: debugWholeEntryDelivery,
+                    layerFailed: debugWholeLayerFailed,
+                    readyForMore: debugWholeReadyForMore, requestedNumeric: debugWholeRequestedNumeric,
+                    availability: debugWholeAvailability, copied: debugWholeCopied,
+                    enqueueCalled: debugWholeEnqueueCalled)))
+            }
+        }
+        #endif
         guard !invalidated, frameFeedEnabled, let videoOutput, let timebase else { return }
         beginReadinessUpdates()
-        defer { endReadinessUpdates() }
+        defer {
+            #if DEBUG
+            let commitEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+            #endif
+            endReadinessUpdates()
+            #if DEBUG
+            if debugWholeEntry != nil {
+                debugWholeCommit = .init(entryNs: commitEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
+            }
+            #endif
+        }
         #if DEBUG
+        debugWholeStage = .seekGuard
         let debugEnqueueTicket = currentItem.map {
             PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0))
         }
@@ -1012,13 +1093,23 @@ final class ContinuousPictureInPicture: NSObject {
             blockedFrameAcquisitionCount &+= 1
             return
         }
+        #if DEBUG
+        debugWholeStage = .activeGuard
+        #endif
         guard presentationActive else { return }
+        #if DEBUG
+        debugWholeStage = .itemGuard
+        #endif
         guard let item = currentItem, !imageEpochSaturated else { return }
         let pullReceipt = CurrentFrameReceipt(
             ticket: PresentationTicket(generation: presentationRevision, item: ObjectIdentifier(item)),
             output: ObjectIdentifier(videoOutput), imageEpoch: imageEpoch, seekSerial: seekTicket)
+        #if DEBUG
+        debugWholeStage = .ownerGuard
+        #endif
         guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
+        debugWholeStage = .acquisitionGuard
         if let shouldAcquire = shouldDebugAcquireFrame {
             guard shouldAcquire(pullReceipt) else { return }
             guard ownsFramePull(pullReceipt) else { return }
@@ -1026,9 +1117,23 @@ final class ContinuousPictureInPicture: NSObject {
         debugTraceRender(.attempt, sourceTicket: debugSourceTicket)
         #endif
         guard ownsFramePull(pullReceipt) else { return }
+        #if DEBUG
+        debugWholeStage = .layerStatus
+        debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        #endif
         let layerFailed = displayLayer.status == .failed
+        #if DEBUG
+        if debugWholeEntry != nil {
+            debugWholeStatus = .init(entryNs: debugWholeReadEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
+            debugWholeLayerFailed = layerFailed
+        }
+        debugWholeStage = .ownerAfterStatus
+        #endif
         guard ownsFramePull(pullReceipt) else { return }
         if layerFailed {
+            #if DEBUG
+            debugWholeStage = .failedLayerRecovery
+            #endif
             // Discard credit before any observer or SDK flush can reenter.
             let shouldReport = !hasReportedFrameFailure
             let errorCode = shouldReport ? (displayLayer.error as NSError?)?.code : nil
@@ -1048,62 +1153,118 @@ final class ContinuousPictureInPicture: NSObject {
             return // The next pull must capture the new image epoch.
         }
         // Respect platform backpressure. No app-owned pixel-buffer queue or decoded-frame history.
-        guard displayLayer.isReadyForMoreMediaData else { return }
-        guard ownsFramePull(pullReceipt) else { return }
-        let requestedTime = CMTimebaseGetTime(timebase)
-        guard requestedTime.isNumeric else { return }
         #if DEBUG
-        if let item = currentItem { onFrameAcquisition?(item, requestedTime) }
+        debugWholeStage = .backpressure
+        debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        let readyForMore = displayLayer.isReadyForMoreMediaData
+        if debugWholeEntry != nil {
+            debugWholeBackpressure = .init(entryNs: debugWholeReadEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
+            debugWholeReadyForMore = readyForMore
+        }
+        guard readyForMore else { return }
+        debugWholeStage = .ownerAfterBackpressure
+        #else
+        guard displayLayer.isReadyForMoreMediaData else { return }
         #endif
         guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
+        debugWholeStage = .timebase
+        debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        #endif
+        let requestedTime = CMTimebaseGetTime(timebase)
+        #if DEBUG
+        if debugWholeEntry != nil {
+            debugWholeTimebase = .init(entryNs: debugWholeReadEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
+            debugWholeRequestedNumeric = requestedTime.isNumeric
+        }
+        debugWholeStage = .numericTimeGuard
+        #endif
+        guard requestedTime.isNumeric else { return }
+        #if DEBUG
+        debugWholeStage = .acquisitionObserver
+        debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+        if let item = currentItem { onFrameAcquisition?(item, requestedTime) }
+        if debugWholeEntry != nil {
+            debugWholeAcquisition = .init(entryNs: debugWholeReadEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
+        }
+        debugWholeStage = .ownerAfterAcquisitionObserver
+        #endif
+        guard ownsFramePull(pullReceipt) else { return }
+        #if DEBUG
+        debugWholeStage = .availability
         let hasNew = debugNativePull(.availability, sourceTicket: debugEnqueueTicket,
             sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
             videoOutput.hasNewPixelBuffer(forItemTime: requestedTime)
         }
+        debugWholeAvailability = hasNew
+        debugWholeStage = .availabilityGuard
         debugTraceRender(hasNew ? .hasNewTrue : .hasNewFalse, requested: requestedTime, sourceTicket: debugSourceTicket)
         guard hasNew else { return }
         #else
         guard videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
         #endif
+        #if DEBUG
+        debugWholeStage = .ownerBeforeCopy
+        #endif
         guard ownsFramePull(pullReceipt) else { return }
         var displayTime = CMTime.invalid
         #if DEBUG
+        debugWholeStage = .copy
         let copied = debugNativePull(.copy, sourceTicket: debugEnqueueTicket,
             sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
             videoOutput.copyPixelBuffer(forItemTime: requestedTime, itemTimeForDisplay: &displayTime)
         }
+        debugWholeCopied = copied != nil
+        debugWholeStage = .copyGuard
         guard let pixel = copied else { return }
         let debugAlignedAfterCopy = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #else
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
         #endif
+        #if DEBUG
+        debugWholeStage = .ownerAfterCopy
+        #endif
         guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
+        debugWholeStage = .copiedPixelObserver
         if let observer = onDebugCopiedPixel {
             observer(pixel, DebugCopiedPixelContext(pull: pullReceipt,
                 requestedTime: requestedTime, rawDisplayTime: displayTime))
             guard ownsFramePull(pullReceipt) else { return }
         }
+        debugWholeStage = .ownerAfterCopiedPixelObserver
         #endif
         if !displayTime.isNumeric { displayTime = requestedTime }
         lastCopiedFramePositionSeconds = CMTimeGetSeconds(displayTime)
         #if DEBUG
+        debugWholeStage = .timestampCredit
         debugTraceRender(.copied, requested: requestedTime, sample: displayTime, sourceTicket: debugSourceTicket)
         #endif
         guard ownsFramePull(pullReceipt) else { return }
         // A stopped clock cannot advance to a future sample. Do not let an output
         // replay from before a backwards seek pin this epoch ahead of its target.
         // Past samples remain valid for sources with long or variable frame durations.
+        #if DEBUG
+        debugWholeStage = .pausedFutureGuard
+        #endif
         if !playbackState.read().isPlaying && CMTimeCompare(displayTime, requestedTime) > 0 {
             pausedFutureFrameRejectionCount &+= 1
             return
         }
+        #if DEBUG
+        debugWholeStage = .increasingTimeGuard
+        #endif
         guard !lastEnqueuedTime.isNumeric || CMTimeCompare(displayTime, lastEnqueuedTime) > 0 else { return }
         // Never build a future presentation backlog if the video decoder runs ahead of audio.
         let lead = CMTimeGetSeconds(CMTimeSubtract(displayTime, requestedTime))
+        #if DEBUG
+        debugWholeStage = .leadGuard
+        #endif
         guard lead.isFinite, lead <= 1.0 / 30 else { return }
+        #if DEBUG
+        debugWholeStage = .formatCreation
+        #endif
         let width = CVPixelBufferGetWidth(pixel)
         let height = CVPixelBufferGetHeight(pixel)
         let pixelType = CVPixelBufferGetPixelFormatType(pixel)
@@ -1119,22 +1280,35 @@ final class ContinuousPictureInPicture: NSObject {
             formatHeight = height
             formatPixelType = pixelType
         }
+        #if DEBUG
+        debugWholeStage = .formatGuard
+        #endif
         guard let format else { return }
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: displayTime,
                                        decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
+        #if DEBUG
+        debugWholeStage = .sampleCreation
+        #endif
         let status = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
                                                               imageBuffer: pixel,
                                                               formatDescription: format,
                                                               sampleTiming: &timing,
                                                               sampleBufferOut: &sample)
         guard ownsFramePull(pullReceipt) else { return }
+        #if DEBUG
+        debugWholeStage = .sampleGuard
+        #endif
         guard status == noErr, let sample else { reportFrameFailure(status); return }
         #if DEBUG
         let debugAlignedBeforeEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #endif
+        #if DEBUG
+        debugWholeStage = .ownerBeforeEnqueue
+        #endif
         guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
+        debugWholeStage = .enqueue
         debugNativePull(.enqueue, sourceTicket: debugEnqueueTicket,
             sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
             displayLayer.enqueue(sample)
@@ -1144,7 +1318,14 @@ final class ContinuousPictureInPicture: NSObject {
         #else
         displayLayer.enqueue(sample)
         #endif
+        #if DEBUG
+        debugWholeEnqueueCalled = true
+        debugWholeStage = .ownerAfterEnqueue
+        #endif
         guard ownsFramePull(pullReceipt) else { return }
+        #if DEBUG
+        debugWholeStage = .imageCredit
+        #endif
         lastEnqueuedTime = displayTime
         lastFramePositionSeconds = CMTimeGetSeconds(displayTime)
         submittedFrameCount &+= 1
@@ -1157,6 +1338,7 @@ final class ContinuousPictureInPicture: NSObject {
             beforeEnqueue: debugAlignedBeforeEnqueue, afterEnqueue: debugAlignedAfterEnqueue,
             enqueuedNs: debugAlignedEnqueuedNs, requested: requestedTime, sample: displayTime)
         debugTraceRender(.enqueued, requested: requestedTime, sample: displayTime, sourceTicket: debugSourceTicket)
+        debugWholeStage = .enqueued
         #endif
     }
 

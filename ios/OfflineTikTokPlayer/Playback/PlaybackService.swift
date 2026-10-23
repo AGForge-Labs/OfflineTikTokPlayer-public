@@ -122,6 +122,24 @@ final class PlaybackService: NSObject {
     @ObservationIgnored var onDebugCPPNativePullStamp: ((DebugCPPNativePullStamp) -> Void)? {
         didSet { continuousPiP.onDebugNativePullStamp = nil }
     }
+    struct DebugCPPWholeFrameStamp: Sendable {
+        let request: Int?, generation: Int
+        let presentationTicket: ContinuousPictureInPicture.PresentationTicket?
+        let observedItem: ObjectIdentifier?
+        let event: ContinuousPictureInPicture.DebugWholeFrameEvent
+    }
+    @ObservationIgnored var onDebugCPPWholeFrame: (@MainActor (DebugCPPWholeFrameStamp) -> Void)? {
+        didSet {
+            guard let observer = onDebugCPPWholeFrame else { continuousPiP.onDebugWholeFrame = nil; return }
+            continuousPiP.onDebugWholeFrame = { [weak self] event in
+                guard let self else { return }
+                let presentation = self.videoPresentation
+                observer(DebugCPPWholeFrameStamp(request: presentation?.request, generation: self.generation,
+                    presentationTicket: presentation?.ticket,
+                    observedItem: self.observedItem.map { ObjectIdentifier($0) }, event: event))
+            }
+        }
+    }
     // One synchronous notification per start, no retained event history or SDK reads.
     struct DebugFrameMonitorReadBatch {
         let request: Int, generation: Int

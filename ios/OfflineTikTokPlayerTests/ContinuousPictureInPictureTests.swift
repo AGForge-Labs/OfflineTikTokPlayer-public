@@ -10,6 +10,111 @@ import UIKit
 
 @MainActor
 final class ContinuousPictureInPictureTests: XCTestCase {
+    func testWholeFrameBoundaryTraceCoversActualObserverAndRejectsReentrantOwner() async throws {
+        #if DEBUG
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let item = AVPlayerItem(url: url), bridge = ContinuousPictureInPicture()
+        var owned: ContinuousPictureInPicture.PreparedVideoResource?
+        defer {
+            bridge.onDebugWholeFrame = nil; bridge.onFrameAcquisition = nil
+            bridge.shouldDebugAcquireFrame = nil
+            bridge.invalidate(); owned?.retire()
+            XCTAssertTrue(item.outputs.isEmpty); XCTAssertNil(item.videoComposition)
+        }
+        let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+        owned = plan.install()
+        let resource = try XCTUnwrap(owned), output = try XCTUnwrap(resource.output)
+        let ticket = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0.4, durationSeconds: 30, isPlaying: false))
+        var entered: [ContinuousPictureInPicture.DebugWholeFrameEntry] = []
+        var returned: [ContinuousPictureInPicture.DebugWholeFrameSpan] = []
+        entered.reserveCapacity(16); returned.reserveCapacity(16)
+        var overflow = false, hookCalls = 0
+        var hookEntry: UInt64 = 0, hookReturn: UInt64 = 0
+        bridge.onDebugWholeFrame = { event in
+            switch event {
+            case .entered(let value):
+                if entered.count < 16 { entered.append(value) } else { overflow = true }
+            case .returned(let value):
+                if returned.count < 16 { returned.append(value) } else { overflow = true }
+            }
+        }
+        bridge.onFrameAcquisition = { observed, _ in
+            XCTAssertTrue(observed === item)
+            hookCalls += 1; hookEntry = DispatchTime.now().uptimeNanoseconds
+            Thread.sleep(forTimeInterval: 0.025) // Deliberate bounded calibration, never a playback measurement.
+            hookReturn = DispatchTime.now().uptimeNanoseconds
+        }
+        XCTAssertTrue(bridge.activate(ticket))
+        XCTAssertEqual(hookCalls, 1); XCTAssertEqual(entered.count, 1); XCTAssertEqual(returned.count, 1)
+        let first = try XCTUnwrap(returned.first), firstEntry = try XCTUnwrap(entered.first)
+        XCTAssertEqual(first.entry.ordinal, firstEntry.ordinal)
+        XCTAssertEqual(first.entry.entryNs, firstEntry.entryNs)
+        XCTAssertEqual(first.entry.state.ticket, ticket)
+        XCTAssertEqual(first.entry.state.output, ObjectIdentifier(output))
+        XCTAssertEqual(first.layerFailed, false); XCTAssertEqual(first.readyForMore, true)
+        XCTAssertEqual(first.requestedNumeric, true)
+        XCTAssertGreaterThanOrEqual(first.returnNs, hookReturn)
+        XCTAssertLessThanOrEqual(first.entry.entryNs, hookEntry)
+        XCTAssertGreaterThanOrEqual(first.returnNs - first.entry.entryNs, hookReturn - hookEntry)
+        let hook = try XCTUnwrap(first.acquisitionObserver)
+        XCTAssertLessThanOrEqual(hook.entryNs, hookEntry); XCTAssertGreaterThanOrEqual(hook.returnNs, hookReturn)
+        for read in [try XCTUnwrap(first.layerStatus), try XCTUnwrap(first.backpressure), try XCTUnwrap(first.timebase)] {
+            XCTAssertGreaterThanOrEqual(read.entryNs, first.entry.entryNs)
+            XCTAssertGreaterThanOrEqual(read.returnNs, read.entryNs)
+            XCTAssertLessThanOrEqual(read.returnNs, hook.entryNs)
+        }
+        let commit = try XCTUnwrap(first.readinessCommit)
+        XCTAssertGreaterThanOrEqual(commit.entryNs, hook.returnNs)
+        XCTAssertGreaterThanOrEqual(commit.returnNs, commit.entryNs)
+        XCTAssertLessThanOrEqual(commit.returnNs, first.returnNs)
+
+        bridge.onFrameAcquisition = nil; bridge.shouldDebugAcquireFrame = { _ in false }
+        bridge.updatePlayback(positionSeconds: 0.5, durationSeconds: 30, isPlaying: false)
+        let veto = try XCTUnwrap(returned.last)
+        XCTAssertGreaterThan(veto.entry.ordinal, first.entry.ordinal)
+        XCTAssertEqual(veto.stage, .acquisitionGuard)
+        XCTAssertNil(veto.layerStatus); XCTAssertNil(veto.backpressure); XCTAssertNil(veto.timebase)
+        XCTAssertNil(veto.availability)
+
+        bridge.shouldDebugAcquireFrame = nil
+        var issued: UInt64?
+        bridge.onFrameAcquisition = { _, _ in issued = bridge.beginSeek() }
+        bridge.updatePlayback(positionSeconds: 0.6, durationSeconds: 30, isPlaying: false)
+        let superseded = try XCTUnwrap(returned.last), seek = try XCTUnwrap(issued)
+        XCTAssertEqual(superseded.stage, .ownerAfterAcquisitionObserver)
+        XCTAssertEqual(superseded.entry.state.ticket, ticket)
+        XCTAssertEqual(superseded.returnedState.activeSeekTicket, seek)
+        XCTAssertNil(superseded.availability, "Tracing must cover the real early return without manufacturing a native call")
+
+        bridge.onFrameAcquisition = nil
+        bridge.completeSeek(seek)
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0.4, durationSeconds: 30, isPlaying: false))
+        let nestedBase = entered.count
+        var nested = false
+        bridge.onFrameAcquisition = { _, _ in
+            if !nested {
+                nested = true
+                bridge.updatePlayback(positionSeconds: 0.65, durationSeconds: 30, isPlaying: false)
+            }
+        }
+        XCTAssertTrue(bridge.activate(ticket))
+        let nestedEntries = Array(entered.dropFirst(nestedBase))
+        XCTAssertTrue(nested); XCTAssertEqual(nestedEntries.count, 2)
+        let outerEntry = try XCTUnwrap(nestedEntries.first), innerEntry = try XCTUnwrap(nestedEntries.last)
+        let outer = try XCTUnwrap(returned.first { $0.entry.ordinal == outerEntry.ordinal })
+        let inner = try XCTUnwrap(returned.first { $0.entry.ordinal == innerEntry.ordinal })
+        XCTAssertNotEqual(outer.entry.ordinal, inner.entry.ordinal)
+        XCTAssertGreaterThanOrEqual(inner.entry.entryNs, outer.entry.entryNs)
+        XCTAssertLessThanOrEqual(inner.returnNs, outer.returnNs)
+        XCTAssertGreaterThanOrEqual(outer.returnNs, max(outer.returnNs, inner.returnNs),
+            "The enclosing completed return remains the envelope after a nested row")
+        XCTAssertEqual(entered.count, returned.count); XCTAssertFalse(overflow)
+        XCTAssertEqual(Set(entered.map(\.ordinal)).count, entered.count)
+        print("WholeFrameBoundaryCalibration schema=1 actualActivation=true deliberateObserverHoldNs=\(hookReturn - hookEntry) entryExitMatched=true reentrantGuardPreserved=true nestedEntryReturnOrderVerified=true copiedPixelScans=0 extraNativeQueries=0 latencyAcceptance=false")
+        #endif
+    }
+
     func testActiveTimelineReceiptRequiresLiveOwnerWithoutGrantingPendingImageCredit() async throws {
         #if DEBUG
         let urlA = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
