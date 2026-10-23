@@ -527,6 +527,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             traceClockHandoff: true, nativeReaderWaitSampling: false)
     }
 
+    func testInitialVideoPollingOffFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, initialVideoPolling: false)
+    }
+
+    func testInitialVideoPollingOnFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, initialVideoPolling: true)
+    }
+
+    func testInitialVideoPollingOnSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, initialVideoPolling: true)
+    }
+
+    func testInitialVideoPollingOffSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, initialVideoPolling: false)
+    }
+
     func testAWorkerBoundaryAtActualStereoZeroWithOriginalPlaybackGuards() async throws {
         #if DEBUG
         try await runProductionSelectionBenchmark(traceVideoSeeks: true,
@@ -3451,9 +3471,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 nativePlayerReportedState: Bool? = nil,
                                                 nativeAudioTrackDisabling: Bool? = nil,
                                                 sameRetainedAssetAdmission: Bool? = nil,
-                                                nativeReaderWaitSampling: Bool? = nil) async throws {
+                                                nativeReaderWaitSampling: Bool? = nil,
+                                                initialVideoPolling: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if let enabled = initialVideoPolling {
+            guard traceVideoSeeks, traceClockHandoff == true, traceReturnedAStereoZero == true,
+                  nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
+                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
+                  initialNativeStartCurrentItemTime == nil, frameMonitorAlternative == nil,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !traceNativeRefill,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  freshPreviousBundle == nil, queuedPreviousLead == nil, !auditSavedAAfterCleanup,
+                  firstZeroSourceCallbacks == nil, capClockBoundary == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  acceptedPCMOriginBenchmarkMode == nil, sourceOutputBenchmarkMode == nil,
+                  sourceCallbackLedgerBenchmarkMode == nil,
+                  sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("Initial polling comparison changes only the bounded cadence of the existing task")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("InitialVideoPollingScope schema=1 enabled=\(enabled) fastMilliseconds=16 ordinaryMilliseconds=33 maximumWindowSeconds=0.5 requestOwner=latest-only windowOrigin=first-eligible-generation-poll slowLoadCanExhaustWindow=true tasks=existing-single nativeConvergence=required videoIdentityAndFrames=unchanged audioOutputAndMemoryLimits=unchanged")
+        }
         let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
             ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeAudioTrackDisabling == nil && sameRetainedAssetAdmission == nil && nativeReaderWaitSampling == nil ? nil : true)
         if let enabled = nativeReaderWaitSampling {
@@ -3462,6 +3502,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             throw SelectionVideoTestFailure.timeout
             #endif
             guard traceVideoSeeks, traceClockHandoff == true, sameRetainedAssetAdmission == nil,
+                  initialVideoPolling == nil,
                   nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
                   firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
@@ -3683,6 +3724,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if initialVideoPolling != nil {
+            XCTFail("Initial polling comparison requires DEBUG; Release cadence is unchanged")
+            throw SelectionVideoTestFailure.timeout
+        }
         if sameRetainedAssetAdmission != nil {
             XCTFail("Same-retained-asset admission controls require DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3857,6 +3902,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        if let enabled = initialVideoPolling {
+            service.debugInitialVideoPollingControl = enabled
+            XCTAssertEqual(service.debugInitialVideoPollingControl, enabled)
+        }
         let nativeAudioControl = nativeAudioTrackDisabling.map {
             NativeItemAudioTrackControl(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation,
                 aID: fixture.aID, bID: fixture.bID)
@@ -4053,6 +4102,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var measurements: [ProductionSelectionMeasurement] = []
         var streams: [ProductionSelectionStream] = []
         measurements.reserveCapacity(3); streams.reserveCapacity(3)
+        #if DEBUG
+        var initialPollingWindows: [(phase: Int, enabled: Bool, window: InitialPlaybackPollWindow.Snapshot)] = []
+        initialPollingWindows.reserveCapacity(3)
+        #endif
         var returnedStart: Int?
         var returnedEnd: Int?
         var returnedOrigin: Double?
@@ -4134,6 +4187,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             measurements.append(measurement)
             #if DEBUG
+            if let enabled = initialVideoPolling, initialPollingWindows.count < 3 {
+                // Cache only three existing policy windows. Publish after cleanup;
+                // this adds no clock read, SDK getter or in-window logging.
+                initialPollingWindows.append((phase, enabled, service.debugInitialVideoPollingWindow))
+            }
             if phase == 2 { previousBundleControl?.completeQueuedLeadReadback(last: measurement.last) }
             try suppressionControl?.qualify(phase: phase, stage: 1, service: service, audio: audio)
             #endif
@@ -4268,6 +4326,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
         #if DEBUG
         nativeWait?.dump(cleanupAcknowledged: mayRemoveFixture)
+        if initialVideoPolling != nil {
+            XCTAssertEqual(initialPollingWindows.count, measurements.count)
+            for row in initialPollingWindows {
+                let start = row.window.start.map { String($0) } ?? "unknown"
+                let deadline = row.window.deadline.map { String($0) } ?? "unknown"
+                print("InitialVideoPollingWindow schema=1 phase=\(row.phase) enabled=\(row.enabled) request=\(row.window.request) startSeconds=\(start) deadlineSeconds=\(deadline) clock=DispatchTime budgetSeconds=0.5 origin=first-eligible-generation-poll cachedOnly=true actualCadence=not-guaranteed publication=after-cleanup")
+            }
+        }
         if sameRetainedAssetAdmission != nil {
             let final = admissionReply.withLock { $0 }
             let cached = firstZeroProbe?.snapshot().response?.admission

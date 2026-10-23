@@ -381,6 +381,11 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let buffer: PlaybackBuffer
     @ObservationIgnored private let continuousAudio: ContinuousAudioPlayer
     @ObservationIgnored private var audioPollTask: Task<Void, Never>?
+    @ObservationIgnored private var initialPollWindow = InitialPlaybackPollWindow()
+    #if DEBUG
+    @ObservationIgnored var debugInitialVideoPollingControl: Bool?
+    var debugInitialVideoPollingWindow: InitialPlaybackPollWindow.Snapshot { initialPollWindow.snapshot }
+    #endif
     @ObservationIgnored private var audioVisit: Int64 = -1
     @ObservationIgnored private var audioToken = 0
     @ObservationIgnored private var syncingVideoGeneration: Int?
@@ -610,12 +615,28 @@ final class PlaybackService: NSObject {
             while !Task.isCancelled {
                 guard self != nil else { return }
                 self?.sampleContinuousAudio()
-                do { try await Task.sleep(for: .milliseconds(33)) } catch { return }
+                let delay = self?.nextAudioPollDelayMilliseconds() ?? 33
+                do { try await Task.sleep(for: .milliseconds(delay)) } catch { return }
             }
         }
         timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1.0 / 30, preferredTimescale: 600), queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.sampleNativeVideoClock() }
         }
+    }
+
+    private func nextAudioPollDelayMilliseconds() -> Int {
+        #if DEBUG
+        let enabled = debugInitialVideoPollingControl == true
+        let observing = debugInitialVideoPollingControl != nil
+        #else
+        let enabled = false // Controlled comparison first; Release cadence is unchanged.
+        let observing = false
+        #endif
+        guard enabled || observing else { return 33 }
+        let delay = initialPollWindow.milliseconds(request: generation,
+            eligible: intent.canPlay && videoAllowed,
+            monotonicTime: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000)
+        return enabled ? delay : 33
     }
 
     func restore() {
@@ -658,6 +679,7 @@ final class PlaybackService: NSObject {
         defer { continuousPiP.endReadinessUpdates() }
         transferInitialClockBinding(retainActivation: true)
         intent.pause()
+        initialPollWindow.withdraw(request: generation)
         recordDiagnostic(.pauseRequested)
         continuousAudio.suspend()
         continuousPiP.updatePlayback(positionSeconds: clock.position, durationSeconds: clock.duration, isPlaying: false)
@@ -2199,7 +2221,7 @@ final class PlaybackService: NSObject {
         recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
             transferInitialClockBinding(retainActivation: true)
-            intent.interruptionBegan(); cancelStallRecovery()
+            intent.interruptionBegan(); initialPollWindow.withdraw(request: generation); cancelStallRecovery()
             continuousAudio.suspend()
             player.pause(); persist()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
@@ -2232,6 +2254,7 @@ final class PlaybackService: NSObject {
         pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
         if !videoAllowed {
+            initialPollWindow.withdraw(request: generation)
             transferInitialClockBinding(retainActivation: true)
             player.pause(); continuousPiP.suspendFrameFeed()
         }

@@ -427,7 +427,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         expected_selectors = ['OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose']
         self.assertEqual(names, expected_selectors)
         workflow = TARGETED_WORKFLOW.read_text(encoding="utf-8")
-        self.assertEqual(re.findall(r'^\s*timeout-minutes:\s*(\d+)\s*$', workflow, re.MULTILINE), ['40'])
+        self.assertEqual(re.findall(r'^\s*timeout-minutes:\s*(\d+)\s*$', workflow, re.MULTILINE), ['50'])
         # Execute only the workflow's expected-set/source-membership guard.
         # No imports, log reads, SDK invocation, or arbitrary workflow run body.
         scope = re.search(r'^          prefix = .*?(?=^          evidence\.verify_log\()',
