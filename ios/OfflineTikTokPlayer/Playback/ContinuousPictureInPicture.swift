@@ -790,6 +790,13 @@ final class ContinuousPictureInPicture: NSObject {
         return true
     }
 
+    /// Cached ownership only, for a completed offscreen rewind's initial start.
+    /// Any native seek in this presentation session keeps the numeric fallback.
+    func permitsRetainedZeroStart(_ ticket: PresentationTicket) -> Bool {
+        owns(ticket) && installedTimeline == ticket && !imageEpochSaturated
+            && seekTicket == 0 && activeSeekTicket == nil
+    }
+
     private func owns(_ ticket: PresentationTicket) -> Bool {
         !invalidated && ticket.generation == presentationRevision
             && currentItem.map { ObjectIdentifier($0) == ticket.item } == true

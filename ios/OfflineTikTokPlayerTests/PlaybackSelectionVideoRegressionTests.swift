@@ -552,6 +552,71 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             traceClockHandoff: true, initialNativeStartCurrentItemTime: false)
     }
 
+    func testDefaultRetainedPreviousUsesCurrentPositionAfterOwnedRewind() async throws {
+        try await assertDefaultRetainedPreviousStart(priorExplicitSeek: false)
+    }
+
+    func testRetainedPreviousAfterExplicitSeekKeepsNumericStartFallback() async throws {
+        try await assertDefaultRetainedPreviousStart(priorExplicitSeek: true)
+    }
+
+    private func assertDefaultRetainedPreviousStart(priorExplicitSeek: Bool) async throws {
+        #if DEBUG
+        let buffer = PlaybackBuffer()
+        try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
+            var handoffs: [PlaybackService.DebugVideoRateHandoff] = []
+            var overflow = false
+            service.onDebugVideoRateHandoff = { value in
+                if value.cause == .initialReady {
+                    if handoffs.count < 8 { handoffs.append(value) } else { overflow = true }
+                }
+            }
+            defer { service.onDebugVideoRateHandoff = nil }
+            XCTAssertNil(service.debugInitialNativeStartControl, "Exercise default production policy")
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            let originalA = try XCTUnwrap(service.player.currentItem)
+            if priorExplicitSeek {
+                service.pause()
+                try await require({ !service.audioEngineRunning && service.player.rate == 0 }, "A must pause before explicit seek")
+                service.seek(0.65)
+                try await require({ service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                    && service.videoFramePositionSeconds.map { abs($0 - 0.65) < 0.080 } == true },
+                    "Actual paused seek must finish and submit its target before the fallback control")
+                service.play()
+                try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            }
+            try await require({ buffer.hasPrepared(fixture.bID) }, "B must be prepared")
+            service.next()
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
+            try await require({ buffer.previousMediaID == fixture.aID && buffer.debugPreviousCompletedZeroRewind == true },
+                "A must complete its owned native offscreen rewind")
+            let request = service.debugInitialVideoReadyState.generation + 1
+            service.previous()
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            XCTAssertTrue(service.player.currentItem === originalA)
+            let returned = try XCTUnwrap(handoffs.first { $0.request == request })
+            XCTAssertEqual(handoffs.filter { $0.request == request }.count, 1)
+            XCTAssertEqual(returned.item, ObjectIdentifier(originalA))
+            XCTAssertTrue(returned.presentationUnchanged)
+            XCTAssertTrue(returned.entryObservedItemMatches && returned.returnObservedItemMatches)
+            XCTAssertNil(returned.initialStartArgument, "No counterfactual DEBUG override")
+            XCTAssertEqual(returned.anchorTime.isValid, priorExplicitSeek,
+                "Only unseeked, proven retained Previous may avoid numeric repositioning")
+            if priorExplicitSeek {
+                XCTAssertTrue(returned.anchorTime.isNumeric)
+                XCTAssertGreaterThan(returned.entrySeekState.serial, 0)
+            } else { XCTAssertEqual(returned.entrySeekState.serial, 0) }
+            XCTAssertNil(returned.entrySeekState.activeTicket)
+            XCTAssertTrue(handoffs.filter { $0.request < request }.allSatisfy { $0.anchorTime.isNumeric },
+                "Fresh A and Next B retain numeric startup")
+            XCTAssertFalse(overflow); XCTAssertLessThanOrEqual(buffer.retainedItemCount, 4)
+        }
+        #else
+        XCTFail("Default startup argument contracts require native DEBUG receipts")
+        #endif
+    }
+
     func testQueuedPreviousStartCurrentFirst() async throws {
         try await runProductionSelectionBenchmark(traceVideoSeeks: true,
             traceClockHandoff: true, initialNativeStartCurrentItemTime: true)

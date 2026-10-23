@@ -64,7 +64,7 @@ final class PlaybackService: NSObject {
         let historyQualifiedNearZero: Bool
         let desiredAudioGoal: Double
     }
-    // Isolated request only; nil preserves the original numeric argument.
+    // Isolated ablation only; nil uses the guarded production startup policy.
     @ObservationIgnored var debugInitialNativeStartControl: DebugInitialNativeStartControl?
     struct DebugEarlyClockAcquisitionControl: Sendable {
         let request: Int
@@ -757,7 +757,7 @@ final class PlaybackService: NSObject {
         buffer.synchronize()
         endedDuringScroll = false
         guard queue.previous() != nil else { seek(0); return }
-        intent.requestPlay(); activateAudio(); loadCurrent()
+        intent.requestPlay(); activateAudio(); loadCurrent(preferRetainedPreviousStart: true)
     }
 
     func feedDidSettle(direction: Int) {
@@ -827,7 +827,7 @@ final class PlaybackService: NSObject {
     }
 
     private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil,
-                             audioAlreadySelected: Bool = false) {
+                             audioAlreadySelected: Bool = false, preferRetainedPreviousStart: Bool = false) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         pendingAudioSeek = nil; completePiPSkip()
@@ -879,7 +879,8 @@ final class PlaybackService: NSObject {
                 currentIsLocal = prepared.isLocal
                 resumeContinuousAudio()
                 recordPlaybackEvent("preparedAdoption")
-                observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
+                observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind,
+                    retainedPreviousStart: preferRetainedPreviousStart && prepared.completedPreviousZeroRewind)
                 prepareUpcoming()
                 return
             }
@@ -997,7 +998,8 @@ final class PlaybackService: NSObject {
         }
     }
 
-    private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
+    private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false,
+                                retainedPreviousStart: Bool = false) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         observedItem = playerItem
@@ -1177,23 +1179,25 @@ final class PlaybackService: NSObject {
                             if installed, let ticket, let anchor = playbackAnchor,
                                self.currentVideoPresentation(for: playerItem, request: request) == ticket {
                                 guard ownsNativeStart() else { return }
+                                @MainActor func permitsCurrentPositionStart() -> Bool {
+                                    retainedPreviousStart && position == 0 && !rewind && waitsForClock
+                                        && ownsNativeStart() && self.statusHandledGeneration == request
+                                        && self.syncingVideoGeneration != request
+                                        && anchor.position.isFinite && anchor.position >= 0 && anchor.position <= 0.080
+                                        && self.continuousPiP.permitsRetainedZeroStart(ticket)
+                                        && startBinding.map { binding in
+                                            binding.request == request && binding.ticket == ticket
+                                                && binding.accepted && binding.issued && binding.nativeSeek == nil
+                                                && self.pendingInitialClockBinding == binding
+                                                && self.ownsInitialClockBinding(binding, item: playerItem)
+                                        } == true
+                                }
                                 #if DEBUG
                                 self.debugTraceVideoStartup(.setRate, request: request, installed: installed,
                                     anchorHostSeconds: anchor.host.seconds, anchorPosition: anchor.position) {
                                     var argument: DebugInitialNativeStartArgument?
                                     if let control = self.debugInitialNativeStartControl, control.request == request {
-                                        let seek = self.continuousPiP.debugNativeSeekState
-                                        let qualified = position == 0 && !rewind && waitsForClock
-                                            && self.statusHandledGeneration == request
-                                            && self.pendingAudioSeek == nil && self.explicitVideoSeekGeneration != request
-                                            && anchor.position.isFinite && anchor.position >= 0 && anchor.position <= 0.080
-                                            && seek.serial == 0 && seek.activeTicket == nil
-                                            && startBinding.map { binding in
-                                                binding.request == request && binding.ticket == ticket
-                                                    && binding.accepted && binding.issued && binding.nativeSeek == nil
-                                                    && self.pendingInitialClockBinding == binding
-                                                    && self.ownsInitialClockBinding(binding, item: playerItem)
-                                            } == true
+                                        let qualified = permitsCurrentPositionStart()
                                         argument = DebugInitialNativeStartArgument(
                                             requestedCurrentItemTime: control.usesCurrentItemTime,
                                             historyQualifiedNearZero: qualified, desiredAudioGoal: anchor.position)
@@ -1201,15 +1205,15 @@ final class PlaybackService: NSObject {
                                     // History qualifies intent/owner, not the native position at issue.
                                     let useCurrent = argument.map {
                                         $0.requestedCurrentItemTime && $0.historyQualifiedNearZero
-                                    } ?? false
+                                    } ?? permitsCurrentPositionStart()
                                     self.debugSetVideoRate(1, time: useCurrent ? .invalid
                                         : CMTime(seconds: anchor.position, preferredTimescale: 48_000),
                                         atHostTime: anchor.host, item: playerItem, request: request, cause: .initialReady,
                                         initialStartArgument: argument)
                                 }
                                 #else
-                                self.player.setRate(1, time: CMTime(seconds: anchor.position, preferredTimescale: 48_000),
-                                                    atHostTime: anchor.host)
+                                self.player.setRate(1, time: permitsCurrentPositionStart() ? .invalid
+                                    : CMTime(seconds: anchor.position, preferredTimescale: 48_000), atHostTime: anchor.host)
                                 #endif
                             } else {
                                 guard ownsNativeStart() else { return }

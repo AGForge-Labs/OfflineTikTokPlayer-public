@@ -11,12 +11,23 @@ final class PlaybackBuffer {
         var needsRewind = false
         var reachedEnd = false
         var videoResource: ContinuousPictureInPicture.PreparedVideoResource? = nil
+        // Fresh staged items also have needsRewind=false. Only an owned native
+        // offscreen rewind may establish this separate startup provenance.
+        fileprivate(set) var completedPreviousZeroRewind = false
+        init(mediaID: String, item: AVPlayerItem, isLocal: Bool, needsRewind: Bool = false,
+             reachedEnd: Bool = false, videoResource: ContinuousPictureInPicture.PreparedVideoResource? = nil) {
+            self.mediaID = mediaID; self.item = item; self.isLocal = isLocal
+            self.needsRewind = needsRewind; self.reachedEnd = reachedEnd; self.videoResource = videoResource
+        }
     }
     let player = AVQueuePlayer()
     private var next: Prepared?
     private var loopReserve: Prepared?
     private var active: Prepared?
-    private var previous: Prepared?
+    private var previousRevision: UInt64 = 0
+    private var previous: Prepared? {
+        didSet { if previousRevision < .max { previousRevision += 1 } }
+    }
     private var observation: NSKeyValueObservation?
     var didAdvance: ((Prepared) -> Void)?
     var automaticAdvancementEnabled = true { didSet { updateEndAction() } }
@@ -26,6 +37,10 @@ final class PlaybackBuffer {
     let debugSuppressesPlayerRendering: Bool
     let debugNativeGeometry: Bool?
     var debugPreviousNeedsRewind: Bool? { previous?.needsRewind }
+    var debugPreviousCompletedZeroRewind: Bool? { previous?.completedPreviousZeroRewind }
+    var debugPreviousRevision: UInt64 { previousRevision }
+    var onDebugPreviousRewindCompletion: (@MainActor (UInt64, Bool, Bool) -> Void)?
+    var onDebugPreviousRewindRead: (@MainActor () -> Void)?
     var debugQueuedPreviousAdvance: Bool?
     func debugResourceIdentity(for item: ObjectIdentifier) -> ObjectIdentifier? {
         videoResources.first {
@@ -125,18 +140,44 @@ final class PlaybackBuffer {
     }
 
     private func preparePreviousStart() {
-        guard let previous, previous.needsRewind, previous.item.status == .readyToPlay,
-              previous.item !== player.currentItem else { return }
-        let item = previous.item
+        // Keep the saturated value invalid even after a final slot mutation.
+        guard let candidate = previous, candidate.needsRewind, previousRevision < UInt64.max - 1 else { return }
+        let revision = previousRevision, item = candidate.item
+        let status = item.status, current = player.currentItem
+        // SDK reads can notify observers. Recheck the slot after both reads;
+        // item identity alone cannot distinguish a later retained visit of A.
+        guard previousRevision == revision, sameOwner(previous, candidate),
+              previous?.needsRewind == true, status == .readyToPlay, current !== item else { return }
+        previousRevision += 1
+        let rewindRevision = previousRevision
         // Rewind off-screen, not on the Previous button's critical path. Weak
         // captures and cancellation on eviction bound preparation to one item.
         item.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
             Task { @MainActor in
-                guard let self, let item, finished, self.previous?.item === item,
-                      self.player.currentItem !== item, abs(item.currentTime().seconds) < 0.005 else { return }
-                self.previous?.needsRewind = false
+                guard let self, let item else { return }
+                let accepted = self.completePreviousRewind(item, revision: rewindRevision, finished: finished)
+                #if DEBUG
+                self.onDebugPreviousRewindCompletion?(rewindRevision, finished, accepted)
+                #endif
             }
         }
+    }
+
+    private func completePreviousRewind(_ item: AVPlayerItem, revision: UInt64, finished: Bool) -> Bool {
+        guard finished, revision < .max, previousRevision == revision,
+              previous?.item === item, previous?.needsRewind == true else { return false }
+        let position = item.currentTime().seconds
+        let current = player.currentItem
+        #if DEBUG
+        onDebugPreviousRewindRead?()
+        #endif
+        guard previousRevision == revision, var committed = previous,
+              committed.item === item, committed.needsRewind, current !== item,
+              position.isFinite, abs(position) < 0.005 else { return false }
+        committed.needsRewind = false
+        committed.completedPreviousZeroRewind = true
+        previous = committed
+        return true
     }
 
     /// KVO may be delivered after a swipe. Always reconcile actual object identity.
@@ -276,6 +317,7 @@ final class PlaybackBuffer {
         retireReleased(candidates.filter { $0 !== prepared.videoResource })
         guard ifEligible() else { return false }
         var committed = prepared
+        committed.completedPreviousZeroRewind = false
         #if DEBUG
         committed.videoResource = videoPreparation?.install(debugSuppressesPlayerRendering: debugSuppressesPlayerRendering,
                                                              ifEligible: ifEligible) ?? prepared.videoResource
@@ -304,6 +346,7 @@ final class PlaybackBuffer {
         discardNext()
         guard ifEligible(), player.canInsert(prepared.item, after: current) else { return false }
         var committed = prepared
+        committed.completedPreviousZeroRewind = false
         #if DEBUG
         committed.videoResource = videoPreparation?.install(debugSuppressesPlayerRendering: debugSuppressesPlayerRendering,
                                                              ifEligible: ifEligible) ?? prepared.videoResource
@@ -327,7 +370,9 @@ final class PlaybackBuffer {
               next.mediaID == prepared.mediaID, player.items().count == 2,
               player.canInsert(prepared.item, after: next.item) else { return }
         player.insert(prepared.item, after: next.item)
-        loopReserve = prepared
+        var committed = prepared
+        committed.completedPreviousZeroRewind = false
+        loopReserve = committed
         updateEndAction()
     }
 
@@ -402,7 +447,9 @@ final class PlaybackBuffer {
                     videoResource: committed.videoResource, ifEligible: ifEligible) else { return nil }
                 let current = player.currentItem
                 guard ifEligible(), current === committed.item, sameOwner(active, committed) else { return nil }
-                return committed
+                var replaced = committed
+                replaced.completedPreviousZeroRewind = false
+                return replaced
             }
         }
         guard let prepared = next, prepared.mediaID == mediaID else { return nil }

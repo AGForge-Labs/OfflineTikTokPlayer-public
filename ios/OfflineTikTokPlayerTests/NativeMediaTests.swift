@@ -5,6 +5,126 @@ import AudioToolbox
 
 @MainActor
 final class NativeMediaTests: XCTestCase {
+    func testFreshPreviousCannotClaimCompletedOffscreenRewind() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let buffer = PlaybackBuffer(), a = AVPlayerItem(url: url), b = AVPlayerItem(url: url)
+        buffer.usesExternalClock = true; buffer.automaticAdvancementEnabled = false
+        defer { buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+        XCTAssertTrue(buffer.replace(with: b, mediaID: "B"))
+        XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: a, isLocal: true)))
+        XCTAssertEqual(buffer.debugPreviousNeedsRewind, false)
+        XCTAssertEqual(buffer.debugPreviousCompletedZeroRewind, false)
+        let adopted = try XCTUnwrap(buffer.advance(to: "A"))
+        XCTAssertTrue(adopted.item === a); XCTAssertFalse(adopted.needsRewind)
+        XCTAssertFalse(adopted.completedPreviousZeroRewind)
+        XCTAssertLessThanOrEqual(buffer.retainedItemCount, 2)
+    }
+
+    func testOwnedOffscreenRewindProofSurvivesQueuedTransferOnly() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for queued in [true, false] {
+            let buffer = PlaybackBuffer(), a = AVPlayerItem(url: url), b = AVPlayerItem(url: url)
+            buffer.usesExternalClock = true; buffer.automaticAdvancementEnabled = false
+            buffer.debugQueuedPreviousAdvance = queued
+            defer { buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+            XCTAssertTrue(buffer.replace(with: a, mediaID: "A"))
+            buffer.player.playImmediately(atRate: 1)
+            let readyDeadline = Date().addingTimeInterval(5)
+            while a.currentTime().seconds < 0.1, Date() < readyDeadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertGreaterThanOrEqual(a.currentTime().seconds, 0.1)
+            buffer.player.pause()
+            XCTAssertTrue(buffer.stage(.init(mediaID: "B", item: b, isLocal: true), after: "A"))
+            XCTAssertNotNil(buffer.advance(to: "B"))
+            let rewindDeadline = Date().addingTimeInterval(5)
+            while buffer.debugPreviousCompletedZeroRewind != true, Date() < rewindDeadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertEqual(buffer.previousMediaID, "A")
+            XCTAssertEqual(buffer.debugPreviousNeedsRewind, false)
+            XCTAssertEqual(buffer.debugPreviousCompletedZeroRewind, true)
+            XCTAssertEqual(a.currentTime().seconds, 0, accuracy: 0.005)
+            let adopted = try XCTUnwrap(buffer.advance(to: "A"))
+            XCTAssertTrue(adopted.item === a); XCTAssertFalse(adopted.needsRewind)
+            XCTAssertEqual(adopted.completedPreviousZeroRewind, queued,
+                "Replacement cannot inherit queued decoder-start provenance")
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 2)
+        }
+    }
+
+    func testOldNativeRewindCompletionCannotCreditSameItemNewRetainedVisit() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let buffer = PlaybackBuffer(), a = AVPlayerItem(url: url), b = AVPlayerItem(url: url)
+        buffer.usesExternalClock = true; buffer.automaticAdvancementEnabled = false
+        var completions: [(revision: UInt64, accepted: Bool)] = []
+        buffer.onDebugPreviousRewindCompletion = { revision, _, accepted in
+            if completions.count < 8 { completions.append((revision, accepted)) }
+        }
+        defer {
+            buffer.onDebugPreviousRewindCompletion = nil
+            buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious()
+        }
+        XCTAssertTrue(buffer.replace(with: a, mediaID: "A"))
+        buffer.player.playImmediately(atRate: 1)
+        let readyDeadline = Date().addingTimeInterval(5)
+        while a.currentTime().seconds < 0.1, Date() < readyDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertGreaterThanOrEqual(a.currentTime().seconds, 0.1)
+        buffer.player.pause()
+        XCTAssertTrue(buffer.stage(.init(mediaID: "B", item: b, isLocal: true), after: "A"))
+        XCTAssertNotNil(buffer.advance(to: "B"))
+        let oldRevision = buffer.debugPreviousRevision
+        // No actor suspension between native issue and the new same-item slot.
+        // Cancellation may finish true or false; neither result owns this visit.
+        buffer.discardPrevious()
+        XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: a, isLocal: true, needsRewind: true)))
+        XCTAssertGreaterThan(buffer.debugPreviousRevision, oldRevision)
+        let deadline = Date().addingTimeInterval(5)
+        while !completions.contains(where: { $0.revision == oldRevision }), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(completions.filter { $0.revision == oldRevision }.count, 1,
+            "The actual native completion must arrive before the stale-receipt assertion qualifies")
+        XCTAssertFalse(completions.contains { $0.revision == oldRevision && $0.accepted })
+        XCTAssertEqual(buffer.debugPreviousNeedsRewind, true)
+        XCTAssertEqual(buffer.debugPreviousCompletedZeroRewind, false)
+        XCTAssertTrue(buffer.player.currentItem === b)
+        XCTAssertLessThanOrEqual(buffer.retainedItemCount, 2)
+    }
+
+    func testNativeRewindRevalidatesSameItemVisitAfterCompletionReads() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let buffer = PlaybackBuffer(), a = AVPlayerItem(url: url), b = AVPlayerItem(url: url)
+        buffer.usesExternalClock = true; buffer.automaticAdvancementEnabled = false
+        var hookCalls = 0, finished: Bool?, accepted: Bool?
+        buffer.onDebugPreviousRewindCompletion = { _, nativeFinished, credited in
+            finished = nativeFinished; accepted = credited
+        }
+        defer {
+            buffer.onDebugPreviousRewindRead = nil; buffer.onDebugPreviousRewindCompletion = nil
+            buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious()
+        }
+        XCTAssertTrue(buffer.replace(with: a, mediaID: "A"))
+        buffer.player.playImmediately(atRate: 1)
+        let readyDeadline = Date().addingTimeInterval(5)
+        while a.currentTime().seconds < 0.1, Date() < readyDeadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertGreaterThanOrEqual(a.currentTime().seconds, 0.1)
+        buffer.player.pause()
+        buffer.onDebugPreviousRewindRead = {
+            hookCalls += 1; buffer.onDebugPreviousRewindRead = nil
+            buffer.discardPrevious()
+            XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: a, isLocal: true, needsRewind: true)))
+        }
+        XCTAssertTrue(buffer.stage(.init(mediaID: "B", item: b, isLocal: true), after: "A"))
+        XCTAssertNotNil(buffer.advance(to: "B"))
+        let deadline = Date().addingTimeInterval(5)
+        while accepted == nil, Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(hookCalls, 1); XCTAssertEqual(finished, true)
+        XCTAssertEqual(accepted, false, "A successful native read cannot credit the replacement visit")
+        XCTAssertEqual(buffer.debugPreviousNeedsRewind, true)
+        XCTAssertEqual(buffer.debugPreviousCompletedZeroRewind, false)
+        XCTAssertTrue(buffer.player.currentItem === b)
+        XCTAssertLessThanOrEqual(buffer.retainedItemCount, 2)
+    }
+
     func testVideoAndPhotoRenderHaveAudioAndAreSeekable() async throws {
         for name in ["test-video", "test-slideshow", "test-slideshow-mp3.iphone"] {
             let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: name, withExtension: "mp4"))
