@@ -16,10 +16,10 @@ SOURCE = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_SOURCE",
 WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
 CASES = (
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstZeroCallbackRangeUsesActualStorageAcrossTapBuffers',
+    'OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testPresentationClockBoundaryContainsHeldGraphCallAndPendingReentry',
     'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstZeroSourceCallbacksOffThenOn',
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstZeroSourceCallbacksOnThenOff',
+    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testCAPClockBoundaryOffThenOn',
+    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testCAPClockBoundaryOnThenOff',
 )
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
