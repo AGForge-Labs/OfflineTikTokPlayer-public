@@ -31,6 +31,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private var sourceCallbackLedgerBenchmarkMode: Bool?
     private var sourceCallbackExecutionTimingBenchmarkMode: Bool?
     private var sourceCallbackLedgerArmID: String?
+    private static var unresolvedFirstZeroCalibrationAudio: ContinuousAudioPlayer?
     #endif
 
     private func recordRuntimeHost() throws {
@@ -852,6 +853,181 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #else
         XCTFail("Native start argument comparison requires DEBUG")
+        #endif
+    }
+
+    func testFirstStereoZeroEventOffThenOn() async throws {
+        try recordRuntimeHost()
+        for (ordinal, enabled) in [false, true].enumerated() {
+            print("FirstStereoZeroArm schema=1 order=off-then-on ordinal=\(ordinal) enabled=\(enabled) startupTracing=constant workerRequest=ON-only-after-event acceptance=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, traceReturnedAStereoZero: enabled)
+        }
+    }
+
+    func testFirstStereoZeroEventOnThenOff() async throws {
+        try recordRuntimeHost()
+        for (ordinal, enabled) in [true, false].enumerated() {
+            print("FirstStereoZeroArm schema=1 order=on-then-off ordinal=\(ordinal) enabled=\(enabled) startupTracing=constant workerRequest=ON-only-after-event acceptance=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, traceReturnedAStereoZero: enabled)
+        }
+    }
+
+    #if DEBUG
+    private func firstZeroCalibrationBuffer(frames: Int, left: Float = 0, right: Float = 0,
+                                            channels: AVAudioChannelCount = 2,
+                                            rate: Double = 48_000) throws -> AVAudioPCMBuffer {
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: rate, channels: channels))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)))
+        buffer.frameLength = AVAudioFrameCount(frames)
+        let planes = try XCTUnwrap(buffer.floatChannelData)
+        planes[0].update(repeating: left, count: frames)
+        if channels > 1 { planes[1].update(repeating: right, count: frames) }
+        return buffer
+    }
+    private func firstZeroCalibrationTime(_ frame: Int, extra: Double = 0) -> AVAudioTime {
+        AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: 100 + Double(frame) / 48_000 + extra))
+    }
+    #endif
+
+    func testFirstStereoZeroEventUsesActualAppendAndRetainedRange() throws {
+        #if DEBUG
+        func owner(enabled: Bool = true) -> (ProductionSelectionOutputTap, ProductionFirstStereoZeroEvent) {
+            let tap = ProductionSelectionOutputTap()
+            let event = ProductionFirstStereoZeroEvent(window: 7, commandToken: 11, commandVisit: 3,
+                commandVersion: 5, enabled: enabled, recorder: .init())
+            XCTAssertTrue(tap.armFirstStereoZero(event)); tap.begin(auditChannels: true)
+            XCTAssertFalse(tap.armFirstStereoZero(event), "An active tap cannot replace the bound window")
+            return (tap, event)
+        }
+        let (tap, event) = owner()
+        tap.append(try firstZeroCalibrationBuffer(frames: 479), time: firstZeroCalibrationTime(0))
+        XCTAssertNil(event.snapshot(for: 7))
+        tap.append(try firstZeroCalibrationBuffer(frames: 1), time: firstZeroCalibrationTime(479))
+        let frozen = try XCTUnwrap(event.snapshot(for: 7))
+        XCTAssertEqual(frozen.firstFrame, 0); XCTAssertEqual(frozen.endFrame, 480)
+        XCTAssertEqual(frozen.commandToken, 11); XCTAssertEqual(frozen.commandVisit, 3)
+        XCTAssertEqual(frozen.commandVersion, 5); XCTAssertTrue(frozen.timelineContinuous)
+        XCTAssertFalse(frozen.earlierUnqualifiedInput); XCTAssertGreaterThan(frozen.detectionExecutionHost, 0)
+        XCTAssertNil(event.snapshot(for: 8)); XCTAssertNotNil(frozen.lane0); XCTAssertNotNil(frozen.lane2)
+        tap.append(try firstZeroCalibrationBuffer(frames: 480), time: firstZeroCalibrationTime(480))
+        let end = tap.stop()
+        XCTAssertTrue(event.isClosed); XCTAssertEqual(end, 960)
+        XCTAssertEqual(event.snapshot(for: 7)?.endFrame, 480, "The first event remains frozen after more input and close")
+        XCTAssertEqual(tap.samples(from: frozen.firstFrame, to: frozen.endFrame).values.count, 480)
+        XCTAssertFalse(tap.armFirstStereoZero(event))
+
+        for kind in ["reset", "antiphase", "mono", "nonfinite", "invalid-time", "rate", "host-hole", "disabled", "closed"] {
+            let (probe, record) = owner(enabled: kind != "disabled")
+            if kind == "closed" { probe.stop(); probe.begin() }
+            if kind == "host-hole" {
+                probe.append(try firstZeroCalibrationBuffer(frames: 479), time: firstZeroCalibrationTime(0))
+                probe.append(try firstZeroCalibrationBuffer(frames: 1), time: firstZeroCalibrationTime(479, extra: 0.1))
+            } else if kind == "reset" {
+                probe.append(try firstZeroCalibrationBuffer(frames: 479), time: firstZeroCalibrationTime(0))
+                probe.append(try firstZeroCalibrationBuffer(frames: 1, left: 0.25, right: 0.25), time: firstZeroCalibrationTime(479))
+                probe.append(try firstZeroCalibrationBuffer(frames: 479), time: firstZeroCalibrationTime(480))
+            } else if kind == "invalid-time" || kind == "rate" || kind == "nonfinite" {
+                // A bad packet cannot bridge two zero runs, even when it retained no PCM.
+                probe.append(try firstZeroCalibrationBuffer(frames: 479), time: firstZeroCalibrationTime(0))
+                let bad = try firstZeroCalibrationBuffer(frames: 1,
+                    left: kind == "nonfinite" ? .nan : 0, rate: kind == "rate" ? 44_100 : 48_000)
+                probe.append(bad, time: kind == "invalid-time" ? AVAudioTime(sampleTime: 0, atRate: 48_000) : firstZeroCalibrationTime(479))
+                probe.append(try firstZeroCalibrationBuffer(frames: 480), time: firstZeroCalibrationTime(probe.count))
+            } else {
+                probe.append(try firstZeroCalibrationBuffer(frames: 480,
+                    left: kind == "antiphase" ? 0.25 : 0, right: kind == "antiphase" ? -0.25 : 0,
+                    channels: kind == "mono" ? 1 : 2), time: firstZeroCalibrationTime(0))
+            }
+            probe.stop()
+            let observed = record.snapshot(for: 7)
+            if kind == "host-hole" {
+                XCTAssertNotNil(observed); XCTAssertFalse(observed?.timelineContinuous ?? true)
+            } else if ["invalid-time", "rate", "nonfinite"].contains(kind) {
+                XCTAssertNotNil(observed); XCTAssertTrue(observed?.earlierUnqualifiedInput ?? false)
+                XCTAssertEqual(observed?.endFrame, probe.count)
+            } else { XCTAssertNil(observed, "Unqualified or interrupted input must not be reported as actual stereo silence: \(kind)") }
+            XCTAssertTrue(record.isClosed)
+        }
+        let (full, capacityEvent) = owner()
+        full.append(try firstZeroCalibrationBuffer(frames: 575_520, left: 0.25, right: 0.25), time: firstZeroCalibrationTime(0))
+        full.append(try firstZeroCalibrationBuffer(frames: 960), time: firstZeroCalibrationTime(575_520))
+        let capacityEnd = full.stop(), capacityRecord = try XCTUnwrap(capacityEvent.snapshot(for: 7))
+        XCTAssertEqual(capacityEnd, 576_000); XCTAssertEqual(full.validity().droppedFrames, 480)
+        XCTAssertTrue(capacityRecord.earlierUnqualifiedInput)
+        XCTAssertEqual(capacityRecord.firstFrame, 575_520); XCTAssertEqual(capacityRecord.endFrame, capacityEnd)
+        print("FirstStereoZeroAppendCalibration schema=1 passedActualAppendScenarios=11 threshold=479-plus-1 capacity=576000 eventCapacity=1 commandMetadataOnly=true sourceTapFrameJoin=false")
+        #else
+        XCTFail("First-zero actual append calibration requires DEBUG")
+        #endif
+    }
+
+    func testFirstStereoZeroWorkerRequiresActualRequestAndCleanupAcknowledgements() async throws {
+        #if DEBUG
+        guard !Self.targetedFixtureOwnershipLost else { throw SelectionVideoTestFailure.timeout }
+        for endpoint in [false, true] {
+            let recorder = ContinuousPCMDecoder.DebugNativeLaneActivityRecorder()
+            let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: recorder)
+            let event = ProductionFirstStereoZeroEvent(window: 1, commandToken: 1, commandVisit: 1,
+                commandVersion: 1, enabled: true, recorder: recorder)
+            let probe = ProductionFirstZeroWorkerProbe(event: event, audio: audio)
+            let tap = ProductionSelectionOutputTap()
+            XCTAssertTrue(tap.armFirstStereoZero(event)); tap.begin(auditChannels: true)
+            tap.append(try firstZeroCalibrationBuffer(frames: 480), time: firstZeroCalibrationTime(0))
+            tap.stop()
+            if endpoint { probe.observeAtClosedTapEndpoint(audio.renderer.snapshot) }
+            else { probe.observeFromSampler(audio.renderer.snapshot) }
+            let replied = await waitUntil(timeout: 3) { probe.snapshot().response != nil }
+            // A registered request cannot be replaced by the other delivery path.
+            probe.observeAtClosedTapEndpoint(audio.renderer.snapshot)
+            probe.close()
+            let shutdown = ProductionSelectionShutdown()
+            audio.debugShutdown { shutdown.complete($0) }
+            let cleanup = await waitUntil(timeout: 3) { shutdown.result != nil && probe.requestsClosed }
+            let acknowledged = cleanup && shutdown.result == true
+            if !acknowledged {
+                Self.targetedFixtureOwnershipLost = true
+                Self.unresolvedFirstZeroCalibrationAudio = audio
+                XCTFail("The real first-zero request/shutdown did not acknowledge; retain this owner and refuse more owners")
+                throw SelectionVideoTestFailure.timeout
+            }
+            let state = probe.snapshot()
+            XCTAssertTrue(replied && acknowledged); XCTAssertTrue(state.registered && state.issued)
+            XCTAssertEqual(state.endpointFallback, endpoint)
+            XCTAssertFalse(state.taskPending || state.workerOutstanding)
+            XCTAssertNotNil(state.response); XCTAssertFalse(audio.graph.engine.isRunning)
+            probe.dump(cleanupAcknowledged: acknowledged, retainedRange: 0..<tap.count, validRecording: true)
+            print("FirstStereoZeroWorkerCalibration schema=1 endpoint=\(endpoint) registered=\(state.registered) issued=\(state.issued) actualReply=\(state.response != nil) cleanupAcknowledged=\(acknowledged) engineStarted=false syntheticCommandMetadata=true playbackAcceptance=false")
+        }
+        // Closing after registration cannot pretend the queued MainActor task
+        // completed. Its real delivery observes close and skips worker issue.
+        let audio = ContinuousAudioPlayer()
+        let event = ProductionFirstStereoZeroEvent(window: 1, commandToken: 1, commandVisit: 1,
+            commandVersion: 1, enabled: true, recorder: nil)
+        let queued = ProductionFirstZeroWorkerProbe(event: event, audio: audio)
+        let tap = ProductionSelectionOutputTap()
+        XCTAssertTrue(tap.armFirstStereoZero(event)); tap.begin()
+        tap.append(try firstZeroCalibrationBuffer(frames: 480), time: firstZeroCalibrationTime(0)); tap.stop()
+        queued.observeFromSampler(audio.renderer.snapshot)
+        XCTAssertTrue(queued.snapshot().taskPending)
+        queued.close()
+        XCTAssertFalse(queued.requestsClosed)
+        let shutdown = ProductionSelectionShutdown()
+        audio.debugShutdown { shutdown.complete($0) }
+        let closed = await waitUntil(timeout: 3) { queued.requestsClosed && shutdown.result != nil }
+        let acknowledged = closed && shutdown.result == true
+        if !acknowledged {
+            Self.targetedFixtureOwnershipLost = true
+            Self.unresolvedFirstZeroCalibrationAudio = audio
+            XCTFail("The queued-task/shutdown did not acknowledge; retain this owner and refuse more owners")
+            throw SelectionVideoTestFailure.timeout
+        }
+        XCTAssertTrue(acknowledged); XCTAssertFalse(queued.snapshot().issued)
+        XCTAssertNil(queued.snapshot().response)
+        print("FirstStereoZeroQueuedCloseCalibration schema=1 actualTaskAcknowledged=\(queued.requestsClosed) workerIssued=\(queued.snapshot().issued) shutdownAcknowledged=\(acknowledged) syntheticAck=false")
+        #else
+        XCTFail("First-zero worker acknowledgement calibration requires DEBUG")
         #endif
     }
 
@@ -2329,9 +2505,23 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 traceFirstSourceFailure: Bool? = nil,
                                                 queuedPreviousLead: Bool? = nil,
                                                 traceReturnedAProducerBoundary: Bool? = nil,
-                                                initialNativeStartCurrentItemTime: Bool? = nil) async throws {
+                                                initialNativeStartCurrentItemTime: Bool? = nil,
+                                                traceReturnedAStereoZero: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if let enabled = traceReturnedAStereoZero {
+            guard traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
+                  !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
+                  !auditSavedAAfterCleanup, freshPreviousBundle == nil, queuedPreviousLead == nil,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == nil else {
+                XCTFail("First-zero control requires constant startup/clock tracing and otherwise unset alternatives")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("FirstStereoZeroScope schema=1 enabled=\(enabled) target=returned-A-eight-second-window minimumFrames=480 actualChannels=2 normalizedRate=48000 nativeLaneRecorderBothArms=true startupAndClockTracingBothArms=true eventCapacity=1 workerRequestCapacity=1 addedSampler=false sourceTapFrameJoin=false onsetExact=false noEvent=inconclusive originalGuards=unchanged")
+        }
         if initialNativeStartCurrentItemTime != nil {
             guard traceVideoSeeks, traceClockHandoff == true, frameMonitorAlternative == nil,
                   !traceNativeRefill, renderAccounting == nil, traceDefaultFrameMonitor == nil,
@@ -2344,6 +2534,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if traceReturnedAStereoZero != nil {
+            XCTFail("First-zero control is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if initialNativeStartCurrentItemTime != nil {
             XCTFail("Native start argument control is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -2466,7 +2660,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #endif
         #if DEBUG
-        let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true
+        let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true || traceReturnedAStereoZero != nil
             ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
         let firstFailure = traceFirstSourceFailure == true || traceReturnedAProducerBoundary == true
             ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
@@ -2492,11 +2686,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertFalse(traceNativeRefill); XCTAssertFalse(traceVideoSeeks)
             XCTAssertNil(frameMonitorAlternative)
         }
-        let nativeTrace = nativeActivity.map {
+        let nativeTrace = traceReturnedAStereoZero == nil ? nativeActivity.map {
             ProductionNativeRefillTrace(recorder: $0, audio: audio,
                 requestTarget: traceReturnedAProducerBoundary == true ? .returnedA : nil,
                 firstFailure: traceReturnedAProducerBoundary == true ? firstFailure : nil)
-        }
+        } : nil
+        var firstZeroProbe: ProductionFirstZeroWorkerProbe?
         #else
         let audio = ContinuousAudioPlayer()
         #endif
@@ -2523,6 +2718,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if acceptedPCMOrigin != nil {
             startup.pollSummary = ProductionSelectionPollSummary()
             print("ProductionSelectionPollScope schema=1 enabled=true originMode=\(acceptedPCMOrigin == true) phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only capture=unchanged publication=after-cleanup")
+        }
+        if let enabled = traceReturnedAStereoZero {
+            print("FirstStereoZeroPollScope schema=1 zeroEventEnabled=\(enabled) pollSummaryBothArms=true phases=3 stages=3 firstWorstSpanCapacity=18 largestGapCapacity=3 clock=DispatchTime measurementBudget=unchanged sdkQueries=existing-only capture=false publication=after-cleanup")
         }
         #endif
         #if DEBUG
@@ -2742,6 +2940,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             try suppressionControl?.qualify(phase: phase, stage: 1, service: service, audio: audio)
             #endif
             if phase == 2 {
+                #if DEBUG
+                if let enabled = traceReturnedAStereoZero {
+                    let owner = measurement.state.audio
+                    guard measurement.state.selected, owner.token == measurement.state.expectedToken,
+                          owner.token > 0, owner.visit > 0, owner.selectionVersion > 0 else {
+                        throw SelectionVideoTestFailure.timeout
+                    }
+                    let event = ProductionFirstStereoZeroEvent(window: 1, commandToken: owner.token,
+                        commandVisit: owner.visit, commandVersion: owner.selectionVersion, enabled: enabled,
+                        recorder: nativeActivity)
+                    firstZeroProbe = ProductionFirstZeroWorkerProbe(event: event, audio: audio)
+                    guard tap.armFirstStereoZero(event) else { throw SelectionVideoTestFailure.timeout }
+                }
+                #endif
                 returnedOrigin = ProductionSelectionOutputTap.hostSeconds()
                 returnedStart = tap.begin(auditChannels: true)
             }
@@ -2759,7 +2971,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let probe = ProductionRendererProbe(renderer: audio.renderer, nativeTrace: nativeTrace,
                 nativePhase: phase, nativeExpectedToken: measurement.state.expectedToken,
                 nativeCommandUnderruns: measurement.before.underrunFrames, renderAccounting: accounting,
-                captureSnapshotReadReceipt: traceClockHandoff == true)
+                captureSnapshotReadReceipt: traceClockHandoff == true,
+                firstZeroProbe: phase == 2 ? firstZeroProbe : nil)
             #else
             let probe = ProductionRendererProbe(renderer: audio.renderer)
             #endif
@@ -2774,6 +2987,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if phase == 2 {
                 returnedEnd = tap.stop()
                 #if DEBUG
+                firstZeroProbe?.observeAtClosedTapEndpoint(final)
                 if sourceOutputBenchmarkMode != nil { sourceOutputAfter = accounting?.snapshot() }
                 #endif
             }
@@ -2809,6 +3023,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
         #if DEBUG
         if traceReturnedAProducerBoundary == true { nativeTrace?.closeReturnedARequests() }
+        firstZeroProbe?.close()
         #endif
         // No dumps, spectral analysis or assertions interrupt any streaming window.
         tap.stop(); service.pause()
@@ -2826,6 +3041,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let cleanupReturned = await waitUntil(timeout: 3) {
             let acknowledged = shutdown.result != nil && preparation.result != nil
             #if DEBUG
+            if let firstZeroProbe { return acknowledged && firstZeroProbe.requestsClosed }
             // Same original shared deadline. The new ON target also closes its
             // one queued/issued request; nil/OFF performs no extra observer read.
             if traceReturnedAProducerBoundary == true {
@@ -3019,6 +3235,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let validity = tap.validity()
         print("ProductionSelectionReturnedOutput seconds=\(returnedSeconds) wallSeconds=\(returnedWall) firstHostOffsetMs=\(((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0)) * 1_000) lastHostOffsetMs=\(((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity)) * 1_000) frames=\(returned.values.count) rate=\(returned.rate) toneBlocks=\(toneBlocks.total) correctToneBlocks=\(toneBlocks.correct) quietMs=\(returnedQuiet * 1_000) maximumHoleMs=\(returnedHole * 1_000) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) retainedFrames=\(tap.count) capacityFrames=576000")
         let channelAudit = tap.channelAudit()
+        #if DEBUG
+        firstZeroProbe?.dump(cleanupAcknowledged: mayRemoveFixture,
+            retainedRange: (returnedStart ?? tap.count)..<(returnedEnd ?? tap.count),
+            validRecording: validity.invalidTimestamps == 0 && validity.droppedFrames == 0
+                && returned.rate == 48_000 && returnedHole <= 0.5 / 48_000
+                && channelAudit.stereoZeroEvidenceQualified && !channelAudit.layout.changed
+                && channelAudit.nonfiniteFrames == 0 && channelAudit.observedFrames == returned.values.count)
+        #endif
         print("ProductionSelectionReturnedChannelAudit schema=1 minimumRunFrames=\(channelAudit.minimumRunFrames) observedFrames=\(channelAudit.observedFrames) monoZeroFrames=\(channelAudit.monoZeroFrames) stereoZeroFrames=\(channelAudit.stereoZeroFrames) leftSquareSum=\(channelAudit.leftSquareSum) rightSquareSum=\(channelAudit.rightSquareSum) nonfiniteFrames=\(channelAudit.nonfiniteFrames) qualifiedRuns=\(channelAudit.qualifiedRuns) retainedRuns=\(channelAudit.retainedRuns) capacity=4 droppedRuns=\(channelAudit.droppedRuns) overflow=\(channelAudit.overflow) layoutObserved=\(channelAudit.layout.buffers > 0) layoutBuffers=\(channelAudit.layout.buffers) layoutFrames=\(channelAudit.layout.frames) firstChannelCount=\(channelAudit.layout.firstChannelCount) lastChannelCount=\(channelAudit.layout.lastChannelCount) firstInterleaved=\(channelAudit.layout.firstInterleaved) lastInterleaved=\(channelAudit.layout.lastInterleaved) firstSampleRate=\(channelAudit.layout.firstRate) lastSampleRate=\(channelAudit.layout.lastRate) layoutChanged=\(channelAudit.layout.changed) monoDuplicatedFrames=\(channelAudit.layout.monoDuplicatedFrames) stereoInputFrames=\(channelAudit.layout.stereoInputFrames) otherInputFrames=\(channelAudit.layout.otherInputFrames) stereoZeroEvidenceQualified=\(channelAudit.stereoZeroEvidenceQualified) layoutScope=retained-audited-buffers interleavedScope=first-existing-left-index-read exactMonoZero=true playbackAcceptance=unchanged")
         XCTAssertEqual(channelAudit.observedFrames, returned.values.count)
         XCTAssertEqual(channelAudit.nonfiniteFrames, 0)
@@ -8811,16 +9035,18 @@ private final class ProductionRendererProbe: @unchecked Sendable {
     private let nativeExpectedToken: Int
     private let nativeCommandUnderruns: Int64
     private let renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder?
+    private let firstZeroProbe: ProductionFirstZeroWorkerProbe?
     init(renderer: ContinuousPCMRenderer, nativeTrace: ProductionNativeRefillTrace? = nil,
          nativePhase: Int = -1, nativeExpectedToken: Int = 0, nativeCommandUnderruns: Int64 = 0,
          renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil,
-         captureSnapshotReadReceipt: Bool = false) {
+         captureSnapshotReadReceipt: Bool = false, firstZeroProbe: ProductionFirstZeroWorkerProbe? = nil) {
         self.renderer = renderer
         self.captureSnapshotReadReceipt = captureSnapshotReadReceipt
         self.nativeTrace = nativeTrace
         self.nativePhase = nativePhase; self.nativeExpectedToken = nativeExpectedToken
         self.nativeCommandUnderruns = nativeCommandUnderruns
         self.renderAccounting = renderAccounting
+        self.firstZeroProbe = firstZeroProbe
         samples.reserveCapacity(128)
         timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "test.production-render-sampler", qos: .userInitiated))
         timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(1))
@@ -8898,6 +9124,7 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         // pre-stop observation may still deliver its async response after stop;
         // request/reply times and nonjoint coherence qualify that later state.
         if requestFromStoredWindowSample {
+            firstZeroProbe?.observeFromSampler(audio)
             nativeTrace?.observeFirstUnderrun(audio, renderer: renderer, phase: nativePhase, expectedToken: nativeExpectedToken,
                 commandUnderruns: nativeCommandUnderruns, firstWindowSample: firstWindowSample,
                 observationBegin: begin, observationEnd: end)
@@ -9127,6 +9354,157 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
 #endif
 
 #if DEBUG
+/// One immutable actual-stereo-zero record. The tap is its sole producer and
+/// calls producer methods under its existing lock; readers acquire publication.
+private final class ProductionFirstStereoZeroEvent: @unchecked Sendable {
+    struct Event: Sendable {
+        let window: UInt64, commandToken: Int, commandVisit: Int64, commandVersion: Int
+        let firstFrame: Int, endFrame: Int
+        let firstHost: Double, endHost: Double
+        let timelineContinuous: Bool, earlierUnqualifiedInput: Bool
+        let detectionExecutionHost: UInt64
+        let lane0: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
+        let lane1: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
+        let lane2: ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot?
+    }
+    let window: UInt64, commandToken: Int, commandVisit: Int64, commandVersion: Int, enabled: Bool
+    private let recorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder?
+    private let ready = Atomic<Bool>(false), closed = Atomic<Bool>(false)
+    private var record: Event?
+    private var published = false, producerClosed = false
+    private var run = 0, firstFrame = 0, lastFrame = -1
+    private var firstHost = 0.0, lastEndHost = 0.0, continuous = true
+    private var earlierUnqualified = false
+    init(window: UInt64, commandToken: Int, commandVisit: Int64, commandVersion: Int, enabled: Bool,
+         recorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder?) {
+        precondition(window > 0 && commandToken > 0 && commandVisit > 0 && commandVersion > 0)
+        self.window = window; self.commandToken = commandToken; self.commandVisit = commandVisit
+        self.commandVersion = commandVersion; self.enabled = enabled; self.recorder = recorder
+    }
+    func rejectInput() {
+        guard enabled, !published, !producerClosed else { return }
+        earlierUnqualified = true; run = 0; lastFrame = -1
+    }
+    func observe(left: Float, right: Float, frame: Int, host: Double, rate: Double, actualStereo: Bool) {
+        guard enabled, !published, !producerClosed else { return }
+        guard actualStereo, rate == 48_000, host.isFinite, frame >= 0, frame < 12 * 48_000,
+              left.isFinite, right.isFinite else { rejectInput(); return }
+        guard left == 0 && right == 0 else { run = 0; lastFrame = -1; return }
+        if run == 0 || frame != lastFrame + 1 {
+            run = 0; firstFrame = frame; firstHost = host; continuous = true
+        } else if abs(host - lastEndHost) > 0.5 / 48_000 { continuous = false }
+        run += 1; lastFrame = frame; lastEndHost = host + 1 / rate
+        guard run == 480 else { return }
+        let detection = mach_absolute_time()
+        let lane0 = recorder?.snapshot(at: 0), lane1 = recorder?.snapshot(at: 1), lane2 = recorder?.snapshot(at: 2)
+        record = Event(window: window, commandToken: commandToken, commandVisit: commandVisit,
+            commandVersion: commandVersion, firstFrame: firstFrame, endFrame: frame + 1,
+            firstHost: firstHost, endHost: lastEndHost, timelineContinuous: continuous,
+            earlierUnqualifiedInput: earlierUnqualified, detectionExecutionHost: detection,
+            lane0: lane0, lane1: lane1, lane2: lane2)
+        published = true; ready.store(true, ordering: .releasing)
+    }
+    func close() { producerClosed = true; closed.store(true, ordering: .releasing) }
+    var isClosed: Bool { closed.load(ordering: .acquiring) }
+    func snapshot(for window: UInt64) -> Event? {
+        guard window == self.window, ready.load(ordering: .acquiring) else { return nil }
+        return record
+    }
+}
+
+/// One request registered before task creation. Neither endpoint fallback nor
+/// cancellation can manufacture the queued-task/actual-worker acknowledgements.
+private final class ProductionFirstZeroWorkerProbe: @unchecked Sendable {
+    struct Snapshot {
+        let registered: Bool, issued: Bool, closing: Bool, taskPending: Bool, workerOutstanding: Bool
+        let endpointFallback: Bool
+        let observedNs: UInt64, issueNs: UInt64, replyNs: UInt64
+        let renderer: ContinuousPCMRenderer.Snapshot?
+        let response: ContinuousPCMDecoder.DebugFailureState?
+    }
+    let event: ProductionFirstStereoZeroEvent
+    @MainActor private weak var audio: ContinuousAudioPlayer?
+    private let lock = NSLock()
+    private var registered = false, issued = false, closing = false, taskPending = false, workerOutstanding = false
+    private var endpointFallback = false
+    private var observedNs: UInt64 = 0, issueNs: UInt64 = 0, replyNs: UInt64 = 0
+    private var observedRenderer: ContinuousPCMRenderer.Snapshot?
+    private var response: ContinuousPCMDecoder.DebugFailureState?
+    @MainActor init(event: ProductionFirstStereoZeroEvent, audio: ContinuousAudioPlayer) {
+        self.event = event; self.audio = audio
+    }
+    private func register(_ renderer: ContinuousPCMRenderer.Snapshot, endpoint: Bool) -> Bool {
+        guard event.snapshot(for: event.window) != nil else { return false }
+        lock.lock(); defer { lock.unlock() }
+        guard !closing, !registered else { return false }
+        registered = true; taskPending = !endpoint; endpointFallback = endpoint
+        observedNs = DispatchTime.now().uptimeNanoseconds; observedRenderer = renderer
+        return true
+    }
+    func observeFromSampler(_ renderer: ContinuousPCMRenderer.Snapshot) {
+        guard register(renderer, endpoint: false) else { return }
+        Task { @MainActor [self] in
+            defer { completeQueuedTask() }
+            issueIfOpen()
+        }
+    }
+    @MainActor func observeAtClosedTapEndpoint(_ renderer: ContinuousPCMRenderer.Snapshot) {
+        guard event.isClosed, register(renderer, endpoint: true) else { return }
+        issueIfOpen()
+    }
+    @MainActor private func issueIfOpen() {
+        let owner = audio
+        lock.lock()
+        guard !closing, !issued, let owner else { lock.unlock(); return }
+        issued = true; workerOutstanding = true; issueNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+        owner.debugDecoderFailureState { [self] state in
+            lock.lock(); response = state; replyNs = DispatchTime.now().uptimeNanoseconds
+            workerOutstanding = false; lock.unlock()
+        }
+    }
+    private func completeQueuedTask() { lock.lock(); taskPending = false; lock.unlock() }
+    func close() { lock.lock(); closing = true; lock.unlock() }
+    var requestsClosed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return closing && !taskPending && !workerOutstanding
+    }
+    func snapshot() -> Snapshot {
+        lock.lock(); defer { lock.unlock() }
+        return Snapshot(registered: registered, issued: issued, closing: closing, taskPending: taskPending,
+            workerOutstanding: workerOutstanding, endpointFallback: endpointFallback, observedNs: observedNs,
+            issueNs: issueNs, replyNs: replyNs, renderer: observedRenderer, response: response)
+    }
+    @MainActor func dump(cleanupAcknowledged: Bool, retainedRange: Range<Int>, validRecording: Bool) {
+        let frozen = event.snapshot(for: event.window), state = snapshot()
+        let retained = frozen.map { $0.firstFrame >= retainedRange.lowerBound && $0.endFrame <= retainedRange.upperBound
+            && $0.endFrame - $0.firstFrame == 480 } ?? false
+        let continuous = frozen.map { retained && validRecording && $0.timelineContinuous && !$0.earlierUnqualifiedInput } ?? false
+        print("FirstStereoZeroEvent schema=1 enabled=\(event.enabled) window=\(event.window) eventPresent=\(frozen != nil) commandToken=\(event.commandToken) commandVisit=\(event.commandVisit) commandVersion=\(event.commandVersion) firstFrame=\(frozen?.firstFrame ?? -1) endFrame=\(frozen?.endFrame ?? -1) firstHost=\(frozen?.firstHost ?? 0) endHost=\(frozen?.endHost ?? 0) detectionExecutionHost=\(frozen?.detectionExecutionHost ?? 0) retainedRangeQualified=\(retained) recordingQualified=\(validRecording) timelineContinuous=\(frozen?.timelineContinuous ?? false) earlierUnqualifiedInput=\(frozen?.earlierUnqualifiedInput ?? false) continuousTenMillisecondsQualified=\(continuous) producerScope=threshold-audited-before-retention commandMetadataOnly=true sourceTapFrameJoin=false physicalOutput=unverified")
+        print("FirstStereoZeroWorker schema=1 registered=\(state.registered) issued=\(state.issued) responseAvailable=\(state.response != nil) workerEvidence=\(state.response == nil ? "unavailable" : "later-independent-cached-state") endpointFallback=\(state.endpointFallback) observedNs=\(state.observedNs) issueNs=\(state.issueNs) replyNs=\(state.replyNs) sampleToken=\(state.renderer?.token ?? 0) sampleVisit=\(state.renderer?.visit ?? 0) sampleVersion=\(state.renderer?.selectionVersion ?? 0) sampleUnderruns=\(state.renderer?.underrunFrames ?? -1) rendererSampleScope=existing-snapshot-before-event-read eventSampleOrder=unverified closed=\(state.closing) taskPending=\(state.taskPending) workerOutstanding=\(state.workerOutstanding) cleanupAcknowledged=\(cleanupAcknowledged) requestCapacity=1 laneJointCoherence=false onsetExact=false sdkCause=unestablished")
+        if let frozen {
+            for lane in [frozen.lane0, frozen.lane1, frozen.lane2] {
+                print("FirstStereoZeroLane schema=1 available=\(lane != nil) lane=\(lane?.laneIndex ?? -1) packedState=\(lane?.packedState ?? 0) copySequence=\(lane?.copySequence ?? 0) stage=\(lane?.stageCode ?? 0) overflowed=\(lane?.sequenceOverflowed ?? false) scope=separate-load-after-detection-clock historicalOwner=unverified")
+            }
+        }
+        if let response = state.response {
+            let s = response.stats
+            print("FirstStereoZeroCachedWorker schema=1 leasedReaders=\(s.leasedReaders) pendingPreparations=\(s.pendingPreparations) pendingReads=\(s.readJobsAwaitingAcceptanceOrClose) mailboxPackets=\(s.mailboxPackets) shutdownRequested=\(s.shutdownRequested) readerLeasesClosed=\(s.readerLeasesClosed) overflowed=\(s.counterOverflowed) scope=later-worker-reply")
+            for slot in response.slots.prefix(3) {
+                print("FirstStereoZeroCachedSlot schema=1 slot=\(slot.index) token=\(slot.token) epoch=\(slot.epoch) finished=\(slot.finished) cancelled=\(slot.cancelled) lease=\(slot.leaseIndex) streamAvailable=\(slot.stream != nil) cursor=\(slot.stream?.cursor ?? 0) generatedFrames=\(slot.stream?.generatedFrames ?? 0) outputStart=\(slot.stream?.outputStart ?? 0) outputCount=\(slot.stream?.outputCount ?? 0) converterFinished=\(slot.stream?.converterFinished ?? false) reachedEnd=\(slot.stream?.reachedEnd ?? false) scope=later-worker-reply")
+            }
+            for lease in response.leases.prefix(3) {
+                print("FirstStereoZeroCachedLease schema=1 lane=\(lease.index) present=\(lease.present) starting=\(lease.starting) readPending=\(lease.readPending) retired=\(lease.retired) requestedFrames=\(lease.requestedFrames) packetFrames=\(lease.packetFrames) packetOffset=\(lease.packetOffset) reachedEnd=\(lease.reachedEnd) hasFailure=\(lease.hasFailure) scope=later-worker-reply")
+            }
+        }
+        XCTAssertTrue(cleanupAcknowledged && requestsClosed, "Actual queued-task and worker acknowledgements share the original cleanup deadline")
+        if let frozen {
+            XCTAssertTrue(event.enabled); XCTAssertTrue(retained)
+            XCTAssertNotNil(frozen.lane0); XCTAssertNotNil(frozen.lane1); XCTAssertNotNil(frozen.lane2)
+        }
+    }
+}
+
 /// Only append() writes this fixed arena, under the tap's existing lock. Snapshots
 /// are copied under that same lock after cleanup; neither proves an SDK RT join.
 private final class ProductionSelectionTapExecutionTrace {
@@ -9193,6 +9571,7 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     var callbackLedger: ContinuousPCMRenderer.DebugSourceCallbackLedger?
     private let captureExecutionTime: Bool
     private let executionTrace: ProductionSelectionTapExecutionTrace?
+    private var firstStereoZero: ProductionFirstStereoZeroEvent?
     #endif
     struct Tone { let start: Double; let end: Double }
     #if DEBUG
@@ -9314,6 +9693,11 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     func executionSnapshot() -> ProductionSelectionTapExecutionTrace.Snapshot? {
         lock.lock(); defer { lock.unlock() }; return executionTrace?.snapshot()
     }
+    func armFirstStereoZero(_ event: ProductionFirstStereoZeroEvent) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !enabled, firstStereoZero == nil, !event.isClosed else { return false }
+        firstStereoZero = event; return true
+    }
     #else
     init() { values.reserveCapacity(capacity); hosts.reserveCapacity(capacity) }
     #endif
@@ -9338,6 +9722,9 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     func stop() -> Int {
         lock.lock(); defer { lock.unlock() }
         enabled = false
+        #if DEBUG
+        firstStereoZero?.close()
+        #endif
         if auditEnabled { finishChannelRun(); auditEnabled = false }
         return values.count
     }
@@ -9430,16 +9817,35 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         #endif
         guard time.isHostTimeValid, buffer.format.sampleRate.isFinite, buffer.format.sampleRate > 0,
               buffer.format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData else {
-            invalidTimestamps += 1; return
+            invalidTimestamps += 1
+            #if DEBUG
+            firstStereoZero?.rejectInput()
+            #endif
+            return
         }
         let actualRate = buffer.format.sampleRate
         if rate == 0 { rate = actualRate }
-        guard abs(actualRate - rate) < 0.1 else { invalidTimestamps += 1; return }
+        guard abs(actualRate - rate) < 0.1 else {
+            invalidTimestamps += 1
+            #if DEBUG
+            firstStereoZero?.rejectInput()
+            #endif
+            return
+        }
         let start = AVAudioTime.seconds(forHostTime: time.hostTime)
         let channelCount = Int(buffer.format.channelCount)
-        guard channelCount > 0, start.isFinite else { invalidTimestamps += 1; return }
+        guard channelCount > 0, start.isFinite else {
+            invalidTimestamps += 1
+            #if DEBUG
+            firstStereoZero?.rejectInput()
+            #endif
+            return
+        }
         let frames = min(Int(buffer.frameLength), capacity - values.count)
         droppedFrames += Int(buffer.frameLength) - frames
+        #if DEBUG
+        if frames != Int(buffer.frameLength) { firstStereoZero?.rejectInput() }
+        #endif
         for frame in 0..<frames {
             // Bind the first existing format read; retain the original right-side read below.
             let interleaved = buffer.format.isInterleaved
@@ -9455,6 +9861,10 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
                 }
                 auditChannels(left: left, right: right, mono: mono, frame: values.count, host: host, rate: actualRate)
             }
+            #if DEBUG
+            firstStereoZero?.observe(left: left, right: right, frame: values.count,
+                host: host, rate: actualRate, actualStereo: channelCount == 2)
+            #endif
             values.append(mono)
             hosts.append(host)
         }
