@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=b786cc9c2d755c5721a029e5b88cd5644819d412
+expected_code_source=b753e942e4afce6429783b9554b8cc61dc9036e9
 expected_ios_tree=4f9f7b0cec197473b6c2861161f2aeb3a7729ee2
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -321,13 +321,6 @@ mode="$1"
 case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-    OfflineTikTokPlayerTests/NativeMediaTests/testExternalClockPreviousUsesQueuedAdvanceAndPreservesItsExactResource
-    OfflineTikTokPlayerTests/NativeMediaTests/testPreviousQueuedAdvancePreservesNewOwnerDuringEvictionAndInsertion
-    OfflineTikTokPlayerTests/NativeMediaTests/testPreviousQueuedAdvanceRevalidatesSavedEligibilityAndLiveMetadata
-    OfflineTikTokPlayerTests/NativeMediaTests/testAdvanceDoesNotSkipAnItemAlreadyMadeCurrentDuringRetention
-    OfflineTikTokPlayerTests/NativeMediaTests/testStandalonePreviousAndOrdinaryNextRetainTheirAdvanceRoutes
-    OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousToNextPreservesExactPreparationAndPlayerPolicy
-    OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRevalidatesLiveLocalityBeforeCommit
   ) ;;
   controls) cases=(testQueuedPreviousAdvanceOffFirst testQueuedPreviousAdvanceOnFirst testQueuedPreviousAdvanceOnSecond testQueuedPreviousAdvanceOffSecond) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;

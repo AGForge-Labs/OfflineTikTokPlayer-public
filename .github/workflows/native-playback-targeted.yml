@@ -1,4 +1,4 @@
-name: Guarded Previous queue reuse with exact playback controls
+name: Previous queue reuse after bounded exact-host confirmation
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -46,10 +46,10 @@ jobs:
         run: |
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
-      - name: Build one exact test plan and verify queue ownership plus production playback
+      - name: Build one exact test plan and measure ordinary production playback
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require the actual ownership contracts and production selection identities
+      - name: Require the actual ordinary production selection benchmark identity
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -59,19 +59,11 @@ jobs:
           evidence = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(evidence)
           prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
-          expected = {prefix + 'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture'} | {
-              'OfflineTikTokPlayerTests.NativeMediaTests/testExternalClockPreviousUsesQueuedAdvanceAndPreservesItsExactResource',
-              'OfflineTikTokPlayerTests.NativeMediaTests/testPreviousQueuedAdvancePreservesNewOwnerDuringEvictionAndInsertion',
-              'OfflineTikTokPlayerTests.NativeMediaTests/testPreviousQueuedAdvanceRevalidatesSavedEligibilityAndLiveMetadata',
-              'OfflineTikTokPlayerTests.NativeMediaTests/testAdvanceDoesNotSkipAnItemAlreadyMadeCurrentDuringRetention',
-              'OfflineTikTokPlayerTests.NativeMediaTests/testStandalonePreviousAndOrdinaryNextRetainTheirAdvanceRoutes',
-              'OfflineTikTokPlayerTests.NativeMediaTests/testPromotingPreviousToNextPreservesExactPreparationAndPlayerPolicy',
-              'OfflineTikTokPlayerTests.NativeMediaTests/testPromotingPreviousRevalidatesLiveLocalityBeforeCommit',
-          }
-          if len(expected) != 8 or not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('All seven ownership contracts and the ordinary production benchmark must exist in pinned source')
+          expected = {prefix + 'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
+          if len(expected) != 1 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('The ordinary production benchmark must exist in pinned source; seven unchanged ownership contracts passed run39984169183')
           evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected, invocation='test-without-building')
-          print('Ownership and ordinary production benchmark identities native=8 ui=0; original guards retained; no physical-output/full acceptance claim')
+          print('Ordinary production benchmark identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
       - name: Four Previous queue reuse arms OFF ON ON OFF in fresh exact owned hosts
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}

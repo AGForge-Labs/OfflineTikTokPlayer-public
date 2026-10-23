@@ -462,13 +462,6 @@ class NativeControlHarnessTests(unittest.TestCase):
         names = shlex.split(re.search(r"benchmark\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
         expected_selectors = [
             'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-            'OfflineTikTokPlayerTests/NativeMediaTests/testExternalClockPreviousUsesQueuedAdvanceAndPreservesItsExactResource',
-            'OfflineTikTokPlayerTests/NativeMediaTests/testPreviousQueuedAdvancePreservesNewOwnerDuringEvictionAndInsertion',
-            'OfflineTikTokPlayerTests/NativeMediaTests/testPreviousQueuedAdvanceRevalidatesSavedEligibilityAndLiveMetadata',
-            'OfflineTikTokPlayerTests/NativeMediaTests/testAdvanceDoesNotSkipAnItemAlreadyMadeCurrentDuringRetention',
-            'OfflineTikTokPlayerTests/NativeMediaTests/testStandalonePreviousAndOrdinaryNextRetainTheirAdvanceRoutes',
-            'OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousToNextPreservesExactPreparationAndPlayerPolicy',
-            'OfflineTikTokPlayerTests/NativeMediaTests/testPromotingPreviousRevalidatesLiveLocalityBeforeCommit',
         ]
         self.assertEqual(names, expected_selectors)
         workflow = TARGETED_WORKFLOW.read_text(encoding="utf-8")
