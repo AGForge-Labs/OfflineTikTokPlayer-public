@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=4a16da292318299e7063701156cb349526eb7ea0
+expected_code_source=07024a02d1d2bf4ec2ea22fb141ffb6713a05d9b
 expected_ios_tree=7607fab90104204c52cceb16185d041aaa470538
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testSourceAndPresentationClockBoundariesOffThenOn',
-    'testSourceAndPresentationClockBoundariesOnThenOff',
-    'testCAPClockBoundaryOffThenOn',
-    'testCAPClockBoundaryOnThenOff',
+    'testInitialVideoPollingOffFirst',
+    'testInitialVideoPollingOnFirst',
+    'testInitialVideoPollingOnSecond',
+    'testInitialVideoPollingOffSecond',
 )
 
 def require(condition, message):
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testSourceAndPresentationClockBoundariesOffThenOn testSourceAndPresentationClockBoundariesOnThenOff testCAPClockBoundaryOffThenOn testCAPClockBoundaryOnThenOff) ;;
+  controls) cases=(testInitialVideoPollingOffFirst testInitialVideoPollingOnFirst testInitialVideoPollingOnSecond testInitialVideoPollingOffSecond) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
