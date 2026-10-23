@@ -1,7 +1,7 @@
 import XCTest
 import AVFoundation
 import Synchronization
-import PlayerCore
+@testable import PlayerCore
 @testable import OfflineTikTokPlayer
 
 @MainActor
@@ -173,6 +173,201 @@ final class ContinuousAudioPlayerTests: XCTestCase {
         XCTFail("Render-anchor store calibration requires the DEBUG publisher inspection seam")
         #endif
     }
+
+    func testRenderAnchorRequiresCurrentVisitAndConsumedSelectionVersion() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("visit-and-selection-owner") { audio, sample in
+            let owner = audio.graph
+            let host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            let cursor = Double(sample.frame) / 48_000
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            let fresh = audio.presentationPosition(at: host)
+            guard fresh.isFinite, fresh > cursor + 0.25 else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            let mismatches: [(String, ContinuousPCMRenderer.Snapshot)] = [
+                ("visit", .init(token: sample.token, frame: sample.frame, visit: sample.visit + 1,
+                    ended: sample.ended, underrunFrames: sample.underrunFrames,
+                    selectionVersion: sample.selectionVersion)),
+                ("selection-version", .init(token: sample.token, frame: sample.frame, visit: sample.visit,
+                    ended: sample.ended, underrunFrames: sample.underrunFrames,
+                    selectionVersion: sample.selectionVersion + 2))
+            ]
+            for (kind, other) in mismatches {
+                XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(other, hostEnd: 1_000))
+                let observed = audio.presentationPosition(at: host)
+                XCTAssertEqual(observed, cursor, accuracy: 0.5 / 48_000,
+                    "A matching media token does not authorize another visit or consumed selection")
+                print("RenderAnchorOwnerMismatch schema=1 kind=\(kind) expectedToken=\(sample.token) expectedVisit=\(sample.visit) expectedSelectionVersion=\(sample.selectionVersion) publishedVisit=\(other.visit) publishedSelectionVersion=\(other.selectionVersion) actual=\(observed) expectedCursor=\(cursor) freshControl=\(fresh) syntheticPublication=true naturallyCapturedInterleaving=false latencyAcceptance=false")
+            }
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            XCTAssertGreaterThan(audio.presentationPosition(at: host), cursor + 0.25)
+        }
+        #else
+        XCTFail("Render-anchor owner calibration requires DEBUG")
+        #endif
+    }
+
+    func testNewSelectionDuringActualLatencyReadPreservesItsPendingPosition() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("selection-during-latency-read") { audio, sample in
+            let owner = audio.graph
+            let host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            guard audio.presentationPosition(at: host) > Double(sample.frame) / 48_000 + 0.25 else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            var issued = false
+            owner.debugAfterPresentationLatencyRead = {
+                owner.debugAfterPresentationLatencyRead = nil
+                issued = audio.select(id: "a", position: 0.05)
+            }
+            defer { owner.debugAfterPresentationLatencyRead = nil }
+            let observed = audio.presentationPosition(at: host)
+            XCTAssertTrue(issued, "The real same-item selection is issued after the actual SDK getter")
+            XCTAssertTrue(audio.isSelectionPending(in: audio.snapshot))
+            XCTAssertEqual(observed, 0.05, accuracy: 0.5 / 48_000,
+                "An older clock query must preserve the new pending selection on its return")
+            XCTAssertEqual(audio.presentationPosition(at: host), 0.05, accuracy: 0.5 / 48_000)
+            print("RenderAnchorSelectionDuringRead schema=1 issued=\(issued) actual=\(observed) pendingPosition=0.05 sourceSnapshotUnchanged=true hook=after-actual-SDK-getter naturallyCapturedReentrancy=false latencyAcceptance=false")
+        }
+        #else
+        XCTFail("Render-anchor selection calibration requires DEBUG")
+        #endif
+    }
+
+    func testAnchorOwnerSupersededDuringActualLatencyReadCannotCreditTheOldClock() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("anchor-owner-during-latency-read") { audio, sample in
+            let owner = audio.graph
+            let host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            let cursor = Double(sample.frame) / 48_000
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            guard audio.presentationPosition(at: host) > cursor + 0.25 else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            var matchingRepublished = false
+            owner.debugAfterPresentationLatencyRead = {
+                owner.debugAfterPresentationLatencyRead = nil
+                matchingRepublished = owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000)
+            }
+            let matching = audio.presentationPosition(at: host)
+            XCTAssertTrue(matchingRepublished)
+            XCTAssertGreaterThan(matching, cursor + 0.25,
+                "A new publication sequence for the matching owner remains authorized")
+            let other = ContinuousPCMRenderer.Snapshot(token: sample.token, frame: sample.frame,
+                visit: sample.visit + 1, ended: sample.ended, underrunFrames: sample.underrunFrames,
+                selectionVersion: sample.selectionVersion)
+            var published = false
+            owner.debugAfterPresentationLatencyRead = {
+                owner.debugAfterPresentationLatencyRead = nil
+                published = owner.debugPublishSyntheticRenderAnchor(other, hostEnd: 1_000)
+            }
+            defer { owner.debugAfterPresentationLatencyRead = nil }
+            let observed = audio.presentationPosition(at: host)
+            XCTAssertTrue(published)
+            XCTAssertEqual(observed, cursor, accuracy: 0.5 / 48_000,
+                "Anchor ownership must still match after the actual SDK getter returns")
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            XCTAssertGreaterThan(audio.presentationPosition(at: host), cursor + 0.25)
+            print("RenderAnchorOwnerDuringRead schema=1 published=\(published) actual=\(observed) expectedCursor=\(cursor) sourceSnapshotUnchanged=true syntheticPublication=true hook=after-actual-SDK-getter naturallyCapturedInterleaving=false latencyAcceptance=false")
+        }
+        #else
+        XCTFail("Render-anchor interleaving calibration requires DEBUG")
+        #endif
+    }
+
+    func testAcknowledgedSameTokenSelectionCannotUseThePreviousVisitAnchor() async throws {
+        #if DEBUG
+        guard Self.unresolvedRenderAnchorCalibrationOwner == nil else {
+            XCTFail("An unacknowledged prior owner forbids another calibration")
+            throw RenderAnchorCalibrationSetupError.ownerNotClosed
+        }
+        let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+        let audio = ContinuousAudioPlayer(debugRenderAccounting: accounting)
+        Self.unresolvedRenderAnchorCalibrationOwner = audio
+        var originalError: Error?, qualified = false
+        var before: ContinuousPCMRenderer.Snapshot?, after: ContinuousPCMRenderer.Snapshot?
+        var actual: Double?, cursor: Double?, beforeCallbacks: UInt64 = 0, afterCallbacks: UInt64 = 0
+        do {
+            let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+            audio.setWindow(["a"])
+            let entry = try await audio.prepare(id: "a", url: url, currentPriority: true)
+            try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+            guard entry.frames > 4_832, audio.select(id: "a", position: 0.1) else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            try audio.setPlaying(true)
+            let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+            guard try audio.graph.engine.renderOffline(32, to: output) == .success else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            let old = audio.snapshot, initial = try XCTUnwrap(accounting.snapshot())
+            beforeCallbacks = initial.sourceCallbacksEntered
+            guard old.token == entry.token, old.visit > 0, old.frame == 4_832,
+                  !old.ended, old.underrunFrames == 0, !audio.isSelectionPending(in: old),
+                  beforeCallbacks > 0, beforeCallbacks == initial.sourceCallbacksCompleted, !initial.overflowed else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            let owner = audio.graph, interval = owner.debugPlayingInterval
+            let host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(old, hostEnd: 1_000))
+            guard audio.presentationPosition(at: host) > Double(old.frame) / 48_000 + 0.25 else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            let publication = owner.debugRenderAnchorPublicationSequence
+            guard audio.select(id: "a", position: 0.05) else { throw RenderAnchorCalibrationSetupError.unqualified }
+            // One serial manual render owner. Stage the real kernel's publication
+            // before the Graph publication, without replacing an SDK callback.
+            var step = [Float](repeating: .nan, count: 64)
+            step.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 32) }
+            let current = audio.snapshot, final = try XCTUnwrap(accounting.snapshot())
+            afterCallbacks = final.sourceCallbacksEntered
+            guard current.token == old.token, current.visit == old.visit + 1,
+                  current.selectionVersion == old.selectionVersion + 2, current.frame == 2_432,
+                  !current.ended, current.underrunFrames == 0, !audio.isSelectionPending(in: current),
+                  step.allSatisfy(\.isFinite), step.contains(where: { $0 != 0 }),
+                  owner.debugPlayingInterval == interval, owner.debugRenderAnchorPublicationSequence == publication,
+                  afterCallbacks == beforeCallbacks, final.sourceCallbacksCompleted == beforeCallbacks, !final.overflowed else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            qualified = true; before = old; after = current
+            cursor = Double(current.frame) / 48_000
+            actual = audio.presentationPosition(at: host)
+            XCTAssertEqual(try XCTUnwrap(actual), try XCTUnwrap(cursor), accuracy: 0.5 / 48_000,
+                "The real acknowledged same-token selection cannot use its prior visit's anchor")
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(current, hostEnd: 1_000))
+            XCTAssertGreaterThan(audio.presentationPosition(at: host), try XCTUnwrap(cursor) + 0.25)
+            let retained = audio.snapshot, completed = try XCTUnwrap(accounting.snapshot())
+            afterCallbacks = completed.sourceCallbacksEntered
+            guard retained.token == current.token, retained.visit == current.visit,
+                  retained.selectionVersion == current.selectionVersion, retained.frame == current.frame,
+                  retained.underrunFrames == 0, afterCallbacks == beforeCallbacks,
+                  completed.sourceCallbacksCompleted == beforeCallbacks, !completed.overflowed else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, 6_912_000); XCTAssertEqual(audio.preparedCount, 1)
+        } catch { qualified = false; originalError = error }
+        audio.graph.debugAfterPresentationLatencyRead = nil
+        audio.suspend(); audio.graph.engine.stop()
+        let closed = Mutex<Bool?>(nil)
+        audio.debugShutdown { value in closed.withLock { $0 = value } }
+        let returned = await Self.capCancellationWait(.seconds(3)) { closed.withLock { $0 != nil } }
+        let acknowledged = returned && closed.withLock { $0 == true }
+        if acknowledged, Self.unresolvedRenderAnchorCalibrationOwner === audio {
+            Self.unresolvedRenderAnchorCalibrationOwner = nil
+        } else {
+            qualified = false
+            if originalError == nil { originalError = RenderAnchorCalibrationSetupError.closeUnacknowledged }
+        }
+        XCTAssertTrue(acknowledged)
+        print("RenderAnchorAcknowledgedSelection schema=1 qualified=\(qualified) token=\(before?.token ?? 0) beforeVisit=\(before?.visit ?? 0) afterVisit=\(after?.visit ?? 0) beforeSelectionVersion=\(before?.selectionVersion ?? 0) afterSelectionVersion=\(after?.selectionVersion ?? 0) actual=\(actual.map { String($0) } ?? "unavailable") expectedCursor=\(cursor.map { String($0) } ?? "unavailable") callbackBefore=\(beforeCallbacks) callbackAfter=\(afterCallbacks) closeAcknowledged=\(acknowledged) ownerRetained=\(Self.unresolvedRenderAnchorCalibrationOwner === audio) realKernelStep=true syntheticHostSeed=true naturallyCapturedSDKCallbackInterleaving=false physicalOutput=false latencyAcceptance=false")
+        if let originalError { throw originalError }
+        #else
+        XCTFail("Render-anchor acknowledged selection calibration requires DEBUG")
+        #endif
+    }
+
 
     func testRenderAnchorRejectsOldAndInactivePublicationsAfterResume() async throws {
         #if DEBUG
