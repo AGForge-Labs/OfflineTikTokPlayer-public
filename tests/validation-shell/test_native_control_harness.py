@@ -154,10 +154,10 @@ class NativeControlHarnessTests(unittest.TestCase):
 
     def test_live_control_inventory_and_source_manifest_are_required(self):
         self.assertEqual(self.cases, (
-            'testQueuedPreviousStartNumericFirst',
-            'testQueuedPreviousStartCurrentFirst',
-            'testQueuedPreviousStartCurrentSecond',
-            'testQueuedPreviousStartNumericSecond'))
+            'testActualSourceTapSampleMappingUsesTwoIndependentPCMMarkers',
+            'testRetainedPreviousAfterExplicitSeekKeepsNumericStartFallback',
+            'testFirstZeroSourceCallbacksOffThenOn',
+            'testFirstZeroSourceCallbacksOnThenOff'))
         shell = HARNESS.read_text(encoding="utf-8")
         control_names = shlex.split(re.search(r"controls\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
         self.assertEqual(tuple(control_names), self.cases)
@@ -175,7 +175,8 @@ class NativeControlHarnessTests(unittest.TestCase):
         capture = importlib.util.module_from_spec(capture_spec)
         capture_spec.loader.exec_module(capture)
         for requested, effective in ((None, 1200), ("60", 60), ("1800", 1800),
-                                     ("1801", 1801), ("2400", 2400), ("2401", 2400), ("99999", 2400)):
+                                     ("1801", 1801), ("2400", 2400), ("2401", 2401),
+                                     ("3600", 3600), ("3601", 3600), ("99999", 3600)):
             with self.subTest(requested=requested):
                 argv = ["capture-helper", "--udid", SIMULATOR]
                 if requested is not None:
@@ -442,7 +443,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         self.assertEqual(len(probe), 1)
         self.assertIn('run: python3 scripts/check-native-reader-probe-sdk.py', probe[0])
         native = [block for block in blocks if any(block.startswith(name) for name in (
-            'Resolve within', 'Build one exact', 'Require the actual', 'Queued Previous start',
+            'Resolve within', 'Build one exact', 'Require the actual', 'Source tap mapping',
             'Require all four', 'Export each exact'))]
         self.assertEqual(len(native), 6)
         for block in native:
