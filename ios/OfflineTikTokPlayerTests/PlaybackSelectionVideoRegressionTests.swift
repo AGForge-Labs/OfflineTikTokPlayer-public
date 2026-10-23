@@ -97,6 +97,7 @@ private final class NativeItemAudioTrackControl {
             let final = rows.sorted { $0.trackID < $1.trackID }
             qualified = qualified && initial.count == final.count
                 && zip(initial, final).allSatisfy { $0.trackID == $1.trackID && $0.kind == $1.kind }
+                && final.allSatisfy { !$0.wrote && $0.before == $0.after }
         }
         let readyAfter = item.status == .readyToPlay
         qualified = qualified && readyAfter && owns()
@@ -4078,7 +4079,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 nativePhase: phase, nativeExpectedToken: measurement.state.expectedToken,
                 nativeCommandUnderruns: measurement.before.underrunFrames, renderAccounting: accounting,
                 captureSnapshotReadReceipt: traceClockHandoff == true,
-                firstZeroProbe: phase == 2 ? firstZeroProbe : nil)
+                firstZeroProbe: phase == 2 ? firstZeroProbe : nil, activityRecorder: nativeActivity)
             #else
             let probe = ProductionRendererProbe(renderer: audio.renderer)
             #endif
@@ -4966,7 +4967,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         for sample in value.result.samples {
             guard let worker = sample.workerActivity else { continue }
             print("ProductionWorkerActivity schema=1 phase=\(value.phase) beginNs=\(sample.begin) endNs=\(sample.end) rendererToken=\(sample.audio.token) rendererVisit=\(sample.audio.visit) rendererFrame=\(sample.audio.frame) underruns=\(sample.audio.underrunFrames) packed=\(worker.packedState) sequence=\(worker.sequence) stage=\(worker.stageCode) workerToken=\(worker.token) overflowed=\(worker.overflowed) scope=separate-load-within-original-sampler extraSDKQueries=0 workerEpoch=unavailable internalWaitCause=unverified")
+            let a = sample.lane0, b = sample.lane1, c = sample.lane2
+            print("ProductionWorkerLaneBundle schema=1 phase=\(value.phase) beginNs=\(sample.begin) endNs=\(sample.end) lane0Available=\(a != nil) lane0Packed=\(a?.packedState ?? 0) lane0Sequence=\(a?.copySequence ?? 0) lane0Stage=\(a?.stageCode ?? 0) lane0Overflow=\(a?.sequenceOverflowed ?? false) lane1Available=\(b != nil) lane1Packed=\(b?.packedState ?? 0) lane1Sequence=\(b?.copySequence ?? 0) lane1Stage=\(b?.stageCode ?? 0) lane1Overflow=\(b?.sequenceOverflowed ?? false) lane2Available=\(c != nil) lane2Packed=\(c?.packedState ?? 0) lane2Sequence=\(c?.copySequence ?? 0) lane2Stage=\(c?.stageCode ?? 0) lane2Overflow=\(c?.sequenceOverflowed ?? false) scope=three-independent-packed-loads extraSDKQueries=0 historicalOwner=unverified internalWaitCause=unverified")
             XCTAssertFalse(worker.overflowed)
+            XCTAssertNotNil(a); XCTAssertNotNil(b); XCTAssertNotNil(c)
+            XCTAssertFalse(a?.sequenceOverflowed ?? true)
+            XCTAssertFalse(b?.sequenceOverflowed ?? true)
+            XCTAssertFalse(c?.sequenceOverflowed ?? true)
         }
         #endif
     }
@@ -10181,10 +10188,12 @@ private final class ProductionRendererProbe: @unchecked Sendable {
     private let nativeCommandUnderruns: Int64
     private let renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder?
     private let firstZeroProbe: ProductionFirstZeroWorkerProbe?
+    private let activityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder?
     init(renderer: ContinuousPCMRenderer, nativeTrace: ProductionNativeRefillTrace? = nil,
          nativePhase: Int = -1, nativeExpectedToken: Int = 0, nativeCommandUnderruns: Int64 = 0,
          renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil,
-         captureSnapshotReadReceipt: Bool = false, firstZeroProbe: ProductionFirstZeroWorkerProbe? = nil) {
+         captureSnapshotReadReceipt: Bool = false, firstZeroProbe: ProductionFirstZeroWorkerProbe? = nil,
+         activityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil) {
         self.renderer = renderer
         self.captureSnapshotReadReceipt = captureSnapshotReadReceipt
         self.nativeTrace = nativeTrace
@@ -10192,6 +10201,7 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         self.nativeCommandUnderruns = nativeCommandUnderruns
         self.renderAccounting = renderAccounting
         self.firstZeroProbe = firstZeroProbe
+        self.activityRecorder = activityRecorder
         samples.reserveCapacity(128)
         timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "test.production-render-sampler", qos: .userInitiated))
         timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(1))
@@ -10237,10 +10247,14 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         let audio = renderer.snapshot
         #endif
         #if DEBUG
-        let lane0 = nativeTrace?.recorder.snapshot(at: 0)
-        let lane1 = nativeTrace?.recorder.snapshot(at: 1)
-        let lane2 = nativeTrace?.recorder.snapshot(at: 2)
-        let workerActivity = nativeTrace?.recorder.workerSnapshot() ?? firstZeroProbe?.event.workerSnapshot()
+        let lane0 = nativeTrace?.recorder.snapshot(at: 0) ?? activityRecorder?.snapshot(at: 0)
+            ?? firstZeroProbe?.event.laneSnapshot(at: 0)
+        let lane1 = nativeTrace?.recorder.snapshot(at: 1) ?? activityRecorder?.snapshot(at: 1)
+            ?? firstZeroProbe?.event.laneSnapshot(at: 1)
+        let lane2 = nativeTrace?.recorder.snapshot(at: 2) ?? activityRecorder?.snapshot(at: 2)
+            ?? firstZeroProbe?.event.laneSnapshot(at: 2)
+        let workerActivity = nativeTrace?.recorder.workerSnapshot() ?? activityRecorder?.workerSnapshot()
+            ?? firstZeroProbe?.event.workerSnapshot()
         let accounting = renderAccounting?.snapshot()
         #endif
         let end = DispatchTime.now().uptimeNanoseconds
@@ -10562,6 +10576,9 @@ private final class ProductionFirstStereoZeroEvent: @unchecked Sendable {
         return record
     }
     func workerSnapshot() -> ContinuousPCMDecoder.DebugWorkerActivitySnapshot? { recorder?.workerSnapshot() }
+    func laneSnapshot(at index: Int) -> ContinuousPCMDecoder.DebugNativeLaneActivitySnapshot? {
+        recorder?.snapshot(at: index)
+    }
 }
 
 /// One request registered before task creation. Neither endpoint fallback nor
