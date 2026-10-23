@@ -2,16 +2,19 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Require direct fixture lifetime/storage contracts in a disposable host; no playback follows this RED route.
-expected_code_source=3714083c4aed22a52e7dd04b36dadedd0f5942a1
-expected_ios_tree=d703e9c3accc568edea80a88f314f1dea592a1b4
+# Validate actual isolated fixtures and unchanged default playback/cold-load controls; no acceptance from cohort reduction.
+expected_code_source=9747feb32e619adb198ae4d9773c4e43f062492b
+expected_ios_tree=06abf10a7224f2ae9cfc02b61e8ccff4be3f0c7b
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixtureLedgerReloadUsesOwnedVerifiedFilesWithoutTransferSession
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -37,11 +40,14 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixtureLedgerReloadUsesOwnedVerifiedFilesWithoutTransferSession',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace',
 }
-if len(expected) != 2 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly two direct download fixture lifetime and storage identities must exist in the pinned source')
+if len(expected) != 5 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly five fixture ownership and unchanged playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -50,7 +56,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=2 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=5 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -151,9 +157,9 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=2 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# These two exact fixture identities execute in one fresh disposable process; no playback follows.
-# Both cases retain their actual owner, record and saved-file assertions.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=5 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# These five exact identities execute in a fresh disposable process; actual XCTest records establish order.
+# Original timing, continuity, capture, identity and cleanup assertions remain unchanged.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
 # There is no promotion prefix. Actual XCTest start/result records determine
 # execution history; selected-list order is not a matched-history guarantee.
