@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 3
       - name: Require exact committed app and test source before native work
         id: source_pin
         run: |
@@ -68,7 +68,7 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          expected_native, expected_ui = '173', '1'
+          expected_native, expected_ui = '197', '1'
           if not all(value.isdigit() and int(value) > 0 for value in (expected_native, expected_ui)):
               raise SystemExit('Final committed full-manifest counts are required.')
           if len(native) != int(expected_native) or len(ui) != int(expected_ui) or native | ui != expected:
