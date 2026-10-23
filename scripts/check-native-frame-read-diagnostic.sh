@@ -2,18 +2,18 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Calibrate existing CAP clock boundaries; counterbalance scalar observation with constant startup/zero tracing.
-expected_code_source=b9e91a1f6fae1656fbf91cc10e88e8b34e7d9d0c
-expected_ios_tree=9ba0cc1a705d2ad82275eeb8c9aff7d325c44eab
+# Calibrate native reported states; counterbalance bounded extra queries after original clock observations.
+expected_code_source=c0a1c69a473209a191e2ffa7cc00749f9862951c
+expected_ios_tree=0fdb7a494106c210ba9f6b62be1d2ff0d91bb64c
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testPresentationClockBoundaryContainsHeldGraphCallAndPendingReentry
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateCalibratesPauseRecoveryAndSupersession
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testCAPClockBoundaryOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testCAPClockBoundaryOnThenOff
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -39,13 +39,13 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testPresentationClockBoundaryContainsHeldGraphCallAndPendingReentry',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateCalibratesPauseRecoveryAndSupersession',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testCAPClockBoundaryOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testCAPClockBoundaryOnThenOff',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOnThenOff',
 }
 if len(expected) != 4 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly four CAP clock calibration and original guarded playback identities must exist in the pinned source')
+    raise SystemExit('Exactly four reported-state calibration and original guarded playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
