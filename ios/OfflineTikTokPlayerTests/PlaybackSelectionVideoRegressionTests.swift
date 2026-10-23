@@ -14,6 +14,198 @@ import Synchronization
 @testable import OfflineTikTokPlayer
 
 #if DEBUG
+@MainActor
+final class NativePlayerReportedStateTrace {
+    struct Phase {
+        var handoff: PlaybackService.DebugVideoRateHandoff?
+        var handoffCommands = 0
+        var stopped = 0
+        var positiveSeen = false
+        var positiveRecorded = false
+        var reads = 0
+        var rejected = 0
+    }
+    struct Span {
+        let entry: UInt64, returned: UInt64
+    }
+    struct Row {
+        let phase: Int, stoppedOrdinal: Int, positive: Bool
+        let read: PlaybackService.DebugVideoPositionRead
+        let handoff: PlaybackService.DebugVideoRateHandoff
+        let entry: UInt64, returned: UInt64
+        let firstItem: Span, firstStatus: Span?, reason: Span?, lastStatus: Span?, lastItem: Span
+        let statusBefore: Int?, statusAfter: Int?, waitingReason: String?
+        let reasonOversize: Bool, qualified: Bool
+        let beforeRequest: Int, afterRequest: Int, beforeVisit: Int64, afterVisit: Int64
+        let beforeToken: Int, afterToken: Int
+        let beforeItemMatches: Bool, afterItemMatches: Bool
+    }
+    let enabled: Bool, calibration: Bool, armID: String
+    let baseRequest: Int
+    private(set) var phases = Array(repeating: Phase(), count: 3)
+    private(set) var rows = Array<Row?>(repeating: nil, count: 24)
+    private(set) var count = 0
+    private(set) var failed = false
+    private(set) var reentrantReads = 0
+    var manualArmed = false
+    var afterFirstStatus: (() -> Void)?
+    private var collecting = false, active = true
+    init(enabled: Bool, baseRequest: Int, calibration: Bool = false) {
+        self.enabled = enabled; self.baseRequest = baseRequest; self.calibration = calibration
+        armID = UUID().uuidString.lowercased()
+    }
+    func recordHandoff(_ value: PlaybackService.DebugVideoRateHandoff) {
+        guard active, value.cause == .initialReady || calibration else { return }
+        let phase = value.request - baseRequest - 1
+        guard (0..<3).contains(phase) else { return }
+        guard phases[phase].handoffCommands < 32_768 else { failed = true; return }
+        phases[phase].handoffCommands += 1
+        if !calibration && phases[phase].handoff != nil { failed = true; return }
+        phases[phase].handoff = value
+    }
+    func recordRead(_ read: PlaybackService.DebugVideoPositionRead, service: PlaybackService, audio: ContinuousAudioPlayer) {
+        guard active, enabled, !calibration || manualArmed else { return }
+        if collecting {
+            if reentrantReads < 32_768 { reentrantReads += 1 } else { failed = true }
+            return
+        }
+        let phase = read.request - baseRequest - 1
+        guard (0..<3).contains(phase), let handoff = phases[phase].handoff else { return }
+        guard phases[phase].reads < 32_768 else { failed = true; return }
+        phases[phase].reads += 1
+        let stopped = read.itemTimebaseEffectiveRate == 0 && read.rawItemTimebasePosition?.isFinite == true
+            && (read.rawItemTimebasePosition ?? -1) >= 0
+        let positive = read.itemTimebaseEffectiveRate?.isFinite == true
+            && (read.itemTimebaseEffectiveRate ?? 0) > 0 && read.position.isFinite && read.position > 0
+            && read.rawItemTimebasePosition?.isFinite == true && (read.rawItemTimebasePosition ?? 0) > 0
+        if stopped { phases[phase].stopped += 1 }
+        // Sticky at the first candidate, including a rejected/unqualified one.
+        // A later successful query must never replace this missing observation.
+        let firstPositive = positive && !phases[phase].positiveSeen
+        if positive { phases[phase].positiveSeen = true }
+        guard calibration || firstPositive || stopped && [1, 2, 4, 8, 16, 32].contains(phases[phase].stopped) else { return }
+        let entry = DispatchTime.now().uptimeNanoseconds
+        let before = service.debugAlignedVideoPollState
+        let beforeState = service.debugInitialVideoReadyState
+        let beforeSelection = audio.debugSelectionState, selectedID = audio.selectedID
+        @MainActor func ownerMatches() -> Bool {
+            let owner = service.debugAlignedVideoPollState, state = service.debugInitialVideoReadyState
+            let selection = audio.debugSelectionState
+            return read.kind == .itemTimebase && read.request == read.returnGeneration
+                && read.observedItemMatches && read.presentationUnchanged
+                && read.presentationRequest == read.request && read.returnPresentationRequest == read.request
+                && read.presentationTicket != nil && read.presentationTicket == read.returnPresentationTicket
+                && read.entrySeekState == read.returnSeekState && read.entrySeekState.activeTicket == nil
+                && handoff.request == read.request && handoff.item == read.item
+                && handoff.entryGeneration == read.request && handoff.returnGeneration == read.request
+                && handoff.presentationRequest == read.request && handoff.returnPresentationRequest == read.request
+                && handoff.presentationTicket?.debugItemIdentity == read.item && handoff.requestedRate == 1
+                && handoff.entryNs > 0 && handoff.returnNs >= handoff.entryNs
+                && read.entryNs >= handoff.returnNs && read.returnNs >= read.entryNs && read.returnNs <= entry
+                && handoff.entryObservedItemMatches && handoff.returnObservedItemMatches && handoff.presentationUnchanged
+                && handoff.presentationTicket == read.presentationTicket && handoff.returnPresentationTicket == read.presentationTicket
+                && handoff.entrySeekState == read.entrySeekState && handoff.returnSeekState == read.entrySeekState
+                && owner.generation == read.request && owner.request == read.request
+                && owner.frame.ticket == read.presentationTicket && owner.frame.output == before.frame.output
+                && owner.frame.output != nil && owner.presentationMatches && owner.observedItemMatches
+                && owner.frame.seekSerial == read.entrySeekState.serial && owner.frame.activeSeekTicket == nil
+                && owner.frame.imageEpoch == before.frame.imageEpoch
+                && state.generation == beforeState.generation && state.audioVisit == beforeState.audioVisit
+                && selection.selectedToken == beforeSelection.selectedToken && selection.selectedToken > 0
+                && selectedID != nil && audio.selectedID == selectedID && service.queue.currentID == selectedID
+        }
+        guard ownerMatches(), count < rows.count else {
+            phases[phase].rejected += 1
+            if count == rows.count { failed = true }
+            return
+        }
+        collecting = true
+        defer { collecting = false }
+        let firstEntry = DispatchTime.now().uptimeNanoseconds
+        let first = service.player.currentItem
+        let firstReturn = DispatchTime.now().uptimeNanoseconds
+        let firstMatches = first.map(ObjectIdentifier.init) == read.item
+        var statusBefore: Int?, statusAfter: Int?, reasonValue: String?
+        var firstStatus: Span?, reasonSpan: Span?, lastStatus: Span?
+        var oversize = false, ownerThroughout = firstMatches && ownerMatches()
+        if ownerThroughout {
+            let start = DispatchTime.now().uptimeNanoseconds
+            let status = service.player.timeControlStatus
+            firstStatus = .init(entry: start, returned: DispatchTime.now().uptimeNanoseconds)
+            statusBefore = status.rawValue
+            afterFirstStatus?()
+            ownerThroughout = ownerThroughout && ownerMatches()
+            if ownerThroughout && status == .waitingToPlayAtSpecifiedRate {
+                let start = DispatchTime.now().uptimeNanoseconds
+                let reason = service.player.reasonForWaitingToPlay
+                reasonSpan = .init(entry: start, returned: DispatchTime.now().uptimeNanoseconds)
+                if let raw = reason?.rawValue {
+                    oversize = raw.utf8.count > 256
+                    reasonValue = oversize ? "oversize" : raw
+                }
+                ownerThroughout = ownerThroughout && ownerMatches()
+            }
+            if ownerThroughout {
+                let start = DispatchTime.now().uptimeNanoseconds
+                let status = service.player.timeControlStatus
+                lastStatus = .init(entry: start, returned: DispatchTime.now().uptimeNanoseconds)
+                statusAfter = status.rawValue
+                ownerThroughout = ownerThroughout && ownerMatches()
+            }
+        }
+        let lastEntry = DispatchTime.now().uptimeNanoseconds
+        let last = service.player.currentItem
+        let lastReturn = DispatchTime.now().uptimeNanoseconds
+        let lastMatches = last.map(ObjectIdentifier.init) == read.item
+        let afterState = service.debugInitialVideoReadyState, afterSelection = audio.debugSelectionState
+        let qualified = ownerThroughout && ownerMatches() && lastMatches && !oversize
+        rows[count] = Row(phase: phase, stoppedOrdinal: phases[phase].stopped, positive: positive,
+            read: read, handoff: handoff, entry: entry, returned: DispatchTime.now().uptimeNanoseconds,
+            firstItem: .init(entry: firstEntry, returned: firstReturn), firstStatus: firstStatus,
+            reason: reasonSpan, lastStatus: lastStatus, lastItem: .init(entry: lastEntry, returned: lastReturn),
+            statusBefore: statusBefore, statusAfter: statusAfter, waitingReason: reasonValue,
+            reasonOversize: oversize, qualified: qualified, beforeRequest: beforeState.generation,
+            afterRequest: afterState.generation, beforeVisit: beforeState.audioVisit, afterVisit: afterState.audioVisit,
+            beforeToken: beforeSelection.selectedToken, afterToken: afterSelection.selectedToken,
+            beforeItemMatches: firstMatches, afterItemMatches: lastMatches)
+        count += 1
+        if positive && qualified { phases[phase].positiveRecorded = true }
+    }
+    func stop() { active = false; afterFirstStatus = nil }
+    func dumpAndAssert(cleanupAcknowledged: Bool) {
+        XCTAssertTrue(cleanupAcknowledged); XCTAssertFalse(active); XCTAssertFalse(failed)
+        XCTAssertLessThan(count, rows.count); XCTAssertLessThanOrEqual(rows.count * MemoryLayout<Row?>.stride, 65_536)
+        if !enabled { XCTAssertEqual(count, 0) }
+        if enabled && !calibration { XCTAssertGreaterThan(count, 0); XCTAssertEqual(reentrantReads, 0) }
+        print("NativePlayerReportedSummary schema=1 armID=\(armID) enabled=\(enabled) calibration=\(calibration) count=\(count) capacity=24 bytes=\(rows.count * MemoryLayout<Row?>.stride) reentrantReads=\(reentrantReads) failed=\(failed) active=\(active) cleanupAcknowledged=\(cleanupAcknowledged) pausedCode=\(AVPlayer.TimeControlStatus.paused.rawValue) waitingCode=\(AVPlayer.TimeControlStatus.waitingToPlayAtSpecifiedRate.rawValue) playingCode=\(AVPlayer.TimeControlStatus.playing.rawValue) valuesAtomic=false internalDecoderCause=false")
+        for phase in 0..<3 {
+            let p = phases[phase]
+            if enabled && !calibration {
+                XCTAssertNotNil(p.handoff); XCTAssertGreaterThan(p.reads, 0)
+                if p.positiveSeen { XCTAssertTrue(p.positiveRecorded) }
+                let retained = rows.prefix(count).compactMap { $0 }.filter { $0.phase == phase }
+                XCTAssertLessThanOrEqual(retained.count, 7)
+                XCTAssertLessThanOrEqual(retained.filter(\.positive).count, 1)
+            }
+            print("NativePlayerReportedPhase schema=1 armID=\(armID) phase=\(phase) handoffPresent=\(p.handoff != nil) handoffCommands=\(p.handoffCommands) reads=\(p.reads) stoppedReads=\(p.stopped) positiveSeen=\(p.positiveSeen) positiveRecorded=\(p.positiveRecorded) admissionRejected=\(p.rejected) sampling=stopped1-2-4-8-16-32-and-firstpositive rejectedFirstPositive=unavailable-no-retry outputAfterCleanup=true")
+        }
+        for index in 0..<count {
+            guard let row = rows[index] else { XCTFail("Missing native reported-state row"); continue }
+            if !calibration { XCTAssertTrue(row.qualified) }
+            XCTAssertFalse(row.reasonOversize)
+            var previous = row.entry
+            for span in [row.firstItem, row.firstStatus, row.reason, row.lastStatus, row.lastItem].compactMap({ $0 }) {
+                XCTAssertLessThanOrEqual(previous, span.entry); XCTAssertLessThanOrEqual(span.entry, span.returned)
+                previous = span.returned
+            }
+            XCTAssertLessThanOrEqual(previous, row.returned)
+            if row.reason != nil { XCTAssertEqual(row.statusBefore, AVPlayer.TimeControlStatus.waitingToPlayAtSpecifiedRate.rawValue) }
+            let reasonHex = row.waitingReason?.utf8.map { String(format: "%02x", $0) }.joined() ?? "none"
+            print("NativePlayerReportedRow schema=1 armID=\(armID) ordinal=\(index) phase=\(row.phase) request=\(row.read.request) item=\(UInt(bitPattern: row.read.item)) ticketRevision=\(row.read.presentationTicket?.debugGeneration ?? -1) seekSerial=\(row.read.entrySeekState.serial) initialCause=\(row.handoff.cause.rawValue) handoffEntryNs=\(row.handoff.entryNs) handoffReturnNs=\(row.handoff.returnNs) readEntryNs=\(row.read.entryNs) readReturnNs=\(row.read.returnNs) rawPosition=\(row.read.rawItemTimebasePosition ?? .nan) effectiveRate=\(row.read.itemTimebaseEffectiveRate ?? .nan) position=\(row.read.position) stoppedOrdinal=\(row.stoppedOrdinal) positive=\(row.positive) probeEntryNs=\(row.entry) probeReturnNs=\(row.returned) firstItemEntryNs=\(row.firstItem.entry) firstItemReturnNs=\(row.firstItem.returned) firstStatusEntryNs=\(row.firstStatus?.entry ?? 0) firstStatusReturnNs=\(row.firstStatus?.returned ?? 0) reasonEntryNs=\(row.reason?.entry ?? 0) reasonReturnNs=\(row.reason?.returned ?? 0) lastStatusEntryNs=\(row.lastStatus?.entry ?? 0) lastStatusReturnNs=\(row.lastStatus?.returned ?? 0) lastItemEntryNs=\(row.lastItem.entry) lastItemReturnNs=\(row.lastItem.returned) statusBefore=\(row.statusBefore ?? -1) statusAfter=\(row.statusAfter ?? -1) reasonQueried=\(row.reason != nil) reasonHex=\(reasonHex) reasonOversize=\(row.reasonOversize) qualified=\(row.qualified) beforeRequest=\(row.beforeRequest) afterRequest=\(row.afterRequest) beforeVisit=\(row.beforeVisit) afterVisit=\(row.afterVisit) beforeToken=\(row.beforeToken) afterToken=\(row.afterToken) beforeItemMatches=\(row.beforeItemMatches) afterItemMatches=\(row.afterItemMatches) audioOwner=cached-not-render-ACK valuesAtomic=false")
+        }
+    }
+}
+
 /// Fixed MainActor scalar storage; no SDK queries, images or in-window output.
 @MainActor
 final class PresentationClockBoundaryTrace {
@@ -111,6 +303,98 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private var sourceCallbackLedgerArmID: String?
     private static var unresolvedFirstZeroCalibrationAudio: ContinuousAudioPlayer?
     #endif
+
+    func testNativePlayerReportedStateCalibratesPauseRecoveryAndSupersession() async throws {
+        #if DEBUG
+        let trace = NativePlayerReportedStateTrace(enabled: true, baseRequest: 0, calibration: true)
+        let buffer = PlaybackBuffer()
+        var cleanupAcknowledged = false
+        defer { trace.stop() }
+        try await withOwnedNaturalFixture(buffer: buffer, cleanupReceipt: { cleanupAcknowledged = $0 }) { fixture, audio, service, screen in
+            service.onDebugVideoRateHandoff = { trace.recordHandoff($0) }
+            service.onDebugVideoPositionRead = { trace.recordRead($0, service: service, audio: audio) }
+            defer {
+                trace.manualArmed = false; trace.afterFirstStatus = nil
+                service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
+                trace.stop()
+            }
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
+            try await require({ buffer.hasPrepared(fixture.bID) }, "B must be staged before the owner-change control")
+            let item = try XCTUnwrap(service.player.currentItem)
+            service.player.pause()
+            try await require({
+                guard service.player.currentItem === item, let timebase = item.timebase else { return false }
+                return CMTimebaseGetEffectiveRate(timebase) == 0 && service.wantsToPlay && service.audioEngineRunning
+            }, "The actual native player must stop while real PCM and intent continue")
+            let before = audio.renderer.snapshot
+            holdMainActorForStoppedNativeClockControl()
+            let after = audio.renderer.snapshot
+            XCTAssertEqual(after.token, before.token); XCTAssertEqual(after.visit, before.visit)
+            XCTAssertEqual(after.selectionVersion, before.selectionVersion)
+            XCTAssertGreaterThan(Double(after.frame - before.frame) / 48_000, 0.080)
+            XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+            trace.manualArmed = true; service.debugSynchronizeVideoToAudio(); trace.manualArmed = false
+            XCTAssertEqual(trace.count, 1)
+            let stopped = try XCTUnwrap(trace.rows[0])
+            XCTAssertTrue(stopped.qualified); XCTAssertEqual(stopped.read.itemTimebaseEffectiveRate, 0)
+            XCTAssertEqual(stopped.statusBefore, AVPlayer.TimeControlStatus.paused.rawValue)
+            XCTAssertEqual(stopped.statusAfter, AVPlayer.TimeControlStatus.paused.rawValue)
+            XCTAssertNil(stopped.reason)
+            let submitted = service.submittedVideoFrameCount
+            service.debugSynchronizeVideoToAudio(force: true)
+            try await require({
+                guard service.player.currentItem === item, let timebase = item.timebase,
+                      let frame = service.videoFramePositionSeconds else { return false }
+                let goal = audio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+                return service.debugInitialVideoReadyState.syncingVideoGeneration == nil
+                    && CMTimebaseGetEffectiveRate(timebase) > 0
+                    && service.submittedVideoFrameCount > submitted && abs(frame - goal) <= 0.080
+            }, "The original forced path must recover an advancing real image")
+            trace.manualArmed = true; service.debugSynchronizeVideoToAudio(); trace.manualArmed = false
+            XCTAssertEqual(trace.count, 2)
+            let playing = try XCTUnwrap(trace.rows[1])
+            XCTAssertTrue(playing.qualified); XCTAssertGreaterThan(playing.read.itemTimebaseEffectiveRate ?? 0, 0)
+            XCTAssertEqual(playing.statusBefore, AVPlayer.TimeControlStatus.playing.rawValue)
+            XCTAssertEqual(playing.statusAfter, AVPlayer.TimeControlStatus.playing.rawValue)
+            let originalRequest = service.debugInitialVideoReadyState.generation
+            var superseded = false
+            trace.afterFirstStatus = {
+                trace.afterFirstStatus = nil; superseded = true
+                service.start(playlistIDs: [fixture.playlist], at: fixture.bID)
+            }
+            trace.manualArmed = true; service.debugSynchronizeVideoToAudio(); trace.manualArmed = false
+            XCTAssertTrue(superseded); XCTAssertEqual(trace.count, 3)
+            let rejected = try XCTUnwrap(trace.rows[2])
+            XCTAssertFalse(rejected.qualified); XCTAssertEqual(rejected.beforeRequest, originalRequest)
+            XCTAssertGreaterThan(rejected.afterRequest, originalRequest)
+            XCTAssertFalse(rejected.afterItemMatches)
+            try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
+            print("NativePlayerReportedCalibration schema=1 actualPause=true pcmAdvanced=true actualForcedRecovery=true actualSupersessionAfterGetter=true waitingBranch=native-unavailable-unless-observed nativeQueries=actual valuesAtomic=false playbackAcceptance=false")
+        }
+        trace.stop(); trace.dumpAndAssert(cleanupAcknowledged: cleanupAcknowledged)
+        #else
+        XCTFail("Reported native player calibration requires DEBUG")
+        #endif
+    }
+
+    func testNativePlayerReportedStateOffThenOn() async throws {
+        try await runNativePlayerReportedStateComparison([false, true], order: "off-then-on")
+    }
+
+    func testNativePlayerReportedStateOnThenOff() async throws {
+        try await runNativePlayerReportedStateComparison([true, false], order: "on-then-off")
+    }
+
+    private func runNativePlayerReportedStateComparison(_ modes: [Bool], order: String) async throws {
+        try recordRuntimeHost()
+        for (ordinal, enabled) in modes.enumerated() {
+            print("NativePlayerReportedArm schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) originalClockObserver=first zeroProbe=constant-on earlyActivation=nil CAPTrace=nil callbackLedger=nil captures=0 originalGuards=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, nativePlayerReportedState: enabled)
+            print("NativePlayerReportedArmEnd schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) helperReturned=true")
+        }
+    }
 
     func testCAPClockBoundaryOffThenOn() async throws {
         try await runCAPClockBoundaryComparison([false, true], order: "off-then-on")
@@ -2978,11 +3262,27 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 earlyClockAcquisition: Bool? = nil,
                                                 wholeFrameClockAcquisition: Bool? = nil,
                                                 firstZeroSourceCallbacks: Bool? = nil,
-                                                capClockBoundary: Bool? = nil) async throws {
+                                                capClockBoundary: Bool? = nil,
+                                                nativePlayerReportedState: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
         let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
-            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil ? nil : true)
+            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil ? nil : true)
+        if let enabled = nativePlayerReportedState {
+            guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
+                  wholeFrameClockAcquisition == nil, firstZeroSourceCallbacks == nil, capClockBoundary == nil,
+                  traceReturnedAStereoZero == nil, frameMonitorAlternative == nil, !traceNativeRefill,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup,
+                  freshPreviousBundle == nil, queuedPreviousLead == nil, suppressNativePlayerRendering == nil,
+                  nativeVideoGeometry == nil, traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == nil,
+                  sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("Reported player-state comparison varies only its bounded native queries after original clock observation")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("NativePlayerReportedScope schema=1 enabled=\(enabled) phases=3 samplesPerPhase=7 capacity=24 maximumBytes=65536 extraSDKQueriesPerSample=4-or-5 getters=currentItem-status-reasonIfWaiting-status-currentItem valuesAtomic=false firstZeroProbe=constant-on playbackPolicy=unchanged")
+        }
         if let enabled = capClockBoundary {
             guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
                   wholeFrameClockAcquisition == nil, firstZeroSourceCallbacks == nil, traceReturnedAStereoZero == nil,
@@ -3066,6 +3366,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if nativePlayerReportedState != nil {
+            XCTFail("Native reported player-state comparison requires DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if capClockBoundary != nil {
             XCTFail("CAP clock boundary comparison requires DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3333,6 +3637,28 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 service.onDebugAlignedVideoEnqueue = { [weak remainingWitness] value in remainingWitness?.record(value) }
                 service.onDebugVideoRateHandoff = { [weak handoffTrace] value in handoffTrace?.record(value) }
                 service.onDebugVideoPositionRead = { [weak handoffTrace] value in handoffTrace?.record(value) }
+            }
+        }
+        let nativeReportedTrace = nativePlayerReportedState.map {
+            NativePlayerReportedStateTrace(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation)
+        }
+        if let nativeReportedTrace {
+            let previousHandoff = service.onDebugVideoRateHandoff
+            service.onDebugVideoRateHandoff = { [weak nativeReportedTrace] value in
+                previousHandoff?(value); nativeReportedTrace?.recordHandoff(value)
+            }
+            if nativeReportedTrace.enabled {
+                let previousRead = service.onDebugVideoPositionRead
+                service.onDebugVideoPositionRead = { [weak nativeReportedTrace, weak service, weak audio] value in
+                    previousRead?(value)
+                    if let service, let audio { nativeReportedTrace?.recordRead(value, service: service, audio: audio) }
+                }
+            }
+        }
+        defer {
+            if nativeReportedTrace != nil {
+                service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
+                nativeReportedTrace?.stop()
             }
         }
         let earlyAcquisitionTrace = earlyClockAcquisition.map {
@@ -3621,6 +3947,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         earlyAcquisitionTrace?.stop()
         wholeFrameTrace?.stop()
         audio.onDebugPresentationClock = nil; capClockTrace?.stop()
+        if nativeReportedTrace != nil {
+            service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
+            nativeReportedTrace?.stop()
+        }
         #endif
         // No dumps, spectral analysis or assertions interrupt any streaming window.
         tap.stop(); service.pause()
@@ -3736,6 +4066,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         earlyAcquisitionTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         wholeFrameTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         capClockTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
+        nativeReportedTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         if let enabled = traceReturnedAProducerBoundary {
             if enabled {
                 XCTAssertNotNil(nativeTrace); XCTAssertNotNil(nativeActivity); XCTAssertNotNil(firstFailure)
@@ -7611,7 +7942,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     /// requires both existing acknowledgements; failure retains only this fixture.
     private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, buffer: PlaybackBuffer? = nil, recordHost: Bool = true,
         seekVideo: PlaybackService.SeekVideo? = nil,
-        additionalCleanupAcknowledged: @MainActor () -> Bool = { @MainActor in true }, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
+        additionalCleanupAcknowledged: @MainActor () -> Bool = { @MainActor in true },
+        cleanupReceipt: (@MainActor (Bool) -> Void)? = nil, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
         PlaybackService, SelectionVideoScreen) async throws -> Void) async throws {
         if recordHost { try recordRuntimeHost() }
         guard !Self.targetedFixtureOwnershipLost else {
@@ -7667,6 +7999,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             && additionalCleanupAcknowledged()
         print("NaturalFixtureCleanup schema=1 ownedTasksJoined=\(preparation.result == true) decoderClosed=\(decoder.result == true) removeAllowed=\(canRemove) originalErrorRetained=\(originalError != nil) syntheticFilesRetained=\(!canRemove) sdkInternalQuiescence=unverified olderCancelledTasks=unverified")
         XCTAssertTrue(canRemove, "Owned task and decoder close acknowledgements must precede synthetic file removal")
+        cleanupReceipt?(canRemove)
         if canRemove { fixture.remove() }
         else { Self.targetedFixtureOwnershipLost = true; fixture.restorePreferences() }
         #else
