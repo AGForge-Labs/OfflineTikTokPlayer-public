@@ -2,18 +2,18 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Calibrate whole-frame coverage, then counterbalance acquisition with constant scalar tracing/zero probe and no pixel scans.
-expected_code_source=76a9b36ee3d2a5789c8393e20e8fdfe9baeb1d76
-expected_ios_tree=db95d51459c374d1a760fa559add6b396ec358a1
+# Calibrate actual tap index ranges, then counterbalance source/tap observation with constant first-zero detection.
+expected_code_source=c30ec9249a0c4cf3dd68b1e7a158bf05ea43b26d
+expected_ios_tree=cb192bce490f0f3314d9511c45671655e5641753
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testWholeFrameBoundaryTraceCoversActualObserverAndRejectsReentrantOwner
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstZeroCallbackRangeUsesActualStorageAcrossTapBuffers
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOnThenOff
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstZeroSourceCallbacksOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstZeroSourceCallbacksOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -39,13 +39,13 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testWholeFrameBoundaryTraceCoversActualObserverAndRejectsReentrantOwner',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testFirstZeroCallbackRangeUsesActualStorageAcrossTapBuffers',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testWholeFrameBoundaryWithoutPixelScanOnThenOff',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testFirstZeroSourceCallbacksOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testFirstZeroSourceCallbacksOnThenOff',
 }
 if len(expected) != 4 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly four whole-frame calibration and original guarded playback identities must exist in the pinned source')
+    raise SystemExit('Exactly four actual-zero callback calibration and original guarded playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
