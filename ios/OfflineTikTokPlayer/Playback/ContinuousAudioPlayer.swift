@@ -27,6 +27,43 @@ final class ContinuousAudioPlayer {
     private nonisolated let debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder?
     private var debugActivePreparationCalls = 0
     private var debugPreparationCounterOverflowed = false
+    struct DebugClockInterval {
+        let entryNs: UInt64
+        let returnNs: UInt64
+    }
+    struct DebugClockOwner {
+        let graph: ObjectIdentifier
+        let control: UInt64
+        let renderingPermitted: Bool
+        let pendingVersion: Int?
+    }
+    struct DebugClockEntry {
+        let ordinal: UInt64
+        let entryNs: UInt64
+        let owner: DebugClockOwner
+        let exhausted: Bool
+    }
+    struct DebugClockSpan {
+        let entry: DebugClockEntry
+        let returnNs: UInt64
+        let owner: DebugClockOwner
+        let entryDelivery: DebugClockInterval
+        let initialSnapshot: DebugClockInterval?
+        let engineRunning: DebugClockInterval?
+        let refreshedSnapshot: DebugClockInterval?
+        let graphPosition: DebugClockInterval?
+        let finalSnapshot: DebugClockInterval?
+        let usedGraph: ObjectIdentifier?
+        let usedControl: UInt64?
+        let usedSample: ContinuousPCMRenderer.Snapshot?
+    }
+    enum DebugClockEvent { case entered(DebugClockEntry), returned(DebugClockSpan) }
+    var onDebugPresentationClock: ((DebugClockEvent) -> Void)?
+    private var debugClockOrdinal: UInt64 = 0
+    private var debugClockOwner: DebugClockOwner {
+        .init(graph: ObjectIdentifier(graph), control: playbackControlTicket,
+              renderingPermitted: renderingPermitted, pendingVersion: pendingPosition?.version)
+    }
     #endif
     private var entries: [String: Entry] = [:]
     private var preparing: [String: PreparationJob] = [:]
@@ -353,23 +390,82 @@ final class ContinuousAudioPlayer {
         pendingPosition.map { $0.version != sample.selectionVersion } ?? false
     }
     func presentationPosition(at hostTime: CMTime) -> Double {
+        #if DEBUG
+        // Nil adds no clocks or native reads. Entry/return delivery remains outside
+        // the five existing calls; the return observer is outside this envelope.
+        let debugObserver = onDebugPresentationClock
+        var debugEntry: DebugClockEntry?
+        var debugEntryDelivery = DebugClockInterval(entryNs: 0, returnNs: 0)
+        var debugInitial: DebugClockInterval?, debugRunning: DebugClockInterval?
+        var debugRefreshed: DebugClockInterval?, debugGraph: DebugClockInterval?, debugFinal: DebugClockInterval?
+        var debugUsedGraph: ObjectIdentifier?, debugUsedControl: UInt64?
+        var debugUsedSample: ContinuousPCMRenderer.Snapshot?
+        if let debugObserver {
+            let exhausted = debugClockOrdinal == .max
+            if !exhausted { debugClockOrdinal += 1 }
+            let entry = DebugClockEntry(ordinal: debugClockOrdinal, entryNs: DispatchTime.now().uptimeNanoseconds,
+                                       owner: debugClockOwner, exhausted: exhausted)
+            debugEntry = entry
+            let start = DispatchTime.now().uptimeNanoseconds
+            debugObserver(.entered(entry))
+            debugEntryDelivery = .init(entryNs: start, returnNs: DispatchTime.now().uptimeNanoseconds)
+        }
+        defer {
+            if let debugEntry, let debugObserver {
+                let owner = debugClockOwner
+                let end = DispatchTime.now().uptimeNanoseconds
+                debugObserver(.returned(.init(entry: debugEntry, returnNs: end, owner: owner,
+                    entryDelivery: debugEntryDelivery, initialSnapshot: debugInitial, engineRunning: debugRunning,
+                    refreshedSnapshot: debugRefreshed, graphPosition: debugGraph, finalSnapshot: debugFinal,
+                    usedGraph: debugUsedGraph, usedControl: debugUsedControl, usedSample: debugUsedSample)))
+            }
+        }
+        let debugInitialStart = debugObserver == nil ? nil : DispatchTime.now().uptimeNanoseconds
+        #endif
         var sample = renderer.snapshot
+        #if DEBUG
+        if let debugInitialStart { debugInitial = .init(entryNs: debugInitialStart, returnNs: DispatchTime.now().uptimeNanoseconds) }
+        #endif
         if let pendingPosition, pendingPosition.version != sample.selectionVersion { return pendingPosition.position }
         pendingPosition = nil
         guard renderingPermitted else { return Double(sample.frame) / 48_000 }
         let owner = graph, control = playbackControlTicket
+        #if DEBUG
+        if debugObserver != nil { debugUsedGraph = ObjectIdentifier(owner); debugUsedControl = control }
+        let debugRunningStart = debugObserver == nil ? nil : DispatchTime.now().uptimeNanoseconds
+        #endif
         let running = owner.engine.isRunning
+        #if DEBUG
+        if let debugRunningStart { debugRunning = .init(entryNs: debugRunningStart, returnNs: DispatchTime.now().uptimeNanoseconds) }
+        #endif
         // SDK work may return after a newer command. Reconcile its actual
         // acknowledgement before clearing pending time or using an old cursor.
+        #if DEBUG
+        let debugRefreshedStart = debugObserver == nil ? nil : DispatchTime.now().uptimeNanoseconds
+        #endif
         sample = renderer.snapshot
+        #if DEBUG
+        if let debugRefreshedStart { debugRefreshed = .init(entryNs: debugRefreshedStart, returnNs: DispatchTime.now().uptimeNanoseconds) }
+        #endif
         if let pendingPosition, pendingPosition.version != sample.selectionVersion { return pendingPosition.position }
         pendingPosition = nil
         guard ownsPlaybackControl(control, graph: owner), renderingPermitted, running else {
             return Double(sample.frame) / 48_000
         }
+        #if DEBUG
+        if debugObserver != nil { debugUsedSample = sample }
+        let debugGraphStart = debugObserver == nil ? nil : DispatchTime.now().uptimeNanoseconds
+        #endif
         let position = owner.presentationPosition(token: sample.token, visit: sample.visit,
             selectionVersion: sample.selectionVersion, at: hostTime)
+        #if DEBUG
+        if let debugGraphStart { debugGraph = .init(entryNs: debugGraphStart, returnNs: DispatchTime.now().uptimeNanoseconds) }
+        let debugFinalStart = debugObserver == nil ? nil : DispatchTime.now().uptimeNanoseconds
+        #endif
         let current = renderer.snapshot
+        #if DEBUG
+        if let debugFinalStart { debugFinal = .init(entryNs: debugFinalStart, returnNs: DispatchTime.now().uptimeNanoseconds) }
+        #endif
         if let pendingPosition, pendingPosition.version != current.selectionVersion { return pendingPosition.position }
         pendingPosition = nil
         // The renderer can acknowledge a selection or cross a natural boundary

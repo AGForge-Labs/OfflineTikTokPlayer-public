@@ -6,6 +6,73 @@ import Synchronization
 
 @MainActor
 final class ContinuousAudioPlayerTests: XCTestCase {
+    func testPresentationClockBoundaryContainsHeldGraphCallAndPendingReentry() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("CAP-clock-boundary") { audio, sample in
+            let owner = audio.graph, host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            let cursor = Double(sample.frame) / 48_000
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            guard audio.presentationPosition(at: host) > cursor + 0.25 else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            let trace = PresentationClockBoundaryTrace(enabled: true, armID: "calibration", capacity: 8)
+            var request = 1, issued = false
+            var holdEntry: UInt64 = 0, holdReturn: UInt64 = 0
+            var nestedPosition = -1.0
+            audio.onDebugPresentationClock = { event in trace.record(event, request: request, visit: sample.visit) }
+            owner.debugAfterPresentationLatencyRead = {
+                owner.debugAfterPresentationLatencyRead = nil
+                holdEntry = DispatchTime.now().uptimeNanoseconds
+                Thread.sleep(forTimeInterval: 0.025)
+                holdReturn = DispatchTime.now().uptimeNanoseconds
+                nestedPosition = audio.presentationPosition(at: host)
+                issued = audio.select(id: "a", position: 0.05); request = 2
+            }
+            defer { audio.onDebugPresentationClock = nil; owner.debugAfterPresentationLatencyRead = nil; trace.stop() }
+            let observed = audio.presentationPosition(at: host)
+            XCTAssertTrue(issued); XCTAssertGreaterThan(nestedPosition, cursor + 0.25)
+            XCTAssertEqual(observed, 0.05, accuracy: 0.5 / 48_000)
+            XCTAssertTrue(audio.isSelectionPending(in: audio.snapshot))
+            XCTAssertEqual(audio.presentationPosition(at: host), 0.05, accuracy: 0.5 / 48_000)
+            audio.onDebugPresentationClock = nil; trace.stop()
+            XCTAssertEqual(trace.count, 3); XCTAssertEqual(trace.returns, 3)
+            let outer = try XCTUnwrap(trace.rows[0]?.span), nested = try XCTUnwrap(trace.rows[1]?.span)
+            let pending = try XCTUnwrap(trace.rows[2]?.span), graph = try XCTUnwrap(outer.graphPosition)
+            XCTAssertGreaterThanOrEqual(holdReturn - holdEntry, 25_000_000)
+            XCTAssertLessThanOrEqual(graph.entryNs, holdEntry); XCTAssertGreaterThanOrEqual(graph.returnNs, holdReturn)
+            XCTAssertLessThanOrEqual(outer.entry.entryNs, holdEntry); XCTAssertGreaterThanOrEqual(outer.returnNs, holdReturn)
+            XCTAssertLessThanOrEqual(graph.entryNs, nested.entry.entryNs)
+            XCTAssertLessThanOrEqual(nested.returnNs, graph.returnNs)
+            XCTAssertNotNil(outer.finalSnapshot); XCTAssertNotNil(nested.finalSnapshot)
+            for span in [outer, nested] {
+                let stages = [span.initialSnapshot, span.engineRunning, span.refreshedSnapshot,
+                              span.graphPosition, span.finalSnapshot]
+                XCTAssertEqual(stages.compactMap { $0 }.count, 5)
+                var previous = span.entryDelivery.returnNs
+                for stage in stages.compactMap({ $0 }) {
+                    XCTAssertLessThanOrEqual(previous, stage.entryNs)
+                    XCTAssertLessThanOrEqual(stage.entryNs, stage.returnNs)
+                    previous = stage.returnNs
+                }
+                XCTAssertLessThanOrEqual(previous, span.returnNs)
+            }
+            XCTAssertEqual(outer.usedGraph, ObjectIdentifier(owner)); XCTAssertEqual(outer.usedSample?.token, sample.token)
+            XCTAssertEqual(outer.usedSample?.visit, sample.visit)
+            XCTAssertEqual(outer.usedSample?.selectionVersion, sample.selectionVersion)
+            XCTAssertNotNil(outer.owner.pendingVersion); XCTAssertNotNil(pending.initialSnapshot)
+            XCTAssertNil(pending.engineRunning); XCTAssertNil(pending.refreshedSnapshot)
+            XCTAssertNil(pending.graphPosition); XCTAssertNil(pending.finalSnapshot)
+            XCTAssertEqual(trace.rows[0]?.request, 1); XCTAssertEqual(trace.rows[0]?.returnRequest, 2)
+            // Helper checks the actual callback census/resources and owns the strict close ACK.
+            // This dump qualifies storage/order only; it cannot assert that later close yet.
+            XCTAssertFalse(trace.failed)
+            print("CAPClockBoundaryCalibration schema=1 entries=\(trace.count) returns=\(trace.returns) holdEntryNs=\(holdEntry) holdReturnNs=\(holdReturn) graphEntryNs=\(graph.entryNs) graphReturnNs=\(graph.returnNs) nested=true actualSameItemSelection=\(issued) observed=\(observed) pendingFirstSnapshotOnly=true callbackCensus=helper-check-after-body syntheticAnchor=true hook=after-real-latency-getter nativeGetterCostCalibrated=false naturalReentryProof=false playbackAcceptance=false")
+        }
+        #else
+        XCTFail("CAP clock boundary calibration requires DEBUG")
+        #endif
+    }
+
     func testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume() async throws {
         #if DEBUG
         guard Self.unresolvedRenderAnchorCalibrationOwner == nil else {

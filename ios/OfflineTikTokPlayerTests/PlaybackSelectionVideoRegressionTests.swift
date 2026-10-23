@@ -13,6 +13,84 @@ import Synchronization
 #endif
 @testable import OfflineTikTokPlayer
 
+#if DEBUG
+/// Fixed MainActor scalar storage; no SDK queries, images or in-window output.
+@MainActor
+final class PresentationClockBoundaryTrace {
+    struct Row {
+        let entry: ContinuousAudioPlayer.DebugClockEntry
+        let request: Int
+        let visit: Int64
+        var span: ContinuousAudioPlayer.DebugClockSpan?
+        var returnRequest: Int?
+        var returnVisit: Int64?
+    }
+    let enabled: Bool
+    let armID: String
+    private(set) var rows: [Row?]
+    private(set) var count = 0
+    private(set) var returns = 0
+    private(set) var failed = false
+    private(set) var maxBodyNs: UInt64 = 0
+    private var base: UInt64?
+    private var active = true
+    init(enabled: Bool, armID: String, capacity: Int = 3072) {
+        self.enabled = enabled; self.armID = armID
+        rows = Array(repeating: nil, count: capacity)
+    }
+    func record(_ event: ContinuousAudioPlayer.DebugClockEvent, request: Int, visit: Int64) {
+        guard active else { failed = true; return }
+        let start = DispatchTime.now().uptimeNanoseconds
+        defer { maxBodyNs = max(maxBodyNs, DispatchTime.now().uptimeNanoseconds - start) }
+        guard enabled else { failed = true; return }
+        switch event {
+        case .entered(let entry):
+            if base == nil { base = entry.ordinal }
+            guard !entry.exhausted, let base, entry.ordinal >= base,
+                  entry.ordinal - base == UInt64(count), count < rows.count else { failed = true; return }
+            rows[count] = Row(entry: entry, request: request, visit: visit)
+            count += 1
+        case .returned(let span):
+            guard let base, span.entry.ordinal >= base, span.entry.ordinal - base < UInt64(count) else {
+                failed = true; return
+            }
+            let index = Int(span.entry.ordinal - base)
+            guard var row = rows[index], row.span == nil,
+                  row.entry.entryNs == span.entry.entryNs else { failed = true; return }
+            row.span = span; row.returnRequest = request; row.returnVisit = visit
+            rows[index] = row; returns += 1
+        }
+    }
+    func stop() { active = false }
+    func dumpAndAssert(cleanupAcknowledged: Bool) {
+        XCTAssertTrue(cleanupAcknowledged); XCTAssertFalse(active); XCTAssertFalse(failed)
+        XCTAssertEqual(count, returns); XCTAssertLessThan(count, rows.count)
+        XCTAssertLessThanOrEqual(rows.count * MemoryLayout<Row?>.stride, 2 * 1_024 * 1_024)
+        if enabled { XCTAssertGreaterThan(count, 0) }
+        else { XCTAssertEqual(count, 0); XCTAssertEqual(maxBodyNs, 0) }
+        print("CAPClockBoundarySummary schema=1 armID=\(armID) enabled=\(enabled) capacity=\(rows.count) bytes=\(rows.count * MemoryLayout<Row?>.stride) entries=\(count) returns=\(returns) failed=\(failed) active=\(active) maxCollectorBodyNs=\(maxBodyNs) cleanupAcknowledged=\(cleanupAcknowledged) nativeCalls=existing-only returnObserverOutsideEnvelope=true noEntryGapAttribution=false playbackAcceptance=false")
+        for index in 0..<count {
+            guard let row = rows[index], let span = row.span else { XCTFail("Every admitted clock needs its exact return"); continue }
+            let stages = [span.initialSnapshot, span.engineRunning, span.refreshedSnapshot, span.graphPosition, span.finalSnapshot]
+            let retained = stages.compactMap { $0 }
+            XCTAssertNotNil(stages[0]); XCTAssertEqual(Array(stages.prefix(retained.count)).compactMap { $0 }.count, retained.count)
+            XCTAssertLessThanOrEqual(row.entry.entryNs, span.entryDelivery.entryNs)
+            XCTAssertLessThanOrEqual(span.entryDelivery.entryNs, span.entryDelivery.returnNs)
+            var prior = span.entryDelivery.returnNs
+            for stage in retained {
+                XCTAssertLessThanOrEqual(prior, stage.entryNs); XCTAssertLessThanOrEqual(stage.entryNs, stage.returnNs)
+                prior = stage.returnNs
+            }
+            XCTAssertLessThanOrEqual(prior, span.returnNs)
+            XCTAssertEqual(span.graphPosition != nil, span.usedSample != nil)
+            let a = span.initialSnapshot, b = span.engineRunning, c = span.refreshedSnapshot
+            let d = span.graphPosition, e = span.finalSnapshot, s = span.usedSample
+            print("CAPClockBoundarySpan schema=1 armID=\(armID) ordinal=\(row.entry.ordinal) request=\(row.request) serviceVisit=\(row.visit) returnRequest=\(row.returnRequest ?? -1) returnServiceVisit=\(row.returnVisit ?? -1) entryNs=\(row.entry.entryNs) returnNs=\(span.returnNs) entryGraph=\(UInt(bitPattern: row.entry.owner.graph)) returnGraph=\(UInt(bitPattern: span.owner.graph)) entryControl=\(row.entry.owner.control) returnControl=\(span.owner.control) entryPermitted=\(row.entry.owner.renderingPermitted) returnPermitted=\(span.owner.renderingPermitted) entryPending=\(row.entry.owner.pendingVersion ?? -1) returnPending=\(span.owner.pendingVersion ?? -1) deliveryEntryNs=\(span.entryDelivery.entryNs) deliveryReturnNs=\(span.entryDelivery.returnNs) initialEntryNs=\(a?.entryNs ?? 0) initialReturnNs=\(a?.returnNs ?? 0) runningEntryNs=\(b?.entryNs ?? 0) runningReturnNs=\(b?.returnNs ?? 0) refreshedEntryNs=\(c?.entryNs ?? 0) refreshedReturnNs=\(c?.returnNs ?? 0) graphEntryNs=\(d?.entryNs ?? 0) graphReturnNs=\(d?.returnNs ?? 0) finalEntryNs=\(e?.entryNs ?? 0) finalReturnNs=\(e?.returnNs ?? 0) usedGraph=\(span.usedGraph.map { UInt(bitPattern: $0) } ?? 0) usedControl=\(span.usedControl ?? 0) token=\(s?.token ?? 0) visit=\(s?.visit ?? 0) selectionVersion=\(s?.selectionVersion ?? -1) frame=\(s?.frame ?? -1)")
+        }
+    }
+}
+#endif
+
 /// Service/render integration regressions. The opaque magenta poster deliberately differs from
 /// both generated movies, so a decoded asset or advancing audio clock cannot satisfy visibility.
 @MainActor
@@ -33,6 +111,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private var sourceCallbackLedgerArmID: String?
     private static var unresolvedFirstZeroCalibrationAudio: ContinuousAudioPlayer?
     #endif
+
+    func testCAPClockBoundaryOffThenOn() async throws {
+        try await runCAPClockBoundaryComparison([false, true], order: "off-then-on")
+    }
+
+    func testCAPClockBoundaryOnThenOff() async throws {
+        try await runCAPClockBoundaryComparison([true, false], order: "on-then-off")
+    }
+
+    private func runCAPClockBoundaryComparison(_ modes: [Bool], order: String) async throws {
+        try recordRuntimeHost()
+        for (ordinal, enabled) in modes.enumerated() {
+            print("CAPClockBoundaryArm schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) zeroProbe=constant-on startupClock=constant-on pixelScans=0 earlyAcquisition=nil callbackLedger=nil captures=0 playbackPolicy=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, capClockBoundary: enabled)
+            print("CAPClockBoundaryArmEnd schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) helperReturned=true")
+        }
+    }
 
     func testFirstZeroCallbackRangeUsesActualStorageAcrossTapBuffers() throws {
         #if DEBUG
@@ -2881,11 +2977,27 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 traceReturnedAStereoZero: Bool? = nil,
                                                 earlyClockAcquisition: Bool? = nil,
                                                 wholeFrameClockAcquisition: Bool? = nil,
-                                                firstZeroSourceCallbacks: Bool? = nil) async throws {
+                                                firstZeroSourceCallbacks: Bool? = nil,
+                                                capClockBoundary: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
         let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
-            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil ? nil : true)
+            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil ? nil : true)
+        if let enabled = capClockBoundary {
+            guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
+                  wholeFrameClockAcquisition == nil, firstZeroSourceCallbacks == nil, traceReturnedAStereoZero == nil,
+                  frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
+                  traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup, freshPreviousBundle == nil,
+                  queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == nil,
+                  sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("CAP clock comparison varies only existing-call scalar timing with constant startup/zero observers")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("CAPClockBoundaryScope schema=1 enabled=\(enabled) existingCalls=5 capacity=3072 maximumBytes=2097152 newNativeQueries=0 rtObserver=false firstZeroProbe=constant-on inlinePixels=false earlyActivation=false playbackPolicy=unchanged")
+        }
         if let enabled = firstZeroSourceCallbacks {
             guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
                   wholeFrameClockAcquisition == nil, traceReturnedAStereoZero == nil,
@@ -2954,6 +3066,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if capClockBoundary != nil {
+            XCTFail("CAP clock boundary comparison requires DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if firstZeroSourceCallbacks != nil {
             XCTFail("Source callback/first-zero comparison is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3186,6 +3302,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             NativeClockHandoffTrace(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation,
                 expectedCurrentItemTime: initialNativeStartCurrentItemTime)
         }
+        let capClockTrace = capClockBoundary.map {
+            PresentationClockBoundaryTrace(enabled: $0, armID: UUID().uuidString.lowercased())
+        }
+        if let capClockTrace, capClockTrace.enabled {
+            audio.onDebugPresentationClock = { [weak capClockTrace, weak service] event in
+                guard let service else { return }
+                let state = service.debugInitialVideoReadyState
+                capClockTrace?.record(event, request: state.generation, visit: state.audioVisit)
+            }
+        }
+        defer { audio.onDebugPresentationClock = nil; capClockTrace?.stop() }
         if let currentItemTime = initialNativeStartCurrentItemTime {
             // Initial A and B stay numeric. Only the existing returned-A start varies.
             service.debugInitialNativeStartControl = .init(
@@ -3493,6 +3620,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         firstZeroProbe?.close()
         earlyAcquisitionTrace?.stop()
         wholeFrameTrace?.stop()
+        audio.onDebugPresentationClock = nil; capClockTrace?.stop()
         #endif
         // No dumps, spectral analysis or assertions interrupt any streaming window.
         tap.stop(); service.pause()
@@ -3607,6 +3735,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         nativeTrace?.dumpAfterCleanup()
         earlyAcquisitionTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         wholeFrameTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
+        capClockTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         if let enabled = traceReturnedAProducerBoundary {
             if enabled {
                 XCTAssertNotNil(nativeTrace); XCTAssertNotNil(nativeActivity); XCTAssertNotNil(firstFailure)
