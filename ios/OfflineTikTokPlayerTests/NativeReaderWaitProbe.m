@@ -3,7 +3,6 @@
 #include <mach/mach.h>
 #include <mach/thread_status.h>
 #include <mach/thread_info.h>
-#include <mach/mach_vm.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -142,8 +141,12 @@ static OPRegisters OPRegistersFor(thread_t thread) {
             while (frameCount < 16 && context.bottom > 0 && fp >= context.bottom && fp >= registers.sp
                 && context.top >= 2 * sizeof(uintptr_t) && fp <= context.top - 2 * sizeof(uintptr_t)
                 && fp % (2 * sizeof(uintptr_t)) == 0) {
-                uintptr_t pair[2] = {0}; mach_vm_size_t bytes = 0;
-                kern_return_t read = mach_vm_read_overwrite(mach_task_self(), fp, sizeof(pair), (mach_vm_address_t)pair, &bytes);
+                // iOS exports the native-width vm_* interface; mach_vm.h is
+                // explicitly unsupported by its SDK. Refuse a narrower ABI.
+                _Static_assert(sizeof(vm_address_t) >= sizeof(uintptr_t), "Own stack address must not truncate");
+                uintptr_t pair[2] = {0}; vm_size_t bytes = 0;
+                kern_return_t read = vm_read_overwrite(mach_task_self(), (vm_address_t)fp,
+                    (vm_size_t)sizeof(pair), (vm_address_t)pair, &bytes);
                 if (read != KERN_SUCCESS || bytes != sizeof(pair)) { break; }
                 uintptr_t next = OPStripData(pair[0]), caller = OPStripCode(pair[1]);
                 if (!caller) { break; }
