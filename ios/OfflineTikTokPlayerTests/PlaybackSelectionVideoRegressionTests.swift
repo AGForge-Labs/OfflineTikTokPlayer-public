@@ -527,6 +527,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             traceClockHandoff: true, nativeReaderWaitSampling: false)
     }
 
+    func testReadyNotificationTimingOffFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, readyNotificationTiming: false)
+    }
+
+    func testReadyNotificationTimingOnFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, readyNotificationTiming: true)
+    }
+
+    func testReadyNotificationTimingOnSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, readyNotificationTiming: true)
+    }
+
+    func testReadyNotificationTimingOffSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, readyNotificationTiming: false)
+    }
+
     func testQueuedPreviousAdvanceOffFirst() async throws {
         try await runProductionSelectionBenchmark(traceVideoSeeks: true,
             traceClockHandoff: true, traceReturnedAStereoZero: true, queuedPreviousAdvance: false)
@@ -3493,9 +3513,28 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 sameRetainedAssetAdmission: Bool? = nil,
                                                 nativeReaderWaitSampling: Bool? = nil,
                                                 initialVideoPolling: Bool? = nil,
-                                                queuedPreviousAdvance: Bool? = nil) async throws {
+                                                queuedPreviousAdvance: Bool? = nil,
+                                                readyNotificationTiming: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if let enabled = readyNotificationTiming {
+            guard traceVideoSeeks, traceClockHandoff == true, queuedPreviousAdvance == nil,
+                  initialVideoPolling == nil, nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
+                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
+                  initialNativeStartCurrentItemTime == nil, frameMonitorAlternative == nil,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !traceNativeRefill,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  freshPreviousBundle == nil, queuedPreviousLead == nil, !auditSavedAAfterCleanup,
+                  firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  acceptedPCMOriginBenchmarkMode == nil, sourceOutputBenchmarkMode == nil,
+                  sourceCallbackLedgerBenchmarkMode == nil, sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("Ready delivery comparison varies only its two clocks and bounded point-recording bundle at existing callbacks")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("ReadyNotificationTimingScope schema=1 enabled=\(enabled) phases=3 maximumQualifiedPairsPerPhase=4 existingStartupCapacity=32 clocksPerExistingCallback=\(enabled ? 2 : 0) status=supplied-newValue sdkQueriesAdded=0 tasksAdded=0 nativeObserversAdded=0 capture=false policy=unchanged originalGuards=unchanged")
+        }
         if let enabled = queuedPreviousAdvance {
             guard traceVideoSeeks, traceClockHandoff == true, traceReturnedAStereoZero == true,
                   initialVideoPolling == nil, nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
@@ -3763,6 +3802,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if readyNotificationTiming != nil {
+            XCTFail("Ready notification timing requires DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if queuedPreviousAdvance != nil {
             XCTFail("Previous route comparison requires DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3946,6 +3989,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        if let enabled = readyNotificationTiming { service.debugReadyNotificationTiming = enabled }
         var previousRouteRows: [(route: Int, id: String, item: ObjectIdentifier)] = []
         var previousRouteOverflow = false
         var previousRouteResources: [ObjectIdentifier?] = []
@@ -4697,6 +4741,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             seeks.assertUnused()
         }
         startup.dumpAndAssert()
+        #if DEBUG
+        if let enabled = readyNotificationTiming { startup.dumpReadyNotificationTiming(enabled: enabled) }
+        #endif
         #if DEBUG
         startup.pollSummary?.dumpAndAssert()
         if let enabled = sourceOutputBenchmarkMode {
@@ -9059,6 +9106,58 @@ private final class ProductionVideoStartupTrace {
         events.append(event)
     }
     func record(_ stamp: PlaybackService.DebugVideoStartupStamp) { append(.startup(phase, stamp)) }
+    func dumpReadyNotificationTiming(enabled: Bool) {
+        XCTAssertTrue(serviceTracing); XCTAssertFalse(overflow); XCTAssertEqual(dropped, 0)
+        for phase in 0..<3 {
+            let accepted: [PlaybackService.DebugVideoStartupStamp] = events.compactMap {
+                guard case .startup(let recordedPhase, let stamp) = $0,
+                      recordedPhase == phase, stamp.kind == .readyAccepted else { return nil }
+                return stamp
+            }
+            XCTAssertEqual(accepted.count, 1, "Each real source visit must have one accepted ready callback")
+            guard accepted.count == 1, let stamp = accepted.first else { continue }
+            XCTAssertEqual(stamp.request, stamp.entryGeneration); XCTAssertEqual(stamp.request, stamp.returnGeneration)
+            XCTAssertEqual(stamp.presentationRequest, stamp.request); XCTAssertTrue(stamp.presentationUnchanged)
+            if enabled {
+                guard let pair = stamp.readyNotificationTiming else {
+                    XCTFail("ON must retain the actual callback/handler pair"); continue
+                }
+                let frame = remainingLatencyWitness?.firstAlignedEnqueue(phase: phase)
+                XCTAssertNotNil(frame)
+                XCTAssertEqual(frame?.frame.ticket?.debugItemIdentity, pair.item)
+                XCTAssertEqual(frame?.request, stamp.request); XCTAssertEqual(frame?.generation, stamp.request)
+                XCTAssertGreaterThan(pair.notificationNs, 0)
+                XCTAssertGreaterThanOrEqual(pair.handlerEntryNs, pair.notificationNs)
+                XCTAssertGreaterThanOrEqual(stamp.entryNs, pair.handlerEntryNs)
+                XCTAssertNotNil(pair.suppliedStatus)
+                if let status = pair.suppliedStatus { XCTAssertTrue((0...2).contains(status)) }
+                let callbacks: [PlaybackService.DebugVideoStartupStamp] = events.compactMap {
+                    guard case .startup(let recordedPhase, let callback) = $0,
+                          callback.request == stamp.request, callback.kind == .readyNotificationDelivered else { return nil }
+                    return callback
+                }
+                XCTAssertGreaterThanOrEqual(callbacks.count, 1); XCTAssertLessThanOrEqual(callbacks.count, 4)
+                let readyStatus = AVPlayerItem.Status.readyToPlay.rawValue
+                XCTAssertTrue(callbacks.contains { $0.readyNotificationTiming?.suppliedStatus == readyStatus },
+                    "Ready-arrival attribution requires an actual supplied ready notification, not an earlier unknown callback")
+                XCTAssertEqual(callbacks.filter { $0.readyNotificationTiming?.notificationNs == pair.notificationNs
+                    && $0.readyNotificationTiming?.handlerEntryNs == pair.handlerEntryNs }.count, 1)
+                for (ordinal, callback) in callbacks.enumerated() {
+                    guard let observed = callback.readyNotificationTiming else { XCTFail("Missing callback pair"); continue }
+                    let current = callback.request == stamp.request && callback.entryGeneration == stamp.request
+                        && callback.returnGeneration == stamp.request && callback.presentationRequest == stamp.request
+                        && observed.item == pair.item && observed.notificationNs > 0
+                        && observed.notificationNs <= observed.handlerEntryNs
+                    XCTAssertTrue(current)
+                    print("ReadyNotificationCallback schema=1 phase=\(phase) ordinal=\(ordinal) request=\(callback.request) item=\(observed.item) notificationNs=\(observed.notificationNs) handlerEntryNs=\(observed.handlerEntryNs) suppliedStatus=\(observed.suppliedStatus.map(String.init) ?? "unknown") cachedOwnerQualified=\(current) nativeOwnerAtPoint=unavailable pointEvent=true readyArrivalQualified=\(current && observed.suppliedStatus == readyStatus) sdkQueriesAdded=0 formalNativeReadyInstant=unavailable")
+                }
+                print("ReadyNotificationTiming schema=1 enabled=true phase=\(phase) request=\(stamp.request) item=\(pair.item) notificationNs=\(pair.notificationNs) handlerEntryNs=\(pair.handlerEntryNs) acceptedEntryNs=\(stamp.entryNs) suppliedStatus=\(pair.suppliedStatus.map(String.init) ?? "unknown") acceptedOriginIsReadyNotification=\(pair.suppliedStatus == readyStatus) actualAlignedItemMatches=\(frame?.frame.ticket?.debugItemIdentity == pair.item) sdkQueriesAdded=0 statusRead=unchanged formalNativeReadyInstant=unavailable")
+            } else {
+                XCTAssertNil(stamp.readyNotificationTiming)
+                print("ReadyNotificationTiming schema=1 enabled=false phase=\(phase) request=\(stamp.request) notificationNs=unobserved handlerEntryNs=unobserved acceptedEntryNs=\(stamp.entryNs) sdkQueriesAdded=0 clocksAdded=0")
+            }
+        }
+    }
     func recordSeek(_ stamp: PlaybackService.DebugVideoSeekStamp) {
         guard serviceTracing else { return }
         append(.seek(phase, DispatchTime.now().uptimeNanoseconds, stamp))

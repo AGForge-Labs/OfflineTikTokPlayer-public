@@ -218,7 +218,14 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var debugVideoSeekReason: DebugVideoSeekReason = .unattributed
     enum DebugVideoStartupKind: Int, Sendable {
         case itemReadyEvent = 0, setRate = 1, playImmediately = 2, startSkipped = 3, firstFrameEvent = 4, readyAccepted = 5
+        case readyNotificationDelivered = 6
     }
+    struct DebugReadyNotificationTiming: Sendable {
+        let item: ObjectIdentifier
+        let notificationNs: UInt64, handlerEntryNs: UInt64
+        let suppliedStatus: Int?
+    }
+    @ObservationIgnored var debugReadyNotificationTiming = false
     struct DebugVideoStartupStamp: Sendable {
         let kind: DebugVideoStartupKind
         let request: Int, entryGeneration: Int, returnGeneration: Int
@@ -227,6 +234,7 @@ final class PlaybackService: NSObject {
         let audioToken: Int, audioVisit: Int64, readyGeneration: Int?
         let entryVideoReady: Bool, returnVideoReady: Bool, entryLoading: Bool, returnLoading: Bool
         let timelineInstalled: Bool, anchorHostSeconds: Double?, anchorPosition: Double?
+        let readyNotificationTiming: DebugReadyNotificationTiming?
     }
     @ObservationIgnored var onDebugVideoStartupStamp: ((DebugVideoStartupStamp) -> Void)?
     struct DebugVideoRenderStamp: Sendable {
@@ -283,6 +291,7 @@ final class PlaybackService: NSObject {
     }
     private func debugTraceVideoStartup(_ kind: DebugVideoStartupKind, request: Int,
         installed: Bool = false, anchorHostSeconds: Double? = nil, anchorPosition: Double? = nil,
+        readyNotificationTiming: DebugReadyNotificationTiming? = nil,
         _ operation: () -> Void) {
         guard let observer = onDebugVideoStartupStamp else { operation(); return }
         let entryGeneration = generation, presentation = videoPresentation
@@ -299,7 +308,21 @@ final class PlaybackService: NSObject {
             audioToken: token, audioVisit: visit, readyGeneration: ready,
             entryVideoReady: videoReady, returnVideoReady: isVideoReady,
             entryLoading: loading, returnLoading: isLoading, timelineInstalled: installed,
-            anchorHostSeconds: anchorHostSeconds, anchorPosition: anchorPosition))
+            anchorHostSeconds: anchorHostSeconds, anchorPosition: anchorPosition,
+            readyNotificationTiming: readyNotificationTiming))
+    }
+    private func debugRecordReadyNotification(_ pair: DebugReadyNotificationTiming, request: Int) {
+        guard let observer = onDebugVideoStartupStamp else { return }
+        // Point event at handler entry, not a timed SDK operation. Cached state
+        // only; the two callback/handler clocks have already been read.
+        observer(DebugVideoStartupStamp(kind: .readyNotificationDelivered, request: request,
+            entryGeneration: generation, returnGeneration: generation,
+            entryNs: pair.handlerEntryNs, returnNs: pair.handlerEntryNs,
+            presentationRequest: videoPresentation?.request, presentationUnchanged: videoPresentation?.request == request,
+            audioToken: audioToken, audioVisit: audioVisit, readyGeneration: readyGeneration,
+            entryVideoReady: isVideoReady, returnVideoReady: isVideoReady,
+            entryLoading: isLoading, returnLoading: isLoading, timelineInstalled: false,
+            anchorHostSeconds: nil, anchorPosition: nil, readyNotificationTiming: pair))
     }
     struct DebugInitialVideoReadyState: Sendable {
         let audioVisit: Int64
@@ -1020,8 +1043,32 @@ final class PlaybackService: NSObject {
         // A restored offset must finish seeking before its first-frame epoch begins.
         if position == 0 && !rewind { monitorFirstFrame(playerItem, request: request) }
         armStallRecovery()
-        itemObservation = playerItem.observe(\.status, options: [.initial, .new]) { [weak self, weak playerItem] _, _ in
+        #if DEBUG
+        // Capture immutable policy/identity before registration. The KVO callback
+        // may run off-actor; its supplied value requires no native status query.
+        let timeReadyNotification = debugReadyNotificationTiming
+        let readyNotificationItem = ObjectIdentifier(playerItem)
+        #endif
+        itemObservation = playerItem.observe(\.status, options: [.initial, .new]) { [weak self, weak playerItem] _, change in
+            #if DEBUG
+            let notificationNs = timeReadyNotification ? DispatchTime.now().uptimeNanoseconds : nil
+            let suppliedStatus = timeReadyNotification ? change.newValue?.rawValue : nil
+            #endif
             Task { @MainActor in
+                #if DEBUG
+                let notificationTiming: DebugReadyNotificationTiming?
+                if let notificationNs {
+                    notificationTiming = .init(item: readyNotificationItem, notificationNs: notificationNs,
+                        handlerEntryNs: DispatchTime.now().uptimeNanoseconds, suppliedStatus: suppliedStatus)
+                } else { notificationTiming = nil }
+                // Record before the original guard, so any reentrant observer
+                // is followed by its unchanged request/current-item validation.
+                // Point rows describe the registration/cached owner; admission
+                // to the real ready handler is established separately below.
+                if let owner = self, let notificationTiming {
+                    owner.debugRecordReadyNotification(notificationTiming, request: request)
+                }
+                #endif
                 guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
                 if playerItem.status == .readyToPlay {
                     guard self.statusHandledGeneration != request else { return }
@@ -1057,7 +1104,8 @@ final class PlaybackService: NSObject {
                             && (!waitsForClock || self.pendingInitialClockBinding == statusBinding)
                     }
                     #if DEBUG
-                    self.debugTraceVideoStartup(.readyAccepted, request: request) {}
+                    self.debugTraceVideoStartup(.readyAccepted, request: request,
+                        readyNotificationTiming: notificationTiming) {}
                     #endif
                     guard ownsAcceptedStatus() else { return }
                     if let owner = self.pendingInitialZeroStart, owner.request == request,
