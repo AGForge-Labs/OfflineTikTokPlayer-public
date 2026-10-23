@@ -132,7 +132,7 @@ class SimulatorDestinationResolutionTests(unittest.TestCase):
         return rows
 
     def test_capture_lifecycle_deadline_and_cap_require_no_discovery(self):
-        for requested, effective in [(1800, 1800), (999999, 2400)]:
+        for requested, effective in [(1800, 1800), (999999, 3600)]:
             with self.subTest(requested=requested):
                 output = io.StringIO()
                 with patch.object(sys, "argv", ["capture-simulator-test-frames.py",
