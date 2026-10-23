@@ -4500,10 +4500,25 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstFrameTrace() async throws {
+        #if DEBUG
+        try await runInitialClockBindingTransferControl(pausedTarget: 0.4, beforeInitialStart: true,
+            tracePausedFirstFrame: true)
+        #else
+        XCTFail("First-frame tracing requires DEBUG observation")
+        #endif
+    }
+
     #if DEBUG
     private func runInitialClockBindingTransferControl(pausedTarget: Double?,
         beforeInitialStart: Bool = false, traceColdBoundary: Bool = false,
-        completedOwnerPendingImage: Bool = false) async throws {
+        completedOwnerPendingImage: Bool = false, tracePausedFirstFrame: Bool = false) async throws {
+        if tracePausedFirstFrame {
+            guard beforeInitialStart, pausedTarget == 0.4, !traceColdBoundary, !completedOwnerPendingImage else {
+                XCTFail("First-frame tracing requires the unchanged preissue paused .4 control")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
         if completedOwnerPendingImage {
             guard beforeInitialStart, pausedTarget == 0.4, !traceColdBoundary else {
                 XCTFail("Pending-image control requires the exact preissue paused .4 fixture")
@@ -4518,11 +4533,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var warmPreparationResult: Result<ContinuousAudioPlayer.Entry, Error>?
         weak var warmPreparationAudio: ContinuousAudioPlayer?
         let diagnostic = beforeInitialStart || pausedTarget == nil ? InitialClockTransferTrace() : nil
+        var firstFrameTrace: PausedFirstFrameTrace?
         var coldObservation: (probe: NaturalNativeRunwayProbe, reached: Bool)?
         defer {
             // Publish retained cadence rows only after owned fixture cleanup.
             if let coldObservation { coldObservation.probe.dumpAndAssert(reached: coldObservation.reached) }
             diagnostic?.dumpAndAssert(); if let receipt { print(receipt) }
+            firstFrameTrace?.dumpAndAssert()
             if let pendingImageReceipt { print(pendingImageReceipt) }
             if let warmPreparationReceipt { print(warmPreparationReceipt) }
             warmPreparationTask?.cancel()
@@ -4543,6 +4560,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }) { fixture, audio, service, screen in
             if traceCold { service.debugInitialLoadPhaseEnabled = true }
             let request = service.debugInitialVideoReadyState.generation + 1
+            if tracePausedFirstFrame {
+                let probe = PausedFirstFrameTrace(request: request)
+                firstFrameTrace = probe
+                service.onDebugVideoRenderStamp = { [weak service, weak probe] value in
+                    guard let service else { return }
+                    probe?.record(service, render: value)
+                }
+            }
             var starts = 0, overflow = false, qualified = false
             var readyAtReturn: Bool?, loadingAtReturn: Bool?, pendingAtReturn: Bool?
             var transferred = false, userSeekIssued = false
@@ -4605,6 +4630,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
                 if value.request == request, value.reason == .userPausedSeek {
                     userSeekIssued = true
+                    firstFrameTrace?.bindUserSeek(value.nativeSeekTicket)
                     if completedOwnerPendingImage {
                         if pendingImageIssue == nil { pendingImageIssue = value }
                         else { pendingImageGateOverflow = true }
@@ -4635,6 +4661,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if let diagnostic {
                 service.onDebugVideoSeekCompletionTerminal = { [weak service, weak diagnostic] value in
                     if value.request == request, let service { diagnostic?.record(service, kind: 2, terminal: value) }
+                    if let service { firstFrameTrace?.record(service, terminal: value) }
                     if completedOwnerPendingImage, value.request == request,
                        value.nativeSeekTicket == pendingImageIssue?.nativeSeekTicket {
                         if pendingImageTerminals < 2 { pendingImageTerminals += 1 }
@@ -4643,6 +4670,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
             }
             defer {
+                firstFrameTrace?.stop()
                 holdPendingImage = false; holdPendingImageAdoption = false
                 if completedOwnerPendingImage {
                     warmPreparationTask?.cancel()
@@ -4655,6 +4683,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 service.onDebugVideoSeekStamp = nil
                 service.onDebugVideoStartupStamp = nil
                 service.onDebugVideoSeekCompletionTerminal = nil
+                service.onDebugVideoRenderStamp = nil
             }
             let coldProbe = traceCold
                 ? NaturalNativeRunwayProbe(phase: "initial-clock-preissue-cold", minimumFailureSeconds: 3) : nil
@@ -4857,6 +4886,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 XCTAssertFalse(pausedSourceVisitOverflow)
             }
             observePausedSourceVisits = false // Later explicit Play owns its genuine corrections.
+            firstFrameTrace?.stop(); service.onDebugVideoRenderStamp = nil
             service.play()
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
             diagnostic?.phase = 4; diagnostic?.record(service, kind: 3)
@@ -4874,6 +4904,81 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
             XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
             receipt = "InitialClockBindingTransfer schema=2 beforeInitialStart=\(beforeInitialStart) explicitPausedSeek=\(pausedTarget != nil) request=\(request) actualReadyAccepts=\(readyAccepts) actualInitialStarts=\(starts) qualified=\(qualified) readyAtIntervention=\(readyAtReturn.map { String($0) } ?? "unavailable") loadingAtIntervention=\(loadingAtReturn.map { String($0) } ?? "unavailable") pendingAtIntervention=\(pendingAtReturn.map { String($0) } ?? "unavailable") statusTransferred=\(transferred) pausedHoldMs=200 realUserSeekIssued=\(userSeekIssued) overflow=\(overflow) movingRecoveryChecksReturned=true xctestOutcome=external output=after-owned-cleanup-attempt latencyAcceptance=false"
+        }
+    }
+
+    /// Separate default-off observation of the unchanged paused-target control.
+    /// Stamps use CPP's existing first-stage clocks, not a timed SDK copy call.
+    @MainActor private final class PausedFirstFrameTrace {
+        private struct Event {
+            let render: PlaybackService.DebugVideoRenderStamp?
+            let terminal: PlaybackService.DebugVideoSeekCompletionTerminal?
+            let marker: PlaybackService.DebugPausedExplicitVisitState?
+            let owner: PlaybackService.DebugAlignedVideoPollState
+        }
+        private let request: Int
+        private var events: [Event] = []
+        private var active = true, overflow = false
+        private var userSeek: UInt64?
+        private var ticket: ContinuousPictureInPicture.PresentationTicket?
+        private var revision: Int?
+        private var otherRevisions = 0
+        init(request: Int) { self.request = request; events.reserveCapacity(32) }
+        func bindUserSeek(_ value: UInt64) {
+            guard active, value > 0, userSeek == nil else { overflow = true; return }
+            userSeek = value
+        }
+        func stop() { active = false }
+        func record(_ service: PlaybackService, render value: PlaybackService.DebugVideoRenderStamp) {
+            guard active, value.generation == request, value.presentationRequest == request,
+                  let candidate = value.render.ticket else { return }
+            if ticket == nil, value.presentationMatches { ticket = candidate; revision = value.render.presentationRevision }
+            if let ticket, ticket != candidate || revision != value.render.presentationRevision {
+                if otherRevisions < Int.max { otherRevisions += 1 } else { overflow = true }
+            }
+            guard events.count < 32 else { overflow = true; return }
+            events.append(Event(render: value, terminal: nil, marker: service.debugPausedExplicitVisitState,
+                owner: service.debugAlignedVideoPollState))
+        }
+        func record(_ service: PlaybackService, terminal value: PlaybackService.DebugVideoSeekCompletionTerminal) {
+            guard active, value.request == request else { return }
+            guard events.count < 32 else { overflow = true; return }
+            events.append(Event(render: nil, terminal: value, marker: service.debugPausedExplicitVisitState,
+                owner: service.debugAlignedVideoPollState))
+        }
+        func dumpAndAssert() {
+            func show<T>(_ value: T?) -> String { value.map { String(describing: $0) } ?? "unavailable" }
+            let copies = events.filter {
+                $0.render?.render.stage == .copied && $0.render?.render.region == 2
+                    && $0.render?.render.nativeSeekTicket == userSeek
+            }
+            let copyOwnerQualified = copies.count == 1 && copies.allSatisfy { event in
+                guard let value = event.render else { return false }
+                let frame = event.owner.frame
+                return ticket != nil && value.render.ticket == ticket && value.render.presentationRevision == revision
+                    && value.generation == request && value.presentationRequest == request
+                    && value.presentationMatches && value.render.ownershipUnchanged
+                    && event.owner.generation == request && event.owner.request == request
+                    && event.owner.presentationMatches && event.owner.observedItemMatches
+                    && frame.ticket == ticket && frame.output != nil && frame.seekSerial == userSeek
+                    && frame.activeSeekTicket == nil && frame.coherent
+            }
+            let terminals = events.compactMap(\.terminal).filter { $0.nativeSeekTicket == userSeek }
+            print("PausedFirstFrameTraceCoverage schema=1 request=\(request) retained=\(events.count) capacity=32 overflow=\(overflow) otherRevisions=\(otherRevisions) revision=\(show(revision)) userSeek=\(show(userSeek)) selectedPostSeekCopies=\(copies.count) copyOwnerQualified=\(copyOwnerQualified) selectedTerminals=\(terminals.count) stopped=\(!active) stageScope=per-region-per-presentation-revision rawSDKTimestampValidity=unavailable copyCallDuration=unmeasured output=after-owned-cleanup-attempt xctestOutcome=external")
+            XCTAssertFalse(overflow); XCTAssertFalse(active)
+            XCTAssertNotNil(userSeek); XCTAssertNotNil(ticket)
+            XCTAssertEqual(otherRevisions, 0, "Another presentation revision makes this first-frame attribution unavailable")
+            XCTAssertEqual(copies.count, 1, "Retain the actual first copied frame for the exact user seek")
+            XCTAssertTrue(copyOwnerQualified, "The copied timestamp must join the exact live presentation and completed user seek")
+            XCTAssertEqual(terminals.count, 1, "Retain the matching real user-seek terminal callback")
+            if let copy = copies.first?.render {
+                XCTAssertTrue(copy.render.requestedSeconds?.isFinite == true)
+                XCTAssertTrue(copy.render.sampleSeconds?.isFinite == true)
+            }
+            for (index, event) in events.enumerated() {
+                let render = event.render?.render, marker = event.marker, frame = event.owner.frame
+                print("PausedFirstFrameTrace schema=1 index=\(index) request=\(request) generation=\(event.owner.generation) presentationMatches=\(event.owner.presentationMatches) observedItemMatches=\(event.owner.observedItemMatches) renderStage=\(show(render?.stage.rawValue)) region=\(show(render?.region)) revision=\(show(render?.presentationRevision)) ownershipUnchanged=\(show(render?.ownershipUnchanged)) renderSeek=\(show(render?.nativeSeekTicket)) requestedSeconds=\(show(render?.requestedSeconds)) sampleSeconds=\(show(render?.sampleSeconds)) copiedPTS=\(show(render?.copiedPTS)) submittedPTS=\(show(render?.submittedPTS)) submittedCount=\(show(render?.submittedCount)) markerToken=\(show(marker?.token)) markerVisit=\(show(marker?.visit)) markerVersion=\(show(marker?.selectionVersion)) markerTarget=\(show(marker?.target)) markerSeek=\(show(marker?.nativeSeek)) markerCompletedEpoch=\(show(marker?.completedEpoch)) markerOwnsCurrent=\(show(marker?.ownsCurrentPausedCommand)) terminalSeek=\(show(event.terminal?.nativeSeekTicket)) seekSerial=\(frame.seekSerial) activeSeek=\(show(frame.activeSeekTicket)) imageEpoch=\(frame.imageEpoch) coherent=\(frame.coherent) markerEntryNs=\(show(render?.entryNs)) markerReturnNs=\(show(render?.returnNs)) rawSDKTimestampValidity=unavailable copyCallDuration=unmeasured")
+            }
         }
     }
 
