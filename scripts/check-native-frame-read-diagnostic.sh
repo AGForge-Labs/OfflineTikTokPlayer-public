@@ -2,19 +2,19 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Validate actual isolated fixtures and unchanged default playback/cold-load controls; no acceptance from cohort reduction.
-expected_code_source=9747feb32e619adb198ae4d9773c4e43f062492b
-expected_ios_tree=06abf10a7224f2ae9cfc02b61e8ccff4be3f0c7b
+# Calibrate actual first-zero detection and ACKs, then counterbalance tracing; no acceptance from cohort reduction.
+expected_code_source=1e6fbea6192b5692a7dfb934ba55e76b15a93dbe
+expected_ios_tree=5876c1b66fe29ec6b4344ccd21db6f319f6ce8bd
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDownloadFixtureLedgerReloadUsesOwnedVerifiedFilesWithoutTransferSession
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstStereoZeroEventUsesActualAppendAndRetainedRange
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstStereoZeroWorkerRequiresActualRequestAndCleanupAcknowledgements
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstStereoZeroEventOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFirstStereoZeroEventOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -41,13 +41,13 @@ evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixtureLedgerReloadUsesOwnedVerifiedFilesWithoutTransferSession',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithColdBoundaryTrace',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testFirstStereoZeroEventUsesActualAppendAndRetainedRange',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testFirstStereoZeroWorkerRequiresActualRequestAndCleanupAcknowledgements',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testFirstStereoZeroEventOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testFirstStereoZeroEventOnThenOff',
 }
 if len(expected) != 5 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly five fixture ownership and unchanged playback identities must exist in the pinned source')
+    raise SystemExit('Exactly five first-zero calibration and unchanged playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:

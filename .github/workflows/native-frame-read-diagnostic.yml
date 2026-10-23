@@ -1,4 +1,4 @@
-name: Local fixture isolation and playback validation
+name: Actual first stereo zero and warm readiness diagnostic
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -45,7 +45,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run exact fixture and unchanged playback controls
+      - name: Run exact first-zero calibrations and matched playback controls
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
