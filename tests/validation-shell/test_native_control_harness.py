@@ -154,15 +154,10 @@ class NativeControlHarnessTests(unittest.TestCase):
 
     def test_live_control_inventory_and_source_manifest_are_required(self):
         self.assertEqual(self.cases, (
-            'testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek',
-            'testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek',
-            'testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
-            'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
-            'testNaturalBoundaryWithNativeLaneActivityRevealsB',
-            'testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner',
-            'testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
-            'testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
-            'testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld'))
+            'testSameRetainedAssetAdmissionOffFirst',
+            'testSameRetainedAssetAdmissionOnFirst',
+            'testSameRetainedAssetAdmissionOnSecond',
+            'testSameRetainedAssetAdmissionOffSecond'))
         shell = HARNESS.read_text(encoding="utf-8")
         control_names = shlex.split(re.search(r"controls\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
         self.assertEqual(tuple(control_names), self.cases)
@@ -186,14 +181,20 @@ class NativeControlHarnessTests(unittest.TestCase):
                 if requested is not None:
                     argv += ["--lifetime", requested]
                 clock = types.SimpleNamespace(
-                    monotonic=mock.Mock(side_effect=[100.0, 100.0 + effective]),
+                    monotonic=mock.Mock(side_effect=[100.0, 100.0 + effective, 100.0 + effective]),
                     sleep=mock.Mock(side_effect=AssertionError("Real waiting is forbidden")))
+                lifecycle = io.StringIO()
                 with mock.patch.object(sys, "argv", argv), mock.patch.object(capture, "time", clock), \
-                        mock.patch.object(capture, "locate", side_effect=AssertionError("SDK lookup is forbidden")) as lookup:
+                        mock.patch.object(capture, "locate", side_effect=AssertionError("SDK lookup is forbidden")) as lookup, \
+                        contextlib.redirect_stdout(lifecycle):
                     self.assertEqual(capture.main(), 0)
                     self.assertEqual(capture.DEADLINE, 100.0 + effective)
                     lookup.assert_not_called()
                     clock.sleep.assert_not_called()
+                events = [json.loads(line.split(" ", 1)[1]) for line in lifecycle.getvalue().splitlines()]
+                self.assertEqual([event["eventCode"] for event in events], [0, 1])
+                self.assertEqual(events[-1]["reasonCode"], 1)
+                self.assertEqual(events[-1]["elapsedSeconds"], effective)
         for invalid in ("0", "-1", "nan", "inf"):
             with self.subTest(invalid_lifetime=invalid):
                 with mock.patch.object(sys, "argv", ["capture-helper", "--udid", SIMULATOR, "--lifetime", invalid]), \
@@ -406,21 +407,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         end = shell.index('\nfi\n\ntest_plan=', start) + len('\nfi')
         benchmark = shell[start:end]
         names = shlex.split(re.search(r"benchmark\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
-        expected_selectors = [
-            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
-            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation',
-            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testOffscreenPreparationInstallsActualGeometryAndSingleStagedOutput',
-            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testPreparedResourcesSurviveABAReturnWithoutOutputPullBeforeActivation',
-            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedInstallEligibilityConsumesPlanWithoutMutatingItem',
-            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased',
-            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRetirementPreservesExternallyReplacedComposition',
-            'OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRepeatedBufferTransitionsBoundActualAttachedOutputs',
-            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame',
-            'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault',
-            'OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource',
-            'OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks']
+        expected_selectors = ['OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose']
         self.assertEqual(names, expected_selectors)
         workflow = TARGETED_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(re.findall(r'^\s*timeout-minutes:\s*(\d+)\s*$', workflow, re.MULTILINE), ['40'])

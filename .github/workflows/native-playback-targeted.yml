@@ -1,8 +1,11 @@
-name: Native playback targeted causal controls
+name: Same retained asset admission with isolated playback processes
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh']
+    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh', 'scripts/export-native-control-results.py', 'tests/validation-shell/test_native_control_harness.py', 'tests/validation-shell/test_native_control_results.py']
+concurrency:
+  group: offline-player-native-validation
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -19,19 +22,29 @@ jobs:
         id: source_pin
         run: bash scripts/check-native-playback-targeted.sh --verify-source
       - name: Portable Core regressions
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/test-core.sh
       - name: Preserve launcher and strict evidence and isolated-host regression gates
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 tests/validation-shell/test_check_ios_shell.py
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_native_control_harness.py
-      - name: Production benchmarks and PiP resource and readiness diagnostic regressions before causal controls
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+          python3 tests/validation-shell/test_native_control_results.py
+          python3 tests/validation-shell/test_simulator_boot_preflight.py
+          python3 tests/validation-shell/test_simulator_destination_resolution.py
+          python3 tests/validation-shell/test_native_xcresult_export.py
+      - name: Resolve within sixty seconds and boot within four minutes
+        id: simulator_boot
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        run: |
+          simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
+      - name: Build one exact test plan and calibrate actual admission and close ordering
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require all fourteen benchmark and resource and readiness identities
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+      - name: Require the actual same-asset calibration identity
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import importlib.util
@@ -39,35 +52,19 @@ jobs:
           spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
           evidence = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(evidence)
-          prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
-          expected = {prefix + name for name in (
-              'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-              'testProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-              'testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation',
-              'testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation')}
-          resource_prefix = 'OfflineTikTokPlayerTests.ContinuousPictureInPictureResourceTests/'
-          expected.update(resource_prefix + name for name in (
-              'testOffscreenPreparationInstallsActualGeometryAndSingleStagedOutput',
-              'testPreparedResourcesSurviveABAReturnWithoutOutputPullBeforeActivation',
-              'testRejectedInstallEligibilityConsumesPlanWithoutMutatingItem',
-              'testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased',
-              'testRetirementPreservesExternallyReplacedComposition',
-              'testRepeatedBufferTransitionsBoundActualAttachedOutputs'))
-          expected.update(prefix + name for name in (
-              'testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame',
-              'testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault'))
-          monitor_prefix = 'OfflineTikTokPlayerTests.PlaybackFrameMonitorTests/'
-          expected.update(monitor_prefix + name for name in (
-              'testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource',
-              'testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks'))
-          if len(expected) != 14 or not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('A benchmark or resource or readiness test is missing from pinned source')
+          prefix = 'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/'
+          expected = {prefix + 'testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose'}
+          if len(expected) != 1 or not expected.issubset(evidence.source_manifest(Path('.'))):
+              raise SystemExit('The same-asset actual-read/close calibration must exist in pinned source')
           evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected, invocation='test-without-building')
-          print('Targeted benchmark and resource and readiness identities native=14 ui=0; original guards retained; no physical-output/full acceptance claim')
+          print('Same-asset calibration identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
-      - name: Nine ordered controls using benchmark-built products
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+      - name: Four OFF ON ON OFF arms with fresh exact owned hosts and calibration-built products
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh controls
-      - name: Require all nine singleton identities and native exit and host-boundary receipts
-        if: ${{ always() && steps.source_pin.outcome == 'success' }}
+      - name: Require all four singleton identities and native exit and host-boundary receipts
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh --verify-controls
+      - name: Export each exact attempted structured result independently
+        if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
+        run: python3 scripts/export-native-control-results.py

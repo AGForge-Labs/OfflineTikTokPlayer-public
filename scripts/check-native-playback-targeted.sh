@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=441002cf4dfdf2ecda3fc1e37fd777f3d63065ec
-expected_ios_tree=2608730f78323a6c836f7473a6202203f7dd93f5
+expected_code_source=88a6a8f6979613d56b6c9e91068e7c2020ee1a92
+expected_ios_tree=20ccfe41042418e379fb095e68b5aa9899b4e89d
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,15 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek',
-    'testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek',
-    'testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking',
-    'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
-    'testNaturalBoundaryWithNativeLaneActivityRevealsB',
-    'testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner',
-    'testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection',
-    'testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce',
-    'testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld',
+    'testSameRetainedAssetAdmissionOffFirst',
+    'testSameRetainedAssetAdmissionOnFirst',
+    'testSameRetainedAssetAdmissionOnSecond',
+    'testSameRetainedAssetAdmissionOffSecond',
 )
 
 def require(condition, message):
@@ -96,7 +91,7 @@ def runtime_host(log, identity, simulator):
         raise RuntimeHostIdentityError('Runtime host identity unavailable or mismatched') from None
 
 def verifier():
-    require(len(CASES) == 9 and len(set(CASES)) == 9, 'Expected nine distinct isolated controls')
+    require(len(CASES) == 4 and len(set(CASES)) == 4, 'Expected four distinct isolated controls')
     spec = importlib.util.spec_from_file_location('evidence', ROOT / 'scripts/verify-native-test-log.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -286,7 +281,7 @@ try:
         module, errors, seen, runtime_nonces = verifier(), [], set(), set()
         rows = STATUSES.read_text().splitlines() if STATUSES.is_file() else []
         if len(rows) != len(CASES):
-            errors.append('Expected nine isolated command receipts; found %d' % len(rows))
+            errors.append('Expected four isolated command receipts; found %d' % len(rows))
         for ordinal, name in enumerate(CASES, 1):
             identity = PREFIX + name
             try:
@@ -303,8 +298,8 @@ try:
                 print('NativeIsolatedControlVerified ordinal=%d identity=%s native=1 ui=0' % (ordinal, identity))
             except (OSError, ValueError) as error:
                 errors.append('%s: %s' % (identity, error))
-        require(len(seen) == 9 and not errors, '\n'.join(errors) or 'Missing unique control identity')
-        print('Targeted isolated controls native=9 ui=0; nine raw singleton logs; original guards retained; no full/device acceptance claim')
+        require(len(seen) == 4 and not errors, '\n'.join(errors) or 'Missing unique control identity')
+        print('Targeted isolated controls native=4 ui=0; four raw singleton logs; original guards retained; no full/device acceptance claim')
     else:
         raise ValueError('Unknown local evidence operation')
 except RuntimeHostIdentityError:
@@ -323,22 +318,9 @@ if [ "$1" = --verify-controls ]; then evidence_tool verify-controls "$expected_c
 mode="$1"
 case "$mode" in
   benchmark) cases=(
-    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation
-    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testWaitUntilLatchesSuccessAndPreservesDeadlineAndCancellation
-    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testOffscreenPreparationInstallsActualGeometryAndSingleStagedOutput
-    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testPreparedResourcesSurviveABAReturnWithoutOutputPullBeforeActivation
-    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedInstallEligibilityConsumesPlanWithoutMutatingItem
-    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRejectedAndEvictedResourcesDeferDetachUntilActiveBorrowIsReleased
-    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRetirementPreservesExternallyReplacedComposition
-    OfflineTikTokPlayerTests/ContinuousPictureInPictureResourceTests/testRepeatedBufferTransitionsBoundActualAttachedOutputs
-    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkDefaultThenCurrentCustomFrame
-    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testFrameReadinessMonitorBenchmarkCurrentCustomFrameThenDefault
-    OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testPausedCurrentEpochQualifiesWithoutAnotherOutputAndCancelPreservesResource
-    OfflineTikTokPlayerTests/PlaybackFrameMonitorTests/testFlushBetweenManualDisplayTicksRequiresNewCurrentEpochAndTwoFreshTicks
+    OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose
   ) ;;
-  controls) cases=(testReturnedVideoReadyBeforeFirstVisitDoesNotForceSourceVisitSeek testReturnedVideoWaitsForInitialReadyCallbackBeforeVisitOrDriftSeek testInitialReadyBindsNativeVideoToAdvancedAudioWithoutReseeking testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testNaturalBoundaryWithNativeLaneActivityRevealsB testStaleHeldReadyCallbackCannotDisplaceNewInitialZeroOwner testExplicitSeekEntryBeforeInitialOwnerInstallationPreservesNativeCorrection testPauseSeekResumeBeforeFirstReturnedVisitPreservesExplicitForce testFrameReadinessMonitorUsesOnePreparedOutputWhileReadyIsWithheld) ;;
+  controls) cases=(testSameRetainedAssetAdmissionOffFirst testSameRetainedAssetAdmissionOnFirst testSameRetainedAssetAdmissionOnSecond testSameRetainedAssetAdmissionOffSecond) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
@@ -346,7 +328,7 @@ mkdir -p artifacts/native
 native_log="artifacts/native/native-playback-$mode.log"
 : > "$native_log"
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode on macOS is required.' >&2; exit 2; }
-printf '' | xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/targeted-swift-plan.log 2>&1
+printf '' | python3 scripts/run-owned-xcodebuild.py --phase driver -- xcrun swiftc -driver-print-jobs -j1 -j3 -typecheck - > artifacts/native/targeted-swift-plan.log 2>&1
 cat artifacts/native/targeted-swift-plan.log
 grep -Fq 'SWIFTC_MAXIMUM_DETERMINISM overriding -j' artifacts/native/targeted-swift-plan.log
 python3 scripts/generate-ios-project.py --check
@@ -363,10 +345,13 @@ cleanup() {
 }
 trap cleanup EXIT
 printf '%s\n' "NativePlaybackTargetedScope mode=$mode appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=${#cases[@]} expectedUI=0 maximumBuildJobs=1 physicalOutput=unverified fullAcceptance=false"
+owned_phase=case-01
+xcodebuild() { python3 scripts/run-owned-xcodebuild.py --phase "$owned_phase" -- xcodebuild "$@"; }
 if [ "$mode" = benchmark ]; then
   evidence_tool initialize-build
   build_log="artifacts/native/native-playback-build.log"
   : > "$build_log"
+  owned_phase=build
   # Only build-for-testing promises to emit the immutable xctestrun product.
   # Build the complete pinned test target; selectors belong to the later run.
   set +e
@@ -384,6 +369,7 @@ if [ "$mode" = benchmark ]; then
   # path/size/hash. A failed build or plan check cannot create a receipt.
   generated_plan="$(evidence_tool generated-plan)"
   test_plan="$(evidence_tool plan-path "$generated_plan")"
+  owned_phase=case-01
   arguments=()
   for name in "${cases[@]}"; do arguments+=("-only-testing:$name"); done
   set +e
