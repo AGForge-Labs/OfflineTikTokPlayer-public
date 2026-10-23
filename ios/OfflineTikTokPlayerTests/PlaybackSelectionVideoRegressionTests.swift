@@ -5577,6 +5577,34 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let recorded = tap.samples(from: value.first, to: value.last)
         let quiet = ProductionSelectionOutputTap.quietRun(recorded.values, rate: recorded.rate)
         let hole = ProductionSelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
+        // This assertion helper runs after the existing cleanup wait. Reuse its
+        // retained measurement, including the precommand lead; the later stable
+        // returned-A recording cannot locate a quiet selection/acquisition window.
+        let anomalies = ProductionSelectionOutputTap.anomalyLocations(recorded, origin: value.origin,
+            frequency: value.frequency)
+        let quietWindows = anomalies.records.filter { $0.kind == 0 }
+        let samplePeriod = recorded.rate.isFinite && recorded.rate > 0 ? 1 / recorded.rate : .nan
+        let completeQuietWindow = recorded.values.count >= 2
+            && Double(recorded.values.count) >= recorded.rate * 0.01
+        let hostStepsQualified = recorded.hosts.count == recorded.values.count
+            && recorded.hosts.allSatisfy { $0.isFinite && $0 > 0 }
+            && zip(recorded.hosts, recorded.hosts.dropFirst()).allSatisfy {
+                let step = $0.1 - $0.0
+                return step.isFinite && abs(step - samplePeriod) <= samplePeriod / 2
+            }
+        let quietLocationsQualified = anomalies.available && recorded.rate.isFinite && recorded.rate > 0
+            && completeQuietWindow && hostStepsQualified
+            && value.origin.isFinite && value.first >= 0 && value.last >= value.first
+            && recorded.values.count == value.last - value.first && recorded.values.allSatisfy { $0.isFinite }
+            && hole <= 0.5 / max(1, recorded.rate) && quietWindows.allSatisfy {
+                $0.firstFrame >= 0 && $0.endFrame <= recorded.values.count && $0.endFrame > $0.firstFrame
+                    && $0.startOffsetMs?.isFinite == true && $0.endOffsetMs?.isFinite == true
+                    && ($0.endOffsetMs ?? -.infinity) > ($0.startOffsetMs ?? .infinity)
+            }
+        print("ProductionSelectionMeasurementQuietSummary schema=1 phase=\(value.phase) qualified=\(quietLocationsQualified) completeQuietWindow=\(completeQuietWindow) hostStepsQualified=\(hostStepsQualified) rangeFirst=\(value.first) rangeEnd=\(value.last) recordedFrames=\(recorded.values.count) rate=\(recorded.rate) commandHostSeconds=\(value.origin) longestQuietMs=\(quiet * 1_000) quietWindowCount=\(anomalies.quietCount) retainedQuietWindows=\(quietWindows.count) quietWindowCapacity=4 droppedQuietWindows=\(max(0, anomalies.quietCount - quietWindows.count)) outgoingToneEndMs=\(value.outgoing.map { String(($0.end - value.origin) * 1_000) } ?? "unavailable") targetToneStartMs=\(value.tone.map { String(($0.start - value.origin) * 1_000) } ?? "unavailable") targetToneEndMs=\(value.tone.map { String(($0.end - value.origin) * 1_000) } ?? "unavailable") classification=mono-RMS-below-0.01 windows=10ms exactStereoZeros=unmeasured physicalOutput=unverified publication=after-cleanup-wait acceptance=unchanged")
+        for (ordinal, window) in quietWindows.enumerated() {
+            print("ProductionSelectionMeasurementQuietWindow schema=1 phase=\(value.phase) ordinal=\(ordinal) qualified=\(quietLocationsQualified) firstFrame=\(window.firstFrame) endFrame=\(window.endFrame) tapStorageFirst=\(value.first + window.firstFrame) tapStorageEnd=\(value.first + window.endFrame) startOffsetMs=\(window.startOffsetMs.map { String($0) } ?? "unavailable") endOffsetMs=\(window.endOffsetMs.map { String($0) } ?? "unavailable") rms=\(window.rms) classification=mono-RMS-below-0.01 exactStereoZeros=unmeasured physicalOutput=unverified")
+        }
         #if DEBUG
         if value.replayToneAfterCleanup {
         let replay = ProductionSelectionOutputTap.replayTone(recorded, origin: value.origin,
