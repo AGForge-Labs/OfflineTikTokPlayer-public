@@ -16,15 +16,7 @@ SOURCE = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_SOURCE",
 WORKFLOW = Path(os.environ.get("NATIVE_FRAME_READ_DIAGNOSTIC_WORKFLOW",
                                ROOT / ".github/workflows/native-frame-read-diagnostic.yml"))
 CASES = (
-    'OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume',
-    'OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testRenderAnchorRejectsOldAndInactivePublicationsAfterResume',
-    'OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval',
-    'OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testExplicitPauseDuringActualLatencyReadRejectsTheOldClock',
-    'OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testReentrantPlaybackControlPreservesNewerPauseResumeAndGraphOwner',
-    'OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testPlaybackClockAuthorityExhaustionCannotReuseAnOldInterval',
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testTapExecutionTraceRejectsMalformedClockOrderAndOverflow',
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn',
+    'OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedAProducerBoundaryTraceEnabled',
 )
 SIMULATOR = "00000000-0000-0000-0000-000000000001"
 
@@ -258,9 +250,9 @@ exit "$FRAME_READ_TEE_EXIT"
     def test_exact_singleton_selector_limits_and_cleanup(self):
         result, arguments, receipt, verified = self.exercise()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("expectedNative=9", result.stdout)
+        self.assertIn("expectedNative=1", result.stdout)
         self.assertIn("expectedCore=110", result.stdout)
-        self.assertIn("NativeFrameReadDiagnosticEvidence native=9 ui=0 nativeExit=0 teeExit=0", result.stdout)
+        self.assertIn("NativeFrameReadDiagnosticEvidence native=1 ui=0 nativeExit=0 teeExit=0", result.stdout)
         self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
         self.assertEqual(receipt, "0\t0\n")
         self.assertEqual([value for value in arguments if value.startswith("-only-testing:")],
@@ -295,7 +287,7 @@ exit "$FRAME_READ_TEE_EXIT"
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(receipt, "0\t0\n")
                 self.assertNotEqual(verified.returncode, 0)
-                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=9", result.stdout)
+                self.assertNotIn("NativeFrameReadDiagnosticEvidence native=1", result.stdout)
 
     def test_failed_preflights_clear_stale_evidence_and_prevent_launch(self):
         for scenario, expected in (("core-failure", 19), ("driver-failure", 31),
@@ -356,7 +348,7 @@ exit "$FRAME_READ_TEE_EXIT"
         source = SOURCE.read_text(encoding="utf-8")
         declaration = re.search(r"^cases=\((.*?)\)\s*$", source, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(declaration)
-        self.assertEqual(len(CASES), 9)
+        self.assertEqual(len(CASES), 1)
         self.assertEqual(tuple(shlex.split(declaration.group(1))), CASES)
         workflow = WORKFLOW.read_text(encoding="utf-8").replace("\r\n", "\n")
         self.assertIn("fetch-depth: 2", workflow)
