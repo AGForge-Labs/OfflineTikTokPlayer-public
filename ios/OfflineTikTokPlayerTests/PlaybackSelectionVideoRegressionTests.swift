@@ -14,6 +14,126 @@ import Synchronization
 @testable import OfflineTikTokPlayer
 
 #if DEBUG
+/// Test-only item configuration comparison. Muting is not a track-disable receipt.
+@MainActor
+private final class NativeItemAudioTrackControl {
+    struct TrackRow {
+        let phase: Int, stage: Int, ordinal: Int, kind: Int
+        let trackID: CMPersistentTrackID
+        let before: Bool, after: Bool, wrote: Bool
+        let entered: UInt64, returned: UInt64
+    }
+    struct OwnerRow {
+        let phase: Int, stage: Int, request: Int, item: UInt
+        let entered: UInt64, returned: UInt64
+        let tracks: Int, readyAfter: Bool, qualified: Bool
+    }
+    let enabled: Bool
+    private let baseRequest: Int, aID: String, bID: String
+    private var tracks: [TrackRow] = []
+    private var owners: [OwnerRow] = []
+    private var stopped = false, failed = false
+    private var readyRequests = Set<Int>()
+    init(enabled: Bool, baseRequest: Int, aID: String, bID: String) {
+        self.enabled = enabled; self.baseRequest = baseRequest; self.aID = aID; self.bID = bID
+        tracks.reserveCapacity(48); owners.reserveCapacity(6)
+    }
+    func ready(request: Int, service: PlaybackService, audio: ContinuousAudioPlayer) {
+        guard !stopped, readyRequests.count < 3, readyRequests.insert(request).inserted else {
+            failed = true; return
+        }
+        observe(request: request, stage: 0, service: service, audio: audio)
+    }
+    func verify(phase: Int, service: PlaybackService, audio: ContinuousAudioPlayer) {
+        observe(request: baseRequest + phase + 1, stage: 1, service: service, audio: audio)
+    }
+    private func observe(request: Int, stage: Int, service: PlaybackService, audio: ContinuousAudioPlayer) {
+        let entered = DispatchTime.now().uptimeNanoseconds
+        let phase = request - baseRequest - 1
+        guard !stopped, (0..<3).contains(phase), owners.count < 6,
+              !owners.contains(where: { $0.phase == phase && $0.stage == stage }),
+              let item = service.player.currentItem else { failed = true; return }
+        let expectedID = phase == 1 ? bID : aID
+        @MainActor func owns() -> Bool {
+            // SDK reads precede the final cached generation/selection check.
+            let sameItem = service.player.currentItem === item
+            return sameItem && service.debugInitialVideoReadyState.generation == request
+                && service.queue.currentID == expectedID && audio.selectedID == expectedID
+        }
+        guard owns(), item.status == .readyToPlay, owns() else { failed = true; return }
+        let actualTracks = item.tracks
+        var qualified = !actualTracks.isEmpty && actualTracks.count <= 8 && owns()
+        let first = tracks.count
+        if qualified {
+            for (ordinal, track) in actualTracks.enumerated() {
+                guard tracks.count < 48, owns() else { qualified = false; break }
+                let start = DispatchTime.now().uptimeNanoseconds
+                guard let assetTrack = track.assetTrack else { qualified = false; break }
+                let type = assetTrack.mediaType
+                let trackID = assetTrack.trackID
+                guard trackID != kCMPersistentTrackID_Invalid else { qualified = false; break }
+                let kind = type == .audio ? 0 : (type == .video ? 1 : 2)
+                let before = track.isEnabled
+                guard owns() else { qualified = false; break }
+                let wrote = stage == 0 && enabled && kind == 0 && before
+                if wrote { track.isEnabled = false }
+                let after = track.isEnabled
+                let returned = DispatchTime.now().uptimeNanoseconds
+                tracks.append(TrackRow(phase: phase, stage: stage, ordinal: ordinal, kind: kind, trackID: trackID,
+                    before: before, after: after, wrote: wrote, entered: start, returned: returned))
+                if !owns() { qualified = false; break }
+            }
+        }
+        let rows = tracks[first...]
+        qualified = qualified && rows.count == actualTracks.count
+            && Set(rows.map(\.trackID)).count == rows.count
+            && rows.contains { $0.kind == 0 } && rows.contains { $0.kind == 1 }
+            && rows.allSatisfy { row in
+                if row.kind == 0 { return row.after == !enabled }
+                return row.before == row.after && !row.wrote && (row.kind != 1 || row.after)
+            }
+        if stage == 1 {
+            let initial = tracks.filter { $0.phase == phase && $0.stage == 0 }.sorted { $0.trackID < $1.trackID }
+            let final = rows.sorted { $0.trackID < $1.trackID }
+            qualified = qualified && initial.count == final.count
+                && zip(initial, final).allSatisfy { $0.trackID == $1.trackID && $0.kind == $1.kind }
+        }
+        let readyAfter = item.status == .readyToPlay
+        qualified = qualified && readyAfter && owns()
+        owners.append(OwnerRow(phase: phase, stage: stage, request: request,
+            item: UInt(bitPattern: ObjectIdentifier(item)), entered: entered,
+            returned: DispatchTime.now().uptimeNanoseconds, tracks: actualTracks.count,
+            readyAfter: readyAfter, qualified: qualified))
+        if !qualified { failed = true }
+    }
+    func stop() { stopped = true }
+    func dumpAndAssert(cleanupAcknowledged: Bool) {
+        print("NativeItemAudioSummary schema=1 enabled=\(enabled) owners=\(owners.count) trackRows=\(tracks.count) ownerCapacity=6 trackCapacity=48 readyRequests=\(readyRequests.count) bytes=\(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6) stopped=\(stopped) failed=\(failed) cleanupAcknowledged=\(cleanupAcknowledged) configurationAt=existing-ready-callback originalAssetPreserved=true audioEngine=unchanged causalProof=false")
+        XCTAssertTrue(stopped && cleanupAcknowledged); XCTAssertFalse(failed)
+        XCTAssertEqual(owners.count, 6); XCTAssertEqual(readyRequests.count, 3)
+        XCTAssertLessThan(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6, 65_536)
+        for owner in owners {
+            print("NativeItemAudioOwner schema=1 enabled=\(enabled) phase=\(owner.phase) stage=\(owner.stage) request=\(owner.request) item=\(owner.item) entryNs=\(owner.entered) returnNs=\(owner.returned) tracks=\(owner.tracks) readyAfter=\(owner.readyAfter) qualified=\(owner.qualified)")
+            XCTAssertTrue(owner.qualified && owner.readyAfter); XCTAssertGreaterThanOrEqual(owner.returned, owner.entered)
+        }
+        for row in tracks {
+            print("NativeItemAudioTrack schema=1 enabled=\(enabled) phase=\(row.phase) stage=\(row.stage) ordinal=\(row.ordinal) kind=\(row.kind) trackID=\(row.trackID) before=\(row.before) after=\(row.after) wrote=\(row.wrote) entryNs=\(row.entered) returnNs=\(row.returned)")
+        }
+        for phase in 0..<3 {
+            let ready = owners.filter { $0.phase == phase && $0.stage == 0 }
+            let after = owners.filter { $0.phase == phase && $0.stage == 1 }
+            XCTAssertEqual(ready.count, 1); XCTAssertEqual(after.count, 1)
+            XCTAssertEqual(ready.first?.item, after.first?.item)
+            let startAudio = tracks.filter { $0.phase == phase && $0.stage == 0 && $0.kind == 0 }
+            XCTAssertFalse(startAudio.isEmpty)
+            XCTAssertTrue(startAudio.allSatisfy { $0.before == !(enabled && phase == 2) })
+        }
+        XCTAssertEqual(owners.first(where: { $0.phase == 0 && $0.stage == 0 })?.item,
+                       owners.first(where: { $0.phase == 2 && $0.stage == 0 })?.item,
+                       "Returned A must retain the actual item whose audio configuration was measured")
+    }
+}
+
 @MainActor
 final class NativePlayerReportedStateTrace {
     struct Phase {
@@ -380,6 +500,24 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testNativePlayerReportedStateOffThenOn() async throws {
         try await runNativePlayerReportedStateComparison([false, true], order: "off-then-on")
+    }
+
+    func testNativeItemAudioTrackDisablingOffThenOn() async throws {
+        try await runNativeItemAudioTrackComparison([false, true], order: "off-then-on")
+    }
+
+    func testNativeItemAudioTrackDisablingOnThenOff() async throws {
+        try await runNativeItemAudioTrackComparison([true, false], order: "on-then-off")
+    }
+
+    private func runNativeItemAudioTrackComparison(_ modes: [Bool], order: String) async throws {
+        try recordRuntimeHost()
+        for (ordinal, enabled) in modes.enumerated() {
+            print("NativeItemAudioArm schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) hook=existing-ready-callback zeroProbe=constant-on startupClock=constant-on originalGuards=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, nativeAudioTrackDisabling: enabled)
+            print("NativeItemAudioArmEnd schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) helperReturned=true")
+        }
     }
 
     func testNativePlayerReportedStateOnThenOff() async throws {
@@ -3263,11 +3401,28 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 wholeFrameClockAcquisition: Bool? = nil,
                                                 firstZeroSourceCallbacks: Bool? = nil,
                                                 capClockBoundary: Bool? = nil,
-                                                nativePlayerReportedState: Bool? = nil) async throws {
+                                                nativePlayerReportedState: Bool? = nil,
+                                                nativeAudioTrackDisabling: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
         let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
-            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil ? nil : true)
+            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeAudioTrackDisabling == nil ? nil : true)
+        if let enabled = nativeAudioTrackDisabling {
+            guard traceVideoSeeks, traceClockHandoff == true, nativePlayerReportedState == nil,
+                  earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
+                  firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
+                  frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
+                  traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup, freshPreviousBundle == nil,
+                  queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == nil,
+                  sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("Native audio-track comparison changes only loaded item audio enablement at the existing ready callback")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("NativeItemAudioScope schema=1 enabled=\(enabled) phases=3 stages=2 trackLimit=8 trackCapacity=48 queries=both-arms onlyAudioWrites=\(enabled) originalAssetPreserved=true noCompositionChange=true readinessPolicy=unchanged")
+        }
         if let enabled = nativePlayerReportedState {
             guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
                   wholeFrameClockAcquisition == nil, firstZeroSourceCallbacks == nil, capClockBoundary == nil,
@@ -3438,6 +3593,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if nativeAudioTrackDisabling != nil {
+            XCTFail("Native audio-track comparison is unavailable outside DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if traceReturnedAProducerBoundary != nil {
             XCTFail("Returned-A producer boundary is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3591,6 +3750,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        let nativeAudioControl = nativeAudioTrackDisabling.map {
+            NativeItemAudioTrackControl(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation,
+                aID: fixture.aID, bID: fixture.bID)
+        }
+        if let nativeAudioControl {
+            service.onDebugInitialVideoReady = { [weak nativeAudioControl, weak service, weak audio] request in
+                if let service, let audio { nativeAudioControl?.ready(request: request, service: service, audio: audio) }
+            }
+        }
+        defer {
+            if nativeAudioControl != nil { service.onDebugInitialVideoReady = nil; nativeAudioControl?.stop() }
+        }
         if suppressionControl != nil || traceFirstSourceFailure != nil || queuedPreviousLead != nil {
             XCTAssertTrue(service.debugUsesCurrentCustomFrameForReadiness)
         }
@@ -3912,6 +4083,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 #endif
             }
             #if DEBUG
+            nativeAudioControl?.verify(phase: phase, service: service, audio: audio)
             if let control = suppressionControl {
                 // The original measurement and eight-second sampler/tap endpoint
                 // have stopped. These matched captures change later framework
@@ -3943,6 +4115,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
         #if DEBUG
         if traceReturnedAProducerBoundary == true { nativeTrace?.closeReturnedARequests() }
+        if nativeAudioControl != nil { service.onDebugInitialVideoReady = nil; nativeAudioControl?.stop() }
         firstZeroProbe?.close()
         earlyAcquisitionTrace?.stop()
         wholeFrameTrace?.stop()
@@ -4067,6 +4240,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         wholeFrameTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         capClockTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         nativeReportedTrace?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
+        nativeAudioControl?.dumpAndAssert(cleanupAcknowledged: mayRemoveFixture)
         if let enabled = traceReturnedAProducerBoundary {
             if enabled {
                 XCTAssertNotNil(nativeTrace); XCTAssertNotNil(nativeActivity); XCTAssertNotNil(firstFailure)
