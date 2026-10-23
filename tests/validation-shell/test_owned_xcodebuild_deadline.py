@@ -213,7 +213,7 @@ class OwnedXcodebuildDeadlineTests(unittest.TestCase):
 
 
     def test_full_test_cli_uses_only_the_fixed_combined_action_and_budget(self):
-        expected = {"build": (0, 720), "case-01": (1, 300), "case-02": (2, 300),
+        expected = {"build": (0, 1080), "case-01": (1, 300), "case-02": (2, 300),
                     "driver": (3, 60), "full-test": (4, 2100)}
         self.assertEqual(self.module.PHASES, expected)
         self.assertEqual(self.module.MAX_SESSION_SECONDS, 2100)
