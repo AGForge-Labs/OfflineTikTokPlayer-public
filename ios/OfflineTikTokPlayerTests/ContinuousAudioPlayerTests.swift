@@ -68,10 +68,10 @@ final class ContinuousAudioPlayerTests: XCTestCase {
                 throw RenderAnchorCalibrationSetupError.unqualified
             }
             sequenceAtSeed = audio.graph.debugRenderAnchorPublicationSequence
-            let current = audio.graph.presentationPosition(token: entry.token,
+            let current = audio.graph.presentationPosition(token: entry.token, visit: before.visit, selectionVersion: before.selectionVersion,
                 at: CMTime(seconds: seedHost, preferredTimescale: 1_000_000))
             freshBefore = current?.isFinite == true
-            wrongTokenRejected = audio.graph.presentationPosition(token: entry.token + 1, at: afterPauseHost) == nil
+            wrongTokenRejected = audio.graph.presentationPosition(token: entry.token + 1, visit: before.visit, selectionVersion: before.selectionVersion, at: afterPauseHost) == nil
             guard sequenceAtSeed > 0, sequenceAtSeed & 1 == 0, freshBefore, wrongTokenRejected else {
                 XCTFail("The real query must accept a coherent fresh publication and reject a different token")
                 throw RenderAnchorCalibrationSetupError.unqualified
@@ -105,7 +105,7 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             // No renderOffline call occurs between suspend and these queries. A new
             // publication nevertheless observed here makes setup unavailable, never a RED.
             sequenceBeforeQuery = audio.graph.debugRenderAnchorPublicationSequence
-            resumedAnchor = audio.graph.presentationPosition(token: entry.token, at: afterPauseHost)
+            resumedAnchor = audio.graph.presentationPosition(token: entry.token, visit: before.visit, selectionVersion: before.selectionVersion, at: afterPauseHost)
             resumedPosition = audio.presentationPosition(at: afterPauseHost)
             sequenceAfterQuery = audio.graph.debugRenderAnchorPublicationSequence
             let callbacksAfter = try XCTUnwrap(accounting.snapshot(), "Source callback accounting must remain available after resume queries")
@@ -134,10 +134,10 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             // Positive recovery: the same actual publisher/query remains usable after
             // a fresh current-interval synthetic publication. No SDK callback is fabricated.
             XCTAssertTrue(audio.graph.debugPublishSyntheticRenderAnchor(resumed, hostEnd: seedHost + 10))
-            let fresh = audio.graph.presentationPosition(token: entry.token, at: afterPauseHost)
+            let fresh = audio.graph.presentationPosition(token: entry.token, visit: before.visit, selectionVersion: before.selectionVersion, at: afterPauseHost)
             freshAfter = fresh?.isFinite == true
             XCTAssertTrue(freshAfter)
-            freshWrongTokenRejected = audio.graph.presentationPosition(token: entry.token + 1, at: afterPauseHost) == nil
+            freshWrongTokenRejected = audio.graph.presentationPosition(token: entry.token + 1, visit: before.visit, selectionVersion: before.selectionVersion, at: afterPauseHost) == nil
             XCTAssertTrue(freshWrongTokenRejected)
             XCTAssertGreaterThan(audio.graph.debugRenderAnchorPublicationSequence, sequenceAtSeed)
             XCTAssertEqual(audio.snapshot.underrunFrames, 0)
@@ -380,12 +380,12 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             for captured in [interval, UInt64(0)] {
                 XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000,
                     capturedPlayingInterval: captured))
-                XCTAssertNil(owner.presentationPosition(token: sample.token, at: host))
+                XCTAssertNil(owner.presentationPosition(token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion, at: host))
                 XCTAssertEqual(audio.presentationPosition(at: host), Double(sample.frame) / 48_000,
                     accuracy: 0.5 / 48_000)
             }
             XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
-            XCTAssertNotNil(owner.presentationPosition(token: sample.token, at: host))
+            XCTAssertNotNil(owner.presentationPosition(token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion, at: host))
         }
         #else
         XCTFail("Clock activity calibration requires DEBUG")
@@ -400,16 +400,16 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
             try audio.setPlaying(true)
             XCTAssertEqual(owner.debugPlayingInterval, interval)
-            XCTAssertNotNil(owner.presentationPosition(token: sample.token, at: host))
+            XCTAssertNotNil(owner.presentationPosition(token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion, at: host))
             owner.engine.stop() // Real stopped-engine recovery with unchanged requested Play.
             try audio.setPlaying(true)
             XCTAssertTrue(owner.engine.isRunning)
             XCTAssertGreaterThan(owner.debugPlayingInterval, interval)
-            XCTAssertNil(owner.presentationPosition(token: sample.token, at: host))
+            XCTAssertNil(owner.presentationPosition(token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion, at: host))
             XCTAssertEqual(audio.presentationPosition(at: host), Double(sample.frame) / 48_000,
                 accuracy: 0.5 / 48_000)
             XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
-            XCTAssertNotNil(owner.presentationPosition(token: sample.token, at: host))
+            XCTAssertNotNil(owner.presentationPosition(token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion, at: host))
         }
         #else
         XCTFail("Clock activity calibration requires DEBUG")
@@ -431,7 +431,7 @@ final class ContinuousAudioPlayerTests: XCTestCase {
                 accuracy: 0.5 / 48_000)
             XCTAssertTrue(entered, "The actual SDK latency getter must return before calibration invalidation")
             XCTAssertEqual(owner.debugPlayingInterval, 0)
-            XCTAssertNil(owner.presentationPosition(token: sample.token, at: host))
+            XCTAssertNil(owner.presentationPosition(token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion, at: host))
             audio.settlePausedState(); XCTAssertFalse(owner.engine.isRunning)
         }
         #else
@@ -494,7 +494,7 @@ final class ContinuousAudioPlayerTests: XCTestCase {
             XCTAssertFalse(audio.graph === owner)
             XCTAssertEqual(owner.debugPlayingInterval, 0)
             XCTAssertEqual(audio.graph.debugPlayingInterval, 0)
-            XCTAssertNil(owner.presentationPosition(token: sample.token,
+            XCTAssertNil(owner.presentationPosition(token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion,
                 at: CMTime(seconds: 1_001, preferredTimescale: 1_000_000)))
         }
         #else

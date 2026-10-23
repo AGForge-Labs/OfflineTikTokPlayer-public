@@ -353,11 +353,33 @@ final class ContinuousAudioPlayer {
         pendingPosition.map { $0.version != sample.selectionVersion } ?? false
     }
     func presentationPosition(at hostTime: CMTime) -> Double {
-        let sample = renderer.snapshot
+        var sample = renderer.snapshot
         if let pendingPosition, pendingPosition.version != sample.selectionVersion { return pendingPosition.position }
         pendingPosition = nil
-        guard renderingPermitted, graph.engine.isRunning else { return Double(sample.frame) / 48_000 }
-        return graph.presentationPosition(token: sample.token, at: hostTime) ?? Double(sample.frame) / 48_000
+        guard renderingPermitted else { return Double(sample.frame) / 48_000 }
+        let owner = graph, control = playbackControlTicket
+        let running = owner.engine.isRunning
+        // SDK work may return after a newer command. Reconcile its actual
+        // acknowledgement before clearing pending time or using an old cursor.
+        sample = renderer.snapshot
+        if let pendingPosition, pendingPosition.version != sample.selectionVersion { return pendingPosition.position }
+        pendingPosition = nil
+        guard ownsPlaybackControl(control, graph: owner), renderingPermitted, running else {
+            return Double(sample.frame) / 48_000
+        }
+        let position = owner.presentationPosition(token: sample.token, visit: sample.visit,
+            selectionVersion: sample.selectionVersion, at: hostTime)
+        let current = renderer.snapshot
+        if let pendingPosition, pendingPosition.version != current.selectionVersion { return pendingPosition.position }
+        pendingPosition = nil
+        // The renderer can acknowledge a selection or cross a natural boundary
+        // before the Graph publishes its clock. Its fresh cursor wins that window.
+        guard ownsPlaybackControl(control, graph: owner), renderingPermitted,
+              current.token == sample.token, current.visit == sample.visit,
+              current.selectionVersion == sample.selectionVersion else {
+            return Double(current.frame) / 48_000
+        }
+        return position ?? Double(current.frame) / 48_000
     }
     func onDecodeFailure(_ handler: @escaping @Sendable (Int, ContinuousPCMDecoder.Failure) -> Void) {
         decoder.setFailureHandler(handler)

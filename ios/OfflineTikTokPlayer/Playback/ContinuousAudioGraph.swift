@@ -19,6 +19,8 @@ final class ContinuousAudioGraph {
     private final class RenderAnchor: @unchecked Sendable {
         let sequence = Atomic<Int>(0)
         let token = Atomic<Int>(0)
+        let visit = Atomic<Int64>(0)
+        let selectionVersion = Atomic<Int>(0)
         let frame = Atomic<Int64>(0)
         let hostSeconds = Atomic<UInt64>(0)
         let activeInterval = Atomic<UInt64>(0) // Control writer; zero withdraws extrapolation permission.
@@ -28,17 +30,20 @@ final class ContinuousAudioGraph {
             version &+= 2
             sequence.store(version - 1, ordering: .sequentiallyConsistent)
             token.store(sample.token, ordering: .sequentiallyConsistent)
+            visit.store(sample.visit, ordering: .sequentiallyConsistent)
+            selectionVersion.store(sample.selectionVersion, ordering: .sequentiallyConsistent)
             frame.store(sample.frame, ordering: .sequentiallyConsistent)
             hostSeconds.store(hostEnd.bitPattern, ordering: .sequentiallyConsistent)
             publishedInterval.store(interval, ordering: .sequentiallyConsistent)
             sequence.store(version, ordering: .sequentiallyConsistent)
         }
-        func read() -> (token: Int, frame: Int64, hostEnd: Double, interval: UInt64)? {
+        func read() -> (token: Int, visit: Int64, selectionVersion: Int, frame: Int64, hostEnd: Double, interval: UInt64)? {
             while true {
                 let version = sequence.load(ordering: .sequentiallyConsistent)
                 if version == 0 { return nil }
                 if version & 1 != 0 { continue }
-                let result = (token.load(ordering: .sequentiallyConsistent), frame.load(ordering: .sequentiallyConsistent),
+                let result = (token.load(ordering: .sequentiallyConsistent), visit.load(ordering: .sequentiallyConsistent),
+                              selectionVersion.load(ordering: .sequentiallyConsistent), frame.load(ordering: .sequentiallyConsistent),
                               Double(bitPattern: hostSeconds.load(ordering: .sequentiallyConsistent)),
                               publishedInterval.load(ordering: .sequentiallyConsistent))
                 if sequence.load(ordering: .sequentiallyConsistent) == version { return result }
@@ -48,14 +53,19 @@ final class ContinuousAudioGraph {
 
     /// Position of the current source expected at the speaker at `hostTime`.
     /// The render timestamp, rather than AVPlayer's item clock, is authoritative.
-    @MainActor func presentationPosition(token: Int, at hostTime: CMTime) -> Double? {
+    @MainActor func presentationPosition(token: Int, visit: Int64, selectionVersion: Int, at hostTime: CMTime) -> Double? {
         let interval = anchor.activeInterval.load(ordering: .acquiring)
-        guard interval > 0, let sample = anchor.read(), sample.token == token, sample.interval == interval else { return nil }
+        guard interval > 0, let sample = anchor.read(), sample.token == token, sample.visit == visit,
+              sample.selectionVersion == selectionVersion, sample.interval == interval else { return nil }
         let latency = source.outputPresentationLatency
         #if DEBUG
         debugAfterPresentationLatencyRead?()
         #endif
-        guard anchor.activeInterval.load(ordering: .acquiring) == interval else { return nil }
+        // The same media can be selected again while this SDK getter returns.
+        // A newer publication for this owner remains valid; another visit does not.
+        guard let current = anchor.read(), current.token == token, current.visit == visit,
+              current.selectionVersion == selectionVersion, current.interval == interval,
+              anchor.activeInterval.load(ordering: .acquiring) == interval else { return nil }
         return max(0, Double(sample.frame) / 48_000 + hostTime.seconds - sample.hostEnd - latency)
     }
 
