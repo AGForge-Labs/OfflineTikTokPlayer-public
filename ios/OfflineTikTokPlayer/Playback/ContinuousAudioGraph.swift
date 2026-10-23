@@ -13,6 +13,7 @@ final class ContinuousAudioGraph {
     private let source: AVAudioSourceNode
     private let anchor: RenderAnchor
     private let storage: RenderStorage
+    @MainActor private var intervalIssuer: UInt64 = 0
     var maximumRenderFrameCount: Int { storage.maximumFrameCount.load(ordering: .acquiring) }
 
     private final class RenderAnchor: @unchecked Sendable {
@@ -20,22 +21,26 @@ final class ContinuousAudioGraph {
         let token = Atomic<Int>(0)
         let frame = Atomic<Int64>(0)
         let hostSeconds = Atomic<UInt64>(0)
+        let activeInterval = Atomic<UInt64>(0) // Control writer; zero withdraws extrapolation permission.
+        let publishedInterval = Atomic<UInt64>(0) // Render writer, inside the existing coherent publication.
         var version = 0 // Render owner only.
-        func publish(_ sample: ContinuousPCMRenderer.Snapshot, hostEnd: Double) {
+        func publish(_ sample: ContinuousPCMRenderer.Snapshot, hostEnd: Double, interval: UInt64) {
             version &+= 2
             sequence.store(version - 1, ordering: .sequentiallyConsistent)
             token.store(sample.token, ordering: .sequentiallyConsistent)
             frame.store(sample.frame, ordering: .sequentiallyConsistent)
             hostSeconds.store(hostEnd.bitPattern, ordering: .sequentiallyConsistent)
+            publishedInterval.store(interval, ordering: .sequentiallyConsistent)
             sequence.store(version, ordering: .sequentiallyConsistent)
         }
-        func read() -> (token: Int, frame: Int64, hostEnd: Double)? {
+        func read() -> (token: Int, frame: Int64, hostEnd: Double, interval: UInt64)? {
             while true {
                 let version = sequence.load(ordering: .sequentiallyConsistent)
                 if version == 0 { return nil }
                 if version & 1 != 0 { continue }
                 let result = (token.load(ordering: .sequentiallyConsistent), frame.load(ordering: .sequentiallyConsistent),
-                              Double(bitPattern: hostSeconds.load(ordering: .sequentiallyConsistent)))
+                              Double(bitPattern: hostSeconds.load(ordering: .sequentiallyConsistent)),
+                              publishedInterval.load(ordering: .sequentiallyConsistent))
                 if sequence.load(ordering: .sequentiallyConsistent) == version { return result }
             }
         }
@@ -43,23 +48,51 @@ final class ContinuousAudioGraph {
 
     /// Position of the current source expected at the speaker at `hostTime`.
     /// The render timestamp, rather than AVPlayer's item clock, is authoritative.
-    func presentationPosition(token: Int, at hostTime: CMTime) -> Double? {
-        guard let anchor = anchor.read(), anchor.token == token else { return nil }
-        return max(0, Double(anchor.frame) / 48_000 + hostTime.seconds - anchor.hostEnd - source.outputPresentationLatency)
+    @MainActor func presentationPosition(token: Int, at hostTime: CMTime) -> Double? {
+        let interval = anchor.activeInterval.load(ordering: .acquiring)
+        guard interval > 0, let sample = anchor.read(), sample.token == token, sample.interval == interval else { return nil }
+        let latency = source.outputPresentationLatency
+        #if DEBUG
+        debugAfterPresentationLatencyRead?()
+        #endif
+        guard anchor.activeInterval.load(ordering: .acquiring) == interval else { return nil }
+        return max(0, Double(sample.frame) / 48_000 + hostTime.seconds - sample.hostEnd - latency)
+    }
+
+    @MainActor func beginPlayingInterval(restarting: Bool) -> Bool {
+        if !restarting, anchor.activeInterval.load(ordering: .acquiring) > 0 { return true }
+        guard intervalIssuer < UInt64.max - 1 else {
+            intervalIssuer = .max; endPlayingInterval(); return false
+        }
+        intervalIssuer += 1
+        anchor.activeInterval.store(intervalIssuer, ordering: .releasing)
+        return true
+    }
+
+    @MainActor func endPlayingInterval() {
+        anchor.activeInterval.store(0, ordering: .releasing)
     }
 
     #if DEBUG
     // Store-level calibration only: the caller is the sole offline manual-render owner
     // and must not overlap this publication with renderOffline. No SDK callback is replaced.
     @MainActor func debugPublishSyntheticRenderAnchor(_ sample: ContinuousPCMRenderer.Snapshot,
-        hostEnd: Double) -> Bool {
+        hostEnd: Double, capturedPlayingInterval: UInt64? = nil) -> Bool {
         guard engine.isInManualRenderingMode, engine.manualRenderingMode == .offline,
               sample.token > 0, sample.visit > 0, sample.frame >= 0, hostEnd.isFinite else { return false }
-        anchor.publish(sample, hostEnd: hostEnd)
+        anchor.publish(sample, hostEnd: hostEnd,
+            interval: capturedPlayingInterval ?? anchor.activeInterval.load(ordering: .acquiring))
         return true
     }
     @MainActor var debugRenderAnchorPublicationSequence: Int {
         anchor.sequence.load(ordering: .sequentiallyConsistent)
+    }
+    @MainActor var debugPlayingInterval: UInt64 { anchor.activeInterval.load(ordering: .acquiring) }
+    @MainActor var debugAfterPresentationLatencyRead: (() -> Void)?
+    @MainActor func debugSetInactiveIntervalIssuer(_ value: UInt64) -> Bool {
+        guard engine.isInManualRenderingMode, engine.manualRenderingMode == .offline,
+              anchor.activeInterval.load(ordering: .acquiring) == 0, value >= intervalIssuer else { return false }
+        intervalIssuer = value; return true
     }
     #endif
 
@@ -86,6 +119,9 @@ final class ContinuousAudioGraph {
         let anchor = RenderAnchor()
         self.anchor = anchor
         source = AVAudioSourceNode(format: format) { isSilence, timestamp, count, audioBufferList in
+            // Capture before any render work. A paused or superseded callback
+            // must not gain permission merely because it finishes after resume.
+            let playingInterval = anchor.activeInterval.load(ordering: .acquiring)
             #if DEBUG
             let receipts = storage.debugRenderAccounting?.callbackLedger
             // Optional diagnostic clocks only. End is before final ledger publication,
@@ -161,7 +197,8 @@ final class ContinuousAudioGraph {
             }
             if timestamp.pointee.mFlags.contains(.hostTimeValid) {
                 anchor.publish(storage.renderer.snapshot,
-                    hostEnd: AVAudioTime.seconds(forHostTime: timestamp.pointee.mHostTime) + Double(count) / 48_000)
+                    hostEnd: AVAudioTime.seconds(forHostTime: timestamp.pointee.mHostTime) + Double(count) / 48_000,
+                    interval: playingInterval)
             }
             #if DEBUG
             storage.debugRenderAccounting?.sourceCallbackCompleted(frames: Int(count), invalidLayout: false)

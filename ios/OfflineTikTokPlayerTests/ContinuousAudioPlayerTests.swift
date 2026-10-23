@@ -174,7 +174,231 @@ final class ContinuousAudioPlayerTests: XCTestCase {
         #endif
     }
 
+    func testRenderAnchorRejectsOldAndInactivePublicationsAfterResume() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("old-and-inactive-publication") { audio, sample in
+            let owner = audio.graph, interval = owner.debugPlayingInterval
+            XCTAssertGreaterThan(interval, 0)
+            audio.suspend(); audio.settlePausedState(); try audio.setPlaying(true)
+            XCTAssertGreaterThan(owner.debugPlayingInterval, interval)
+            let host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            for captured in [interval, UInt64(0)] {
+                XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000,
+                    capturedPlayingInterval: captured))
+                XCTAssertNil(owner.presentationPosition(token: sample.token, at: host))
+                XCTAssertEqual(audio.presentationPosition(at: host), Double(sample.frame) / 48_000,
+                    accuracy: 0.5 / 48_000)
+            }
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            XCTAssertNotNil(owner.presentationPosition(token: sample.token, at: host))
+        }
+        #else
+        XCTFail("Clock activity calibration requires DEBUG")
+        #endif
+    }
+
+    func testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("repeated-true-and-engine-restart") { audio, sample in
+            let owner = audio.graph, interval = owner.debugPlayingInterval
+            let host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            try audio.setPlaying(true)
+            XCTAssertEqual(owner.debugPlayingInterval, interval)
+            XCTAssertNotNil(owner.presentationPosition(token: sample.token, at: host))
+            owner.engine.stop() // Real stopped-engine recovery with unchanged requested Play.
+            try audio.setPlaying(true)
+            XCTAssertTrue(owner.engine.isRunning)
+            XCTAssertGreaterThan(owner.debugPlayingInterval, interval)
+            XCTAssertNil(owner.presentationPosition(token: sample.token, at: host))
+            XCTAssertEqual(audio.presentationPosition(at: host), Double(sample.frame) / 48_000,
+                accuracy: 0.5 / 48_000)
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            XCTAssertNotNil(owner.presentationPosition(token: sample.token, at: host))
+        }
+        #else
+        XCTFail("Clock activity calibration requires DEBUG")
+        #endif
+    }
+
+    func testExplicitPauseDuringActualLatencyReadRejectsTheOldClock() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("pause-after-actual-latency-read") { audio, sample in
+            let owner = audio.graph
+            let host = CMTime(seconds: 1_001, preferredTimescale: 1_000_000)
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            var entered = false
+            owner.debugAfterPresentationLatencyRead = { [weak audio] in
+                entered = true; owner.debugAfterPresentationLatencyRead = nil; audio?.suspend()
+            }
+            defer { owner.debugAfterPresentationLatencyRead = nil }
+            XCTAssertEqual(audio.presentationPosition(at: host), Double(sample.frame) / 48_000,
+                accuracy: 0.5 / 48_000)
+            XCTAssertTrue(entered, "The actual SDK latency getter must return before calibration invalidation")
+            XCTAssertEqual(owner.debugPlayingInterval, 0)
+            XCTAssertNil(owner.presentationPosition(token: sample.token, at: host))
+            audio.settlePausedState(); XCTAssertFalse(owner.engine.isRunning)
+        }
+        #else
+        XCTFail("Clock activity calibration requires DEBUG")
+        #endif
+    }
+
+    func testReentrantPlaybackControlPreservesNewerPauseResumeAndGraphOwner() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("reentrant-sdk-boundaries") { audio, sample in
+            let owner = audio.graph
+            var pauseObserved = false
+            audio.debugPlaybackBoundary = { point in
+                guard case .playingRunning = point else { return }
+                audio.debugPlaybackBoundary = nil; pauseObserved = true; audio.suspend()
+            }
+            try audio.setPlaying(true)
+            XCTAssertTrue(pauseObserved); XCTAssertEqual(owner.debugPlayingInterval, 0)
+            audio.settlePausedState(); XCTAssertFalse(owner.engine.isRunning)
+
+            try audio.setPlaying(true); audio.suspend()
+            var resumeObserved = false, callbackError: Error?
+            audio.debugPlaybackBoundary = { point in
+                guard case .pausedRunning = point else { return }
+                audio.debugPlaybackBoundary = nil; resumeObserved = true
+                do { try audio.setPlaying(true) } catch { callbackError = error }
+            }
+            audio.settlePausedState()
+            if let callbackError { throw callbackError }
+            XCTAssertTrue(resumeObserved); XCTAssertTrue(owner.engine.isRunning)
+            XCTAssertGreaterThan(owner.debugPlayingInterval, 0)
+
+            audio.suspend(); audio.settlePausedState()
+            var failureObserved = false
+            audio.debugAfterEngineStart = {
+                audio.debugAfterEngineStart = nil
+                try audio.setPlaying(false); try audio.setPlaying(true)
+                failureObserved = true
+                throw AnchorControlCalibrationFailure.syntheticAfterSuccessfulSDKStart
+            }
+            try audio.setPlaying(true) // The superseded synthetic failure cannot pause the newer resume.
+            XCTAssertTrue(failureObserved); XCTAssertTrue(owner.engine.isRunning)
+            XCTAssertGreaterThan(owner.debugPlayingInterval, 0)
+
+            var resetObserved = false
+            callbackError = nil
+            audio.debugPlaybackBoundary = { point in
+                guard case .rebuildStopped = point else { return }
+                audio.debugPlaybackBoundary = nil; resetObserved = true
+                do { try audio.setPlaying(true) } catch { callbackError = error }
+            }
+            audio.rebuildAfterMediaServicesReset()
+            if let callbackError { throw callbackError }
+            XCTAssertTrue(resetObserved); XCTAssertTrue(audio.graph === owner)
+            XCTAssertTrue(owner.engine.isRunning)
+            XCTAssertTrue(owner.debugPublishSyntheticRenderAnchor(sample, hostEnd: 1_000))
+            XCTAssertGreaterThan(audio.presentationPosition(at: CMTime(seconds: 1_001, preferredTimescale: 1_000_000)),
+                                 Double(sample.frame) / 48_000 + 0.5, "Newer resume retains permission")
+            audio.rebuildAfterMediaServicesReset()
+            XCTAssertFalse(audio.graph === owner)
+            XCTAssertEqual(owner.debugPlayingInterval, 0)
+            XCTAssertEqual(audio.graph.debugPlayingInterval, 0)
+            XCTAssertNil(owner.presentationPosition(token: sample.token,
+                at: CMTime(seconds: 1_001, preferredTimescale: 1_000_000)))
+        }
+        #else
+        XCTFail("Clock activity calibration requires DEBUG")
+        #endif
+    }
+
+    func testPlaybackClockAuthorityExhaustionCannotReuseAnOldInterval() async throws {
+        #if DEBUG
+        try await withManualAnchorControl("control-ticket-exhaustion") { audio, sample in
+            audio.suspend(); audio.settlePausedState()
+            XCTAssertTrue(audio.debugSetInactiveControlTicket(UInt64.max - 2))
+            try audio.setPlaying(true)
+            XCTAssertEqual(audio.debugPlaybackControlTicket, UInt64.max - 1)
+            do { try audio.setPlaying(true); XCTFail("The unissued sentinel must refuse a new operation") }
+            catch ContinuousAudioPlayer.PlaybackControlError.authorityExhausted {}
+            XCTAssertEqual(audio.debugPlaybackControlTicket, UInt64.max)
+            XCTAssertEqual(audio.graph.debugPlayingInterval, 0)
+            audio.suspend(); audio.settlePausedState()
+            XCTAssertFalse(audio.graph.engine.isRunning)
+            XCTAssertEqual(audio.presentationPosition(at: CMTime(seconds: 1_001, preferredTimescale: 1_000_000)),
+                Double(sample.frame) / 48_000, accuracy: 0.5 / 48_000)
+        }
+        try await withManualAnchorControl("render-interval-exhaustion") { audio, _ in
+            audio.suspend(); audio.settlePausedState()
+            XCTAssertTrue(audio.graph.debugSetInactiveIntervalIssuer(UInt64.max - 2))
+            try audio.setPlaying(true)
+            XCTAssertEqual(audio.graph.debugPlayingInterval, UInt64.max - 1)
+            audio.suspend(); audio.settlePausedState()
+            do { try audio.setPlaying(true); XCTFail("An exhausted clock must not reuse its last interval") }
+            catch ContinuousAudioPlayer.PlaybackControlError.renderClockExhausted {}
+            XCTAssertEqual(audio.graph.debugPlayingInterval, 0)
+            audio.suspend(); audio.settlePausedState()
+            XCTAssertFalse(audio.graph.engine.isRunning)
+        }
+        #else
+        XCTFail("Clock activity calibration requires DEBUG")
+        #endif
+    }
+
     #if DEBUG
+    private enum AnchorControlCalibrationFailure: Error { case syntheticAfterSuccessfulSDKStart }
+    private func withManualAnchorControl(_ label: String,
+        body: @MainActor (ContinuousAudioPlayer, ContinuousPCMRenderer.Snapshot) throws -> Void) async throws {
+        guard Self.unresolvedRenderAnchorCalibrationOwner == nil else {
+            XCTFail("An unacknowledged prior owner forbids another calibration")
+            throw RenderAnchorCalibrationSetupError.ownerNotClosed
+        }
+        let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+        let audio = ContinuousAudioPlayer(debugRenderAccounting: accounting)
+        Self.unresolvedRenderAnchorCalibrationOwner = audio
+        var originalError: Error?, sample: ContinuousPCMRenderer.Snapshot?
+        var beforeEntered: UInt64 = 0, afterEntered: UInt64 = 0, afterCompleted: UInt64 = 0
+        var setup = false
+        do {
+            let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+            audio.setWindow(["a"])
+            let entry = try await audio.prepare(id: "a", url: url, currentPriority: true)
+            try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+            guard entry.frames > 4_832, audio.select(id: "a", position: 0.1) else { throw RenderAnchorCalibrationSetupError.unqualified }
+            try audio.setPlaying(true)
+            let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+            guard try audio.graph.engine.renderOffline(32, to: output) == .success else { throw RenderAnchorCalibrationSetupError.unqualified }
+            let observed = audio.snapshot, counters = try XCTUnwrap(accounting.snapshot())
+            beforeEntered = counters.sourceCallbacksEntered
+            guard observed.token == entry.token, observed.visit > 0, observed.frame >= 4_832,
+                  !observed.ended, observed.underrunFrames == 0, !audio.isSelectionPending(in: observed),
+                  beforeEntered > 0, beforeEntered == counters.sourceCallbacksCompleted, !counters.overflowed else {
+                throw RenderAnchorCalibrationSetupError.unqualified
+            }
+            setup = true; sample = observed
+            try body(audio, observed)
+            let after = audio.snapshot, finalCounters = try XCTUnwrap(accounting.snapshot())
+            afterEntered = finalCounters.sourceCallbacksEntered; afterCompleted = finalCounters.sourceCallbacksCompleted
+            XCTAssertEqual(after.token, observed.token); XCTAssertEqual(after.visit, observed.visit)
+            XCTAssertEqual(after.selectionVersion, observed.selectionVersion); XCTAssertEqual(after.frame, observed.frame)
+            XCTAssertEqual(after.underrunFrames, 0)
+            XCTAssertEqual(afterEntered, beforeEntered); XCTAssertEqual(afterCompleted, beforeEntered)
+            XCTAssertFalse(finalCounters.overflowed)
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, 6_912_000); XCTAssertEqual(audio.preparedCount, 1)
+        } catch { originalError = error }
+        audio.debugPlaybackBoundary = nil; audio.debugAfterEngineStart = nil
+        audio.graph.debugAfterPresentationLatencyRead = nil
+        audio.suspend(); audio.graph.engine.stop()
+        let closed = Mutex<Bool?>(nil)
+        audio.debugShutdown { value in closed.withLock { $0 = value } }
+        let returned = await Self.capCancellationWait(.seconds(3)) { closed.withLock { $0 != nil } }
+        let acknowledged = returned && closed.withLock { $0 == true }
+        if acknowledged, Self.unresolvedRenderAnchorCalibrationOwner === audio {
+            Self.unresolvedRenderAnchorCalibrationOwner = nil
+        } else {
+            setup = false
+            if originalError == nil { originalError = RenderAnchorCalibrationSetupError.closeUnacknowledged }
+        }
+        XCTAssertTrue(acknowledged)
+        print("RenderAnchorLifecycleControl schema=1 label=\(label) setup=\(setup) callbackBefore=\(beforeEntered) callbackAfter=\(afterEntered) completedAfter=\(afterCompleted) token=\(sample?.token ?? 0) frame=\(sample?.frame ?? 0) closeAcknowledged=\(acknowledged) ownerRetained=\(Self.unresolvedRenderAnchorCalibrationOwner === audio) originalErrorRetained=\(originalError != nil) syntheticPublication=true sdkTimestampProof=false sdkBoundaryHooks=after-real-call bodyAssertions=external latencyAcceptance=false")
+        if let originalError { throw originalError }
+    }
+
     // One bounded actor-owned retention slot. No automatic late-ACK retry or new owner starts while occupied.
     private static var unresolvedRenderAnchorCalibrationOwner: ContinuousAudioPlayer?
     private enum RenderAnchorCalibrationSetupError: Error { case unqualified, ownerNotClosed, ownerChanged, closeUnacknowledged }

@@ -37,6 +37,7 @@ final class ContinuousAudioPlayer {
     private var successors: [Int: Int] = [:]
     private(set) var selectedID: String?
     private var renderingPermitted = false
+    private var playbackControlTicket: UInt64 = 0 // Main actor only; .max is never issued.
     private var failedTokens = Set<Int>()
     private var pendingPosition: (version: Int, position: Double)?
 
@@ -289,15 +290,63 @@ final class ContinuousAudioPlayer {
     func setPlaying(_ playing: Bool) throws {
         // An engine that iOS stopped during interruption/configuration must be
         // started again only after the service has reactivated its session.
+        let owner = graph
+        guard let control = issuePlaybackControl() else { throw PlaybackControlError.authorityExhausted }
+        if !playing { owner.endPlayingInterval() }
         renderer.setPlaying(playing)
         do {
-            if playing, !graph.engine.isRunning { graph.engine.prepare(); try graph.engine.start() }
+            if playing {
+                let running = owner.engine.isRunning
+                #if DEBUG
+                debugPlaybackBoundary?(.playingRunning)
+                #endif
+                guard ownsPlaybackControl(control, graph: owner) else { return }
+                guard owner.beginPlayingInterval(restarting: !running) else { throw PlaybackControlError.renderClockExhausted }
+                if !running {
+                    owner.engine.prepare()
+                    #if DEBUG
+                    debugPlaybackBoundary?(.playingPrepared)
+                    #endif
+                    guard ownsPlaybackControl(control, graph: owner) else { return }
+                    try owner.engine.start()
+                    #if DEBUG
+                    debugPlaybackBoundary?(.playingStarted)
+                    try debugAfterEngineStart?()
+                    #endif
+                }
+            }
+            guard ownsPlaybackControl(control, graph: owner) else { return }
             renderingPermitted = playing
         } catch {
+            guard ownsPlaybackControl(control, graph: owner) else { return }
+            owner.endPlayingInterval()
             renderer.setPlaying(false); renderingPermitted = false
             throw error
         }
     }
+    private func issuePlaybackControl() -> UInt64? {
+        guard playbackControlTicket < UInt64.max - 1 else {
+            playbackControlTicket = .max
+            graph.endPlayingInterval(); renderer.setPlaying(false); renderingPermitted = false
+            return nil
+        }
+        playbackControlTicket += 1; return playbackControlTicket
+    }
+    private func ownsPlaybackControl(_ control: UInt64, graph owner: ContinuousAudioGraph) -> Bool {
+        playbackControlTicket == control && graph === owner
+    }
+    enum PlaybackControlError: Error { case authorityExhausted, renderClockExhausted }
+    #if DEBUG
+    enum DebugPlaybackBoundary { case playingRunning, playingPrepared, playingStarted, pausedRunning, paused, rebuildStopped, rebuildCreated }
+    var debugPlaybackBoundary: ((DebugPlaybackBoundary) -> Void)?
+    var debugAfterEngineStart: (() throws -> Void)?
+    var debugPlaybackControlTicket: UInt64 { playbackControlTicket }
+    func debugSetInactiveControlTicket(_ value: UInt64) -> Bool {
+        guard !renderingPermitted, graph.engine.isInManualRenderingMode, graph.engine.manualRenderingMode == .offline,
+              value >= playbackControlTicket else { return false }
+        playbackControlTicket = value; return true
+    }
+    #endif
     func setSpeakerEnabled(_ enabled: Bool) { renderer.setSpeakerEnabled(enabled) }
     func adoptRendered(id: String) { selectedID = id }
     func isSelectionPending(in sample: ContinuousPCMRenderer.Snapshot) -> Bool {
@@ -337,15 +386,28 @@ final class ContinuousAudioPlayer {
         evictUnused()
         return selected
     }
-    func suspend() { renderingPermitted = false; renderer.setPlaying(false) }
+    func suspend() {
+        _ = issuePlaybackControl()
+        graph.endPlayingInterval(); renderingPermitted = false; renderer.setPlaying(false)
+    }
     func settlePausedState() {
-        guard !renderingPermitted, graph.engine.isRunning else { return }
+        guard !renderingPermitted else { return }
+        let owner = graph, control = playbackControlTicket
+        let running = owner.engine.isRunning
+        #if DEBUG
+        debugPlaybackBoundary?(.pausedRunning)
+        #endif
+        guard ownsPlaybackControl(control, graph: owner), !renderingPermitted, running else { return }
         let sample = renderer.snapshot
         if let selectedID, entries[selectedID]?.token != sample.token { return }
         if selectedID == nil, sample.token != 0 { return }
         if let pendingPosition, pendingPosition.version != sample.selectionVersion { return }
         pendingPosition = nil
-        graph.engine.pause()
+        owner.engine.pause()
+        #if DEBUG
+        debugPlaybackBoundary?(.paused)
+        #endif
+        guard ownsPlaybackControl(control, graph: owner) else { return }
         evictUnused()
     }
     @discardableResult
@@ -362,8 +424,18 @@ final class ContinuousAudioPlayer {
     }
     func rebuildAfterMediaServicesReset() {
         suspend()
-        graph.engine.stop()
-        graph = ContinuousAudioGraph(renderer: renderer)
+        let owner = graph, control = playbackControlTicket
+        owner.engine.stop()
+        #if DEBUG
+        debugPlaybackBoundary?(.rebuildStopped)
+        #endif
+        guard ownsPlaybackControl(control, graph: owner), !renderingPermitted else { return }
+        let replacement = ContinuousAudioGraph(renderer: renderer)
+        #if DEBUG
+        debugPlaybackBoundary?(.rebuildCreated)
+        #endif
+        guard ownsPlaybackControl(control, graph: owner), !renderingPermitted else { return }
+        graph = replacement
     }
     func trimWindow(preserving requestedID: String? = nil) {
         setWindow(Set([currentEntry?.id, selectedID, requestedID].compactMap { $0 }))
