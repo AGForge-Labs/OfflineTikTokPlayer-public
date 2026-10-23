@@ -552,6 +552,37 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             traceClockHandoff: true, initialNativeStartCurrentItemTime: false)
     }
 
+    func testRetainedNativeHostAnchorValidThenInvalid() async throws {
+        try await runRetainedNativeHostAnchorComparison([true, false], order: "valid-then-invalid")
+    }
+
+    func testRetainedNativeHostAnchorInvalidThenValid() async throws {
+        try await runRetainedNativeHostAnchorComparison([false, true], order: "invalid-then-valid")
+    }
+
+    private func runRetainedNativeHostAnchorComparison(_ modes: [Bool], order: String) async throws {
+        try recordRuntimeHost()
+        for (ordinal, synchronizedHost) in modes.enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            print("NativeHostAnchorArm schema=1 armID=\(armID) order=\(order) ordinal=\(ordinal) synchronizedHost=\(synchronizedHost) itemTime=current-item-time CPPAudioAnchor=unchanged activationBarrier=unchanged acceptance=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, initialNativeStartCurrentItemTime: true,
+                nativeInitialStartUsesSynchronizedHost: synchronizedHost)
+            print("NativeHostAnchorArmEnd schema=1 armID=\(armID) helperReturned=true")
+        }
+    }
+
+    func testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback() async throws {
+        try recordRuntimeHost()
+        try await assertDefaultRetainedPreviousStart(priorExplicitSeek: true, unsynchronizedHostControl: true)
+    }
+
+    func testRetainedNativeHostControlStaleRequestKeepsProductionArgument() async throws {
+        try recordRuntimeHost()
+        try await assertDefaultRetainedPreviousStart(priorExplicitSeek: false,
+            unsynchronizedHostControl: true, mismatchedControlRequest: true)
+    }
+
     func testDefaultRetainedPreviousUsesCurrentPositionAfterOwnedRewind() async throws {
         try await assertDefaultRetainedPreviousStart(priorExplicitSeek: false)
     }
@@ -560,7 +591,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await assertDefaultRetainedPreviousStart(priorExplicitSeek: true)
     }
 
-    private func assertDefaultRetainedPreviousStart(priorExplicitSeek: Bool) async throws {
+    private func assertDefaultRetainedPreviousStart(priorExplicitSeek: Bool,
+        unsynchronizedHostControl: Bool = false, mismatchedControlRequest: Bool = false) async throws {
         #if DEBUG
         let buffer = PlaybackBuffer()
         try await withOwnedNaturalFixture(buffer: buffer) { fixture, audio, service, screen in
@@ -571,7 +603,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     if handoffs.count < 8 { handoffs.append(value) } else { overflow = true }
                 }
             }
-            defer { service.onDebugVideoRateHandoff = nil }
+            defer { service.onDebugVideoRateHandoff = nil; service.debugInitialNativeStartControl = nil }
             XCTAssertNil(service.debugInitialNativeStartControl, "Exercise default production policy")
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
@@ -592,6 +624,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             try await require({ buffer.previousMediaID == fixture.aID && buffer.debugPreviousCompletedZeroRewind == true },
                 "A must complete its owned native offscreen rewind")
             let request = service.debugInitialVideoReadyState.generation + 1
+            if unsynchronizedHostControl {
+                service.debugInitialNativeStartControl = .init(
+                    request: request - (mismatchedControlRequest ? 1 : 0), usesCurrentItemTime: true,
+                    usesSynchronizedHostTime: false)
+            }
             service.previous()
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
             XCTAssertTrue(service.player.currentItem === originalA)
@@ -600,7 +637,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(returned.item, ObjectIdentifier(originalA))
             XCTAssertTrue(returned.presentationUnchanged)
             XCTAssertTrue(returned.entryObservedItemMatches && returned.returnObservedItemMatches)
-            XCTAssertNil(returned.initialStartArgument, "No counterfactual DEBUG override")
+            if unsynchronizedHostControl && !mismatchedControlRequest {
+                let argument = try XCTUnwrap(returned.initialStartArgument)
+                XCTAssertTrue(argument.requestedCurrentItemTime)
+                XCTAssertFalse(argument.requestedSynchronizedHostTime)
+                XCTAssertFalse(argument.historyQualifiedNearZero,
+                    "Explicit-seek history must refuse both current-item-time and unsynchronized-host treatment")
+            } else { XCTAssertNil(returned.initialStartArgument, "Default or stale control keeps production policy") }
+            XCTAssertTrue(returned.anchorHostTime.isNumeric && returned.anchorHostTime.seconds.isFinite,
+                "Explicit-seek and stale-request controls must retain the real synchronized production host")
+            if unsynchronizedHostControl {
+                print("NativeHostFallbackReceipt schema=1 priorExplicitSeek=\(priorExplicitSeek) staleRequest=\(mismatchedControlRequest) request=\(request) argumentPresent=\(returned.initialStartArgument != nil) historyQualified=\(returned.initialStartArgument?.historyQualifiedNearZero == true) actualItemNumeric=\(returned.anchorTime.isNumeric) actualItemValid=\(returned.anchorTime.isValid) actualHostNumeric=\(returned.anchorHostTime.isNumeric) actualHostFinite=\(returned.anchorHostTime.seconds.isFinite) ownerUnchanged=\(returned.presentationUnchanged) seekSerial=\(returned.entrySeekState.serial) acceptance=unchanged")
+            }
             XCTAssertEqual(returned.anchorTime.isValid, priorExplicitSeek,
                 "Only unseeked, proven retained Previous may avoid numeric repositioning")
             if priorExplicitSeek {
@@ -3769,6 +3817,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 queuedPreviousLead: Bool? = nil,
                                                 traceReturnedAProducerBoundary: Bool? = nil,
                                                 initialNativeStartCurrentItemTime: Bool? = nil,
+                                                nativeInitialStartUsesSynchronizedHost: Bool? = nil,
                                                 traceReturnedAStereoZero: Bool? = nil,
                                                 earlyClockAcquisition: Bool? = nil,
                                                 wholeFrameClockAcquisition: Bool? = nil,
@@ -3783,6 +3832,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 queuedPreviousAdvance: Bool? = nil,
                                                 readyNotificationTiming: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
+        if nativeInitialStartUsesSynchronizedHost != nil && initialNativeStartCurrentItemTime != true {
+            XCTFail("Host comparison requires the existing eligible current-item-time control")
+            throw SelectionVideoTestFailure.timeout
+        }
         #if DEBUG
         if joinSourceCallbackClockLedger && capClockBoundary == nil {
             XCTFail("Joined source receipts require the explicit existing CAP boundary comparison")
@@ -4313,7 +4366,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         let handoffTrace = traceClockHandoff.map {
             NativeClockHandoffTrace(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation,
-                expectedCurrentItemTime: initialNativeStartCurrentItemTime)
+                expectedCurrentItemTime: initialNativeStartCurrentItemTime,
+                expectedSynchronizedHostTime: nativeInitialStartUsesSynchronizedHost)
         }
         let capClockTrace = capClockBoundary.map {
             PresentationClockBoundaryTrace(enabled: $0,
@@ -4330,7 +4384,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let currentItemTime = initialNativeStartCurrentItemTime {
             // Initial A and B stay numeric. Only the existing returned-A start varies.
             service.debugInitialNativeStartControl = .init(
-                request: service.debugInitialVideoReadyState.generation + 3, usesCurrentItemTime: currentItemTime)
+                request: service.debugInitialVideoReadyState.generation + 3, usesCurrentItemTime: currentItemTime,
+                usesSynchronizedHostTime: nativeInitialStartUsesSynchronizedHost ?? true)
         }
         if let enabled = traceClockHandoff {
             print("NativeClockHandoffInstrumentationBundle schema=3 enabled=\(enabled) actualRateAndOrdinaryRead=true snapshotReadReceipt=\(enabled) firstAlignedEnqueue=\(enabled) compoundPollPair=\(enabled) firstPositiveExistingRead=\(enabled) addedReadValueCapacity=6 noNewReadCalls=true noNewClockSites=true observersBundled=true individualObserverAttribution=false acceptance=unchanged")
@@ -12724,14 +12779,17 @@ private final class NativeClockHandoffTrace {
     }
     private let enabled: Bool, baseRequest: Int
     private let expectedCurrentItemTime: Bool?
+    private let expectedSynchronizedHostTime: Bool?
     private var slots = Array(repeating: Slot(), count: 6)
     private var orphans: UInt64 = 0, reads: UInt64 = 0
     private var overflow = false
     private var availabilitySlots: [AvailabilitySlot] = []
     private var availabilityOrphans: UInt64 = 0, availabilityOverflow = false
-    init(enabled: Bool, baseRequest: Int, expectedCurrentItemTime: Bool? = nil) {
+    init(enabled: Bool, baseRequest: Int, expectedCurrentItemTime: Bool? = nil,
+        expectedSynchronizedHostTime: Bool? = nil) {
         self.enabled = enabled; self.baseRequest = baseRequest
         self.expectedCurrentItemTime = expectedCurrentItemTime
+        self.expectedSynchronizedHostTime = expectedSynchronizedHostTime
         if enabled {
             availabilitySlots = Array(repeating: AvailabilitySlot(), count: 3)
             print("NativeClockStartScope schema=1 enabled=true phases=3 additionalReadValueCapacity=6 selection=first-qualified-returned-positive-after-sole-initial-setRate positive=rate-and-raw-and-decision-position-greater-than-zero predecessor=immediately-previous-returned-callback-stopped-rate-zero seekSerialRequired=0 counters=saturating extraGetters=0 newClockSites=0 timebaseIdentity=unavailable jointSnapshot=false unreturnedCalls=unverified publication=after-cleanup playbackAcceptance=unchanged")
@@ -12806,10 +12864,16 @@ private final class NativeClockHandoffTrace {
         guard let argument = h.initialStartArgument, argument.requestedCurrentItemTime == expected,
               argument.historyQualifiedNearZero, argument.desiredAudioGoal.isFinite,
               argument.desiredAudioGoal >= 0, argument.desiredAudioGoal <= 0.080,
-              h.anchorHostTime.isNumeric, h.anchorHostTime.seconds.isFinite else { return false }
+              hostArgumentMatches(h) else { return false }
         if expected { return !h.anchorTime.isValid && !h.anchorTime.isNumeric }
         return h.anchorTime.isNumeric && CMTimeCompare(h.anchorTime,
             CMTime(seconds: argument.desiredAudioGoal, preferredTimescale: 48_000)) == 0
+    }
+    private func hostArgumentMatches(_ h: PlaybackService.DebugVideoRateHandoff) -> Bool {
+        let expected = expectedSynchronizedHostTime ?? true
+        guard h.initialStartArgument?.requestedSynchronizedHostTime == expected else { return false }
+        return expected ? (h.anchorHostTime.isNumeric && h.anchorHostTime.seconds.isFinite)
+            : (!h.anchorHostTime.isValid && !h.anchorHostTime.isNumeric)
     }
     private func initialClockHandoffQualified(_ h: PlaybackService.DebugVideoRateHandoff, phase: Int) -> Bool {
         guard h.cause == .initialReady, slots[phase * 2].commands == 1,
@@ -12961,13 +13025,24 @@ private final class NativeClockHandoffTrace {
         XCTAssertTrue(qualified, "Unqualified/missing target start cannot establish argument sensitivity")
         XCTAssertTrue(expectedCurrentItemTime ? actualInvalid : actualNumericMatchesGoal,
                       "The ON arm must actually pass invalid; numeric is never an ON substitute")
-        XCTAssertTrue(handoff?.anchorHostTime.isNumeric == true)
-        XCTAssertTrue(handoff?.anchorHostTime.seconds.isFinite == true)
+        if expectedSynchronizedHostTime == false {
+            XCTAssertTrue(handoff.map { !$0.anchorHostTime.isValid && !$0.anchorHostTime.isNumeric } == true)
+        } else {
+            XCTAssertTrue(handoff?.anchorHostTime.isNumeric == true)
+            XCTAssertTrue(handoff?.anchorHostTime.seconds.isFinite == true)
+        }
+        if let expectedSynchronizedHostTime {
+            XCTAssertEqual(argument?.requestedSynchronizedHostTime, expectedSynchronizedHostTime)
+            XCTAssertTrue(handoff.map { hostArgumentMatches($0) } == true)
+            print("NativeHostArgumentReceipt schema=1 phase=2 expectedSynchronizedHost=\(expectedSynchronizedHostTime) argumentPresent=\(argument != nil) historyQualified=\(qualified) actualHostValid=\(handoff?.anchorHostTime.isValid ?? false) actualHostNumeric=\(handoff?.anchorHostTime.isNumeric ?? false) actualHostSeconds=\(handoff.map { String($0.anchorHostTime.seconds) } ?? "unavailable") actualHostMatches=\(handoff.map { hostArgumentMatches($0) } == true) actualItemInvalid=\(actualInvalid) noNewGetters=true CPPAudioAnchor=unchanged activationBarrier=unchanged publication=after-cleanup-wait acceptance=unchanged")
+        }
         for phase in 0..<2 {
             let control = slots[phase * 2].handoff
             XCTAssertNotNil(control, "Initial A and B are unchanged numeric positive controls")
             XCTAssertNil(control?.initialStartArgument)
             XCTAssertTrue(control?.anchorTime.isNumeric == true)
+            XCTAssertTrue(control?.anchorHostTime.isNumeric == true)
+            XCTAssertTrue(control?.anchorHostTime.seconds.isFinite == true)
         }
     }
     func dumpAndAssert() {

@@ -1,0 +1,13 @@
+# Retained Previous native host-anchor comparison
+
+The authorized repair must eliminate loading delay and audible gaps while preserving source content, selected visible frames, user intent, safe interruptions and bounded resources. Existing instructions delegate routine implementation and free unsigned validation; this document records a small experimental decision, not release approval.
+
+Run40035741696/source27da6fd has114Core passes and5native cases2pass/3fail, six250ms readiness failures. Two retained Previous starts return from setRate at33.306/22.676ms, remain observed stopped through797.112/431.918ms, become observed positive at832.285/468.967ms, then admit output within0.16ms. Owner/seekserial0/current-item-time and valid near-current host anchors qualify. The underlying wait cause is unproved. DefaultNext253.996ms is separate and untraced. All9audio audit windows are clean; historical silence remains unresolved.
+
+Approaches considered: an immediate second output pull targets only a later17.8ms component and Apple requires newer data after acquisition; a broad player/preloading rewrite is not yet justified. The selected experiment varies only the native host-time argument at the measured stopped-clock boundary. It is the implementer's choice under the delegated cause-focused workflow, not a user-selected release policy.
+
+Extend the existing request-scoped DEBUG initial-start control. Both comparison arms request itemTime.invalid only under the existing exact retained-zero eligibility. Native host time is either the unchanged audio-derived anchor or invalid. CPP's installed audio-derived timeline, native-clock activation barrier, ordinary drift correction, timers and output ownership remain unchanged. A failed eligibility condition keeps the production numeric/valid-host fallback and must not qualify treatment. No Release behavior changes.
+
+Counterbalanced native tests retain the original250ms video/100ms audio/80ms alignment/5ms acquisition/two-display-tick/identity/progress/actual-stereo-zero/memory/cleanup guards. Existing handoff receipts must verify the actual host argument, with finite-host qualification preserved for ordinary controls. Exercise explicit-seek fallback and stale request controls. One unsigned standard Mac worker/jobs1, synthetic fixtures only, exact source pins, bounded raw/structured evidence. No merge/sign/upload/release/environment or credential changes.
+
+Accept an optimization only after supported measured benefit and all applicable final-source checks. Clean nonrecurrence is not a silence fix. User-permitted overlap stays strictly below100ms and remains disabled. Physical iPhone/OnTrac and speaker behavior remain pending; another app's exclusive audio session cannot be overridden.

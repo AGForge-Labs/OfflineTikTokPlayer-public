@@ -58,11 +58,24 @@ final class PlaybackService: NSObject {
     struct DebugInitialNativeStartControl: Sendable {
         let request: Int
         let usesCurrentItemTime: Bool
+        let usesSynchronizedHostTime: Bool
+        init(request: Int, usesCurrentItemTime: Bool, usesSynchronizedHostTime: Bool = true) {
+            self.request = request; self.usesCurrentItemTime = usesCurrentItemTime
+            self.usesSynchronizedHostTime = usesSynchronizedHostTime
+        }
     }
     struct DebugInitialNativeStartArgument: Sendable {
         let requestedCurrentItemTime: Bool
         let historyQualifiedNearZero: Bool
         let desiredAudioGoal: Double
+        let requestedSynchronizedHostTime: Bool
+        init(requestedCurrentItemTime: Bool, historyQualifiedNearZero: Bool,
+            desiredAudioGoal: Double, requestedSynchronizedHostTime: Bool = true) {
+            self.requestedCurrentItemTime = requestedCurrentItemTime
+            self.historyQualifiedNearZero = historyQualifiedNearZero
+            self.desiredAudioGoal = desiredAudioGoal
+            self.requestedSynchronizedHostTime = requestedSynchronizedHostTime
+        }
     }
     // Isolated ablation only; nil uses the guarded production startup policy.
     @ObservationIgnored var debugInitialNativeStartControl: DebugInitialNativeStartControl?
@@ -1200,15 +1213,20 @@ final class PlaybackService: NSObject {
                                         let qualified = permitsCurrentPositionStart()
                                         argument = DebugInitialNativeStartArgument(
                                             requestedCurrentItemTime: control.usesCurrentItemTime,
-                                            historyQualifiedNearZero: qualified, desiredAudioGoal: anchor.position)
+                                            historyQualifiedNearZero: qualified, desiredAudioGoal: anchor.position,
+                                            requestedSynchronizedHostTime: control.usesSynchronizedHostTime)
                                     }
                                     // History qualifies intent/owner, not the native position at issue.
                                     let useCurrent = argument.map {
                                         $0.requestedCurrentItemTime && $0.historyQualifiedNearZero
                                     } ?? permitsCurrentPositionStart()
+                                    // Only the exact eligible retained start may vary its native host argument.
+                                    // CPP keeps its installed audio-derived timeline and normal activation barrier.
+                                    let nativeHost: CMTime = useCurrent
+                                        && argument?.requestedSynchronizedHostTime == false ? .invalid : anchor.host
                                     self.debugSetVideoRate(1, time: useCurrent ? .invalid
                                         : CMTime(seconds: anchor.position, preferredTimescale: 48_000),
-                                        atHostTime: anchor.host, item: playerItem, request: request, cause: .initialReady,
+                                        atHostTime: nativeHost, item: playerItem, request: request, cause: .initialReady,
                                         initialStartArgument: argument)
                                 }
                                 #else
