@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=b753e942e4afce6429783b9554b8cc61dc9036e9
+expected_code_source=cbaf778759092dd0c2157ef91324e4f828b08097
 expected_ios_tree=4f9f7b0cec197473b6c2861161f2aeb3a7729ee2
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testQueuedPreviousAdvanceOffFirst',
-    'testQueuedPreviousAdvanceOnFirst',
-    'testQueuedPreviousAdvanceOnSecond',
-    'testQueuedPreviousAdvanceOffSecond',
+    'testFirstZeroSourceCallbacksOffThenOn',
+    'testFirstZeroSourceCallbacksOnThenOff',
+    'testFirstStereoZeroEventOffThenOn',
+    'testFirstStereoZeroEventOnThenOff',
 )
 
 def require(condition, message):
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testQueuedPreviousAdvanceOffFirst testQueuedPreviousAdvanceOnFirst testQueuedPreviousAdvanceOnSecond testQueuedPreviousAdvanceOffSecond) ;;
+  controls) cases=(testFirstZeroSourceCallbacksOffThenOn testFirstZeroSourceCallbacksOnThenOff testFirstStereoZeroEventOffThenOn testFirstStereoZeroEventOnThenOff) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
