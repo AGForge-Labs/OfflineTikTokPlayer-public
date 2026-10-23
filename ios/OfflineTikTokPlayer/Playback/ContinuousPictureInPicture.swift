@@ -495,6 +495,13 @@ final class ContinuousPictureInPicture: NSObject {
         let resourceOwnership: Int
     }
     var onDebugRenderStamp: ((DebugRenderStamp) -> Void)?
+    struct DebugCopiedPixelContext {
+        let pull: CurrentFrameReceipt
+        let requestedTime: CMTime, rawDisplayTime: CMTime
+    }
+    // Synchronous borrowed pixel only. Observers retain scalar audit results;
+    // the actual buffer is never put in a cross-thread or retained receipt.
+    var onDebugCopiedPixel: ((CVPixelBuffer, DebugCopiedPixelContext) -> Void)?
     private var debugRenderRevision: Int?
     private var debugBeforeMask: UInt16 = 0, debugDuringMask: UInt16 = 0, debugAfterMask: UInt16 = 0
     private var debugRenderSawSeek = false
@@ -944,6 +951,7 @@ final class ContinuousPictureInPicture: NSObject {
         onFrameAcquisition = nil
         onDebugRenderStamp = nil
         onDebugNativePullStamp = nil
+        onDebugCopiedPixel = nil
         #endif
         activeSeekTicket = nil
         preparationTask?.cancel()
@@ -1072,6 +1080,13 @@ final class ContinuousPictureInPicture: NSObject {
                                                       itemTimeForDisplay: &displayTime) else { return }
         #endif
         guard ownsFramePull(pullReceipt) else { return }
+        #if DEBUG
+        if let observer = onDebugCopiedPixel {
+            observer(pixel, DebugCopiedPixelContext(pull: pullReceipt,
+                requestedTime: requestedTime, rawDisplayTime: displayTime))
+            guard ownsFramePull(pullReceipt) else { return }
+        }
+        #endif
         if !displayTime.isNumeric { displayTime = requestedTime }
         lastCopiedFramePositionSeconds = CMTimeGetSeconds(displayTime)
         #if DEBUG

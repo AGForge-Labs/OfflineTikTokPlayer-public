@@ -4509,10 +4509,64 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace() async throws {
+        #if DEBUG
+        try await runInitialClockBindingTransferControl(pausedTarget: 0.4, beforeInitialStart: true,
+            tracePausedFirstFrame: true, tracePausedFirstPixel: true)
+        #else
+        XCTFail("First copied-pixel tracing requires DEBUG observation")
+        #endif
+    }
+
+    func testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins() async throws {
+        #if DEBUG
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        guard reader.canAdd(output) else { throw SelectionVideoTestFailure.timeout }
+        reader.add(output)
+        guard reader.startReading() else { throw reader.error ?? SelectionVideoTestFailure.timeout }
+        defer { reader.cancelReading() }
+        var counts = [0, 0, 0]
+        for index in 0..<720 {
+            let (pts, colors) = try autoreleasepool { () throws -> (Double, PausedFirstFrameTrace.PixelColors) in
+                let sample = try XCTUnwrap(output.copyNextSampleBuffer())
+                let pixel = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+                let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
+                XCTAssertTrue(timestamp.isNumeric); XCTAssertEqual(timestamp.epoch, 0)
+                return (timestamp.seconds,
+                    try XCTUnwrap(PausedFirstFrameTrace.pixelColors(pixel)))
+            }
+            XCTAssertEqual(pts, Double(index) / 24, accuracy: 0.5 / 48_000)
+            let step = index / 3, x = ((index / 3) * 10) % 144
+            let y = (step / 72) * 24
+            XCTAssertEqual(colors.minX, x); XCTAssertEqual(colors.maxX, x + 15)
+            XCTAssertEqual(colors.minY, y); XCTAssertEqual(colors.maxY, y + 23)
+            XCTAssertEqual(colors.blueCount, 384); XCTAssertTrue(colors.backgroundRed)
+            let expected = index < 3 ? 1 : ((9...11).contains(index) ? 2 : 0)
+            XCTAssertEqual(colors.classification, expected,
+                "Decoded fixture frame \(index) must separate the initial bin, target .4 bin and every other bin")
+            counts[colors.classification] += 1
+        }
+        XCTAssertNil(output.copyNextSampleBuffer(), "Calibration must cover the complete encoded fixture")
+        XCTAssertEqual(reader.status, .completed)
+        XCTAssertEqual(counts, [714, 3, 3])
+        print("PausedFirstPixelCalibration schema=2 decodedFrames=720 width=160 height=96 initialBin=0 targetBin=3 initialFrames=\(counts[1]) targetFrames=\(counts[2]) otherFrames=\(counts[0]) classifier=blue-marker-full-bounds maximumInspectedPixelsPerFrame=15360 retainedPixelBuffers=0 exactFrameWithinThreeFrameBin=unavailable output=scalar-only")
+        #else
+        XCTFail("First copied-pixel calibration requires DEBUG audit helper")
+        #endif
+    }
+
     #if DEBUG
     private func runInitialClockBindingTransferControl(pausedTarget: Double?,
         beforeInitialStart: Bool = false, traceColdBoundary: Bool = false,
-        completedOwnerPendingImage: Bool = false, tracePausedFirstFrame: Bool = false) async throws {
+        completedOwnerPendingImage: Bool = false, tracePausedFirstFrame: Bool = false,
+        tracePausedFirstPixel: Bool = false) async throws {
+        guard !tracePausedFirstPixel || tracePausedFirstFrame else { throw SelectionVideoTestFailure.timeout }
         if tracePausedFirstFrame {
             guard beforeInitialStart, pausedTarget == 0.4, !traceColdBoundary, !completedOwnerPendingImage else {
                 XCTFail("First-frame tracing requires the unchanged preissue paused .4 control")
@@ -4561,11 +4615,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if traceCold { service.debugInitialLoadPhaseEnabled = true }
             let request = service.debugInitialVideoReadyState.generation + 1
             if tracePausedFirstFrame {
-                let probe = PausedFirstFrameTrace(request: request)
+                let probe = PausedFirstFrameTrace(request: request, tracePixel: tracePausedFirstPixel)
                 firstFrameTrace = probe
                 service.onDebugVideoRenderStamp = { [weak service, weak probe] value in
                     guard let service else { return }
                     probe?.record(service, render: value)
+                }
+                if tracePausedFirstPixel {
+                    service.onDebugCopiedVideoPixel = { [weak service, weak probe] pixel, context in
+                        guard let service else { return }
+                        if probe?.recordCopiedPixel(pixel, context: context, service: service) == true {
+                            service.onDebugCopiedVideoPixel = nil
+                        }
+                    }
                 }
             }
             var starts = 0, overflow = false, qualified = false
@@ -4684,6 +4746,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 service.onDebugVideoStartupStamp = nil
                 service.onDebugVideoSeekCompletionTerminal = nil
                 service.onDebugVideoRenderStamp = nil
+                service.onDebugCopiedVideoPixel = nil
             }
             let coldProbe = traceCold
                 ? NaturalNativeRunwayProbe(phase: "initial-clock-preissue-cold", minimumFailureSeconds: 3) : nil
@@ -4887,6 +4950,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             observePausedSourceVisits = false // Later explicit Play owns its genuine corrections.
             firstFrameTrace?.stop(); service.onDebugVideoRenderStamp = nil
+            service.onDebugCopiedVideoPixel = nil
             service.play()
             try await requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.aID)
             diagnostic?.phase = 4; diagnostic?.record(service, kind: 3)
@@ -4910,6 +4974,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     /// Separate default-off observation of the unchanged paused-target control.
     /// Stamps use CPP's existing first-stage clocks, not a timed SDK copy call.
     @MainActor private final class PausedFirstFrameTrace {
+        struct PixelColors {
+            let minX: Int, maxX: Int, minY: Int, maxY: Int
+            let blueCount: Int, redCount: Int
+            var backgroundRed: Bool { redCount > 14_000 }
+            // These fixture bins each contain three identical consecutive frames.
+            // Full bounds distinguish later positions that cover the same interior patch.
+            var classification: Int {
+                guard backgroundRed, blueCount == 384, minY == 0, maxY == 23 else { return 0 }
+                if minX == 0 && maxX == 15 { return 1 }
+                if minX == 30 && maxX == 45 { return 2 }
+                return 0
+            }
+        }
+        private struct PixelObservation {
+            let context: ContinuousPictureInPicture.DebugCopiedPixelContext
+            let before: ContinuousPCMRenderer.Snapshot, after: ContinuousPCMRenderer.Snapshot
+            let markerVersion: Int?
+            let ownerQualified: Bool
+            let width: Int, height: Int, pixelType: OSType
+            let colors: PixelColors?
+            let auditDurationNs: UInt64
+            let beforeRenderStampOrdinal: Int
+        }
         private struct Event {
             let render: PlaybackService.DebugVideoRenderStamp?
             let terminal: PlaybackService.DebugVideoSeekCompletionTerminal?
@@ -4917,13 +5004,66 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let owner: PlaybackService.DebugAlignedVideoPollState
         }
         private let request: Int
+        private let tracePixel: Bool
+        private var pixelObservation: PixelObservation?
         private var events: [Event] = []
         private var active = true, overflow = false
         private var userSeek: UInt64?
         private var ticket: ContinuousPictureInPicture.PresentationTicket?
         private var revision: Int?
         private var otherRevisions = 0
-        init(request: Int) { self.request = request; events.reserveCapacity(32) }
+        init(request: Int, tracePixel: Bool = false) {
+            self.request = request; self.tracePixel = tracePixel; events.reserveCapacity(32)
+        }
+        // One bounded fixture scan; no buffer copy or retained CV object.
+        static func pixelColors(_ pixel: CVPixelBuffer) -> PixelColors? {
+            let stride = CVPixelBufferGetBytesPerRow(pixel)
+            guard CVPixelBufferGetWidth(pixel) == 160, CVPixelBufferGetHeight(pixel) == 96,
+                  CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
+                  !CVPixelBufferIsPlanar(pixel), stride >= 160 * 4, stride <= 4096,
+                  CVPixelBufferGetDataSize(pixel) >= stride * 96,
+                  CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
+            defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+            guard let base = CVPixelBufferGetBaseAddress(pixel)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            var minX = 160, maxX = -1, minY = 96, maxY = -1, blueCount = 0, redCount = 0
+            for y in 0..<96 { for x in 0..<160 {
+                let index = y * stride + x * 4
+                let b = base[index], g = base[index + 1], r = base[index + 2]
+                if b > 150 && g < 100 && r < 100 {
+                    minX = min(minX, x); maxX = max(maxX, x)
+                    minY = min(minY, y); maxY = max(maxY, y); blueCount += 1
+                } else if r > 150 && g < 100 && b < 100 { redCount += 1 }
+            } }
+            return PixelColors(minX: minX, maxX: maxX, minY: minY, maxY: maxY,
+                blueCount: blueCount, redCount: redCount)
+        }
+        func recordCopiedPixel(_ pixel: CVPixelBuffer,
+            context: ContinuousPictureInPicture.DebugCopiedPixelContext, service: PlaybackService) -> Bool {
+            guard active, tracePixel, pixelObservation == nil,
+                  context.pull.ticket == ticket, context.pull.seekSerial == userSeek else { return false }
+            let ownerBefore = service.debugAlignedVideoPollState
+            let before = service.audioSnapshot
+            let auditBegin = DispatchTime.now().uptimeNanoseconds
+            let colors = Self.pixelColors(pixel)
+            let auditDurationNs = DispatchTime.now().uptimeNanoseconds - auditBegin
+            let after = service.audioSnapshot
+            let ownerAfter = service.debugAlignedVideoPollState
+            func owns(_ value: PlaybackService.DebugAlignedVideoPollState) -> Bool {
+                let frame = value.frame
+                return value.generation == request && value.request == request
+                    && value.presentationMatches && value.observedItemMatches && frame.coherent
+                    && frame.ticket == context.pull.ticket && frame.output == context.pull.output
+                    && frame.seekSerial == context.pull.seekSerial && frame.activeSeekTicket == nil
+                    && frame.imageEpoch == context.pull.imageEpoch
+            }
+            pixelObservation = PixelObservation(context: context, before: before, after: after,
+                markerVersion: service.debugPausedExplicitVisitState?.selectionVersion,
+                ownerQualified: owns(ownerBefore) && owns(ownerAfter),
+                width: CVPixelBufferGetWidth(pixel), height: CVPixelBufferGetHeight(pixel),
+                pixelType: CVPixelBufferGetPixelFormatType(pixel), colors: colors, auditDurationNs: auditDurationNs,
+                beforeRenderStampOrdinal: events.count)
+            return true
+        }
         func bindUserSeek(_ value: UInt64) {
             guard active, value > 0, userSeek == nil else { overflow = true; return }
             userSeek = value
@@ -4948,6 +5088,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         func dumpAndAssert() {
             func show<T>(_ value: T?) -> String { value.map { String(describing: $0) } ?? "unavailable" }
+            if tracePixel {
+                XCTAssertNotNil(pixelObservation, "Inspect the actual first copied pixel for the bound user seek")
+                if let pixel = pixelObservation {
+                    XCTAssertTrue(pixel.ownerQualified)
+                    XCTAssertNotNil(pixel.colors)
+                    XCTAssertTrue(pixel.colors?.classification == 1 || pixel.colors?.classification == 2,
+                        "Ambiguous pixels cannot establish either the initial or requested fixture bin")
+                    let raw = pixel.context.rawDisplayTime
+                    print("PausedFirstCopiedPixel schema=2 request=\(request) seek=\(pixel.context.pull.seekSerial) epoch=\(pixel.context.pull.imageEpoch) beforeRenderStampOrdinal=\(pixel.beforeRenderStampOrdinal) ownerQualified=\(pixel.ownerQualified) width=\(pixel.width) height=\(pixel.height) pixelType=\(pixel.pixelType) requestedSeconds=\(pixel.context.requestedTime.seconds) rawDisplayValue=\(raw.value) rawDisplayTimescale=\(raw.timescale) rawDisplayFlags=\(raw.flags.rawValue) rawDisplayNumeric=\(raw.isNumeric) rawDisplaySeconds=\(show(raw.isNumeric ? raw.seconds : nil)) classification=\(show(pixel.colors?.classification)) minX=\(show(pixel.colors?.minX)) maxX=\(show(pixel.colors?.maxX)) minY=\(show(pixel.colors?.minY)) maxY=\(show(pixel.colors?.maxY)) blueCount=\(show(pixel.colors?.blueCount)) redCount=\(show(pixel.colors?.redCount)) auditDurationNs=\(pixel.auditDurationNs) classifier=blue-marker-full-bounds backgroundRed=\(show(pixel.colors?.backgroundRed)) markerVersion=\(show(pixel.markerVersion)) sourceBeforeToken=\(pixel.before.token) sourceBeforeVisit=\(pixel.before.visit) sourceBeforeVersion=\(pixel.before.selectionVersion) sourceBeforeFrame=\(pixel.before.frame) sourceAfterToken=\(pixel.after.token) sourceAfterVisit=\(pixel.after.visit) sourceAfterVersion=\(pixel.after.selectionVersion) sourceAfterFrame=\(pixel.after.frame) sourceObservations=separate-after-native-copy exactFrameWithinThreeFrameBin=unavailable bufferRetained=false extraConsumingCopies=0 output=after-owned-cleanup-attempt")
+                }
+            }
             let copies = events.filter {
                 $0.render?.render.stage == .copied && $0.render?.render.region == 2
                     && $0.render?.render.nativeSeekTicket == userSeek

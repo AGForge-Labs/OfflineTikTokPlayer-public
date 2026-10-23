@@ -207,6 +207,10 @@ final class PlaybackService: NSObject {
             }
         }
     }
+    @ObservationIgnored var onDebugCopiedVideoPixel:
+        ((CVPixelBuffer, ContinuousPictureInPicture.DebugCopiedPixelContext) -> Void)? {
+        didSet { continuousPiP.onDebugCopiedPixel = onDebugCopiedVideoPixel }
+    }
     struct DebugAlignedVideoPollState: Sendable {
         let frame: ContinuousPictureInPicture.DebugAlignedPollState
         let generation: Int, request: Int?
