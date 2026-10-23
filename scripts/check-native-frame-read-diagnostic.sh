@@ -2,18 +2,17 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Calibrate native reported states; counterbalance bounded extra queries after original clock observations.
-expected_code_source=c0a1c69a473209a191e2ffa7cc00749f9862951c
-expected_ios_tree=0fdb7a494106c210ba9f6b62be1d2ff0d91bb64c
+# Compare loaded native audio-track configuration; retain all original playback guards and constant clock/zero tracing.
+expected_code_source=e9da668cdea770b6d5c15f1cf839ae3103cb3e35
+expected_ios_tree=55158115a3a303908e29f03348e5a7be9f009c1e
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateCalibratesPauseRecoveryAndSupersession
   OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOnThenOff
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -39,13 +38,12 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateCalibratesPauseRecoveryAndSupersession',
     'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativePlayerReportedStateOnThenOff',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOnThenOff',
 }
-if len(expected) != 4 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly four reported-state calibration and original guarded playback identities must exist in the pinned source')
+if len(expected) != 3 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly three loaded-audio track configuration and original guarded playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -54,7 +52,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=4 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=3 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -155,8 +153,8 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=4 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# These four exact identities execute in a fresh disposable process; actual XCTest records establish order.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# These three exact identities execute in a fresh disposable process; actual XCTest records establish order.
 # Original timing, continuity, capture, identity and cleanup assertions remain unchanged.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
 # There is no promotion prefix. Actual XCTest start/result records determine
