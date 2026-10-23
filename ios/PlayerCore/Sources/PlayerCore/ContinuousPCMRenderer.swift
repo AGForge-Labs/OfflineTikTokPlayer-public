@@ -792,12 +792,175 @@ extension ContinuousPCMRenderer {
         }
     }
 
+    /// Diagnostic append-only prefixes. Source and tap have separate writers.
+    /// Publishing a count makes only the immutable entries below that count readable.
+    /// Reading after engine.stop is NOT asserted to be a formal render-thread join.
+    public final class DebugSourceCallbackLedger: @unchecked Sendable {
+        public struct Stamp: Sendable {
+            public var host: UInt64 = 0, sample: Double = 0, rate: Double = 0
+            public var nativeFlags: UInt32 = 0, valid: UInt32 = 0 // 1 host, 2 sample.
+            public init(host: UInt64 = 0, sample: Double = 0, rate: Double = 0,
+                        nativeFlags: UInt32 = 0, valid: UInt32 = 0) {
+                self.host = host; self.sample = sample; self.rate = rate
+                self.nativeFlags = nativeFlags; self.valid = valid
+            }
+        }
+        public struct Run: Sendable { public var first: UInt32 = 0, end: UInt32 = 0 }
+        public struct Source: Sendable {
+            public var stamp = Stamp(), ordinal: UInt64 = 0
+            public var frames: UInt32 = 0, buffers: UInt32 = 0, channels0: UInt32 = 0, channels1: UInt32 = 0
+            public var bytes0: UInt32 = 0, bytes1: UInt32 = 0
+            public var result: Int32 = 0
+            public var entered: UInt32 = 0, completed: UInt32 = 0, requested: UInt32 = 0, classified: UInt32 = 0
+            public var copied: UInt32 = 0, paused: UInt32 = 0, inactive: UInt32 = 0, eof: UInt32 = 0, underrun: UInt32 = 0
+            public var pairs: UInt32 = 0, zeros: UInt32 = 0, nonfinite: UInt32 = 0, runCount: UInt32 = 0
+            public var first = Run(), second = Run(), third = Run(), fourth = Run()
+            public var flags: UInt32 = 0 // 1 complete, 2 accepted planar layout, 4 invalid, 8 run overflow, 16 changed chunk identity.
+            public var token: Int64 = 0, visit: Int64 = 0 // Last-kernel identity only; epoch unavailable.
+        }
+        public struct Tap: Sendable {
+            public var stamp = Stamp()
+            public var bufferRate: Double = 0
+            public var first: UInt32 = 0, end: UInt32 = 0, inputFrames: UInt32 = 0, channels: UInt32 = 0
+            public var flags: UInt32 = 0 // 1 complete admitted input, 2 interleaved; rejected input remains recorded.
+            public init(stamp: Stamp, first: UInt32, end: UInt32, inputFrames: UInt32,
+                        channels: UInt32, flags: UInt32, bufferRate: Double = 0) {
+                self.stamp = stamp; self.first = first; self.end = end
+                self.inputFrames = inputFrames; self.channels = channels; self.flags = flags
+                self.bufferRate = bufferRate
+            }
+        }
+        public struct Prefix: Sendable {
+            public let source: [Source], tap: [Tap]
+            public let enteredBefore: UInt64, enteredAfter: UInt64
+            public let completedBefore: Int, completedAfter: Int, tapsBefore: Int, tapsAfter: Int
+            public let failed: Bool
+            public var stableObservedPrefix: Bool {
+                enteredBefore == enteredAfter && completedBefore == completedAfter && tapsBefore == tapsAfter
+            }
+            public var coverageClosed: Bool { false } // No callback-acknowledged closure protocol.
+        }
+        public let sourceCapacity: Int, tapCapacity: Int
+        public var reservedPayloadBytes: Int {
+            sourceCapacity * MemoryLayout<Source>.stride + tapCapacity * MemoryLayout<Tap>.stride
+        }
+        private let source: UnsafeMutablePointer<Source>, tap: UnsafeMutablePointer<Tap>
+        private let sourceCommitted = Atomic<Int>(0), tapCommitted = Atomic<Int>(0)
+        private let entered = Atomic<UInt64>(0), failed = Atomic<Bool>(false)
+        private var pending = Source(), before = DebugRenderAccountingSnapshot()
+        private var open = false, pendingRun: UInt32?, identitySeen = false
+        private var enteredValue: UInt64 = 0 // Source writer only.
+        public init(sourceCapacity: Int = 4096, tapCapacity: Int = 2048) {
+            precondition(sourceCapacity > 0 && tapCapacity > 0)
+            self.sourceCapacity = sourceCapacity; self.tapCapacity = tapCapacity
+            source = .allocate(capacity: sourceCapacity); tap = .allocate(capacity: tapCapacity)
+            source.initialize(repeating: Source(), count: sourceCapacity)
+            tap.initialize(repeating: Tap(stamp: Stamp(), first: 0, end: 0, inputFrames: 0, channels: 0, flags: 0), count: tapCapacity)
+        }
+        deinit {
+            source.deinitialize(count: sourceCapacity); source.deallocate()
+            tap.deinitialize(count: tapCapacity); tap.deallocate()
+        }
+        private func fail() { failed.store(true, ordering: .releasing) }
+        private func u32(_ value: UInt64) -> UInt32 {
+            guard let value = UInt32(exactly: value) else { fail(); return .max }; return value
+        }
+        private func delta(_ end: UInt64, _ start: UInt64) -> UInt32 {
+            guard end >= start else { fail(); return .max }; return u32(end - start)
+        }
+        public func beginSource(stamp: Stamp, frames: UInt32, counters: DebugRenderAccountingSnapshot) {
+            if open { fail() }
+            if enteredValue == .max { fail() } else { enteredValue += 1 }
+            entered.store(enteredValue, ordering: .releasing)
+            pending = Source(); pending.ordinal = enteredValue; pending.stamp = stamp; pending.frames = frames
+            before = counters; open = true; pendingRun = nil; identitySeen = false
+        }
+        public func layout(buffers: UInt32, channels0: UInt32, channels1: UInt32,
+                           bytes0: UInt32, bytes1: UInt32, dataPresent: Bool) {
+            guard open else { fail(); return }
+            pending.buffers = buffers; pending.channels0 = channels0; pending.channels1 = channels1
+            pending.bytes0 = bytes0; pending.bytes1 = bytes1
+            let needed = UInt64(pending.frames) * 4
+            if buffers == 2 && channels0 == 1 && channels1 == 1 && dataPresent
+                && UInt64(bytes0) >= needed && UInt64(bytes1) >= needed { pending.flags |= 2 }
+            else { pending.flags |= 4; fail() }
+        }
+        /// Existing kernel completion fields only. No new origin capture or per-frame branch.
+        public func observeChunk(_ value: DebugRenderAccountingSnapshot) {
+            guard open else { fail(); return }
+            let token = Int64(value.lastKernelToken), visit = value.lastKernelVisit
+            if identitySeen && (pending.token != token || pending.visit != visit) { pending.flags |= 16 }
+            pending.token = token; pending.visit = visit; identitySeen = true
+        }
+        private func finishRun() {
+            guard let first = pendingRun else { return }; pendingRun = nil
+            let run = Run(first: first, end: pending.pairs)
+            switch pending.runCount {
+            case 0: pending.first = run
+            case 1: pending.second = run
+            case 2: pending.third = run
+            case 3: pending.fourth = run
+            default: pending.flags |= 8; fail()
+            }
+            if pending.runCount == .max { fail() } else { pending.runCount += 1 }
+        }
+        public func writtenPair(left: Float, right: Float) {
+            guard open, pending.pairs < pending.frames else { fail(); return }
+            if !left.isFinite || !right.isFinite { finishRun(); pending.nonfinite += 1 }
+            else if left == 0 && right == 0 {
+                if pendingRun == nil { pendingRun = pending.pairs }; pending.zeros += 1
+            } else { finishRun() }
+            pending.pairs += 1
+        }
+        public func endSource(result: Int32, counters end: DebugRenderAccountingSnapshot) {
+            guard open else { fail(); return }; finishRun(); open = false
+            pending.result = result; pending.flags |= 1
+            pending.entered = delta(end.kernelCallsEntered, before.kernelCallsEntered)
+            pending.completed = delta(end.kernelCallsCompleted, before.kernelCallsCompleted)
+            pending.requested = delta(end.kernelFramesRequested, before.kernelFramesRequested)
+            pending.classified = delta(end.kernelFramesClassified, before.kernelFramesClassified)
+            pending.copied = delta(end.copiedPCMFrames, before.copiedPCMFrames)
+            pending.paused = delta(end.pausedPositiveTokenFrames, before.pausedPositiveTokenFrames)
+            pending.inactive = delta(end.inactiveFrames, before.inactiveFrames)
+            pending.eof = delta(end.eofRemainderFrames, before.eofRemainderFrames)
+            pending.underrun = delta(end.underrunFrames, before.underrunFrames)
+            let classified = UInt64(pending.copied) + UInt64(pending.paused) + UInt64(pending.inactive)
+                + UInt64(pending.eof) + UInt64(pending.underrun)
+            if result != 0 || pending.frames == 0 || end.overflowed || before.overflowed || pending.nonfinite > 0
+                || pending.pairs != pending.frames || pending.entered != pending.completed
+                || pending.requested != pending.frames || pending.classified != pending.frames
+                || classified != UInt64(pending.frames) { pending.flags |= 4; fail() }
+            let index = sourceCommitted.load(ordering: .relaxed)
+            guard index < sourceCapacity else { fail(); return }
+            source[index] = pending; sourceCommitted.store(index + 1, ordering: .releasing)
+        }
+        /// Tap writer only; caller holds its already-existing lock.
+        public func appendTap(_ value: Tap) {
+            let index = tapCommitted.load(ordering: .relaxed)
+            guard index < tapCapacity else { fail(); return }
+            tap[index] = value; tapCommitted.store(index + 1, ordering: .releasing)
+        }
+        /// Off-render only. Copies only immutable, release-published prefixes.
+        public func prefix() -> Prefix {
+            let e0 = entered.load(ordering: .acquiring), s0 = sourceCommitted.load(ordering: .acquiring)
+            let t0 = tapCommitted.load(ordering: .acquiring)
+            let sources = Array(UnsafeBufferPointer(start: source, count: s0))
+            let taps = Array(UnsafeBufferPointer(start: tap, count: t0))
+            return Prefix(source: sources, tap: taps, enteredBefore: e0, enteredAfter: entered.load(ordering: .acquiring),
+                completedBefore: s0, completedAfter: sourceCommitted.load(ordering: .acquiring),
+                tapsBefore: t0, tapsAfter: tapCommitted.load(ordering: .acquiring), failed: failed.load(ordering: .acquiring))
+        }
+    }
+
     /// Optional immutable render configuration. One graph/kernel render writer only.
     /// All storage is fixed before rendering; methods allocate, scan, clock and lock nothing.
     /// Entry/completion are separate short publications, never odd across render/SDK work.
     public final class DebugRenderAccountingRecorder: @unchecked Sendable {
         public let capturesPCMOrigin: Bool
         public let capturesSourceOutput: Bool
+        public let callbackLedger: DebugSourceCallbackLedger?
+        /// Render writer only. This is a plain value copy, NOT snapshot()'s observer protocol.
+        public func renderWriterCounters() -> DebugRenderAccountingSnapshot { state }
         private var state = DebugRenderAccountingSnapshot() // Render writer only.
         private var outputPending = DebugSourceOutputSnapshot()
         private var outputOpen = false
@@ -832,9 +995,12 @@ extension ContinuousPCMRenderer {
             }
         }
 
-        public init(capturePCMOrigin: Bool = false, captureSourceOutput: Bool = false) {
-            capturesPCMOrigin = capturePCMOrigin; capturesSourceOutput = captureSourceOutput; testHooks = nil
-            state.sourceOutput.enabled = captureSourceOutput
+        public init(capturePCMOrigin: Bool = false, captureSourceOutput: Bool = false,
+                    captureCallbackLedger: Bool = false) {
+            capturesPCMOrigin = capturePCMOrigin
+            capturesSourceOutput = captureSourceOutput || captureCallbackLedger; testHooks = nil
+            callbackLedger = captureCallbackLedger ? DebugSourceCallbackLedger() : nil
+            state.sourceOutput.enabled = capturesSourceOutput
             if capturePCMOrigin {
                 state.pcmOrigin = DebugPCMOriginReceipt(valid: false, completion: 0,
                     token: 0, visit: 0, epoch: 0, firstFrame: 0, endFrame: 0)
@@ -844,6 +1010,7 @@ extension ContinuousPCMRenderer {
         }
         init(capturePCMOrigin: Bool = false, captureSourceOutput: Bool = false, testHooks: PublicationTestHooks) {
             precondition(testHooks.initialSequence & 1 == 0)
+            callbackLedger = nil
             capturesPCMOrigin = capturePCMOrigin; capturesSourceOutput = captureSourceOutput; self.testHooks = testHooks
             state.sourceOutput.enabled = captureSourceOutput
             if capturePCMOrigin {
@@ -911,6 +1078,7 @@ extension ContinuousPCMRenderer {
         /// is published per pair; an incomplete callback never becomes complete.
         public func sourceOutputPair(left: Float, right: Float) {
             guard capturesSourceOutput else { return }
+            callbackLedger?.writtenPair(left: left, right: right)
             guard outputOpen else {
                 state.sourceOutput.invalidCallbacks = add(state.sourceOutput.invalidCallbacks, 1)
                 return

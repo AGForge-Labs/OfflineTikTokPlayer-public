@@ -24,6 +24,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     // Test-only immutable per-arm input to the unchanged benchmark signature.
     private var acceptedPCMOriginBenchmarkMode: Bool?
     private var sourceOutputBenchmarkMode: Bool?
+    private var sourceCallbackLedgerBenchmarkMode: Bool?
+    private var sourceCallbackLedgerArmID: String?
     #endif
 
     private func recordRuntimeHost() throws {
@@ -752,6 +754,23 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #else
         XCTFail("Native start argument comparison requires DEBUG")
+        #endif
+    }
+
+    func testSourceCallbackLedgerOffThenOn() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        defer { sourceCallbackLedgerBenchmarkMode = nil; sourceCallbackLedgerArmID = nil }
+        for (ordinal, enabled) in [false, true].enumerated() {
+            sourceCallbackLedgerBenchmarkMode = enabled
+            let armID = UUID().uuidString.lowercased()
+            sourceCallbackLedgerArmID = armID
+            print("SourceCallbackLedgerArm schema=1 armID=\(armID) ordinal=\(ordinal) enabled=\(enabled) numericDefault=true traceVideoSeeks=true traceClockHandoff=true originMode=nil epoch=unavailable exactJoin=false acceptance=unchanged")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false, traceClockHandoff: true)
+            print("SourceCallbackLedgerArmEnd schema=1 armID=\(armID) helperReturned=true")
+        }
+        #else
+        XCTFail("Source callback ledger requires DEBUG")
         #endif
     }
 
@@ -2386,9 +2405,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let acceptedPCMOrigin = acceptedPCMOriginBenchmarkMode
         let originRecorder = acceptedPCMOrigin == true ? DebugAcceptedPCMOriginRecorder() : nil
         let originReply = acceptedPCMOrigin == true ? ProductionPCMOriginReply() : nil
-        let accounting = renderAccounting == true || acceptedPCMOrigin == true
+        let accounting = renderAccounting == true || acceptedPCMOrigin == true || sourceCallbackLedgerBenchmarkMode == true
             ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(capturePCMOrigin: acceptedPCMOrigin == true,
-                captureSourceOutput: sourceOutputBenchmarkMode == true) : nil
+                captureSourceOutput: sourceOutputBenchmarkMode == true,
+                captureCallbackLedger: sourceCallbackLedgerBenchmarkMode == true) : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity,
                                           debugRenderAccounting: accounting, debugAcceptedPCMOrigin: originRecorder,
                                           debugFirstFailure: firstFailure)
@@ -2412,6 +2432,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let audio = ContinuousAudioPlayer()
         #endif
         let tap = ProductionSelectionOutputTap()
+        #if DEBUG
+        tap.callbackLedger = accounting?.callbackLedger
+        let callbackLedgerGraph = sourceCallbackLedgerBenchmarkMode == true ? audio.graph : nil
+        if sourceCallbackLedgerBenchmarkMode != nil {
+            XCTAssertNotNil(sourceCallbackLedgerArmID)
+            XCTAssertTrue(traceVideoSeeks); XCTAssertEqual(traceClockHandoff, true)
+            XCTAssertFalse(traceNativeRefill); XCTAssertNil(initialNativeStartCurrentItemTime)
+            XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(sourceOutputBenchmarkMode)
+            XCTAssertNil(renderAccounting); XCTAssertNil(frameMonitorAlternative); XCTAssertNil(traceDefaultFrameMonitor)
+            XCTAssertNil(suppressNativePlayerRendering); XCTAssertNil(freshPreviousBundle); XCTAssertNil(queuedPreviousLead)
+            XCTAssertNil(nativeVideoGeometry); XCTAssertNil(traceFirstSourceFailure); XCTAssertNil(traceReturnedAProducerBoundary)
+            XCTAssertFalse(auditSavedAAfterCleanup)
+        }
+        #endif
         let seeks = ProductionSelectionSeekRecorder()
         let startup = ProductionVideoStartupTrace(serviceTracing: traceVideoSeeks)
         #if DEBUG
@@ -2734,6 +2768,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         mayRemoveFixture = cleanupReturned && decoderAck == true && preparationAck == true
         print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
         #if DEBUG
+        if let ledger = accounting?.callbackLedger {
+            let prefix = ledger.prefix()
+            let bytes = ledger.reservedPayloadBytes
+            let arm = sourceCallbackLedgerArmID ?? "missing"
+            let ownerMatches = callbackLedgerGraph === audio.graph
+            let admitted = prefix.tap.reduce(UInt64(0)) { $0 + ($1.end >= $1.first ? UInt64($1.end - $1.first) : 0) }
+            print("SourceCallbackLedgerSummary schema=1 armID=\(arm) ownerMatches=\(ownerMatches) bytes=\(bytes) sourceStride=\(MemoryLayout<ContinuousPCMRenderer.DebugSourceCallbackLedger.Source>.stride) tapStride=\(MemoryLayout<ContinuousPCMRenderer.DebugSourceCallbackLedger.Tap>.stride) sourceCapacity=\(ledger.sourceCapacity) tapCapacity=\(ledger.tapCapacity) sourceRecords=\(prefix.source.count) tapRecords=\(prefix.tap.count) enteredBefore=\(prefix.enteredBefore) enteredAfter=\(prefix.enteredAfter) completedBefore=\(prefix.completedBefore) completedAfter=\(prefix.completedAfter) admitted=\(admitted) recorded=\(tap.count) failed=\(prefix.failed) stableObservedPrefix=\(prefix.stableObservedPrefix) coverageClosed=\(prefix.coverageClosed) engineStopObserved=true formalRTJoin=false epoch=unavailable exactJoin=false")
+            XCTAssertLessThan(bytes, 2 * 1024 * 1024)
+            XCTAssertTrue(ownerMatches); XCTAssertGreaterThan(prefix.source.count, 0); XCTAssertGreaterThan(prefix.tap.count, 0)
+            XCTAssertGreaterThan(admitted, 0); XCTAssertEqual(admitted, UInt64(tap.count))
+            XCTAssertEqual(prefix.tap.first?.first, 0); XCTAssertEqual(prefix.tap.last?.end, UInt32(tap.count))
+            XCTAssertTrue(prefix.tap.allSatisfy { $0.end >= $0.first && $0.end - $0.first == $0.inputFrames && $0.flags & 1 != 0 })
+            XCTAssertTrue(zip(prefix.tap, prefix.tap.dropFirst()).allSatisfy { before, after in before.end == after.first })
+            XCTAssertFalse(prefix.failed); XCTAssertTrue(prefix.stableObservedPrefix)
+            XCTAssertEqual(prefix.enteredBefore, UInt64(prefix.completedBefore))
+            // Fixed scalar fields; no reflection/type-name expansion or PCM dump.
+            for s in prefix.source {
+                print("SourceCallbackReceipt schema=1 armID=\(arm) ordinal=\(s.ordinal) host=\(s.stamp.host) hostSeconds=\(AVAudioTime.seconds(forHostTime: s.stamp.host)) sample=\(s.stamp.sample) rate=\(s.stamp.rate) nativeFlags=\(s.stamp.nativeFlags) valid=\(s.stamp.valid) frames=\(s.frames) layout=\(s.buffers),\(s.channels0),\(s.channels1),\(s.bytes0),\(s.bytes1) result=\(s.result) kernel=\(s.entered),\(s.completed),\(s.requested),\(s.classified) disposition=\(s.copied),\(s.paused),\(s.inactive),\(s.eof),\(s.underrun) pairs=\(s.pairs) zeros=\(s.zeros) nonfinite=\(s.nonfinite) runCount=\(s.runCount) runs=\(s.first.first),\(s.first.end);\(s.second.first),\(s.second.end);\(s.third.first),\(s.third.end);\(s.fourth.first),\(s.fourth.end) flags=\(s.flags) token=\(s.token) visit=\(s.visit)")
+            }
+            for (ordinal, t) in prefix.tap.enumerated() {
+                print("TapCallbackReceipt schema=1 armID=\(arm) ordinal=\(ordinal) host=\(t.stamp.host) hostSeconds=\(AVAudioTime.seconds(forHostTime: t.stamp.host)) sample=\(t.stamp.sample) sampleRate=\(t.stamp.rate) bufferRate=\(t.bufferRate) valid=\(t.stamp.valid) first=\(t.first) end=\(t.end) inputFrames=\(t.inputFrames) channels=\(t.channels) flags=\(t.flags)")
+            }
+        }
         if handoffTrace != nil {
             service.onDebugVideoRateHandoff = nil; service.onDebugVideoPositionRead = nil
             service.onDebugAlignedVideoEnqueue = nil
@@ -8630,6 +8687,10 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
 /// Fixed 12-second storage for actual mixer PCM and its AVAudioTime host timeline.
 /// The tap is disabled during the first two 8-second renderer-only windows.
 private final class ProductionSelectionOutputTap: @unchecked Sendable {
+    #if DEBUG
+    // Set before tap installation; only append() writes its tap-owned prefix.
+    var callbackLedger: ContinuousPCMRenderer.DebugSourceCallbackLedger?
+    #endif
     struct Tone { let start: Double; let end: Double }
     #if DEBUG
     struct ToneReplay {
@@ -8817,6 +8878,22 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     func append(_ buffer: AVAudioPCMBuffer, time: AVAudioTime) {
         lock.lock(); defer { lock.unlock() }
         guard enabled else { return }
+        #if DEBUG
+        let receiptFirst = values.count
+        // Supplied timestamp fields, not a new native/current-clock query.
+        let receiptStamp = callbackLedger.map { _ in ContinuousPCMRenderer.DebugSourceCallbackLedger.Stamp(
+            host: time.hostTime, sample: Double(time.sampleTime), rate: time.sampleRate,
+            valid: (time.isHostTimeValid ? 1 : 0) | (time.isSampleTimeValid ? 2 : 0)) }
+        defer {
+            if let stamp = receiptStamp {
+                let input = Int(buffer.frameLength), admitted = values.count - receiptFirst
+                callbackLedger?.appendTap(.init(stamp: stamp, first: UInt32(receiptFirst), end: UInt32(values.count),
+                    inputFrames: UInt32(input), channels: buffer.format.channelCount,
+                    flags: (admitted == input && input > 0 ? 1 : 0) | (buffer.format.isInterleaved ? 2 : 0),
+                    bufferRate: buffer.format.sampleRate))
+            }
+        }
+        #endif
         guard time.isHostTimeValid, buffer.format.sampleRate.isFinite, buffer.format.sampleRate > 0,
               buffer.format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData else {
             invalidTimestamps += 1; return

@@ -69,6 +69,14 @@ final class ContinuousAudioGraph {
         self.anchor = anchor
         source = AVAudioSourceNode(format: format) { isSilence, timestamp, count, audioBufferList in
             #if DEBUG
+            let receipts = storage.debugRenderAccounting?.callbackLedger
+            if let receipts, let accounting = storage.debugRenderAccounting {
+                let value = timestamp.pointee
+                receipts.beginSource(stamp: .init(host: value.mHostTime, sample: value.mSampleTime, rate: 48_000,
+                    nativeFlags: value.mFlags.rawValue,
+                    valid: (value.mFlags.contains(.hostTimeValid) ? 1 : 0) | (value.mFlags.contains(.sampleTimeValid) ? 2 : 0)),
+                    frames: count, counters: accounting.renderWriterCounters())
+            }
             storage.debugRenderAccounting?.sourceCallbackEntered(frames: Int(count),
                 hostTimeValid: timestamp.pointee.mFlags.contains(.hostTimeValid),
                 hostTime: timestamp.pointee.mHostTime)
@@ -80,11 +88,22 @@ final class ContinuousAudioGraph {
             }
             isSilence.pointee = false
             let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            #if DEBUG
+            receipts?.layout(buffers: UInt32(buffers.count),
+                channels0: buffers.count > 0 ? buffers[0].mNumberChannels : 0,
+                channels1: buffers.count > 1 ? buffers[1].mNumberChannels : 0,
+                bytes0: buffers.count > 0 ? buffers[0].mDataByteSize : 0,
+                bytes1: buffers.count > 1 ? buffers[1].mDataByteSize : 0,
+                dataPresent: buffers.count == 2 && buffers[0].mData != nil && buffers[1].mData != nil)
+            #endif
             guard buffers.count == 2,
                   let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
                   let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else {
                 #if DEBUG
                 storage.debugRenderAccounting?.sourceCallbackCompleted(frames: Int(count), invalidLayout: true)
+                if let accounting = storage.debugRenderAccounting {
+                    receipts?.endSource(result: kAudio_ParamError, counters: accounting.renderWriterCounters())
+                }
                 #endif
                 return kAudio_ParamError
             }
@@ -93,6 +112,9 @@ final class ContinuousAudioGraph {
                 let frames = min(512, Int(count) - offset)
                 storage.renderer.render(interleaved: UnsafeMutableBufferPointer(start: storage.scratch, count: frames * 2), frameCount: frames)
                 #if DEBUG
+                if let accounting = storage.debugRenderAccounting, receipts != nil {
+                    receipts?.observeChunk(accounting.renderWriterCounters())
+                }
                 if let audit = storage.debugRenderAccounting, audit.capturesSourceOutput {
                     for frame in 0..<frames {
                         let l = storage.scratch[frame * 2]
@@ -121,6 +143,9 @@ final class ContinuousAudioGraph {
             }
             #if DEBUG
             storage.debugRenderAccounting?.sourceCallbackCompleted(frames: Int(count), invalidLayout: false)
+            if let accounting = storage.debugRenderAccounting {
+                receipts?.endSource(result: noErr, counters: accounting.renderWriterCounters())
+            }
             #endif
             return noErr
         }

@@ -8,6 +8,75 @@ import Synchronization
 
 /// Actual kernel branches, not a PCM-energy classifier or mocked render result.
 final class ContinuousRenderAccountingTests: XCTestCase {
+    func testCallbackLedgerDistinguishesCopiedZeroPauseAndUnavailablePrefixes() throws {
+        #if DEBUG
+        let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder(captureCallbackLedger: true)
+        XCTAssertNil(ContinuousPCMRenderer.DebugRenderAccountingRecorder().callbackLedger)
+        let ledger = try XCTUnwrap(accounting.callbackLedger)
+        let renderer = ContinuousPCMRenderer(channels: 2, prefixFrames: 8, ringFrames: 8, debugRenderAccounting: accounting)
+        let input: [Float] = [0, 0, 0, 0, 1, 1, 2, 2]
+        XCTAssertTrue(input.withUnsafeBufferPointer { renderer.source(at: 0).prepare(token: 7, totalFrames: 4, prefix: $0) })
+        renderer.select(token: 7); renderer.setPlaying(true)
+        func callback(sample: Double) -> [Float] {
+            let suppliedHost = UInt64(sample + 100)
+            ledger.beginSource(stamp: .init(host: suppliedHost, sample: sample, rate: 48_000, valid: 3),
+                frames: 4, counters: accounting.renderWriterCounters())
+            accounting.sourceCallbackEntered(frames: 4, hostTimeValid: true, hostTime: suppliedHost)
+            ledger.layout(buffers: 2, channels0: 1, channels1: 1, bytes0: 16, bytes1: 16, dataPresent: true)
+            var output = [Float](repeating: -1, count: 8)
+            output.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 4) }
+            ledger.observeChunk(accounting.renderWriterCounters())
+            for frame in 0..<4 { accounting.sourceOutputPair(left: output[frame * 2], right: output[frame * 2 + 1]) }
+            accounting.sourceCallbackCompleted(frames: 4, invalidLayout: false)
+            ledger.endSource(result: 0, counters: accounting.renderWriterCounters())
+            return output
+        }
+        XCTAssertEqual(callback(sample: 10), input)
+        renderer.setPlaying(false)
+        XCTAssertEqual(callback(sample: 14), [Float](repeating: 0, count: 8))
+        let prefix = ledger.prefix()
+        XCTAssertEqual(prefix.source.count, 2); XCTAssertFalse(prefix.failed)
+        XCTAssertEqual(prefix.source[0].copied, 4); XCTAssertEqual(prefix.source[0].paused, 0)
+        XCTAssertEqual(prefix.source[0].first.first, 0); XCTAssertEqual(prefix.source[0].first.end, 2)
+        XCTAssertEqual(prefix.source[1].copied, 0); XCTAssertEqual(prefix.source[1].paused, 4)
+        XCTAssertEqual(prefix.source[1].zeros, 4); XCTAssertFalse(prefix.coverageClosed)
+        ledger.beginSource(stamp: .init(), frames: 4, counters: accounting.renderWriterCounters())
+        let open = ledger.prefix()
+        XCTAssertEqual(open.enteredBefore, 3); XCTAssertEqual(open.completedBefore, 2)
+        ledger.layout(buffers: 1, channels0: 2, channels1: 0, bytes0: 32, bytes1: 0, dataPresent: true)
+        ledger.endSource(result: -50, counters: accounting.renderWriterCounters())
+        XCTAssertTrue(ledger.prefix().failed)
+        let sourceTiny = ContinuousPCMRenderer.DebugSourceCallbackLedger(sourceCapacity: 1, tapCapacity: 1)
+        let tinyAccounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+        let tinyRenderer = ContinuousPCMRenderer(channels: 2, prefixFrames: 1, ringFrames: 1,
+                                                debugRenderAccounting: tinyAccounting)
+        XCTAssertTrue([Float(1), 1].withUnsafeBufferPointer {
+            tinyRenderer.source(at: 0).prepare(token: 8, totalFrames: 1, prefix: $0)
+        })
+        tinyRenderer.select(token: 8) // Actual positive-token paused disposition.
+        for ordinal in 0..<2 {
+            sourceTiny.beginSource(stamp: .init(host: UInt64(ordinal + 100), sample: Double(ordinal), rate: 48_000, valid: 3),
+                                   frames: 1, counters: tinyAccounting.renderWriterCounters())
+            tinyAccounting.sourceCallbackEntered(frames: 1, hostTimeValid: true, hostTime: UInt64(ordinal + 100))
+            sourceTiny.layout(buffers: 2, channels0: 1, channels1: 1, bytes0: 4, bytes1: 4, dataPresent: true)
+            var paused = [Float](repeating: -1, count: 2)
+            paused.withUnsafeMutableBufferPointer { tinyRenderer.render(interleaved: $0, frameCount: 1) }
+            sourceTiny.observeChunk(tinyAccounting.renderWriterCounters())
+            sourceTiny.writtenPair(left: paused[0], right: paused[1])
+            tinyAccounting.sourceCallbackCompleted(frames: 1, invalidLayout: false)
+            sourceTiny.endSource(result: 0, counters: tinyAccounting.renderWriterCounters())
+            if ordinal == 0 { XCTAssertFalse(sourceTiny.prefix().failed) }
+        }
+        XCTAssertEqual(sourceTiny.prefix().source.count, 1)
+        XCTAssertEqual(sourceTiny.prefix().enteredBefore, 2); XCTAssertTrue(sourceTiny.prefix().failed)
+        let tiny = ContinuousPCMRenderer.DebugSourceCallbackLedger(sourceCapacity: 1, tapCapacity: 1)
+        let emptyTap = ContinuousPCMRenderer.DebugSourceCallbackLedger.Tap(stamp: .init(), first: 0, end: 0, inputFrames: 0, channels: 0, flags: 0)
+        tiny.appendTap(emptyTap); tiny.appendTap(emptyTap)
+        XCTAssertEqual(tiny.prefix().tap.count, 1); XCTAssertTrue(tiny.prefix().failed)
+        #else
+        XCTFail("Callback ledger requires DEBUG")
+        #endif
+    }
     func testAccountingIsAbsentByDefaultAndDoesNotChangeExactSamples() throws {
         #if DEBUG
         let plain = ContinuousPCMRenderer(channels: 1, prefixFrames: 8, ringFrames: 8)
