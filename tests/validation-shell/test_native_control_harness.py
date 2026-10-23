@@ -154,10 +154,10 @@ class NativeControlHarnessTests(unittest.TestCase):
 
     def test_live_control_inventory_and_source_manifest_are_required(self):
         self.assertEqual(self.cases, (
-            'testSameRetainedAssetAdmissionOffFirst',
-            'testSameRetainedAssetAdmissionOnFirst',
-            'testSameRetainedAssetAdmissionOnSecond',
-            'testSameRetainedAssetAdmissionOffSecond'))
+            'testNativeReaderWaitSamplingOffFirst',
+            'testNativeReaderWaitSamplingOnFirst',
+            'testNativeReaderWaitSamplingOnSecond',
+            'testNativeReaderWaitSamplingOffSecond'))
         shell = HARNESS.read_text(encoding="utf-8")
         control_names = shlex.split(re.search(r"controls\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
         self.assertEqual(tuple(control_names), self.cases)

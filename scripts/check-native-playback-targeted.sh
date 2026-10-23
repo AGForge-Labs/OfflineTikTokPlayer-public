@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=88a6a8f6979613d56b6c9e91068e7c2020ee1a92
-expected_ios_tree=20ccfe41042418e379fb095e68b5aa9899b4e89d
+expected_code_source=1b26a83c4ac0ec99e63a5bba58cf3a77603ef374
+expected_ios_tree=b2ae7c27d8efcd769f4728dd5d5bb2b5f9c6a922
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testSameRetainedAssetAdmissionOffFirst',
-    'testSameRetainedAssetAdmissionOnFirst',
-    'testSameRetainedAssetAdmissionOnSecond',
-    'testSameRetainedAssetAdmissionOffSecond',
+    'testNativeReaderWaitSamplingOffFirst',
+    'testNativeReaderWaitSamplingOnFirst',
+    'testNativeReaderWaitSamplingOnSecond',
+    'testNativeReaderWaitSamplingOffSecond',
 )
 
 def require(condition, message):
@@ -320,7 +320,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose
   ) ;;
-  controls) cases=(testSameRetainedAssetAdmissionOffFirst testSameRetainedAssetAdmissionOnFirst testSameRetainedAssetAdmissionOnSecond testSameRetainedAssetAdmissionOffSecond) ;;
+  controls) cases=(testNativeReaderWaitSamplingOffFirst testNativeReaderWaitSamplingOnFirst testNativeReaderWaitSamplingOnSecond testNativeReaderWaitSamplingOffSecond) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1

@@ -1,4 +1,4 @@
-name: Same retained asset admission with isolated playback processes
+name: Owned reader wait at dropout with isolated playback controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -40,10 +40,10 @@ jobs:
         run: |
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
-      - name: Build one exact test plan and calibrate actual admission and close ordering
+      - name: Build one exact test plan and calibrate owned thread and actual close ordering
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require the actual same-asset calibration identity
+      - name: Require the actual held-reader and own-thread calibration identity
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -55,11 +55,11 @@ jobs:
           prefix = 'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/'
           expected = {prefix + 'testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose'}
           if len(expected) != 1 or not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('The same-asset actual-read/close calibration must exist in pinned source')
+              raise SystemExit('The held-reader actual-read/close and own-thread calibration must exist in pinned source')
           evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected, invocation='test-without-building')
-          print('Same-asset calibration identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
+          print('Held-reader and own-thread calibration identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
-      - name: Four OFF ON ON OFF arms with fresh exact owned hosts and calibration-built products
+      - name: Four context-only and sampled arms OFF ON ON OFF in fresh exact owned hosts
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh controls
       - name: Require all four singleton identities and native exit and host-boundary receipts
