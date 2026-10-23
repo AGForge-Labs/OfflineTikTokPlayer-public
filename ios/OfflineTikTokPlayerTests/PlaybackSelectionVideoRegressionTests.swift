@@ -4553,6 +4553,45 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         XCTAssertTrue(secondSurvived, "Removing the first owner must preserve the second owner's actual saved video")
     }
 
+    func testDownloadFixtureLedgerReloadUsesOwnedVerifiedFilesWithoutTransferSession() async throws {
+        #if DEBUG
+        let first = try await SelectionVideoFixture()
+        defer { first.remove() }
+        let second = try await SelectionVideoFixture()
+        defer { second.remove() }
+        func savedIDs(_ root: URL) throws -> Set<String> {
+            let data = try Data(contentsOf: root.appendingPathComponent("downloads.json"))
+            return Set(try JSONDecoder().decode([String: DownloadRecord].self, from: data).keys)
+        }
+        let firstIDs = try savedIDs(first.temporary), secondIDs = try savedIDs(second.temporary)
+        XCTAssertEqual(firstIDs, Set(first.ids)); XCTAssertEqual(secondIDs, Set(second.ids))
+        XCTAssertFalse(first.downloads.debugTransferSessionWasCreated)
+        XCTAssertFalse(second.downloads.debugTransferSessionWasCreated)
+        first.remove()
+        let survivingIDs = try savedIDs(second.temporary)
+        XCTAssertEqual(survivingIDs, Set(second.ids), "Removing another fixture cannot rewrite this actual ledger")
+        let reloaded = try OfflineDownloads(cloud: second.cloud, network: NetworkStatus(), debugLocalRoot: second.temporary)
+        XCTAssertEqual(Set(reloaded.records.keys), Set(second.ids))
+        let actualURL = await reloaded.localURL(for: MediaRecord(id: second.aID, title: "Reloaded synthetic video"))
+        XCTAssertEqual(actualURL, second.savedURLs[second.aID], "A fresh manager must verify the actual persisted file")
+        let ledger = second.temporary.appendingPathComponent("downloads.json")
+        let beforeRejectedTransfer = try Data(contentsOf: ledger)
+        let asset = try XCTUnwrap(reloaded.records[second.aID]?.asset)
+        let forbiddenID = "synthetic-forbidden-transfer-" + UUID().uuidString
+        reloaded.enqueue([MediaRecord(id: forbiddenID, title: "Unscheduled synthetic transfer", status: .ready, asset: asset)])
+        reloaded.resume(forbiddenID)
+        XCTAssertNil(reloaded.records[forbiddenID])
+        XCTAssertEqual(try Data(contentsOf: ledger), beforeRejectedTransfer)
+        XCTAssertFalse(reloaded.debugTransferSessionWasCreated, "Local-only ownership must never realize a background session")
+        let invalidRoot = second.temporary.appendingPathComponent("not-an-owned-uuid")
+        XCTAssertThrowsError(try OfflineDownloads(cloud: second.cloud, network: NetworkStatus(), debugLocalRoot: invalidRoot))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invalidRoot.path))
+        print("SelectionDownloadLedgerReload schema=1 firstLedgerOwned=\(firstIDs == Set(first.ids)) secondLedgerOwned=\(secondIDs == Set(second.ids)) secondLedgerSurvived=\(survivingIDs == Set(second.ids)) actualSavedURLVerified=\(actualURL == second.savedURLs[second.aID]) forbiddenTransferAdded=\(reloaded.records[forbiddenID] != nil) transferSessionCreated=\(reloaded.debugTransferSessionWasCreated) syntheticOnly=true playbackAcceptance=false")
+        #else
+        XCTFail("Isolated local download fixtures require DEBUG storage injection")
+        #endif
+    }
+
     func testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins() async throws {
         #if DEBUG
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
@@ -9757,10 +9796,20 @@ final class SelectionVideoFixture {
     private let previousAutomaticPiP = UserDefaults.standard.object(forKey: "automaticPiP")
 
     init() async throws {
-        temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let ownedTemporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        temporary = ownedTemporary
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         cloud = OneDriveClient(account: MicrosoftAccount())
+        #if DEBUG
+        do {
+            downloads = try OfflineDownloads(cloud: cloud, network: NetworkStatus(), debugLocalRoot: ownedTemporary)
+        } catch {
+            Self.removeOwnedTemporary(ownedTemporary)
+            throw error
+        }
+        #else
         downloads = OfflineDownloads(cloud: cloud, network: NetworkStatus())
+        #endif
         library = LibraryRepository(cloud: cloud, catalogURL: temporary.appendingPathComponent("catalog.json"))
         ids = ["local:selected-A-" + UUID().uuidString, "local:selected-B-" + UUID().uuidString]
         do {
@@ -9834,6 +9883,11 @@ final class SelectionVideoFixture {
 
     func remove() {
         for id in ids { downloads.remove(id) }
+        Self.removeOwnedTemporary(temporary)
+        restorePreferences()
+    }
+
+    private static func removeOwnedTemporary(_ temporary: URL) {
         let manager = FileManager.default
         let parent = manager.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
         let owned = temporary.standardizedFileURL
@@ -9846,7 +9900,6 @@ final class SelectionVideoFixture {
             do { try manager.removeItem(at: owned) }
             catch { print("SelectionFixture cleanupErrorCode=\((error as NSError).code)") }
         }
-        restorePreferences()
     }
 
     func restorePreferences() {

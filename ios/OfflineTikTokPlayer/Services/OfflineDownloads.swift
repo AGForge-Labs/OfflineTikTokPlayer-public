@@ -28,11 +28,27 @@ final class OfflineDownloads: NSObject {
     @ObservationIgnored private var policyRestarts = Set<String>()
     @ObservationIgnored private var backgroundGate = BackgroundTransferGate()
     @ObservationIgnored var backgroundCompletion: (() -> Void)? { didSet { finishBackgroundEvents() } }
-    nonisolated private let staging = AppFiles.directory("Staging", excludeFromBackup: true)
-    private let files = AppFiles.directory("Offline", excludeFromBackup: true)
-    private let transfers = AppFiles.directory("Transfers", excludeFromBackup: true)
-    private let ledgerURL = AppFiles.root.appendingPathComponent("downloads.json")
+    nonisolated private let staging: URL
+    private let files: URL
+    private let transfers: URL
+    private let ledgerURL: URL
+    @ObservationIgnored private let allowsTransfers: Bool
+    #if DEBUG
+    @ObservationIgnored private(set) var debugTransferSessionWasCreated = false
+    #endif
+    private struct Storage {
+        let staging: URL, files: URL, transfers: URL, ledger: URL
+        static var application: Storage {
+            Storage(staging: AppFiles.directory("Staging", excludeFromBackup: true),
+                files: AppFiles.directory("Offline", excludeFromBackup: true),
+                transfers: AppFiles.directory("Transfers", excludeFromBackup: true),
+                ledger: AppFiles.root.appendingPathComponent("downloads.json"))
+        }
+    }
     @ObservationIgnored private lazy var session: URLSession = {
+        #if DEBUG
+        debugTransferSessionWasCreated = true
+        #endif
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
         config.sessionSendsLaunchEvents = true
         config.waitsForConnectivity = true
@@ -40,8 +56,55 @@ final class OfflineDownloads: NSObject {
         return URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }()
 
-    init(cloud: OneDriveClient, network: NetworkStatus) {
+    convenience init(cloud: OneDriveClient, network: NetworkStatus) {
+        self.init(cloud: cloud, network: network, storage: .application, allowsTransfers: true)
+    }
+
+    #if DEBUG
+    /// Local playback fixtures use the real import, verification and ledger paths
+    /// without sharing the app's files or creating a background transfer session.
+    convenience init(cloud: OneDriveClient, network: NetworkStatus, debugLocalRoot: URL) throws {
+        let manager = FileManager.default
+        let root = debugLocalRoot.standardizedFileURL
+        let parent = manager.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let resolved = root.resolvingSymlinksInPath()
+        guard root.isFileURL, UUID(uuidString: root.lastPathComponent) != nil,
+              root.deletingLastPathComponent().resolvingSymlinksInPath() == parent,
+              resolved.deletingLastPathComponent() == parent,
+              resolved.lastPathComponent == root.lastPathComponent else {
+            throw AppError.message("A local playback fixture must own its temporary UUID directory.")
+        }
+        let values = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw AppError.message("A local playback fixture must own its temporary UUID directory.")
+        }
+        func directory(_ name: String) throws -> URL {
+            var url = root.appendingPathComponent(name, isDirectory: true)
+            guard url.resolvingSymlinksInPath().deletingLastPathComponent() == resolved,
+                  url.resolvingSymlinksInPath().lastPathComponent == name,
+                  (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+                throw AppError.message("A local playback fixture directory cannot redirect its files.")
+            }
+            try manager.createDirectory(at: url, withIntermediateDirectories: true,
+                attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+            var backup = URLResourceValues(); backup.isExcludedFromBackup = true
+            try? url.setResourceValues(backup)
+            return url
+        }
+        let ledger = root.appendingPathComponent("downloads.json")
+        guard (try? ledger.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
+            throw AppError.message("A local playback fixture cannot redirect its checkpoint.")
+        }
+        let storage = try Storage(staging: directory("Staging"), files: directory("Offline"),
+            transfers: directory("Transfers"), ledger: ledger)
+        self.init(cloud: cloud, network: network, storage: storage, allowsTransfers: false)
+    }
+    #endif
+
+    private init(cloud: OneDriveClient, network: NetworkStatus, storage: Storage, allowsTransfers: Bool) {
         self.cloud = cloud; self.network = network
+        staging = storage.staging; files = storage.files; transfers = storage.transfers; ledgerURL = storage.ledger
+        self.allowsTransfers = allowsTransfers
         wifiOnly = UserDefaults.standard.object(forKey: "wifiOnlyDownloads") as? Bool ?? true
         super.init()
         do {
@@ -52,6 +115,7 @@ final class OfflineDownloads: NSObject {
         } catch { records = [:]; message = "Download checkpoints could not be read. Your cloud files are unchanged." }
         updateSummary()
         network.didChange = { [weak self] in self?.pump() }
+        guard allowsTransfers else { return }
         session.getAllTasks { [weak self] existing in
             Task { @MainActor in
                 guard let self else { return }
@@ -88,6 +152,7 @@ final class OfflineDownloads: NSObject {
     }
 
     func enqueue(_ media: [MediaRecord]) {
+        guard allowsTransfers else { message = "This local playback fixture does not schedule transfers."; return }
         let assets = media.compactMap(\.asset)
         let needed = DownloadRecord.estimatedBytes(assets, verifiedHashes: Set(records.values.filter(\.isReady).map(\.asset.sha256)))
         let capacity = (try? files.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage ?? 0
@@ -103,6 +168,7 @@ final class OfflineDownloads: NSObject {
     }
 
     func resume(_ id: String) {
+        guard allowsTransfers else { return }
         guard records[id] != nil, records[id]?.isReady == false else { return }
         records[id]?.state = .queued; records[id]?.error = nil; retries.remove(id)
         persist(); pump()
@@ -171,6 +237,7 @@ final class OfflineDownloads: NSObject {
     }
 
     private func pump() {
+        guard allowsTransfers else { return }
         guard TransferNetworkPolicy(wifiOnly: wifiOnly).canSchedule(isConnected: network.isConnected, isWiFi: network.isWiFi) else { return }
         var busyHashes = Set(tasks.keys.compactMap { records[$0]?.asset.sha256 })
         busyHashes.formUnion(resolutionJobs.keys.compactMap { records[$0]?.asset.sha256 })
@@ -190,6 +257,7 @@ final class OfflineDownloads: NSObject {
     }
 
     private func start(_ record: DownloadRecord) async {
+        guard allowsTransfers else { return }
         let id = record.mediaID
         defer {
             resolutionJobs.removeValue(forKey: id)
