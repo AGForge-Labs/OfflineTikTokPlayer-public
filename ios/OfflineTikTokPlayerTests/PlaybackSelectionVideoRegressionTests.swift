@@ -763,18 +763,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testSourceCallbackExecutionTimingOffThenOn() async throws {
+        try await runSourceCallbackExecutionTiming([false, true], order: "off-then-on")
+    }
+
+    func testSourceAndTapExecutionTimingOnThenOff() async throws {
+        try await runSourceCallbackExecutionTiming([true, false], order: "on-then-off")
+    }
+
+    private func runSourceCallbackExecutionTiming(_ modes: [Bool], order: String) async throws {
         try recordRuntimeHost()
         #if DEBUG
         defer {
             sourceCallbackExecutionTimingBenchmarkMode = nil
             sourceCallbackLedgerBenchmarkMode = nil; sourceCallbackLedgerArmID = nil
         }
-        for (ordinal, timed) in [false, true].enumerated() {
+        for (ordinal, timed) in modes.enumerated() {
             sourceCallbackLedgerBenchmarkMode = true
             sourceCallbackExecutionTimingBenchmarkMode = timed
             let armID = UUID().uuidString.lowercased()
             sourceCallbackLedgerArmID = armID
-            print("SourceCallbackExecutionArm schema=2 armID=\(armID) ordinal=\(ordinal) ledger=true executionTiming=\(timed) clocksPerSourceCallback=\(timed ? 2 : 0) clocksPerTapCallback=\(timed ? 3 : 0) disabledTapCallbacksRecorded=\(timed) clock=mach_absolute_time endScope=before-final-ledger-publication tapEndScope=before-trace-publication-unlock-and-SDK-return numericDefault=true traceVideoSeeks=true traceClockHandoff=true acceptance=unchanged")
+            print("SourceCallbackExecutionArm schema=3 armID=\(armID) order=\(order) ordinal=\(ordinal) ledger=true executionTiming=\(timed) clocksPerSourceCallback=\(timed ? 2 : 0) clocksPerTapCallback=\(timed ? 3 : 0) disabledTapCallbacksRecorded=\(timed) clock=mach_absolute_time endScope=before-final-ledger-publication tapEndScope=before-trace-publication-unlock-and-SDK-return numericDefault=true traceVideoSeeks=true traceClockHandoff=true acceptance=unchanged")
             try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false, traceClockHandoff: true)
             print("SourceCallbackExecutionArmEnd schema=1 armID=\(armID) helperReturned=true")
         }
