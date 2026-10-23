@@ -764,6 +764,148 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runFirstZeroSourceCallbackComparison([false, true], order: "off-then-on")
     }
 
+    func testActualSourceTapSampleMappingUsesTwoIndependentPCMMarkers() async throws {
+        #if DEBUG
+        try recordRuntimeHost()
+        let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder(captureCallbackLedger: true)
+        let ledger = try XCTUnwrap(accounting.callbackLedger)
+        let renderer = ContinuousPCMRenderer(sampleRate: 48_000, channels: 2,
+            prefixFrames: 96_000, ringFrames: 16, debugRenderAccounting: accounting)
+        let markers = [9_013..<9_746, 25_021..<26_024]
+        var pcm = [Float](repeating: 0.125, count: 96_000 * 2)
+        for range in markers { for frame in range { pcm[frame * 2] = 0; pcm[frame * 2 + 1] = 0 } }
+        XCTAssertTrue(pcm.withUnsafeBufferPointer { renderer.source(at: 0).prepare(token: 1, totalFrames: 96_000, prefix: $0) })
+        renderer.setSpeakerEnabled(false); renderer.setSuccessor(token: 1, for: 1)
+        renderer.select(token: 1); renderer.setPlaying(true)
+        let graph = ContinuousAudioGraph(renderer: renderer), tap = ProductionSelectionOutputTap()
+        tap.callbackLedger = ledger
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try session.setActive(true)
+        graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
+            tap.append(buffer, time: time)
+        }
+        defer {
+            graph.engine.stop(); graph.engine.mainMixerNode.removeTap(onBus: 0)
+            renderer.setPlaying(false)
+        }
+        XCTAssertEqual(tap.begin(auditChannels: true), 0)
+        try graph.engine.start()
+        try await require({ tap.count >= 38_400 }, "Actual realtime mixer must deliver both independent markers")
+        graph.engine.stop()
+        let captured = tap.stop(), audit = tap.channelAudit(), prefix = ledger.prefix()
+        XCTAssertLessThan(captured, 96_000, "A second source visit would make marker ownership ambiguous")
+        XCTAssertFalse(prefix.failed); XCTAssertTrue(prefix.stableObservedPrefix)
+        XCTAssertEqual(prefix.enteredBefore, UInt64(prefix.completedBefore))
+        XCTAssertTrue(audit.stereoZeroEvidenceQualified); XCTAssertFalse(audit.overflow)
+        XCTAssertEqual(audit.nonfiniteFrames, 0); XCTAssertEqual(audit.droppedRuns, 0)
+        XCTAssertEqual(audit.qualifiedRuns, 2); XCTAssertEqual(audit.retainedRuns, 2)
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        XCTAssertLessThan(renderer.retainedPCMMemoryBytes + ledger.reservedPayloadBytes, 4 * 1024 * 1024)
+
+        typealias Source = ContinuousPCMRenderer.DebugSourceCallbackLedger.Source
+        typealias Tap = ContinuousPCMRenderer.DebugSourceCallbackLedger.Tap
+        func valid(_ sources: [Source], _ taps: [Tap]) -> Bool {
+            guard let first = sources.first, !taps.isEmpty,
+                  sources.allSatisfy({ s in s.stamp.valid & 3 == 3 && s.stamp.rate == 48_000
+                    && s.stamp.sample.isFinite && s.stamp.sample.rounded() == s.stamp.sample
+                    && abs(s.stamp.sample) < 9_007_199_254_740_000
+                    && s.stamp.host > 0 && s.frames > 0 && s.result == 0 && s.flags & 3 == 3
+                    && s.flags & 28 == 0 && s.pairs == s.frames && s.copied == s.frames
+                    && s.paused == 0 && s.inactive == 0 && s.eof == 0 && s.underrun == 0
+                    && s.nonfinite == 0 && s.token == 1 && s.visit == 1 }),
+                  taps.allSatisfy({ t in t.stamp.valid & 3 == 3 && t.stamp.rate == 48_000
+                    && t.bufferRate == 48_000 && t.channels == 2 && t.flags & 1 == 1
+                    && t.stamp.sample.isFinite && t.stamp.sample.rounded() == t.stamp.sample
+                    && abs(t.stamp.sample) < 9_007_199_254_740_000
+                    && t.stamp.host > 0 && t.inputFrames > 0 && t.end >= t.first && t.end - t.first == t.inputFrames }),
+                  zip(sources, sources.dropFirst()).allSatisfy({ a, b in
+                    a.ordinal + 1 == b.ordinal && a.stamp.sample + Double(a.frames) == b.stamp.sample }),
+                  zip(taps, taps.dropFirst()).allSatisfy({ a, b in
+                    a.end == b.first && a.stamp.sample + Double(a.inputFrames) == b.stamp.sample }) else { return false }
+            // Validate this actual engine epoch's affine host/sample relation.
+            // This is not a mapping transferred from another graph or restart.
+            let origin = AVAudioTime.seconds(forHostTime: first.stamp.host) - first.stamp.sample / 48_000
+            return (sources.map(\.stamp) + taps.map(\.stamp)).allSatisfy { stamp in
+                abs((AVAudioTime.seconds(forHostTime: stamp.host) - stamp.sample / 48_000 - origin) * 48_000) < 0.5
+            }
+        }
+        func sampleRange(_ range: Range<Int>, taps: [Tap]) -> Range<Int64>? {
+            var next = range.lowerBound, first: Int64?, end: Int64?
+            for t in taps where Int(t.first) < range.upperBound && Int(t.end) > range.lowerBound {
+                let lower = max(range.lowerBound, Int(t.first)), upper = min(range.upperBound, Int(t.end))
+                guard lower == next else { return nil }
+                let begin = Int64(t.stamp.sample) + Int64(lower - Int(t.first))
+                guard end == nil || end == begin else { return nil }
+                if first == nil { first = begin }
+                end = begin + Int64(upper - lower); next = upper
+            }
+            guard next == range.upperBound, let first, let end else { return nil }
+            return first..<end
+        }
+        func covers(_ range: Range<Int64>, sources: [Source]) -> Bool {
+            var next = range.lowerBound
+            for s in sources where Int64(s.stamp.sample) < range.upperBound
+                && Int64(s.stamp.sample) + Int64(s.frames) > range.lowerBound {
+                let lower = max(range.lowerBound, Int64(s.stamp.sample))
+                let upper = min(range.upperBound, Int64(s.stamp.sample) + Int64(s.frames))
+                guard lower == next else { return false }; next = upper
+            }
+            return next == range.upperBound
+        }
+        let timestampsQualified = valid(prefix.source, prefix.tap)
+        XCTAssertTrue(timestampsQualified, "Actual node timestamps/rates/epochs/layouts and source dispositions must qualify")
+        guard timestampsQualified else { throw SelectionVideoTestFailure.timeout }
+        let sourceStart = try XCTUnwrap(prefix.source.first).stamp.sample
+        var written: [Range<Int64>] = []
+        for s in prefix.source {
+            XCTAssertLessThanOrEqual(s.runCount, 4)
+            let runs = [s.first, s.second, s.third, s.fourth].prefix(Int(s.runCount))
+            guard runs.allSatisfy({ $0.first < $0.end && $0.end <= s.frames }) else {
+                XCTFail("Malformed source-written zero range"); throw SelectionVideoTestFailure.timeout
+            }
+            XCTAssertEqual(runs.reduce(UInt32(0)) { $0 + $1.end - $1.first }, s.zeros)
+            for run in runs {
+                XCTAssertLessThan(run.first, run.end); XCTAssertLessThanOrEqual(run.end, s.frames)
+                let range = (Int64(s.stamp.sample) + Int64(run.first))..<(Int64(s.stamp.sample) + Int64(run.end))
+                if written.last?.upperBound == range.lowerBound {
+                    written[written.count - 1] = written.last!.lowerBound..<range.upperBound
+                } else { written.append(range) }
+            }
+        }
+        let expected = markers.map { (Int64(sourceStart) + Int64($0.lowerBound))..<(Int64(sourceStart) + Int64($0.upperBound)) }
+        XCTAssertEqual(written, expected, "Actual source-written markers must match independently specified PCM")
+        guard written.count == 2, audit.qualifiedRuns == 2 else { throw SelectionVideoTestFailure.timeout }
+        var mapped: [Range<Int64>] = []
+        for index in 0..<2 {
+            let run = try XCTUnwrap(audit.run(at: index))
+            XCTAssertEqual(run.frames, markers[index].count)
+            XCTAssertEqual(run.stereoZeroFrames, run.frames)
+            let range = try XCTUnwrap(sampleRange(run.firstFrame..<run.endFrame, taps: prefix.tap))
+            XCTAssertTrue(covers(range, sources: prefix.source)); mapped.append(range)
+        }
+        let offset = try XCTUnwrap(written.first).lowerBound - (try XCTUnwrap(mapped.first).lowerBound)
+        XCTAssertEqual(mapped.map { ($0.lowerBound + offset)..<($0.upperBound + offset) }, written,
+            "Marker two and both edges must predict exactly from marker one's measured relation")
+        // Negative controls alter only retained off-render copies, never playback.
+        var shifted = prefix.tap
+        let second = try XCTUnwrap(audit.run(at: 1))
+        let shiftedIndex = try XCTUnwrap(shifted.firstIndex { Int($0.first) <= second.firstFrame && Int($0.end) > second.firstFrame })
+        shifted[shiftedIndex].stamp.sample += 1
+        XCTAssertFalse(valid(prefix.source, shifted), "A one-frame timestamp shift must not qualify")
+        let missingIndex = try XCTUnwrap(prefix.source.firstIndex {
+            Int64($0.stamp.sample) <= written[1].lowerBound && Int64($0.stamp.sample) + Int64($0.frames) > written[1].lowerBound
+        })
+        var missing = prefix.source; missing.remove(at: missingIndex)
+        XCTAssertFalse(covers(written[1], sources: missing), "Missing interior source coverage must remain unavailable")
+        let sourceRanges = written.map { String($0.lowerBound) + ":" + String($0.upperBound) }.joined(separator: ",")
+        let tapRanges = mapped.map { String($0.lowerBound) + ":" + String($0.upperBound) }.joined(separator: ",")
+        print("SourceTapMarkerCalibration schema=1 realEngine=true sameGraphEpoch=true speakerProcessing=false rate=48000 sourceRecords=\(prefix.source.count) tapRecords=\(prefix.tap.count) capturedFrames=\(captured) markerFrames=733,1003 sourceRanges=\(sourceRanges) tapRanges=\(tapRanges) sourceMinusTapFrames=\(offset) shiftedTimestampRejected=true missingSourceRejected=true immutableCoveredPrefix=true formalRTJoin=false transferableAcrossRestart=false physicalOutput=false playbackAcceptance=false")
+        #else
+        XCTFail("Real source/tap calibration requires the existing DEBUG ledger")
+        #endif
+    }
+
     func testFirstZeroSourceCallbacksOnThenOff() async throws {
         try await runFirstZeroSourceCallbackComparison([true, false], order: "on-then-off")
     }
