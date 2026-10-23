@@ -153,6 +153,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         fileprivate let worker = WorkerRecord()
         func workerSnapshot() -> DebugWorkerActivitySnapshot { worker.snapshot() }
         fileprivate final class Record: @unchecked Sendable {
+            let laneIndex: Int
+            let beforeCopyThread: (@Sendable (Int, UInt64) -> Void)?
+            init(laneIndex: Int, beforeCopyThread: (@Sendable (Int, UInt64) -> Void)?) {
+                self.laneIndex = laneIndex; self.beforeCopyThread = beforeCopyThread
+            }
             private let packed = Atomic<UInt64>(0)
             private var sequence: UInt64 = 0 // Owning lane only.
             private var overflowed = false // Latched, never wraps the sequence.
@@ -168,11 +173,18 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 else { sequence += 1 }
                 publish(.copyEntered)
             }
+            fileprivate func recordExecutingThreadBeforeGate() {
+                guard sequence < Self.maximumSequence, !overflowed else { return }
+                beforeCopyThread?(laneIndex, sequence + 1)
+            }
             fileprivate func load() -> UInt64 { packed.load(ordering: .acquiring) }
         }
-        private let first = Record()
-        private let second = Record()
-        private let third = Record()
+        private let first: Record, second: Record, third: Record
+        init(beforeCopyThread: (@Sendable (Int, UInt64) -> Void)? = nil) {
+            first = Record(laneIndex: 0, beforeCopyThread: beforeCopyThread)
+            second = Record(laneIndex: 1, beforeCopyThread: beforeCopyThread)
+            third = Record(laneIndex: 2, beforeCopyThread: beforeCopyThread)
+        }
         fileprivate func record(at laneIndex: Int) -> Record {
             switch laneIndex {
             case 0: return first
@@ -248,6 +260,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
     struct DebugLeaseState: Sendable {
         let index: Int
+        let admissionAssetID: Int, admissionLeaseID: Int
         let present: Bool
         let starting: Bool
         let readPending: Bool
@@ -274,6 +287,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private let returned = Atomic<Bool>(false)
         private let released = Atomic<Bool>(false)
         private let timedOut = Atomic<Bool>(false)
+        private let lane = Atomic<Int>(-1)
         private let semaphore = DispatchSemaphore(value: 0)
 
         func arm(token: Int) -> Bool {
@@ -283,15 +297,17 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 ordering: .acquiringAndReleasing).exchanged
         }
         var didEnter: Bool { entered.load(ordering: .acquiring) }
+        var enteredLane: Int { didEnter ? lane.load(ordering: .acquiring) : -1 }
         var isHolding: Bool { didEnter && !returned.load(ordering: .acquiring) }
         var didTimeOut: Bool { timedOut.load(ordering: .acquiring) }
 
         func release() {
             if !released.exchange(true, ordering: .acquiringAndReleasing) { semaphore.signal() }
         }
-        fileprivate func beforeCopy(token: Int) {
+        fileprivate func beforeCopy(token: Int, laneIndex: Int = -1) {
             guard token > 0, target.compareExchange(expected: token, desired: 0,
                 ordering: .acquiringAndReleasing).exchanged else { return }
+            lane.store(laneIndex, ordering: .relaxed)
             entered.store(true, ordering: .releasing)
             timedOut.store(semaphore.wait(timeout: .now() + .seconds(5)) == .timedOut,
                 ordering: .releasing)
@@ -816,7 +832,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             }
             let leaseStates = (0..<3).map { index in
                 let lease = leases[index]
-                return DebugLeaseState(index: index, present: lease != nil,
+                return DebugLeaseState(index: index, admissionAssetID: lease?.debugAdmissionAssetID ?? 0,
+                    admissionLeaseID: lease?.debugAdmissionLeaseID ?? 0, present: lease != nil,
                     starting: lease?.starting ?? false, readPending: lease?.readPending ?? false,
                     retired: lease?.retired ?? false, requestedFrames: lease?.requestedFrames ?? 0,
                     packetFrames: lease?.packet?.frames ?? 0, packetOffset: lease?.packetOffset ?? 0,
@@ -1609,7 +1626,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
         private func nextSample() throws {
             #if DEBUG
-            debugReadGate?.beforeCopy(token: debugReadToken)
+            debugActivity?.recordExecutingThreadBeforeGate()
+            debugReadGate?.beforeCopy(token: debugReadToken, laneIndex: debugActivity?.laneIndex ?? -1)
             debugActivity?.enterCopy()
             #endif
             guard let buffer = output.copyNextSampleBuffer() else {

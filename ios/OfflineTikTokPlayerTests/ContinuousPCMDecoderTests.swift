@@ -18,7 +18,7 @@ enum PCMWorkerBoundaryOwnership {
 
 final class ContinuousPCMDecoderTests: XCTestCase {
     func testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose() async throws {
-        #if DEBUG
+        #if DEBUG && targetEnvironment(simulator)
         for enabled in [false, true] {
             guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
                 XCTFail("An unresolved actual reader close blocks new calibration owners")
@@ -35,46 +35,99 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             } catch { try? FileManager.default.removeItem(at: directory); throw error }
             let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
             let admission = ContinuousPCMDecoder.DebugReaderAdmissionRecorder(excludesSameAsset: enabled)
-            let decoder = ContinuousPCMDecoder(renderer: renderer, debugReaderAdmission: admission)
+            let threadProbe = NativeReaderWaitObservation(enabled: true)
+            let activity = ContinuousPCMDecoder.DebugNativeLaneActivityRecorder(beforeCopyThread: { lane, sequence in
+                threadProbe.note(lane: lane, sequence: sequence)
+            })
+            let decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: activity,
+                                               debugReaderAdmission: admission)
             let gate = ContinuousPCMDecoder.DebugNativeReadGate()
             decoder.debugSetNativeReadGate(gate)
             var bodyError: Error?
             var independentPreparedWhileHeld = false, exactPCM = false
             do {
                 _ = try await Self.mailboxPrepare(decoder, url: a, token: 1, slot: 0)
+                let source = renderer.source(at: 0)
+                let initialRequest = source.streamRequest
+                _ = try await Self.mailboxStateUntil(decoder, timeout: 1) { value in
+                    value.stats.leasedReaders == 1 && value.stats.startingLeases == 0
+                        && value.stats.retiredLeasesAwaitingClose == 0
+                        && value.leases.allSatisfy { !$0.readPending }
+                        && source.availableStreamFrames(for: initialRequest.epoch) == 1_024
+                }
                 XCTAssertTrue(gate.arm(token: 1))
                 Self.mailboxAcknowledge(renderer, token: 1, frame: 2_049)
+                let firstRequest = source.streamRequest
                 try await Self.mailboxWait(timeout: 1, "The actual A native read must enter") { gate.didEnter }
-                guard gate.isHolding, !gate.didTimeOut else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+                guard gate.isHolding, !gate.didTimeOut, (0..<3).contains(gate.enteredLane) else {
+                    XCTFail("Calibration must identify the held executing native lane")
+                    throw ContinuousPCMDecoder.Failure.cannotDecode
+                }
+                let lane = gate.enteredLane, bit = 1 << lane
+                let pinned = try await Self.mailboxStateUntil(decoder, timeout: 1) { value in
+                    let lease = value.leases[lane], slot = value.slots[0]
+                    return slot.epoch == firstRequest.epoch && slot.leaseIndex == lane
+                        && lease.present && !lease.starting && !lease.retired && lease.readPending
+                        && lease.admissionLeaseID > 0 && lease.admissionAssetID > 0
+                }
+                let heldLease = pinned.leases[lane]
+                let cutoff = try XCTUnwrap(pinned.admission).events.count
+                // Context was captured on THIS executing lane before the gate.
+                // copyEntered has deliberately not published yet: this is a known
+                // calibration wait before the SDK call, never an SDK-wait claim.
+                let boundary = try XCTUnwrap(activity.snapshot(at: lane))
+                XCTAssertFalse(boundary.sequenceOverflowed)
+                let sample = threadProbe.calibrationSample(lane: lane, sequence: boundary.copySequence + 1)
+                XCTAssertEqual(threadProbe.calibrationSample(lane: lane, sequence: boundary.copySequence + 2)["available"] as? Bool, false)
+                XCTAssertEqual(threadProbe.calibrationSample(lane: -1, sequence: boundary.copySequence + 1)["available"] as? Bool, false)
+                XCTAssertEqual(sample["available"] as? Bool, true)
+                XCTAssertEqual(sample["contextUnchanged"] as? Bool, true)
+                XCTAssertEqual(sample["basicReturn"] as? Int, 0)
+                XCTAssertEqual(sample["basicValid"] as? Bool, true)
+                XCTAssertEqual(sample["registerReturn"] as? Int, 0)
+                XCTAssertEqual(sample["runState"] as? Int, 3, "Known gate must be observed waiting")
+                var calibration = sample
+                calibration["calibration"] = true; calibration["gateBeforeSDK"] = true
+                calibration["gateHolding"] = gate.isHolding && !gate.didTimeOut
+                calibration["admissionLeaseID"] = heldLease.admissionLeaseID
+                let data = try JSONSerialization.data(withJSONObject: calibration, options: [.sortedKeys])
+                XCTAssertLessThanOrEqual(data.count, 16_384)
+                print("NativeReaderWaitCalibration " + String(decoding: data, as: UTF8.self))
                 Self.mailboxAcknowledge(renderer, token: 1, frame: 2_203)
-                let state = Mutex<ContinuousPCMDecoder.DebugFailureState?>(nil)
-                let deadline = ProcessInfo.processInfo.systemUptime + 1
-                repeat {
-                    decoder.debugFailureState { value in state.withLock { $0 = value } }
-                    try await Task.sleep(for: .milliseconds(5))
-                    if let value = state.withLock({ $0 }), let receipt = value.admission,
-                       (enabled ? receipt.exclusions > 0 : receipt.overlaps > 0) { break }
-                } while ProcessInfo.processInfo.systemUptime < deadline
-                let held = try XCTUnwrap(state.withLock { $0 })
+                let latestRequest = source.streamRequest
+                XCTAssertNotEqual(latestRequest.epoch, firstRequest.epoch)
+                XCTAssertEqual(latestRequest.startFrame, 2_203)
+                let held = try await Self.mailboxStateUntil(decoder, timeout: 1) { value in
+                    guard gate.isHolding, !gate.didTimeOut, let receipt = value.admission,
+                          receipt.events.count >= cutoff else { return false }
+                    let lease = value.leases[lane], slot = value.slots[0]
+                    guard lease.present && lease.retired && lease.readPending,
+                          lease.admissionLeaseID == heldLease.admissionLeaseID,
+                          lease.admissionAssetID == heldLease.admissionAssetID else { return false }
+                    return receipt.events.dropFirst(cutoff).contains { event in
+                        guard event.asset == heldLease.admissionAssetID && event.token == 1,
+                              event.matchingMask & bit != 0, event.retiredMask & bit != 0 else { return false }
+                        if enabled { return event.kind == 2 && event.freeMask != 0 && slot.stream == nil }
+                        return event.kind == 1 && event.lease != heldLease.admissionLeaseID
+                            && slot.epoch == latestRequest.epoch && slot.leaseIndex == event.lane
+                    }
+                }
                 let receipt = try XCTUnwrap(held.admission)
                 Self.assertMailboxBounds(held.stats)
                 XCTAssertFalse(receipt.overflowed)
                 XCTAssertTrue(gate.isHolding); XCTAssertFalse(gate.didTimeOut)
                 XCTAssertGreaterThan(held.stats.retiredLeasesAwaitingClose, 0)
+                let later = receipt.events.dropFirst(cutoff)
+                XCTAssertFalse(later.contains { $0.kind == 3 && $0.lease == heldLease.admissionLeaseID })
                 if enabled {
                     XCTAssertGreaterThan(receipt.exclusions, 0); XCTAssertEqual(receipt.overlaps, 0)
-                    XCTAssertTrue(receipt.events.contains { $0.kind == 2 && $0.freeMask != 0 && $0.retiredMask != 0 },
-                        "A free lane must exist so the new predicate, rather than the global cap, excludes the replacement")
-                } else {
-                    XCTAssertGreaterThan(receipt.overlaps, 0)
-                    XCTAssertTrue(receipt.events.contains { $0.kind == 1 && $0.token == 1 && $0.retiredMask != 0 })
-                }
+                } else { XCTAssertGreaterThan(receipt.overlaps, 0) }
                 // A distinct retained asset can prepare while the A read remains held.
                 _ = try await Self.mailboxPrepare(decoder, url: b, token: 2, slot: 1, timeout: 1)
                 independentPreparedWhileHeld = gate.isHolding && !gate.didTimeOut
                 XCTAssertTrue(gate.isHolding); XCTAssertFalse(gate.didTimeOut)
                 gate.release()
-                let source = renderer.source(at: 0), request = renderer.source(at: 0).streamRequest
+                let request = source.streamRequest
                 try await Self.mailboxWait(timeout: 2, "The actual latest A epoch must refill after held read release") {
                     source.availableStreamFrames(for: request.epoch) >= 32
                 }
@@ -101,6 +154,9 @@ final class ContinuousPCMDecoderTests: XCTestCase {
                 XCTFail("Exact unresolved same-asset calibration owners retained; no later fixture allocation")
                 throw bodyError ?? error
             }
+            threadProbe.close(); XCTAssertTrue(threadProbe.requestsClosed)
+            threadProbe.dump(cleanupAcknowledged: true)
+            XCTAssertEqual(threadProbe.calibrationSample(lane: 0, sequence: 1)["available"] as? Bool, false)
             let final = try XCTUnwrap(closed.withLock { $0?.1 })
             XCTAssertFalse(final.overflowed)
             var live: [Int: Set<Int>] = [:]
@@ -120,7 +176,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             if let bodyError { throw bodyError }
         }
         #else
-        XCTFail("Same-asset admission calibration requires DEBUG")
+        XCTFail("Same-asset admission/own-thread calibration requires DEBUG Simulator")
         #endif
     }
 
@@ -597,6 +653,22 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             value.withLock { $0 } != nil
         }
         return try XCTUnwrap(value.withLock { $0 }).get()
+    }
+
+    private static func mailboxStateUntil(_ decoder: ContinuousPCMDecoder, timeout: Double,
+        _ condition: (ContinuousPCMDecoder.DebugFailureState) -> Bool) async throws -> ContinuousPCMDecoder.DebugFailureState {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        repeat {
+            let value = Mutex<ContinuousPCMDecoder.DebugFailureState?>(nil)
+            decoder.debugFailureState { state in value.withLock { $0 = state } }
+            try await mailboxWait(timeout: min(0.25, max(0.001, deadline - ProcessInfo.processInfo.systemUptime)),
+                "The exact worker state request must actually return") { value.withLock { $0 } != nil }
+            let state = try XCTUnwrap(value.withLock { $0 })
+            if condition(state) { return state }
+            try await Task.sleep(for: .milliseconds(2))
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        XCTFail("The exact held lane, lease, new epoch and later event did not qualify")
+        throw ContinuousPCMDecoder.Failure.cannotDecode
     }
 
     private static func mailboxStats(_ decoder: ContinuousPCMDecoder, timeout: Double = 0.25) async throws -> ContinuousPCMDecoder.DebugWorkerStats {

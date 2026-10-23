@@ -507,6 +507,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runNativeItemAudioTrackComparison([false, true], order: "off-then-on")
     }
 
+    func testNativeReaderWaitSamplingOffFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, nativeReaderWaitSampling: false)
+    }
+
+    func testNativeReaderWaitSamplingOnFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, nativeReaderWaitSampling: true)
+    }
+
+    func testNativeReaderWaitSamplingOnSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, nativeReaderWaitSampling: true)
+    }
+
+    func testNativeReaderWaitSamplingOffSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, nativeReaderWaitSampling: false)
+    }
+
     func testAWorkerBoundaryAtActualStereoZeroWithOriginalPlaybackGuards() async throws {
         #if DEBUG
         try await runProductionSelectionBenchmark(traceVideoSeeks: true,
@@ -3430,11 +3450,33 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 capClockBoundary: Bool? = nil,
                                                 nativePlayerReportedState: Bool? = nil,
                                                 nativeAudioTrackDisabling: Bool? = nil,
-                                                sameRetainedAssetAdmission: Bool? = nil) async throws {
+                                                sameRetainedAssetAdmission: Bool? = nil,
+                                                nativeReaderWaitSampling: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
         let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
-            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeAudioTrackDisabling == nil && sameRetainedAssetAdmission == nil ? nil : true)
+            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeAudioTrackDisabling == nil && sameRetainedAssetAdmission == nil && nativeReaderWaitSampling == nil ? nil : true)
+        if let enabled = nativeReaderWaitSampling {
+            #if !targetEnvironment(simulator)
+            XCTFail("Own-reader native wait observation requires Simulator; a missing context is not a device control")
+            throw SelectionVideoTestFailure.timeout
+            #endif
+            guard traceVideoSeeks, traceClockHandoff == true, sameRetainedAssetAdmission == nil,
+                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
+                  firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
+                  frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
+                  traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup, freshPreviousBundle == nil,
+                  queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == nil,
+                  sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("Native reader observation varies only bounded own-thread queries with equal context hooks")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("NativeReaderWaitScope schema=1 enabled=\(enabled) phases=returned-A context=both-arms queries=on-only trigger=actual-zero-or-unchanged-copy300ms rows=6 frames=16 extraSampler=false noMediaQueries=true noExternalTask=true noExplicitSuspend=true kernelGetStateMayStop=true stackCoherent=false playbackPolicy=unchanged originalGuards=unchanged")
+        }
         if let enabled = sameRetainedAssetAdmission {
             guard traceVideoSeeks, traceClockHandoff == true, nativeAudioTrackDisabling == nil,
                   nativePlayerReportedState == nil, earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
@@ -3565,6 +3607,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if nativeReaderWaitSampling != nil {
+            XCTFail("Own-thread observation requires DEBUG Simulator")
+            throw SelectionVideoTestFailure.timeout
+        }
         if nativePlayerReportedState != nil {
             XCTFail("Native reported player-state comparison requires DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3725,8 +3771,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #endif
         #if DEBUG
+        let nativeWait = nativeReaderWaitSampling.map { NativeReaderWaitObservation(enabled: $0) }
         let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true || returnedZeroEventMode != nil
-            ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+            ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder(beforeCopyThread: nativeWait.map { probe in
+                { @Sendable lane, sequence in probe.note(lane: lane, sequence: sequence) }
+            }) : nil
         let admission = sameRetainedAssetAdmission.map {
             ContinuousPCMDecoder.DebugReaderAdmissionRecorder(excludesSameAsset: $0)
         }
@@ -4121,7 +4170,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 nativePhase: phase, nativeExpectedToken: measurement.state.expectedToken,
                 nativeCommandUnderruns: measurement.before.underrunFrames, renderAccounting: accounting,
                 captureSnapshotReadReceipt: traceClockHandoff == true,
-                firstZeroProbe: phase == 2 ? firstZeroProbe : nil, activityRecorder: nativeActivity)
+                firstZeroProbe: phase == 2 ? firstZeroProbe : nil, activityRecorder: nativeActivity, nativeWait: nativeWait)
             #else
             let probe = ProductionRendererProbe(renderer: audio.renderer)
             #endif
@@ -4174,7 +4223,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         if traceReturnedAProducerBoundary == true { nativeTrace?.closeReturnedARequests() }
         if nativeAudioControl != nil { service.onDebugInitialVideoReady = nil; nativeAudioControl?.stop() }
-        firstZeroProbe?.close()
+        firstZeroProbe?.close(); nativeWait?.close()
         earlyAcquisitionTrace?.stop()
         wholeFrameTrace?.stop()
         audio.onDebugPresentationClock = nil; capClockTrace?.stop()
@@ -4203,6 +4252,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let cleanupReturned = await waitUntil(timeout: 3) {
             let acknowledged = shutdown.result != nil && preparation.result != nil
             #if DEBUG
+            if let nativeWait, !nativeWait.requestsClosed { return false }
             if let firstZeroProbe { return acknowledged && firstZeroProbe.requestsClosed }
             // Same original shared deadline. The new ON target also closes its
             // one queued/issued request; nil/OFF performs no extra observer read.
@@ -4217,6 +4267,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         mayRemoveFixture = cleanupReturned && decoderAck == true && preparationAck == true
         print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
         #if DEBUG
+        nativeWait?.dump(cleanupAcknowledged: mayRemoveFixture)
         if sameRetainedAssetAdmission != nil {
             let final = admissionReply.withLock { $0 }
             let cached = firstZeroProbe?.snapshot().response?.admission
@@ -10254,11 +10305,13 @@ private final class ProductionRendererProbe: @unchecked Sendable {
     private let renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder?
     private let firstZeroProbe: ProductionFirstZeroWorkerProbe?
     private let activityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder?
+    private let nativeWait: NativeReaderWaitObservation?
     init(renderer: ContinuousPCMRenderer, nativeTrace: ProductionNativeRefillTrace? = nil,
          nativePhase: Int = -1, nativeExpectedToken: Int = 0, nativeCommandUnderruns: Int64 = 0,
          renderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil,
          captureSnapshotReadReceipt: Bool = false, firstZeroProbe: ProductionFirstZeroWorkerProbe? = nil,
-         activityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil) {
+         activityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil,
+         nativeWait: NativeReaderWaitObservation? = nil) {
         self.renderer = renderer
         self.captureSnapshotReadReceipt = captureSnapshotReadReceipt
         self.nativeTrace = nativeTrace
@@ -10266,7 +10319,7 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         self.nativeCommandUnderruns = nativeCommandUnderruns
         self.renderAccounting = renderAccounting
         self.firstZeroProbe = firstZeroProbe
-        self.activityRecorder = activityRecorder
+        self.activityRecorder = activityRecorder; self.nativeWait = nativeWait
         samples.reserveCapacity(128)
         timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "test.production-render-sampler", qos: .userInitiated))
         timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(1))
@@ -10351,6 +10404,10 @@ private final class ProductionRendererProbe: @unchecked Sendable {
         // request/reply times and nonjoint coherence qualify that later state.
         if requestFromStoredWindowSample {
             firstZeroProbe?.observeFromSampler(audio)
+            if let nativeWait, let activityRecorder {
+                let zero = firstZeroProbe.flatMap { $0.event.snapshot(for: $0.event.window) } != nil
+                nativeWait.observe(recorder: activityRecorder, zero: zero, phase: nativePhase)
+            }
             nativeTrace?.observeFirstUnderrun(audio, renderer: renderer, phase: nativePhase, expectedToken: nativeExpectedToken,
                 commandUnderruns: nativeCommandUnderruns, firstWindowSample: firstWindowSample,
                 observationBegin: begin, observationEnd: end)

@@ -1,5 +1,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
+#import "NativeReaderWaitProbe.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
