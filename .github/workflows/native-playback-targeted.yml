@@ -1,4 +1,4 @@
-name: Owned reader wait at dropout with isolated playback controls
+name: Bounded startup polling with isolated playback controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -46,10 +46,10 @@ jobs:
         run: |
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
-      - name: Build one exact test plan and calibrate owned thread and actual close ordering
+      - name: Build one exact test plan and measure ordinary production selection and continuity
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh benchmark
-      - name: Require the actual held-reader and own-thread calibration identity
+      - name: Require the actual ordinary production selection benchmark identity
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: |
           python3 - <<'PY'
@@ -58,14 +58,14 @@ jobs:
           spec = importlib.util.spec_from_file_location('evidence', 'scripts/verify-native-test-log.py')
           evidence = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(evidence)
-          prefix = 'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/'
-          expected = {prefix + 'testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose'}
+          prefix = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
+          expected = {prefix + 'testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture'}
           if len(expected) != 1 or not expected.issubset(evidence.source_manifest(Path('.'))):
-              raise SystemExit('The held-reader actual-read/close and own-thread calibration must exist in pinned source')
+              raise SystemExit('The ordinary production selection and continuity benchmark must exist in pinned source')
           evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected, invocation='test-without-building')
-          print('Held-reader and own-thread calibration identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
+          print('Ordinary production selection benchmark identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
-      - name: Four context-only and sampled arms OFF ON ON OFF in fresh exact owned hosts
+      - name: Four bounded startup polling arms OFF ON ON OFF in fresh exact owned hosts
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh controls
       - name: Require all four singleton identities and native exit and host-boundary receipts

@@ -154,10 +154,10 @@ class NativeControlHarnessTests(unittest.TestCase):
 
     def test_live_control_inventory_and_source_manifest_are_required(self):
         self.assertEqual(self.cases, (
-            'testNativeReaderWaitSamplingOffFirst',
-            'testNativeReaderWaitSamplingOnFirst',
-            'testNativeReaderWaitSamplingOnSecond',
-            'testNativeReaderWaitSamplingOffSecond'))
+            'testInitialVideoPollingOffFirst',
+            'testInitialVideoPollingOnFirst',
+            'testInitialVideoPollingOnSecond',
+            'testInitialVideoPollingOffSecond'))
         shell = HARNESS.read_text(encoding="utf-8")
         control_names = shlex.split(re.search(r"controls\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
         self.assertEqual(tuple(control_names), self.cases)
@@ -406,7 +406,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         self.assertEqual(len(probe), 1)
         self.assertIn('run: python3 scripts/check-native-reader-probe-sdk.py', probe[0])
         native = [block for block in blocks if any(block.startswith(name) for name in (
-            'Resolve within', 'Build one exact', 'Require the actual', 'Four context-only',
+            'Resolve within', 'Build one exact', 'Require the actual', 'Four bounded startup polling',
             'Require all four', 'Export each exact'))]
         self.assertEqual(len(native), 6)
         for block in native:
@@ -424,7 +424,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         end = shell.index('\nfi\n\ntest_plan=', start) + len('\nfi')
         benchmark = shell[start:end]
         names = shlex.split(re.search(r"benchmark\) cases=\((.*?)\) ;;", shell, re.DOTALL).group(1))
-        expected_selectors = ['OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose']
+        expected_selectors = ['OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture']
         self.assertEqual(names, expected_selectors)
         workflow = TARGETED_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(re.findall(r'^\s*timeout-minutes:\s*(\d+)\s*$', workflow, re.MULTILINE), ['50'])

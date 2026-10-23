@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=8f76eaa54a11bb2221d4d58f8150104148cdce94
-expected_ios_tree=3a3798418dfd6dbc489a6e4a9cf1a8766d17b4f2
+expected_code_source=379153d69c88df998f4112631fba3e44d4b1872c
+expected_ios_tree=e6844f22469ac97f2d4a4fa83e64f38df6c3d28d
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testNativeReaderWaitSamplingOffFirst',
-    'testNativeReaderWaitSamplingOnFirst',
-    'testNativeReaderWaitSamplingOnSecond',
-    'testNativeReaderWaitSamplingOffSecond',
+    'testInitialVideoPollingOffFirst',
+    'testInitialVideoPollingOnFirst',
+    'testInitialVideoPollingOnSecond',
+    'testInitialVideoPollingOffSecond',
 )
 
 def require(condition, message):
@@ -318,9 +318,9 @@ if [ "$1" = --verify-controls ]; then evidence_tool verify-controls "$expected_c
 mode="$1"
 case "$mode" in
   benchmark) cases=(
-    OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose
+    OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testNativeReaderWaitSamplingOffFirst testNativeReaderWaitSamplingOnFirst testNativeReaderWaitSamplingOnSecond testNativeReaderWaitSamplingOffSecond) ;;
+  controls) cases=(testInitialVideoPollingOffFirst testInitialVideoPollingOnFirst testInitialVideoPollingOnSecond testInitialVideoPollingOffSecond) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
