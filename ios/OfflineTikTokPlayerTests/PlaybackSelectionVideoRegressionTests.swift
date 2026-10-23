@@ -727,6 +727,45 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
     }
 
+    func testSourceAndPresentationClockBoundariesOffThenOn() async throws {
+        try await runSourceAndPresentationClockBoundaries([false, true], order: "off-then-on")
+    }
+
+    func testSourceAndPresentationClockBoundariesOnThenOff() async throws {
+        try await runSourceAndPresentationClockBoundaries([true, false], order: "on-then-off")
+    }
+
+    private func runSourceAndPresentationClockBoundaries(_ modes: [Bool], order: String) async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        defer {
+            sourceCallbackLedgerBenchmarkMode = nil; sourceCallbackExecutionTimingBenchmarkMode = nil
+            sourceCallbackLedgerArmID = nil
+        }
+        for (ordinal, enabled) in modes.enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            sourceCallbackLedgerBenchmarkMode = true; sourceCallbackExecutionTimingBenchmarkMode = true
+            sourceCallbackLedgerArmID = armID
+            // Bracket the existing clocks once, outside playback. No transferred offset.
+            let hostBefore = mach_absolute_time()
+            let dispatchNs = DispatchTime.now().uptimeNanoseconds
+            let hostAfter = mach_absolute_time()
+            let beforeSeconds = AVAudioTime.seconds(forHostTime: hostBefore)
+            let afterSeconds = AVAudioTime.seconds(forHostTime: hostAfter)
+            let dispatchSeconds = Double(dispatchNs) / 1_000_000_000
+            XCTAssertLessThanOrEqual(beforeSeconds, dispatchSeconds)
+            XCTAssertLessThanOrEqual(dispatchSeconds, afterSeconds)
+            print("SourcePresentationClockArm schema=1 armID=\(armID) order=\(order) ordinal=\(ordinal) presentationTiming=\(enabled) sourceLedger=true sourceExecutionTiming=true firstZeroProbe=constant-on clockHandoff=constant-on newNativeQueries=0 playbackPolicy=unchanged acceptance=unchanged")
+            print("SourcePresentationClockBridge schema=1 armID=\(armID) hostBeforeSeconds=\(beforeSeconds) dispatchSeconds=\(dispatchSeconds) hostAfterSeconds=\(afterSeconds) transferOffset=false placement=before-playback")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, capClockBoundary: enabled, joinSourceCallbackClockLedger: true)
+            print("SourcePresentationClockArmEnd schema=1 armID=\(armID) helperReturned=true")
+        }
+        #else
+        XCTFail("Joined existing source and presentation clocks require DEBUG")
+        #endif
+    }
+
     func testFirstZeroCallbackRangeUsesActualStorageAcrossTapBuffers() throws {
         #if DEBUG
         let ledger = ContinuousPCMRenderer.DebugSourceCallbackLedger(sourceCapacity: 1, tapCapacity: 4)
@@ -3735,6 +3774,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 wholeFrameClockAcquisition: Bool? = nil,
                                                 firstZeroSourceCallbacks: Bool? = nil,
                                                 capClockBoundary: Bool? = nil,
+                                                joinSourceCallbackClockLedger: Bool = false,
                                                 nativePlayerReportedState: Bool? = nil,
                                                 nativeAudioTrackDisabling: Bool? = nil,
                                                 sameRetainedAssetAdmission: Bool? = nil,
@@ -3744,6 +3784,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 readyNotificationTiming: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
+        if joinSourceCallbackClockLedger && capClockBoundary == nil {
+            XCTFail("Joined source receipts require the explicit existing CAP boundary comparison")
+            throw SelectionVideoTestFailure.timeout
+        }
         if let enabled = readyNotificationTiming {
             guard traceVideoSeeks, traceClockHandoff == true, queuedPreviousAdvance == nil,
                   initialVideoPolling == nil, nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
@@ -3871,6 +3915,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("NativePlayerReportedScope schema=1 enabled=\(enabled) phases=3 samplesPerPhase=7 capacity=24 maximumBytes=65536 extraSDKQueriesPerSample=4-or-5 getters=currentItem-status-reasonIfWaiting-status-currentItem valuesAtomic=false firstZeroProbe=constant-on playbackPolicy=unchanged")
         }
         if let enabled = capClockBoundary {
+            let legacyLedger = !joinSourceCallbackClockLedger && sourceCallbackLedgerBenchmarkMode == nil
+                && sourceCallbackExecutionTimingBenchmarkMode == nil
+            let joinedLedger = joinSourceCallbackClockLedger && sourceCallbackLedgerBenchmarkMode == true
+                && sourceCallbackExecutionTimingBenchmarkMode == true && sourceCallbackLedgerArmID != nil
             guard traceVideoSeeks, traceClockHandoff == true, earlyClockAcquisition == nil,
                   wholeFrameClockAcquisition == nil, firstZeroSourceCallbacks == nil, traceReturnedAStereoZero == nil,
                   frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
@@ -3878,8 +3926,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                   queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
                   traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
                   initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
-                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == nil,
-                  sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                  sourceOutputBenchmarkMode == nil, legacyLedger || joinedLedger else {
                 XCTFail("CAP clock comparison varies only existing-call scalar timing with constant startup/zero observers")
                 throw SelectionVideoTestFailure.timeout
             }
@@ -4269,7 +4316,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 expectedCurrentItemTime: initialNativeStartCurrentItemTime)
         }
         let capClockTrace = capClockBoundary.map {
-            PresentationClockBoundaryTrace(enabled: $0, armID: UUID().uuidString.lowercased())
+            PresentationClockBoundaryTrace(enabled: $0,
+                armID: sourceCallbackLedgerArmID ?? UUID().uuidString.lowercased())
         }
         if let capClockTrace, capClockTrace.enabled {
             audio.onDebugPresentationClock = { [weak capClockTrace, weak service] event in
