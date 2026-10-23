@@ -3394,6 +3394,23 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
+    func testSameRetainedAssetAdmissionOffFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true,
+            sameRetainedAssetAdmission: false)
+    }
+    func testSameRetainedAssetAdmissionOnFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true,
+            sameRetainedAssetAdmission: true)
+    }
+    func testSameRetainedAssetAdmissionOnSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true,
+            sameRetainedAssetAdmission: true)
+    }
+    func testSameRetainedAssetAdmissionOffSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true,
+            sameRetainedAssetAdmission: false)
+    }
+
     private func runProductionSelectionBenchmark(traceVideoSeeks: Bool, frameMonitorAlternative: Bool? = nil,
                                                 recordHost: Bool = true, traceNativeRefill: Bool = false,
                                                 renderAccounting: Bool? = nil, traceDefaultFrameMonitor: Bool? = nil,
@@ -3412,11 +3429,28 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 firstZeroSourceCallbacks: Bool? = nil,
                                                 capClockBoundary: Bool? = nil,
                                                 nativePlayerReportedState: Bool? = nil,
-                                                nativeAudioTrackDisabling: Bool? = nil) async throws {
+                                                nativeAudioTrackDisabling: Bool? = nil,
+                                                sameRetainedAssetAdmission: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
         let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
-            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeAudioTrackDisabling == nil ? nil : true)
+            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeAudioTrackDisabling == nil && sameRetainedAssetAdmission == nil ? nil : true)
+        if let enabled = sameRetainedAssetAdmission {
+            guard traceVideoSeeks, traceClockHandoff == true, nativeAudioTrackDisabling == nil,
+                  nativePlayerReportedState == nil, earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
+                  firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
+                  frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
+                  traceDefaultFrameMonitor == nil, !auditSavedAAfterCleanup, freshPreviousBundle == nil,
+                  queuedPreviousLead == nil, suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  initialNativeStartCurrentItemTime == nil, acceptedPCMOriginBenchmarkMode == nil,
+                  sourceOutputBenchmarkMode == nil, sourceCallbackLedgerBenchmarkMode == nil,
+                  sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("Same-asset admission varies only the worker admission predicate with constant native tracing")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("SameAssetAdmissionScope schema=1 enabled=\(enabled) identity=retained-AVURLAsset-instance maximumLeases=3 activeBudget=8 inactiveBudget=2 nativeAudioPolicy=default trace=constant firstZeroProbe=constant eventCapacity=256 maximumAssets=64 maximumLeaseIDs=128 addedClocks=0 crossThreadCancel=false releasePolicy=unchanged originalGuards=unchanged")
+        }
         if let enabled = nativeAudioTrackDisabling {
             guard traceVideoSeeks, traceClockHandoff == true, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
@@ -3603,6 +3637,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if sameRetainedAssetAdmission != nil {
+            XCTFail("Same-retained-asset admission controls require DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if nativeAudioTrackDisabling != nil {
             XCTFail("Native audio-track comparison is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
@@ -3689,6 +3727,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true || returnedZeroEventMode != nil
             ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+        let admission = sameRetainedAssetAdmission.map {
+            ContinuousPCMDecoder.DebugReaderAdmissionRecorder(excludesSameAsset: $0)
+        }
+        let admissionReply = Mutex<ContinuousPCMDecoder.DebugReaderAdmissionState?>(nil)
         let firstFailure = traceFirstSourceFailure == true || traceReturnedAProducerBoundary == true
             ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
         let acceptedPCMOrigin = acceptedPCMOriginBenchmarkMode
@@ -3701,7 +3743,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 captureCallbackExecutionTime: sourceCallbackExecutionTimingBenchmarkMode == true) : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: nativeActivity,
                                           debugRenderAccounting: accounting, debugAcceptedPCMOrigin: originRecorder,
-                                          debugFirstFailure: firstFailure)
+                                          debugFirstFailure: firstFailure, debugReaderAdmission: admission)
         if let enabled = acceptedPCMOrigin {
             print("AcceptedPCMOriginScope schema=1 enabled=\(enabled) prefixCapacity=3 ringEpochCapacity=12 minimumZeroRunFrames=480 normalizedRate=48000 channels=2 noRetainedPCM=true noWorkerClock=true receipt=existing-kernel-completion rendererSnapshotUnchanged=true nativeTrace=false defaultMonitor=true independentDomains=true originalGuards=unchanged")
             XCTAssertFalse(traceVideoSeeks); XCTAssertFalse(traceNativeRefill)
@@ -4149,7 +4191,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let preparation = ProductionSelectionShutdown()
         #if DEBUG
         service.debugStopPreparation { preparation.complete(true) }
-        audio.debugShutdown { shutdown.complete($0) }
+        if admission != nil {
+            audio.debugShutdownWithAdmission { acknowledged, state in
+                admissionReply.withLock { $0 = state }; shutdown.complete(acknowledged)
+            }
+        } else { audio.debugShutdown { shutdown.complete($0) } }
         if let originReply {
             audio.debugAcceptedPCMOriginSnapshot { snapshot in originReply.complete(snapshot) }
         }
@@ -4171,6 +4217,25 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         mayRemoveFixture = cleanupReturned && decoderAck == true && preparationAck == true
         print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
         #if DEBUG
+        if sameRetainedAssetAdmission != nil {
+            let final = admissionReply.withLock { $0 }
+            let cached = firstZeroProbe?.snapshot().response?.admission
+            let state = final ?? cached
+            print("SameAssetAdmissionSummary schema=1 available=\(state != nil) finalActualACK=\(final != nil && decoderAck == true) scope=\(final == nil ? "later-independent-cached-state" : "actual-shutdown-ack-worker") enabled=\(state?.excludesSameAsset ?? false) exclusions=\(state?.exclusions ?? 0) overlaps=\(state?.overlaps ?? 0) events=\(state?.events.count ?? 0) overflowed=\(state?.overflowed ?? true) cleanupAcknowledged=\(mayRemoveFixture) sourceTapFrameJoin=false sdkInternalCause=unestablished")
+            XCTAssertNotNil(state); XCTAssertFalse(state?.overflowed ?? true)
+            if let state {
+                var live: [Int: Set<Int>] = [:]
+                for e in state.events {
+                    print("SameAssetAdmissionEvent schema=1 ordinal=\(e.ordinal) kind=\(e.kind) asset=\(e.asset) lease=\(e.lease) lane=\(e.lane) token=\(e.token) matchingMask=\(e.matchingMask) retiredMask=\(e.retiredMask) freeMask=\(e.freeMask) kindCodes=admit1-exclude2-actualClose3 scope=worker-ordered-no-clock")
+                    if e.kind == 1 {
+                        if state.excludesSameAsset { XCTAssertTrue(live[e.asset, default: []].isEmpty); XCTAssertEqual(e.matchingMask, 0) }
+                        live[e.asset, default: []].insert(e.lease)
+                    } else if e.kind == 3 { XCTAssertNotNil(live[e.asset]?.remove(e.lease)) }
+                }
+                if state.excludesSameAsset { XCTAssertEqual(state.overlaps, 0) }
+                if final != nil { XCTAssertTrue(live.values.allSatisfy { $0.isEmpty }) }
+            }
+        }
         if let ledger = accounting?.callbackLedger {
             let prefix = ledger.prefix()
             let bytes = ledger.reservedPayloadBytes

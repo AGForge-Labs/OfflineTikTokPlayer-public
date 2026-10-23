@@ -17,6 +17,113 @@ enum PCMWorkerBoundaryOwnership {
 #endif
 
 final class ContinuousPCMDecoderTests: XCTestCase {
+    func testSameRetainedAssetAdmissionWaitsForActualRetiredReaderClose() async throws {
+        #if DEBUG
+        for enabled in [false, true] {
+            guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
+                XCTFail("An unresolved actual reader close blocks new calibration owners")
+                throw ContinuousPCMDecoder.Failure.cannotDecode
+            }
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let a = directory.appendingPathComponent("same-asset-A.caf")
+            let b = directory.appendingPathComponent("independent-B.caf")
+            let expected = Self.mailboxPattern(frames: 8_193, identity: 1)
+            do {
+                try writePCM(expected, to: a)
+                try writePCM(Self.mailboxPattern(frames: 8_193, identity: 2), to: b)
+            } catch { try? FileManager.default.removeItem(at: directory); throw error }
+            let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+            let admission = ContinuousPCMDecoder.DebugReaderAdmissionRecorder(excludesSameAsset: enabled)
+            let decoder = ContinuousPCMDecoder(renderer: renderer, debugReaderAdmission: admission)
+            let gate = ContinuousPCMDecoder.DebugNativeReadGate()
+            decoder.debugSetNativeReadGate(gate)
+            var bodyError: Error?
+            var independentPreparedWhileHeld = false, exactPCM = false
+            do {
+                _ = try await Self.mailboxPrepare(decoder, url: a, token: 1, slot: 0)
+                XCTAssertTrue(gate.arm(token: 1))
+                Self.mailboxAcknowledge(renderer, token: 1, frame: 2_049)
+                try await Self.mailboxWait(timeout: 1, "The actual A native read must enter") { gate.didEnter }
+                guard gate.isHolding, !gate.didTimeOut else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+                Self.mailboxAcknowledge(renderer, token: 1, frame: 2_203)
+                let state = Mutex<ContinuousPCMDecoder.DebugFailureState?>(nil)
+                let deadline = ProcessInfo.processInfo.systemUptime + 1
+                repeat {
+                    decoder.debugFailureState { value in state.withLock { $0 = value } }
+                    try await Task.sleep(for: .milliseconds(5))
+                    if let value = state.withLock({ $0 }), let receipt = value.admission,
+                       (enabled ? receipt.exclusions > 0 : receipt.overlaps > 0) { break }
+                } while ProcessInfo.processInfo.systemUptime < deadline
+                let held = try XCTUnwrap(state.withLock { $0 })
+                let receipt = try XCTUnwrap(held.admission)
+                Self.assertMailboxBounds(held.stats)
+                XCTAssertFalse(receipt.overflowed)
+                XCTAssertTrue(gate.isHolding); XCTAssertFalse(gate.didTimeOut)
+                XCTAssertGreaterThan(held.stats.retiredLeasesAwaitingClose, 0)
+                if enabled {
+                    XCTAssertGreaterThan(receipt.exclusions, 0); XCTAssertEqual(receipt.overlaps, 0)
+                    XCTAssertTrue(receipt.events.contains { $0.kind == 2 && $0.freeMask != 0 && $0.retiredMask != 0 },
+                        "A free lane must exist so the new predicate, rather than the global cap, excludes the replacement")
+                } else {
+                    XCTAssertGreaterThan(receipt.overlaps, 0)
+                    XCTAssertTrue(receipt.events.contains { $0.kind == 1 && $0.token == 1 && $0.retiredMask != 0 })
+                }
+                // A distinct retained asset can prepare while the A read remains held.
+                _ = try await Self.mailboxPrepare(decoder, url: b, token: 2, slot: 1, timeout: 1)
+                independentPreparedWhileHeld = gate.isHolding && !gate.didTimeOut
+                XCTAssertTrue(gate.isHolding); XCTAssertFalse(gate.didTimeOut)
+                gate.release()
+                let source = renderer.source(at: 0), request = renderer.source(at: 0).streamRequest
+                try await Self.mailboxWait(timeout: 2, "The actual latest A epoch must refill after held read release") {
+                    source.availableStreamFrames(for: request.epoch) >= 32
+                }
+                var pcm = [Float](repeating: .nan, count: 64)
+                renderer.setPlaying(true)
+                pcm.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 32) }
+                renderer.setPlaying(false)
+                assertSamples(pcm, equal: Array(expected[Int(request.startFrame) * 2..<Int(request.startFrame + 32) * 2]))
+                exactPCM = pcm == Array(expected[Int(request.startFrame) * 2..<Int(request.startFrame + 32) * 2])
+                XCTAssertFalse(gate.didTimeOut)
+            } catch { bodyError = error }
+            gate.release(); renderer.setPlaying(false); decoder.shutdown()
+            let closed = Mutex<(Bool, ContinuousPCMDecoder.DebugReaderAdmissionState?)?>(nil)
+            decoder.debugAfterShutdownWithAdmission { acknowledged, state in closed.withLock { $0 = (acknowledged, state) } }
+            do {
+                try await Self.mailboxWait(timeout: 2, "Actual close acceptance is required before calibration fixture removal") {
+                    closed.withLock { $0 } != nil
+                }
+                guard closed.withLock({ $0?.0 }) == true else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+            } catch {
+                PCMWorkerBoundaryOwnership.unresolved.withLock {
+                    $0 = .init(decoder: decoder, renderer: renderer, gate: gate, directory: directory)
+                }
+                XCTFail("Exact unresolved same-asset calibration owners retained; no later fixture allocation")
+                throw bodyError ?? error
+            }
+            let final = try XCTUnwrap(closed.withLock { $0?.1 })
+            XCTAssertFalse(final.overflowed)
+            var live: [Int: Set<Int>] = [:]
+            for e in final.events {
+                if e.kind == 1 {
+                    if enabled { XCTAssertTrue(live[e.asset, default: []].isEmpty); XCTAssertEqual(e.matchingMask, 0) }
+                    live[e.asset, default: []].insert(e.lease)
+                } else if e.kind == 3 {
+                    XCTAssertNotNil(live[e.asset]?.remove(e.lease), "Only an actually admitted lease can close")
+                }
+            }
+            XCTAssertTrue(live.values.allSatisfy { $0.isEmpty })
+            XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+            print("SameAssetAdmissionCalibration schema=1 enabled=\(enabled) exclusions=\(final.exclusions) overlaps=\(final.overlaps) events=\(final.events.count) actualCleanupAcknowledged=true independentAssetPreparedWhileHeld=\(independentPreparedWhileHeld) exactPCM=\(exactPCM) bodyCompleted=\(bodyError == nil) gateMaximumSeconds=5 sourceIdentity=retained-asset-instance sdkInternalWait=false")
+            do { try FileManager.default.removeItem(at: directory) }
+            catch { XCTFail("Acknowledged same-asset fixture removal failed"); throw bodyError ?? error }
+            if let bodyError { throw bodyError }
+        }
+        #else
+        XCTFail("Same-asset admission calibration requires DEBUG")
+        #endif
+    }
+
     func testWorkerBoundaryReceiptSeparatesHeldConversionFromQueuedShutdown() async throws {
         #if DEBUG
         guard !PCMWorkerBoundaryOwnership.blocksFixtures else {

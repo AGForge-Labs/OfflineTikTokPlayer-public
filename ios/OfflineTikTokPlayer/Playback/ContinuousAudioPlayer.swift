@@ -82,12 +82,14 @@ final class ContinuousAudioPlayer {
     init(debugNativeLaneActivityRecorder: ContinuousPCMDecoder.DebugNativeLaneActivityRecorder? = nil,
          debugRenderAccounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder? = nil,
          debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder? = nil,
-         debugFirstFailure: ContinuousPCMRenderer.DebugFirstFailureRecorder? = nil) {
+         debugFirstFailure: ContinuousPCMRenderer.DebugFirstFailureRecorder? = nil,
+         debugReaderAdmission: ContinuousPCMDecoder.DebugReaderAdmissionRecorder? = nil) {
         renderer = ContinuousPCMRenderer(debugRenderAccounting: debugRenderAccounting, debugFirstFailure: debugFirstFailure)
         self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
         graph = ContinuousAudioGraph(renderer: renderer)
         decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder,
-                                       debugAcceptedPCMOrigin: debugAcceptedPCMOrigin)
+                                       debugAcceptedPCMOrigin: debugAcceptedPCMOrigin,
+                                       debugReaderAdmission: debugReaderAdmission)
     }
     #else
     init() {
@@ -139,6 +141,11 @@ final class ContinuousAudioPlayer {
         cancelPreparations(outside: [])
         decoder.shutdown()
         decoder.debugAfterShutdown(completion)
+    }
+    func debugShutdownWithAdmission(_ completion: @escaping @Sendable (Bool, ContinuousPCMDecoder.DebugReaderAdmissionState?) -> Void) {
+        cancelPreparations(outside: [])
+        decoder.shutdown()
+        decoder.debugAfterShutdownWithAdmission(completion)
     }
     #endif
     var preparedCount: Int { entries.count }

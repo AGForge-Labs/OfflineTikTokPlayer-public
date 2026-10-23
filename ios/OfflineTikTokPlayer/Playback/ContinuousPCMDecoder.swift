@@ -47,6 +47,50 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private enum ReadControl: Error { case deferred, pending }
 
     #if DEBUG
+    /// Worker-only counterfactual. Asset identities are local ordinals, never URLs.
+    /// Both arms retain the same asset on each lease until actual close acceptance.
+    struct DebugReaderAdmissionState: Sendable {
+        struct Event: Sendable {
+            let ordinal: Int, kind: Int, asset: Int, lease: Int, lane: Int, token: Int
+            let matchingMask: Int, retiredMask: Int, freeMask: Int
+        }
+        let excludesSameAsset: Bool, overflowed: Bool
+        let exclusions: Int, overlaps: Int, events: [Event]
+    }
+    final class DebugReaderAdmissionRecorder: @unchecked Sendable {
+        let excludesSameAsset: Bool
+        private var nextAsset = 0, nextLease = 0, exclusions = 0, overlaps = 0
+        private var overflowed = false
+        private var events: [DebugReaderAdmissionState.Event] = []
+        init(excludesSameAsset: Bool) {
+            self.excludesSameAsset = excludesSameAsset
+            events.reserveCapacity(256)
+        }
+        fileprivate func asset() -> Int {
+            guard nextAsset < 64 else { overflowed = true; return 0 }
+            nextAsset += 1; return nextAsset
+        }
+        fileprivate func lease() -> Int {
+            guard nextLease < 128 else { overflowed = true; return 0 }
+            nextLease += 1; return nextLease
+        }
+        fileprivate func note(kind: Int, asset: Int, lease: Int, lane: Int, token: Int,
+                              matchingMask: Int = 0, retiredMask: Int = 0, freeMask: Int = 0) {
+            // kind: 1 admitted, 2 excluded, 3 actual close accepted.
+            if kind == 2 { exclusions = min(257, exclusions + 1) }
+            if kind == 1 && matchingMask != 0 { overlaps = min(257, overlaps + 1) }
+            guard events.count < 256, asset > 0, kind != 1 || lease > 0 else {
+                overflowed = true; return
+            }
+            events.append(.init(ordinal: events.count, kind: kind, asset: asset, lease: lease,
+                lane: lane, token: token, matchingMask: matchingMask, retiredMask: retiredMask, freeMask: freeMask))
+        }
+        fileprivate func snapshot() -> DebugReaderAdmissionState {
+            .init(excludesSameAsset: excludesSameAsset, overflowed: overflowed,
+                  exclusions: exclusions, overlaps: overlaps, events: events)
+        }
+    }
+
     enum DebugNativeLaneActivityStage: UInt64, Sendable {
         case none = 0, construction = 1, startReading = 2, nativeReadEntered = 3
         case copyEntered = 4, copyReturned = 5, parser = 6, nativeReadReturned = 7, close = 8
@@ -219,6 +263,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let preparationTokens: [Int] // Exactly three physical preparation slots.
         let slots: [DebugSlotState] // Exactly three physical playback slots.
         let leases: [DebugLeaseState] // Exactly three physical native lanes.
+        let admission: DebugReaderAdmissionState?
     }
 
     /// One-shot test gate immediately before native acquisition. This models an
@@ -271,6 +316,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let nativeChannels: UInt32
         #if DEBUG
         var debugReadToken = 0
+        var debugAdmissionAssetID = 0
+        var debugAdmissionLastExcludedMask = -1
         var debugReadGate: DebugNativeReadGate?
         let debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?
         #endif
@@ -309,6 +356,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         var totalFrames: Int64
         #if DEBUG
         var debugToken = 0
+        var debugAdmissionAsset: AVURLAsset?
+        var debugAdmissionAssetID = 0
+        var debugAdmissionLeaseID = 0
         #endif
 
         init(index: Int, lane: ReaderLane, totalFrames: Int64,
@@ -536,6 +586,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     private let yieldCount = Atomic<Int64>(0)
     #if DEBUG
     private let debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?
+    private let debugReaderAdmission: DebugReaderAdmissionRecorder?
     private let debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder?
     private var peakLeasedReaders = 0
     private var positiveInputRanDryBuffersRetained: UInt64 = 0
@@ -553,8 +604,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     #if DEBUG
     init(renderer: ContinuousPCMRenderer, debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder? = nil,
-         debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder? = nil) {
+         debugAcceptedPCMOrigin: DebugAcceptedPCMOriginRecorder? = nil,
+         debugReaderAdmission: DebugReaderAdmissionRecorder? = nil) {
         self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
+        self.debugReaderAdmission = debugReaderAdmission
         self.debugAcceptedPCMOrigin = debugAcceptedPCMOrigin
         self.renderer = renderer
         let timer = DispatchSource.makeTimerSource(queue: worker)
@@ -771,7 +824,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             }
             completion(DebugFailureState(stats: debugWorkerStatsNow(),
                 preparationTokens: preparations.map { $0?.token ?? 0 },
-                slots: slotStates, leases: leaseStates))
+                slots: slotStates, leases: leaseStates, admission: debugReaderAdmission?.snapshot()))
         }
     }
 
@@ -809,9 +862,32 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             }
         }
     }
+    func debugAfterShutdownWithAdmission(_ completion: @escaping @Sendable (Bool, DebugReaderAdmissionState?) -> Void) {
+        debugAfterShutdown { [self] closed in completion(closed, debugReaderAdmission?.snapshot()) }
+    }
     #endif
 
     private func acquireReader(_ description: Description) throws -> ReaderLease {
+        #if DEBUG
+        var matchingMask = 0, retiredMask = 0, freeMask = 0
+        if let recorder = debugReaderAdmission {
+            if description.debugAdmissionAssetID == 0 { description.debugAdmissionAssetID = recorder.asset() }
+            for index in 0..<3 where leases[index] == nil { freeMask |= 1 << index }
+            for lease in leases.compactMap({ $0 }) where lease.debugAdmissionAsset === description.asset {
+                matchingMask |= 1 << lease.index
+                if lease.retired { retiredMask |= 1 << lease.index }
+            }
+            if recorder.excludesSameAsset && matchingMask != 0 {
+                let signature = matchingMask | (retiredMask << 3) | (freeMask << 6)
+                if description.debugAdmissionLastExcludedMask != signature {
+                    recorder.note(kind: 2, asset: description.debugAdmissionAssetID, lease: 0, lane: -1,
+                        token: description.debugReadToken, matchingMask: matchingMask, retiredMask: retiredMask, freeMask: freeMask)
+                    description.debugAdmissionLastExcludedMask = signature
+                }
+                throw ReadControl.pending
+            }
+        }
+        #endif
         guard let index = leases.firstIndex(where: { $0 == nil }) else { throw ReadControl.pending }
         let total = try Self.frame(description.endTime, rate: description.nativeRate)
         let lease = ReaderLease(index: index, lane: lanes[index], totalFrames: total) { [weak self] lease in
@@ -820,6 +896,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         leases[index] = lease
         #if DEBUG
         lease.debugToken = description.debugReadToken
+        if let recorder = debugReaderAdmission {
+            lease.debugAdmissionAsset = description.asset
+            lease.debugAdmissionAssetID = description.debugAdmissionAssetID
+            lease.debugAdmissionLeaseID = recorder.lease()
+            description.debugAdmissionLastExcludedMask = -1
+            recorder.note(kind: 1, asset: lease.debugAdmissionAssetID, lease: lease.debugAdmissionLeaseID,
+                lane: index, token: lease.debugToken, matchingMask: matchingMask, retiredMask: retiredMask, freeMask: freeMask)
+        }
         peakLeasedReaders = max(peakLeasedReaders, leases.compactMap { $0 }.count)
         #endif
         readerClosures.enter()
@@ -880,6 +964,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 let activity = debugNativeLaneActivityRecorder?.worker
                 activity?.publish(.closeAcceptanceEntered, token: lease.debugToken)
                 defer { activity?.publish(.closeAcceptanceReturned, token: lease.debugToken) }
+                if leases[lease.index] === lease {
+                    debugReaderAdmission?.note(kind: 3, asset: lease.debugAdmissionAssetID,
+                        lease: lease.debugAdmissionLeaseID, lane: lease.index, token: lease.debugToken)
+                }
                 #endif
                 if leases[lease.index] === lease { leases[lease.index] = nil }
                 readerClosures.leave()
