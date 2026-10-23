@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=b1e7e25cf97f7094948bcb74de5a0bcfd29926df
+expected_code_source=8f76eaa54a11bb2221d4d58f8150104148cdce94
 expected_ios_tree=3a3798418dfd6dbc489a6e4a9cf1a8766d17b4f2
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in

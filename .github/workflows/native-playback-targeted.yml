@@ -2,7 +2,7 @@ name: Owned reader wait at dropout with isolated playback controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh', 'scripts/export-native-control-results.py', 'tests/validation-shell/test_native_control_harness.py', 'tests/validation-shell/test_native_control_results.py', 'scripts/check-native-reader-probe-sdk.py', 'tests/validation-shell/test_native_reader_probe_sdk.py']
+    paths: ['.github/workflows/native-playback-targeted.yml', 'scripts/check-native-playback-targeted.sh', 'scripts/export-native-control-results.py', 'tests/validation-shell/test_native_control_harness.py', 'tests/validation-shell/test_native_control_results.py', 'scripts/check-native-reader-probe-sdk.py', 'tests/validation-shell/test_native_reader_probe_sdk.py', 'scripts/run-owned-xcodebuild.py', 'tests/validation-shell/test_owned_xcodebuild_deadline.py']
 concurrency:
   group: offline-player-native-validation
   cancel-in-progress: true
@@ -12,7 +12,7 @@ jobs:
   native-playback-targeted:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -35,6 +35,7 @@ jobs:
           python3 tests/validation-shell/test_native_test_evidence.py
           python3 tests/validation-shell/test_native_control_harness.py
           python3 tests/validation-shell/test_native_reader_probe_sdk.py
+          python3 tests/validation-shell/test_owned_xcodebuild_deadline.py
           python3 tests/validation-shell/test_native_control_results.py
           python3 tests/validation-shell/test_simulator_boot_preflight.py
           python3 tests/validation-shell/test_simulator_destination_resolution.py
