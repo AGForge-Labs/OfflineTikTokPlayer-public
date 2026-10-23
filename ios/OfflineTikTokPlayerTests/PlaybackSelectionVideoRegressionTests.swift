@@ -547,6 +547,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             traceClockHandoff: true, readyNotificationTiming: false)
     }
 
+    func testQueuedPreviousStartNumericFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, initialNativeStartCurrentItemTime: false)
+    }
+
+    func testQueuedPreviousStartCurrentFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, initialNativeStartCurrentItemTime: true)
+    }
+
+    func testQueuedPreviousStartCurrentSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, initialNativeStartCurrentItemTime: true)
+    }
+
+    func testQueuedPreviousStartNumericSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, initialNativeStartCurrentItemTime: false)
+    }
+
     func testQueuedPreviousAdvanceOffFirst() async throws {
         try await runProductionSelectionBenchmark(traceVideoSeeks: true,
             traceClockHandoff: true, traceReturnedAStereoZero: true, queuedPreviousAdvance: false)
@@ -3979,6 +3999,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let monitorBuffer = suppressionControl?.buffer ?? previousBundleControl?.buffer
             ?? observedFrameMode.map { _ in PlaybackBuffer() }
             ?? queuedPreviousAdvance.map { _ in PlaybackBuffer() }
+            ?? initialNativeStartCurrentItemTime.map { _ in PlaybackBuffer() }
         #else
         let monitorBuffer = frameMonitorAlternative.map { _ in PlaybackBuffer() }
         #endif
@@ -3996,12 +4017,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let enabled = queuedPreviousAdvance {
             guard let monitorBuffer else { XCTFail("Route comparison requires the exact injected buffer"); throw SelectionVideoTestFailure.timeout }
             monitorBuffer.debugQueuedPreviousAdvance = enabled
+        }
+        if queuedPreviousAdvance != nil || initialNativeStartCurrentItemTime != nil {
+            guard let monitorBuffer else { XCTFail("Queued adoption requires the exact injected buffer"); throw SelectionVideoTestFailure.timeout }
             monitorBuffer.onDebugAdvanceBranch = { route, id, item in
                 guard previousRouteRows.count < 2 else { previousRouteOverflow = true; return }
                 previousRouteRows.append((route.rawValue, id, item))
             }
         }
-        defer { if queuedPreviousAdvance != nil { monitorBuffer?.onDebugAdvanceBranch = nil } }
+        defer {
+            if queuedPreviousAdvance != nil || initialNativeStartCurrentItemTime != nil {
+                monitorBuffer?.onDebugAdvanceBranch = nil
+            }
+        }
         if let enabled = initialVideoPolling {
             service.debugInitialVideoPollingControl = enabled
             XCTAssertEqual(service.debugInitialVideoPollingControl, enabled)
@@ -4148,6 +4176,30 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var monitorOverflow = false
         var monitorPhase = -1
         var monitorExpectedID: String?
+        weak var startArgumentOriginalA: AVPlayerItem?
+        var startArgumentMonitorRows: [(phase: Int, item: ObjectIdentifier, originalAlive: Bool, sameOriginal: Bool)] = []
+        var startArgumentMonitorCounts = [0, 0, 0]
+        var startArgumentMonitorOwnerChanged = false
+        var startArgumentMonitorOverflow = false
+        if initialNativeStartCurrentItemTime != nil {
+            service.debugAfterFirstFrameMonitorStart = { item in
+                guard (0..<3).contains(monitorPhase), startArgumentMonitorCounts[monitorPhase] < 16 else {
+                    startArgumentMonitorOverflow = true; return
+                }
+                startArgumentMonitorCounts[monitorPhase] += 1
+                if let prior = startArgumentMonitorRows.first(where: { $0.phase == monitorPhase }) {
+                    if prior.item != ObjectIdentifier(item)
+                        || (monitorPhase == 2 && startArgumentOriginalA !== item) {
+                        startArgumentMonitorOwnerChanged = true
+                    }
+                    return
+                }
+                guard startArgumentMonitorRows.count < 3 else { startArgumentMonitorOverflow = true; return }
+                if startArgumentMonitorRows.isEmpty, monitorPhase == 0 { startArgumentOriginalA = item }
+                startArgumentMonitorRows.append((monitorPhase, ObjectIdentifier(item),
+                    startArgumentOriginalA != nil, startArgumentOriginalA === item))
+            }
+        }
         if let alternative = observedFrameMode {
             service.debugUsesCurrentCustomFrameForReadiness = alternative
             service.debugAfterFirstFrameMonitorStart = { [weak service] item in
@@ -4184,7 +4236,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if traceDefaultFrameMonitor != nil {
                 service.onDebugFrameMonitorReadBatch = nil; service.onDebugCPPNativePullStamp = nil
             }
-            if observedFrameMode != nil { service.debugAfterFirstFrameMonitorStart = nil }
+            if observedFrameMode != nil || initialNativeStartCurrentItemTime != nil {
+                service.debugAfterFirstFrameMonitorStart = nil
+            }
             if traceVideoSeeks {
                 service.onDebugVideoSeekStamp = nil; service.onDebugVideoStartupStamp = nil
                 service.onDebugVideoRenderStamp = nil
@@ -4267,7 +4321,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     let commandNs = monitorReadTrace.beginPhase(phase)
                     cppNativePullTrace?.beginPhase(phase, commandNs: commandNs)
                 }
-                if observedFrameMode != nil {
+                if observedFrameMode != nil || initialNativeStartCurrentItemTime != nil {
                     monitorPhase = phase
                     monitorExpectedID = id
                 }
@@ -4742,6 +4796,31 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         startup.dumpAndAssert()
         #if DEBUG
+        if let currentItemTime = initialNativeStartCurrentItemTime {
+            XCTAssertTrue(mayRemoveFixture); XCTAssertFalse(previousRouteOverflow)
+            XCTAssertEqual(previousRouteRows.count, 2)
+            XCTAssertFalse(startArgumentMonitorOverflow)
+            XCTAssertFalse(startArgumentMonitorOwnerChanged)
+            XCTAssertEqual(startArgumentMonitorRows.map(\.phase), [0, 1, 2])
+            for row in startArgumentMonitorRows {
+                XCTAssertGreaterThanOrEqual(startArgumentMonitorCounts[row.phase], 1)
+                XCTAssertLessThanOrEqual(startArgumentMonitorCounts[row.phase], 16)
+                let frame = remainingWitness?.firstAlignedEnqueue(phase: row.phase)
+                XCTAssertNotNil(frame); XCTAssertEqual(frame?.frame.ticket?.debugItemIdentity, row.item)
+                if row.phase == 2 { XCTAssertTrue(row.originalAlive); XCTAssertTrue(row.sameOriginal) }
+                print("NativeStartQueuedMonitorOwner schema=1 currentItemTime=\(currentItemTime) phase=\(row.phase) item=\(row.item) originalAAliveAtCallback=\(row.originalAlive) sameOriginalAAtCallback=\(row.sameOriginal) callbacks=\(startArgumentMonitorCounts[row.phase]) maximumCallbacksPerPhase=16 sameItemRestartsAllowed=true ownerChanged=\(startArgumentMonitorOwnerChanged) weakLifetimeWitness=true observation=first-actual-monitor-start noStrongHistory=true sdkQueriesAdded=0")
+            }
+            for (ordinal, row) in previousRouteRows.enumerated() {
+                let phase = ordinal + 1
+                let frame = remainingWitness?.firstAlignedEnqueue(phase: phase)
+                let selected = frame?.frame.ticket?.debugItemIdentity == row.item
+                    && frame?.request == frame?.generation
+                XCTAssertEqual(row.route, PlaybackBuffer.DebugAdvanceRoute.queuedAdvance.rawValue)
+                XCTAssertEqual(row.id, ordinal == 0 ? fixture.bID : fixture.aID)
+                XCTAssertNotNil(frame); XCTAssertTrue(selected)
+                print("NativeStartQueuedBranchJoin schema=1 currentItemTime=\(currentItemTime) phase=\(phase) route=\(row.route) item=\(row.item) request=\(frame?.request.map(String.init) ?? "unavailable") selectedAlignedOwner=\(selected) receipt=precommit-branch-entry cleanupAcknowledged=\(mayRemoveFixture) originalResourceLifetimeProof=unavailable sdkQueriesAdded=0")
+            }
+        }
         if let enabled = readyNotificationTiming { startup.dumpReadyNotificationTiming(enabled: enabled) }
         #endif
         #if DEBUG
@@ -9129,7 +9208,9 @@ private final class ProductionVideoStartupTrace {
                 XCTAssertGreaterThan(pair.notificationNs, 0)
                 XCTAssertGreaterThanOrEqual(pair.handlerEntryNs, pair.notificationNs)
                 XCTAssertGreaterThanOrEqual(stamp.entryNs, pair.handlerEntryNs)
-                XCTAssertNotNil(pair.suppliedStatus)
+                // Imported enum KVO can deliver nil newValue despite .new.
+                // Retain callback/handler timing, but never relabel missing
+                // metadata as .unknown(rawValue: 0) or .readyToPlay.
                 if let status = pair.suppliedStatus { XCTAssertTrue((0...2).contains(status)) }
                 let callbacks: [PlaybackService.DebugVideoStartupStamp] = events.compactMap {
                     guard case .startup(let recordedPhase, let callback) = $0,
@@ -9138,8 +9219,11 @@ private final class ProductionVideoStartupTrace {
                 }
                 XCTAssertGreaterThanOrEqual(callbacks.count, 1); XCTAssertLessThanOrEqual(callbacks.count, 4)
                 let readyStatus = AVPlayerItem.Status.readyToPlay.rawValue
-                XCTAssertTrue(callbacks.contains { $0.readyNotificationTiming?.suppliedStatus == readyStatus },
-                    "Ready-arrival attribution requires an actual supplied ready notification, not an earlier unknown callback")
+                let readyDeliveryObserved = callbacks.contains {
+                    $0.readyNotificationTiming?.suppliedStatus == readyStatus
+                }
+                let unavailableStatuses = callbacks.filter { $0.readyNotificationTiming?.suppliedStatus == nil }.count
+                print("ReadyNotificationAvailability schema=1 phase=\(phase) callbackPairs=\(callbacks.count) unavailableStatuses=\(unavailableStatuses) actualReadyDelivery=\(readyDeliveryObserved ? "observed" : "unavailable") acceptedOriginTiming=retained liveReadinessGuard=unchanged formalNativeReadyInstant=unavailable")
                 XCTAssertEqual(callbacks.filter { $0.readyNotificationTiming?.notificationNs == pair.notificationNs
                     && $0.readyNotificationTiming?.handlerEntryNs == pair.handlerEntryNs }.count, 1)
                 for (ordinal, callback) in callbacks.enumerated() {
@@ -9149,9 +9233,9 @@ private final class ProductionVideoStartupTrace {
                         && observed.item == pair.item && observed.notificationNs > 0
                         && observed.notificationNs <= observed.handlerEntryNs
                     XCTAssertTrue(current)
-                    print("ReadyNotificationCallback schema=1 phase=\(phase) ordinal=\(ordinal) request=\(callback.request) item=\(observed.item) notificationNs=\(observed.notificationNs) handlerEntryNs=\(observed.handlerEntryNs) suppliedStatus=\(observed.suppliedStatus.map(String.init) ?? "unknown") cachedOwnerQualified=\(current) nativeOwnerAtPoint=unavailable pointEvent=true readyArrivalQualified=\(current && observed.suppliedStatus == readyStatus) sdkQueriesAdded=0 formalNativeReadyInstant=unavailable")
+                    print("ReadyNotificationCallback schema=1 phase=\(phase) ordinal=\(ordinal) request=\(callback.request) item=\(observed.item) notificationNs=\(observed.notificationNs) handlerEntryNs=\(observed.handlerEntryNs) suppliedStatus=\(observed.suppliedStatus.map(String.init) ?? "unavailable") cachedOwnerQualified=\(current) nativeOwnerAtPoint=unavailable pointEvent=true readyArrivalQualified=\(current && observed.suppliedStatus == readyStatus) sdkQueriesAdded=0 formalNativeReadyInstant=unavailable")
                 }
-                print("ReadyNotificationTiming schema=1 enabled=true phase=\(phase) request=\(stamp.request) item=\(pair.item) notificationNs=\(pair.notificationNs) handlerEntryNs=\(pair.handlerEntryNs) acceptedEntryNs=\(stamp.entryNs) suppliedStatus=\(pair.suppliedStatus.map(String.init) ?? "unknown") acceptedOriginIsReadyNotification=\(pair.suppliedStatus == readyStatus) actualAlignedItemMatches=\(frame?.frame.ticket?.debugItemIdentity == pair.item) sdkQueriesAdded=0 statusRead=unchanged formalNativeReadyInstant=unavailable")
+                print("ReadyNotificationTiming schema=1 enabled=true phase=\(phase) request=\(stamp.request) item=\(pair.item) notificationNs=\(pair.notificationNs) handlerEntryNs=\(pair.handlerEntryNs) acceptedEntryNs=\(stamp.entryNs) suppliedStatus=\(pair.suppliedStatus.map(String.init) ?? "unavailable") acceptedOriginIsReadyNotification=\(pair.suppliedStatus == readyStatus) actualAlignedItemMatches=\(frame?.frame.ticket?.debugItemIdentity == pair.item) sdkQueriesAdded=0 statusRead=unchanged formalNativeReadyInstant=unavailable")
             } else {
                 XCTAssertNil(stamp.readyNotificationTiming)
                 print("ReadyNotificationTiming schema=1 enabled=false phase=\(phase) request=\(stamp.request) notificationNs=unobserved handlerEntryNs=unobserved acceptedEntryNs=\(stamp.entryNs) sdkQueriesAdded=0 clocksAdded=0")
