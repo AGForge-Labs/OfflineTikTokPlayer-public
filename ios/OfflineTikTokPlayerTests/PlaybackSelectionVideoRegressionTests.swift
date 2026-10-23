@@ -2538,12 +2538,39 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runPreparedNextVideoFirstFrameCapabilityBeforeSelection()
     }
 
+    func testIndependentNextNativeOwnerPrerollOffThenOn() async throws {
+        try await runIndependentNativeOwnerPair(order: "off-on", treatments: [false, true])
+    }
+
+    func testIndependentNextNativeOwnerPrerollOnThenOff() async throws {
+        try await runIndependentNativeOwnerPair(order: "on-off", treatments: [true, false])
+    }
+
+    private func runIndependentNativeOwnerPair(order: String, treatments: [Bool]) async throws {
+        try recordRuntimeHost()
+        guard OPDebugCalibrateNativeAttachProbe() else {
+            XCTFail("Native attachment outcome calibration is required")
+            throw SelectionVideoTestFailure.timeout
+        }
+        for (ordinal, enabled) in treatments.enumerated() {
+            guard Self.preparedPrerollToken < UInt64.max else { throw SelectionVideoTestFailure.timeout }
+            Self.preparedPrerollToken += 1
+            let owner = PreparedNextPrerollOwner(token: Self.preparedPrerollToken,
+                enabled: enabled, order: order, ordinal: ordinal)
+            print("IndependentNativeOwnerArm schema=1 token=\(owner.token) order=\(order) ordinal=\(ordinal) preroll=\(enabled) selected=A item=distinct-B nativeOwner=persistent capabilityOnly=true")
+            try await runPreparedNextVideoFirstFrameCapabilityBeforeSelection(independentNativeOwner: owner)
+            print("IndependentNativeOwnerArmEnd schema=1 token=\(owner.token) cleanupAcknowledged=\(owner.mayRemoveFixture) helperReturned=true")
+        }
+    }
+
     private func runPreparedNextVideoFirstFrameCapabilityBeforeSelection(
-        prerollOwner: PreparedNextPrerollOwner? = nil) async throws {
+        prerollOwner: PreparedNextPrerollOwner? = nil,
+        independentNativeOwner: PreparedNextPrerollOwner? = nil) async throws {
         #if DEBUG
         let buffer = PlaybackBuffer()
-        try await withOwnedNaturalFixture(buffer: buffer, additionalCleanupAcknowledged: { @MainActor in
-            prerollOwner?.mayRemoveFixture ?? true
+        try await withOwnedNaturalFixture(buffer: buffer, recordHost: independentNativeOwner == nil,
+            additionalCleanupAcknowledged: { @MainActor in
+            (prerollOwner?.mayRemoveFixture ?? true) && (independentNativeOwner?.mayRemoveFixture ?? true)
         }) { fixture, audio, service, screen in
             let tap = ProductionSelectionOutputTap()
             let seeks = ProductionSelectionSeekRecorder()
@@ -2622,6 +2649,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 return
             }
             let initialBStatus = queuedB.status.rawValue
+            if let independentNativeOwner {
+                try await self.measureIndependentNativeOwner(independentNativeOwner, fixture: fixture,
+                    audio: audio, service: service, buffer: buffer, a: currentA, queuedB: queuedB,
+                    queuedResource: resource, queuedOutput: output, baseline: checkpointAudio,
+                    tap: tap, first: capabilityFirst)
+                return
+            }
             @MainActor func ownsPreparedB() -> Bool {
                 let items = buffer.player.items()
                 return service.queue.currentID == fixture.aID && audio.selectedID == fixture.aID
@@ -2772,6 +2806,274 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         #else
         XCTFail("Prepared-frame capability diagnostic requires DEBUG")
+        #endif
+    }
+
+    private struct IndependentNativeImage {
+        let available: Bool, copied: Bool, ownerStable: Bool
+        let pts: Double, copyMs: Double, validB: Bool, blueX: Double?
+        let nativePosition: Double, nativeRate: Double, nativeReadMs: Double?
+    }
+
+    /// Public160x96fixture only. The copied buffer never escapes this function.
+    private func independentNativeImage(_ output: AVPlayerItemVideoOutput, item: AVPlayerItem, at target: Double,
+        readNativeClock: Bool = false,
+        owns: @MainActor () -> Bool) -> IndependentNativeImage {
+        let nativeEntry = readNativeClock ? DispatchTime.now().uptimeNanoseconds : nil
+        let timebase = readNativeClock ? item.timebase : nil
+        let nativePosition = timebase.map { CMTimebaseGetTime($0).seconds } ?? .nan
+        let nativeRate = timebase.map { CMTimebaseGetEffectiveRate($0) } ?? .nan
+        let nativeReadMs = nativeEntry.map { Double(DispatchTime.now().uptimeNanoseconds - $0) / 1_000_000 }
+        let time = CMTime(seconds: target, preferredTimescale: 48_000)
+        let available = output.hasNewPixelBuffer(forItemTime: time)
+        guard owns() else {
+            return .init(available: available, copied: false, ownerStable: false,
+                pts: .nan, copyMs: .infinity, validB: false, blueX: nil,
+                nativePosition: nativePosition, nativeRate: nativeRate,
+                nativeReadMs: nativeReadMs)
+        }
+        var pts = CMTime.invalid
+        let entry = DispatchTime.now().uptimeNanoseconds
+        let image = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: &pts)
+        let returned = DispatchTime.now().uptimeNanoseconds
+        let stable = owns()
+        var green = 0, red = 0, magenta = 0, blue = 0, blueSum = 0.0
+        if stable, let image, CVPixelBufferGetWidth(image) == 160, CVPixelBufferGetHeight(image) == 96,
+           CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA,
+           CVPixelBufferGetBytesPerRow(image) >= 640, CVPixelBufferGetBytesPerRow(image) <= 4096,
+           CVPixelBufferLockBaseAddress(image, .readOnly) == kCVReturnSuccess {
+            defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
+            if let base = CVPixelBufferGetBaseAddress(image)?.assumingMemoryBound(to: UInt8.self) {
+                let stride = CVPixelBufferGetBytesPerRow(image)
+                for y in 0..<96 {
+                    for x in 0..<160 {
+                        let offset = y * stride + x * 4
+                        let b = base[offset], g = base[offset + 1], r = base[offset + 2]
+                        if g > 150 && r < 100 && b < 100 { green += 1 }
+                        if r > 150 && g < 100 && b < 100 { red += 1 }
+                        if r > 150 && g < 100 && b > 150 { magenta += 1 }
+                        if b > 150 && r < 100 && g < 100 { blue += 1; blueSum += Double(x) }
+                    }
+                }
+            }
+        }
+        return .init(available: available, copied: image != nil, ownerStable: stable && owns(),
+            pts: pts.isNumeric ? pts.seconds : .nan, copyMs: Double(returned - entry) / 1_000_000,
+            validB: Double(green) / 15_360 > 0.65 && Double(red) / 15_360 < 0.02
+                && Double(magenta) / 15_360 < 0.02 && blue >= 4,
+            blueX: blue >= 4 ? blueSum / Double(blue) : nil,
+            nativePosition: nativePosition, nativeRate: nativeRate,
+            nativeReadMs: nativeReadMs)
+    }
+
+    private func measureIndependentNativeOwner(_ owner: PreparedNextPrerollOwner,
+        fixture: SelectionVideoFixture, audio: ContinuousAudioPlayer, service: PlaybackService,
+        buffer: PlaybackBuffer, a: AVPlayerItem, queuedB: AVPlayerItem,
+        queuedResource: ContinuousPictureInPicture.PreparedVideoResource,
+        queuedOutput: AVPlayerItemVideoOutput, baseline: ContinuousPCMRenderer.Snapshot,
+        tap: ProductionSelectionOutputTap, first: Int) async throws {
+        #if DEBUG
+        let originalPlayer = service.player, originalAsset = queuedB.asset
+        let originalSources = (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+        let originalOwner = service.debugAlignedVideoPollState
+        let clone = AVPlayerItem(asset: originalAsset)
+        let helper = AVPlayer()
+        helper.isMuted = true; helper.volume = 0; helper.automaticallyWaitsToMinimizeStalling = false
+        owner.fixture = fixture; owner.item = clone; owner.helper = helper; owner.cleanupAcknowledged = false
+        let probe = ProductionRendererProbe(renderer: audio.renderer)
+        var failure: Error?, images: [IndependentNativeImage] = []
+        var checkpoints: [(time: UInt64, count: UInt64, pts: Double)] = []
+        checkpoints.reserveCapacity(16); images.reserveCapacity(3)
+        var checkpointOverflow = false
+        var warmOrigin: UInt64 = 0, warmDeadline: UInt64 = 0, warmReturned: UInt64 = 0
+        var readyObserved: UInt64?, playEntry: UInt64?, output: AVPlayerItemVideoOutput?
+        @MainActor func ownsA() -> Bool {
+            let items = originalPlayer.items(), sample = audio.renderer.snapshot
+            let current = service.debugAlignedVideoPollState
+            return !Task.isCancelled && service.player === originalPlayer && originalPlayer.currentItem === a
+                && items.count == 2 && items.first === a && items.last === queuedB
+                && buffer.nextMediaID == fixture.bID && buffer.resource(for: queuedB) === queuedResource
+                && queuedResource.item === queuedB && queuedResource.output === queuedOutput
+                && queuedResource.isAttached && !queuedResource.isRetired && !queuedResource.isBorrowed
+                && queuedB.asset === originalAsset && queuedB.outputs.count == 1 && a.outputs.count == 1
+                && service.queue.currentID == fixture.aID && service.current?.id == fixture.aID
+                && audio.selectedID == fixture.aID && service.wantsToPlay && service.audioEngineRunning
+                && service.isVideoReady && !service.isLoading
+                && sample.token == baseline.token && sample.visit == baseline.visit
+                && sample.selectionVersion == baseline.selectionVersion && !sample.ended
+                && sample.underrunFrames == baseline.underrunFrames
+                && current.generation == originalOwner.generation && current.request == originalOwner.request
+                && current.presentationMatches && current.observedItemMatches && current.frame.coherent
+                && current.frame.ticket == originalOwner.frame.ticket && current.frame.output == originalOwner.frame.output
+                && current.frame.imageEpoch == originalOwner.frame.imageEpoch
+                && current.frame.seekSerial == originalOwner.frame.seekSerial && current.frame.activeSeekTicket == nil
+                && buffer.retainedItemCount == 2 && service.preparedAudioCount == 2
+                && audio.renderer.retainedPCMMemoryBytes == 6_912_000
+                && originalSources == (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+        }
+        @MainActor func ownsHelper() -> Bool {
+            ownsA() && helper.currentItem === clone && clone !== queuedB && clone.asset === originalAsset
+                && helper.isMuted && helper.volume == 0 && clone.status != .failed
+                && owner.resource.map { resource in
+                    resource.item === clone && resource.output === output && resource.isAttached
+                        && !resource.isRetired && !resource.isBorrowed && clone.outputs.count == 1
+                } == true
+        }
+        @MainActor func recordA(force: Bool = false) {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if !force, let last = checkpoints.last, now - last.time < 200_000_000 { return }
+            guard checkpoints.count < 16 else { checkpointOverflow = true; return }
+            checkpoints.append((now, service.submittedVideoFrameCount, service.videoFramePositionSeconds ?? .nan))
+        }
+        do {
+            guard ownsA(), clone !== a, clone !== queuedB else { throw SelectionVideoTestFailure.timeout }
+            recordA()
+            let preparation = try await ContinuousPictureInPicture.prepareVideoResource(for: clone)
+            guard ownsA(), let resource = preparation.install() else { throw SelectionVideoTestFailure.timeout }
+            owner.resource = resource; output = resource.output
+            guard let output else { throw SelectionVideoTestFailure.timeout }
+            warmOrigin = DispatchTime.now().uptimeNanoseconds; warmDeadline = warmOrigin + 1_000_000_000
+            let callback = PreparedNextPrerollCallback(token: owner.token, deadline: warmDeadline)
+            owner.callback = callback
+            guard OPDebugClassifyPlayerAttachment(helper, item: clone, token: owner.token) == .accepted,
+                  ownsHelper() else { throw SelectionVideoTestFailure.timeout }
+            while DispatchTime.now().uptimeNanoseconds < warmDeadline {
+                guard ownsHelper(), helper.rate == 0 else { throw SelectionVideoTestFailure.timeout }
+                recordA()
+                let ready = helper.status == .readyToPlay && clone.status == .readyToPlay
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard ownsHelper() else { throw SelectionVideoTestFailure.timeout }
+                if ready, readyObserved == nil, now < warmDeadline { readyObserved = now }
+                if owner.enabled, ready, !owner.issuedPreroll, now < warmDeadline {
+                    guard helper.status == .readyToPlay, clone.status == .readyToPlay,
+                          helper.currentItem === clone, helper.rate == 0,
+                          DispatchTime.now().uptimeNanoseconds < warmDeadline else {
+                        throw SelectionVideoTestFailure.timeout
+                    }
+                    let token = owner.token
+                    owner.issuedPreroll = true
+                    helper.preroll(atRate: 1) { finished in callback.complete(token: token, finished: finished) }
+                    guard ownsHelper() else { throw SelectionVideoTestFailure.timeout }
+                }
+                let returned = DispatchTime.now().uptimeNanoseconds
+                if returned < warmDeadline {
+                    try await Task.sleep(nanoseconds: min(10_000_000, warmDeadline - returned))
+                    guard ownsHelper() else { throw SelectionVideoTestFailure.timeout }
+                }
+            }
+            warmReturned = DispatchTime.now().uptimeNanoseconds
+            guard ownsHelper(), helper.rate == 0, readyObserved != nil else { throw SelectionVideoTestFailure.timeout }
+            XCTAssertLessThanOrEqual(warmReturned - warmDeadline, 50_000_000,
+                "Synchronous overrun/scheduling is a quality failure, not an interruptible SDK timeout")
+            let pristine = clone.currentTime()
+            guard ownsHelper(), pristine.isNumeric, CMTimeCompare(pristine, .zero) == 0 else {
+                XCTFail("Distinct owner must remain pristine zero without seek/replacement")
+                throw SelectionVideoTestFailure.timeout
+            }
+            let native = callback.snapshot
+            XCTAssertEqual(owner.issuedPreroll, owner.enabled)
+            XCTAssertEqual(native.count, owner.enabled ? 1 : 0)
+            if owner.enabled {
+                XCTAssertEqual(native.finished, true)
+                XCTAssertTrue(native.time.map { $0 >= warmOrigin && $0 <= warmDeadline } == true)
+                guard native.count == 1, native.finished == true,
+                      native.time.map({ $0 >= warmOrigin && $0 <= warmDeadline }) == true else {
+                    throw SelectionVideoTestFailure.timeout
+                }
+            }
+            let initial = independentNativeImage(output, item: clone, at: 0, owns: ownsHelper)
+            images.append(initial)
+            XCTAssertTrue(initial.ownerStable); XCTAssertLessThanOrEqual(initial.copyMs, 5)
+            XCTAssertFalse(initial.available && !initial.copied)
+            if initial.copied { XCTAssertTrue(initial.validB); XCTAssertEqual(initial.pts, 0, accuracy: 0.000_001) }
+            if owner.enabled { XCTAssertTrue(initial.available && initial.copied && initial.validB,
+                "Preroll ON must actually provide the distinct owner's initial B image") }
+            playEntry = DispatchTime.now().uptimeNanoseconds
+            helper.playImmediately(atRate: 1)
+            guard ownsHelper() else { throw SelectionVideoTestFailure.timeout }
+            for target in [0.2, 0.4] {
+                let origin = try XCTUnwrap(playEntry)
+                let due = origin + UInt64(target * 1_000_000_000)
+                let deadline = due + 50_000_000
+                var image: IndependentNativeImage?
+                while DispatchTime.now().uptimeNanoseconds < deadline {
+                    guard ownsHelper() else { throw SelectionVideoTestFailure.timeout }
+                    recordA()
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if now >= due, output.hasNewPixelBuffer(forItemTime: CMTime(seconds: target, preferredTimescale: 48_000)) {
+                        guard ownsHelper() else { throw SelectionVideoTestFailure.timeout }
+                        image = independentNativeImage(output, item: clone, at: target, readNativeClock: true, owns: ownsHelper)
+                        break
+                    }
+                    let returned = DispatchTime.now().uptimeNanoseconds
+                    if returned < deadline { try await Task.sleep(nanoseconds: min(10_000_000, deadline - returned)) }
+                }
+                let actual = try XCTUnwrap(image, "The same warmed native owner must deliver later B within its250ms/450ms deadline")
+                images.append(actual)
+                XCTAssertTrue(actual.available && actual.copied && actual.ownerStable && actual.validB)
+                XCTAssertLessThanOrEqual(actual.copyMs, 5)
+                XCTAssertLessThanOrEqual(actual.nativeReadMs ?? .infinity, 5)
+                XCTAssertGreaterThan(actual.nativeRate, 0)
+                XCTAssertTrue(actual.nativeRate.isFinite)
+                XCTAssertTrue(actual.nativePosition.isFinite)
+                XCTAssertEqual(actual.nativePosition, target, accuracy: 0.080)
+                XCTAssertEqual(actual.pts, actual.nativePosition, accuracy: 0.080)
+                XCTAssertTrue(actual.pts.isFinite); XCTAssertEqual(actual.pts, target, accuracy: 0.080)
+                XCTAssertLessThanOrEqual(DispatchTime.now().uptimeNanoseconds, deadline,
+                    "A completed opaque copy outside the deadline does not qualify")
+            }
+            XCTAssertGreaterThan(images[2].pts, images[1].pts)
+            XCTAssertGreaterThan(images[2].nativePosition, images[1].nativePosition)
+            XCTAssertGreaterThan(abs((images[2].blueX ?? .nan) - (images[1].blueX ?? .nan)), 1)
+        } catch { failure = error }
+        let cleanupEntry = DispatchTime.now().uptimeNanoseconds
+        let cleanupDeadline = cleanupEntry + 250_000_000
+        let cancelled = OPDebugCancelPlayerPrerolls(helper, token: owner.token)
+        let detached = cancelled && OPDebugObservePlayerAttachment(helper, item: nil, token: owner.token)
+        if detached { owner.resource?.retire() }
+        while owner.issuedPreroll, owner.callback?.snapshot.count == 0,
+              DispatchTime.now().uptimeNanoseconds < cleanupDeadline {
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now < cleanupDeadline {
+                do { try await Task.sleep(nanoseconds: min(10_000_000, cleanupDeadline - now)) }
+                catch { break }
+            }
+        }
+        let finalDetached = detached && helper.currentItem == nil
+        let finalRetired = owner.resource?.isRetired ?? true
+        let callbacks = owner.callback?.snapshot.count ?? 0
+        let returned = DispatchTime.now().uptimeNanoseconds
+        owner.cleanupAcknowledged = finalDetached
+            && finalRetired && callbacks == (owner.issuedPreroll ? 1 : 0)
+            && returned <= cleanupDeadline
+        recordA(force: true)
+        let continuity = probe.stop()
+        assertPreparedNextPrerollContinuity(continuity, tap: tap, first: first,
+            audio: audio, service: service, fixture: fixture, baseline: baseline)
+        XCTAssertTrue(ownsA()); XCTAssertFalse(checkpointOverflow)
+        XCTAssertGreaterThanOrEqual(checkpoints.count, 5)
+        for (before, after) in zip(checkpoints, checkpoints.dropFirst()) {
+            let wall = Double(after.time - before.time) / 1_000_000_000
+            XCTAssertTrue(before.pts.isFinite && after.pts.isFinite)
+            XCTAssertEqual(after.pts - before.pts, wall, accuracy: 0.080)
+            if wall >= 0.16 { XCTAssertGreaterThan(after.count, before.count); XCTAssertGreaterThan(after.pts, before.pts) }
+        }
+        for (index, image) in images.enumerated() {
+            print("IndependentNativeImage schema=1 token=\(owner.token) ordinal=\(index) available=\(image.available) copied=\(image.copied) ownerStable=\(image.ownerStable) pts=\(image.pts) copyMs=\(image.copyMs) validB=\(image.validB) blueX=\(image.blueX.map { String($0) } ?? "unavailable") nativePosition=\(image.nativePosition) nativeRate=\(image.nativeRate) nativeReadMs=\(image.nativeReadMs.map { String($0) } ?? "unavailable") clockAndCopyAtomic=false appSelected=false compositorPixels=unmeasured")
+        }
+        for (index, point) in checkpoints.enumerated() {
+            print("IndependentNativeAProgress schema=1 token=\(owner.token) ordinal=\(index) observedNs=\(point.time) submitted=\(point.count) pts=\(point.pts) selected=A compositorPixels=unmeasured")
+        }
+        print("IndependentNativeOwnerResult schema=1 token=\(owner.token) order=\(owner.order) ordinal=\(owner.ordinal) preroll=\(owner.enabled) distinctItem=\(clone !== queuedB) warmOriginNs=\(warmOrigin) warmDeadlineNs=\(warmDeadline) warmReturnNs=\(warmReturned) readyNs=\(readyObserved.map { String($0) } ?? "unavailable") playEntryNs=\(playEntry.map { String($0) } ?? "unavailable") actualIssued=\(owner.issuedPreroll) callbacks=\(callbacks) images=\(images.count) AProgressPoints=\(checkpoints.count) cleanupEntryNs=\(cleanupEntry) cleanupReturnNs=\(returned) cleanupAcknowledged=\(owner.cleanupAcknowledged) maximumNativePlayers=2 maximumItems=3 maximumOutputs=3 maximumAppRetainedImages=1 SDKVideoMemory=unmeasured PCMBytes=\(audio.renderer.retainedPCMMemoryBytes) appSelected=A capabilityOnly=true caughtError=\(failure != nil)")
+        XCTAssertTrue(owner.cleanupAcknowledged)
+        if owner.cleanupAcknowledged {
+            owner.helper = nil; owner.item = nil; owner.resource = nil; owner.fixture = nil
+        } else {
+            Self.unresolvedPreparedPrerollOwner = owner; Self.targetedFixtureOwnershipLost = true
+        }
+        if let failure { throw failure }
+        #else
+        XCTFail("Distinct native owner capability requires DEBUG")
         #endif
     }
 
