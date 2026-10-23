@@ -2,18 +2,32 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Complete render-anchor owner and pending-selection RED; production remains unchanged.
-expected_code_source=f160fe4274cb46b0ffeeb0b58da3ad8f8636ef23
-expected_ios_tree=48b8fbd25a16ad4cbc09ca54622075b5cd53d4bd
+# Complete clock-owner repair with original lifecycle, playback and bounded frame-request controls.
+expected_code_source=93476d49f3392573cc0a95578954e7a988109a83
+expected_ios_tree=ceba843b9600b2278dd26917e0fc4bc15004b78a
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testRenderAnchorRejectsOldAndInactivePublicationsAfterResume
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testExplicitPauseDuringActualLatencyReadRejectsTheOldClock
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testReentrantPlaybackControlPreservesNewerPauseResumeAndGraphOwner
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testPlaybackClockAuthorityExhaustionCannotReuseAnOldInterval
   OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testRenderAnchorRequiresCurrentVisitAndConsumedSelectionVersion
   OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testNewSelectionDuringActualLatencyReadPreservesItsPendingPosition
   OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testAnchorOwnerSupersededDuringActualLatencyReadCannotCreditTheOldClock
   OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testAcknowledgedSameTokenSelectionCannotUseThePreviousVisitAnchor
+  OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testDecodeFailureUsesPendingSelectionOrActualNaturalSuccessor
+  OfflineTikTokPlayerTests/ContinuousAudioGraphTests/testActualSourceNodeJoinsPreparedFramesInsideRenderBlocks
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstFrameTrace
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceAndTapExecutionTimingOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -39,13 +53,27 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testRenderAnchorRejectsOldAndInactivePublicationsAfterResume',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testExplicitPauseDuringActualLatencyReadRejectsTheOldClock',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testReentrantPlaybackControlPreservesNewerPauseResumeAndGraphOwner',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testPlaybackClockAuthorityExhaustionCannotReuseAnOldInterval',
     'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testRenderAnchorRequiresCurrentVisitAndConsumedSelectionVersion',
     'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testNewSelectionDuringActualLatencyReadPreservesItsPendingPosition',
     'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testAnchorOwnerSupersededDuringActualLatencyReadCannotCreditTheOldClock',
     'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testAcknowledgedSameTokenSelectionCannotUseThePreviousVisitAnchor',
+    'OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testDecodeFailureUsesPendingSelectionOrActualNaturalSuccessor',
+    'OfflineTikTokPlayerTests.ContinuousAudioGraphTests/testActualSourceNodeJoinsPreparedFramesInsideRenderBlocks',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRealHeldCompletionFailureCleanupRequiresItsMatchingServiceTaskReturn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceCannotStrandStartup',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstFrameTrace',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceAndTapExecutionTimingOnThenOff',
 }
-if len(expected) != 4 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly four complete render-anchor owner identities must exist in the pinned source')
+if len(expected) != 18 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly eighteen owner, original playback and bounded first-frame identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -54,7 +82,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=4 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=18 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -155,8 +183,8 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=4 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# Only these two exact identities are selected in a fresh hosted job/test process.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=18 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# These eighteen exact identities execute in one fresh hosted job/test process.
 # Its original lost-fixture, paused-seek and cleanup assertions stay intact.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
 # There is no promotion prefix. Actual XCTest start/result records determine
