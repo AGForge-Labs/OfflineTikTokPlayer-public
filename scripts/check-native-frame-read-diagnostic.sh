@@ -2,17 +2,17 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Compare loaded native audio-track configuration; retain all original playback guards and constant clock/zero tracing.
-expected_code_source=e9da668cdea770b6d5c15f1cf839ae3103cb3e35
-expected_ios_tree=55158115a3a303908e29f03348e5a7be9f009c1e
+# Calibrate one worker boundary and observe actual zero events; retain all original playback and cleanup guards.
+expected_code_source=531b618e9e0b7db672b238baea2508edc31c22cc
+expected_ios_tree=66cc1632612ab9f558dfcd517d887a0757f09f47
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOffThenOn
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOnThenOff
+  OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testWorkerBoundaryReceiptSeparatesHeldConversionFromQueuedShutdown
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testAWorkerBoundaryAtActualStereoZeroWithOriginalPlaybackGuards
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedAProducerBoundaryTraceEnabled
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -38,12 +38,12 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOffThenOn',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOnThenOff',
+    'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testWorkerBoundaryReceiptSeparatesHeldConversionFromQueuedShutdown',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testAWorkerBoundaryAtActualStereoZeroWithOriginalPlaybackGuards',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedAProducerBoundaryTraceEnabled',
 }
 if len(expected) != 3 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly three loaded-audio track configuration and original guarded playback identities must exist in the pinned source')
+    raise SystemExit('Exactly three calibrated PCM worker and original guarded playback identities must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
