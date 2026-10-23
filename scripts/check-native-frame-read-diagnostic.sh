@@ -2,15 +2,15 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Identical iOS source: first/only returned-A fixture with existing bounded producer trace.
-expected_code_source=cc19905ed35433b64d4d96c17ee5f8a2a5d5642c
-expected_ios_tree=6e674bc45616c2a2654ee6391d87fa0ea79a1f36
+# First owned source/tap timing ON then OFF; production lifecycle and all playback guards preserved.
+expected_code_source=c46ddcaf1b014487ff2a413ac9ccf266592f0d10
+expected_ios_tree=fc0954be270149413fde4f31543d280cbd617e0d
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedAProducerBoundaryTraceEnabled
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceAndTapExecutionTimingOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -36,10 +36,10 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedAProducerBoundaryTraceEnabled',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceAndTapExecutionTimingOnThenOff',
 }
 if len(expected) != 1 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly one first-fixture returned-A producer-boundary identity must exist in the pinned source')
+    raise SystemExit('Exactly one first-fixture source and tap timing identity must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
