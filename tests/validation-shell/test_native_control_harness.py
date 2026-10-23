@@ -154,8 +154,8 @@ class NativeControlHarnessTests(unittest.TestCase):
 
     def test_live_control_inventory_and_source_manifest_are_required(self):
         self.assertEqual(self.cases, (
-            'testRetainedNativeHostAnchorValidThenInvalid',
-            'testRetainedNativeHostAnchorInvalidThenValid',
+            'testIndependentNextNativeOwnerPrerollOffThenOn',
+            'testIndependentNextNativeOwnerPrerollOnThenOff',
             'testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback',
             'testRetainedNativeHostControlStaleRequestKeepsProductionArgument'))
         shell = HARNESS.read_text(encoding="utf-8")
@@ -443,7 +443,7 @@ class NativeControlHarnessTests(unittest.TestCase):
         self.assertEqual(len(probe), 1)
         self.assertIn('run: python3 scripts/check-native-reader-probe-sdk.py', probe[0])
         native = [block for block in blocks if any(block.startswith(name) for name in (
-            'Resolve within', 'Build one exact', 'Require the actual', 'Retained native host',
+            'Resolve within', 'Build one exact', 'Require the actual', 'Independent native owner',
             'Require all four', 'Export each exact'))]
         self.assertEqual(len(native), 6)
         for block in native:

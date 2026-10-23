@@ -1,4 +1,4 @@
-name: Compare native host anchoring on retained Previous
+name: Test persistent distinct native preload owner
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -65,7 +65,7 @@ jobs:
           evidence.verify_log(Path('artifacts/native/native-playback-benchmark.log').read_text(), expected, invocation='test-without-building')
           print('Ordinary production benchmark identity native=1 ui=0; original guards retained; no physical-output/full acceptance claim')
           PY
-      - name: Retained native host orders and exact fallback contracts in four fresh exact hosts
+      - name: Independent native owner and corrected fallback contracts in four fresh exact hosts
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.probe_sdk.outcome == 'success' }}
         run: bash scripts/check-native-playback-targeted.sh controls
       - name: Require all four singleton identities and native exit and host-boundary receipts

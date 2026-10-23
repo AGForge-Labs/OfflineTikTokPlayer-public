@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=8135d5f781f621e2e6b2d658f9468748db6b1e15
-expected_ios_tree=f4f797084bfd9653a2a002080e49adb707bb0bc4
+expected_code_source=f1b8e88d6c2086b943974aa993b6b963077fb2dd
+expected_ios_tree=2f7893bfd6c43516020e58c6f84338b7dedc7da7
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,8 +44,8 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testRetainedNativeHostAnchorValidThenInvalid',
-    'testRetainedNativeHostAnchorInvalidThenValid',
+    'testIndependentNextNativeOwnerPrerollOffThenOn',
+    'testIndependentNextNativeOwnerPrerollOnThenOff',
     'testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback',
     'testRetainedNativeHostControlStaleRequestKeepsProductionArgument',
 )
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testRetainedNativeHostAnchorValidThenInvalid testRetainedNativeHostAnchorInvalidThenValid testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback testRetainedNativeHostControlStaleRequestKeepsProductionArgument) ;;
+  controls) cases=(testIndependentNextNativeOwnerPrerollOffThenOn testIndependentNextNativeOwnerPrerollOnThenOff testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback testRetainedNativeHostControlStaleRequestKeepsProductionArgument) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
