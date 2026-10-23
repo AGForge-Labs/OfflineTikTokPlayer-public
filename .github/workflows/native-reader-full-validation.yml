@@ -12,7 +12,7 @@ jobs:
   native-reader-full-validation:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.event_name == 'push' && github.ref == 'refs/heads/diagnostic/native-reader-isolation' }}
     runs-on: macos-26
-    timeout-minutes: 50
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -68,7 +68,7 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          expected_native, expected_ui = '197', '1'
+          expected_native, expected_ui = '265', '1'
           if not all(value.isdigit() and int(value) > 0 for value in (expected_native, expected_ui)):
               raise SystemExit('Final committed full-manifest counts are required.')
           if len(native) != int(expected_native) or len(ui) != int(expected_ui) or native | ui != expected:
