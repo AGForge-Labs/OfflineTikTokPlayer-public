@@ -2,17 +2,16 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-# Calibrate one worker boundary and observe actual zero events; retain all original playback and cleanup guards.
-expected_code_source=531b618e9e0b7db672b238baea2508edc31c22cc
-expected_ios_tree=66cc1632612ab9f558dfcd517d887a0757f09f47
+# Compare native audio-track presentation and native read progress; preserve all original playback and strict cleanup guards.
+expected_code_source=50788aad2cd42f2f3991f33f8adf74dcd29d4be5
+expected_ios_tree=99ce3cf7169744c8c94fa3e3dd72a7f69d3ae84e
 native_log=artifacts/native/native-frame-read.log
 native_status=artifacts/native/native-frame-read-status.tsv
 preparation_receipt=artifacts/native/frame-read-prepared-source.tsv
 mode=all
 cases=(
-  OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testWorkerBoundaryReceiptSeparatesHeldConversionFromQueuedShutdown
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testAWorkerBoundaryAtActualStereoZeroWithOriginalPlaybackGuards
-  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testReturnedAProducerBoundaryTraceEnabled
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOffThenOn
+  OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOnThenOff
 )
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -38,12 +37,11 @@ spec = importlib.util.spec_from_file_location('evidence', root / 'scripts/verify
 evidence = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(evidence)
 expected = {
-    'OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testWorkerBoundaryReceiptSeparatesHeldConversionFromQueuedShutdown',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testAWorkerBoundaryAtActualStereoZeroWithOriginalPlaybackGuards',
-    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedAProducerBoundaryTraceEnabled',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOffThenOn',
+    'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeItemAudioTrackDisablingOnThenOff',
 }
-if len(expected) != 3 or not expected.issubset(evidence.source_manifest(root)):
-    raise SystemExit('Exactly three calibrated PCM worker and original guarded playback identities must exist in the pinned source')
+if len(expected) != 2 or not expected.issubset(evidence.source_manifest(root)):
+    raise SystemExit('Exactly two ordered native audio-track controls with all original playback guards must exist in the pinned source')
 if sys.argv[1:] == ['inventory']:
     raise SystemExit(0)
 if sys.argv[1:] != ['results']:
@@ -52,7 +50,7 @@ status = (root / 'artifacts/native/native-frame-read-status.tsv').read_text().sp
 if status != ['0\t0']:
     raise SystemExit('Diagnostic native and tee exits must both be zero')
 evidence.verify_log((root / 'artifacts/native/native-frame-read.log').read_text(encoding='utf-8'), expected)
-print('NativeFrameReadDiagnosticEvidence native=3 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
+print('NativeFrameReadDiagnosticEvidence native=2 ui=0 nativeExit=0 teeExit=0 fullAcceptance=false repairAccepted=false physicalOutput=unverified')
 PY
 }
 if [ "$#" -eq 1 ] && [ "$1" = --verify-source ]; then
@@ -153,8 +151,8 @@ arguments=()
 for name in "${cases[@]}"; do
   arguments+=("-only-testing:$name")
 done
-printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=3 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
-# These three exact identities execute in a fresh disposable process; actual XCTest records establish order.
+printf '%s\n' "NativeFrameReadDiagnosticScope appAndTestsSource=$expected_code_source iosTree=$expected_ios_tree expectedNative=2 expectedUI=0 expectedCore=110 maximumBuildJobs=1 fullAcceptance=false repairAccepted=false physicalOutput=unverified"
+# These two exact identities execute in a fresh disposable process; actual XCTest records establish order.
 # Original timing, continuity, capture, identity and cleanup assertions remain unchanged.
 # No earlier case is credited as passed or bypassed through a fake/reset state.
 # There is no promotion prefix. Actual XCTest start/result records determine

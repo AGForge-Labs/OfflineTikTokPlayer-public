@@ -1,4 +1,4 @@
-name: PCM worker progress at actual zero events
+name: Native input progress and muted audio-track control
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
@@ -45,7 +45,7 @@ jobs:
           simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           python3 scripts/ensure-simulator-booted.py --udid "$simulator_id"
           printf 'simulator_id=%s\n' "$simulator_id" >> "$GITHUB_OUTPUT"
-      - name: Run PCM worker calibration and original guarded playback
+      - name: Run both ordered native audio-track controls with original guards
         id: native
         if: ${{ !cancelled() && steps.source_pin.outcome == 'success' && steps.prepared.outcome == 'success' && steps.simulator_boot.outcome == 'success' }}
         env:
