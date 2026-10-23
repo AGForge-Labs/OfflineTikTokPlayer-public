@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=bdf545d4eb22af4816fa5fcfb9f8697662222846
+expected_code_source=cd512041f670a0d54c386751d4cb9e9f4a441518
 expected_ios_tree=b3d5b085e50e8ef5c77a54d77e2d69d9c2115071
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -44,8 +44,8 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testActualSourceTapSampleMappingUsesTwoIndependentPCMMarkers',
-    'testRetainedPreviousAfterExplicitSeekKeepsNumericStartFallback',
+    'testSourceCallbackExecutionTimingOffThenOn',
+    'testSourceAndTapExecutionTimingOnThenOff',
     'testFirstZeroSourceCallbacksOffThenOn',
     'testFirstZeroSourceCallbacksOnThenOff',
 )
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testActualSourceTapSampleMappingUsesTwoIndependentPCMMarkers testRetainedPreviousAfterExplicitSeekKeepsNumericStartFallback testFirstZeroSourceCallbacksOffThenOn testFirstZeroSourceCallbacksOnThenOff) ;;
+  controls) cases=(testSourceCallbackExecutionTimingOffThenOn testSourceAndTapExecutionTimingOnThenOff testFirstZeroSourceCallbacksOffThenOn testFirstZeroSourceCallbacksOnThenOff) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
