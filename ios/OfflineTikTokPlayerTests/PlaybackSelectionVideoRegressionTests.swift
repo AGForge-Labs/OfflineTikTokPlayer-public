@@ -527,6 +527,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             traceClockHandoff: true, nativeReaderWaitSampling: false)
     }
 
+    func testQueuedPreviousAdvanceOffFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, queuedPreviousAdvance: false)
+    }
+
+    func testQueuedPreviousAdvanceOnFirst() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, queuedPreviousAdvance: true)
+    }
+
+    func testQueuedPreviousAdvanceOnSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, queuedPreviousAdvance: true)
+    }
+
+    func testQueuedPreviousAdvanceOffSecond() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true,
+            traceClockHandoff: true, traceReturnedAStereoZero: true, queuedPreviousAdvance: false)
+    }
+
     func testInitialVideoPollingOffFirst() async throws {
         try await runProductionSelectionBenchmark(traceVideoSeeks: true,
             traceClockHandoff: true, traceReturnedAStereoZero: true, initialVideoPolling: false)
@@ -3472,11 +3492,30 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 nativeAudioTrackDisabling: Bool? = nil,
                                                 sameRetainedAssetAdmission: Bool? = nil,
                                                 nativeReaderWaitSampling: Bool? = nil,
-                                                initialVideoPolling: Bool? = nil) async throws {
+                                                initialVideoPolling: Bool? = nil,
+                                                queuedPreviousAdvance: Bool? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
         #if DEBUG
-        if let enabled = initialVideoPolling {
+        if let enabled = queuedPreviousAdvance {
             guard traceVideoSeeks, traceClockHandoff == true, traceReturnedAStereoZero == true,
+                  initialVideoPolling == nil, nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
+                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
+                  initialNativeStartCurrentItemTime == nil, frameMonitorAlternative == nil,
+                  renderAccounting == nil, traceDefaultFrameMonitor == nil, !traceNativeRefill,
+                  suppressNativePlayerRendering == nil, nativeVideoGeometry == nil,
+                  freshPreviousBundle == nil, queuedPreviousLead == nil, !auditSavedAAfterCleanup,
+                  firstZeroSourceCallbacks == nil, capClockBoundary == nil,
+                  traceFirstSourceFailure == nil, traceReturnedAProducerBoundary == nil,
+                  acceptedPCMOriginBenchmarkMode == nil, sourceOutputBenchmarkMode == nil,
+                  sourceCallbackLedgerBenchmarkMode == nil, sourceCallbackExecutionTimingBenchmarkMode == nil else {
+                XCTFail("Previous route comparison changes only retained-item queued advance versus replacement")
+                throw SelectionVideoTestFailure.timeout
+            }
+            print("QueuedPreviousAdvanceScope schema=1 enabled=\(enabled) leadSeconds=0 nativePlayer=existing-single retainedItemAndOutput=original preparedResource=unchanged displayTicks=two-real audioEngine=unchanged videoAndAudioGuards=unchanged")
+        }
+        if let enabled = initialVideoPolling {
+            guard queuedPreviousAdvance == nil, traceVideoSeeks, traceClockHandoff == true, traceReturnedAStereoZero == true,
                   nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
                   nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
@@ -3724,6 +3763,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         #else
+        if queuedPreviousAdvance != nil {
+            XCTFail("Previous route comparison requires DEBUG")
+            throw SelectionVideoTestFailure.timeout
+        }
         if initialVideoPolling != nil {
             XCTFail("Initial polling comparison requires DEBUG; Release cadence is unchanged")
             throw SelectionVideoTestFailure.timeout
@@ -3892,6 +3935,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let observedFrameMode = frameMonitorAlternative ?? traceDefaultFrameMonitor.map { _ in false }
         let monitorBuffer = suppressionControl?.buffer ?? previousBundleControl?.buffer
             ?? observedFrameMode.map { _ in PlaybackBuffer() }
+            ?? queuedPreviousAdvance.map { _ in PlaybackBuffer() }
         #else
         let monitorBuffer = frameMonitorAlternative.map { _ in PlaybackBuffer() }
         #endif
@@ -3902,6 +3946,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
         }
         #if DEBUG
+        var previousRouteRows: [(route: Int, id: String, item: ObjectIdentifier)] = []
+        var previousRouteOverflow = false
+        var previousRouteResources: [ObjectIdentifier?] = []
+        if let enabled = queuedPreviousAdvance {
+            guard let monitorBuffer else { XCTFail("Route comparison requires the exact injected buffer"); throw SelectionVideoTestFailure.timeout }
+            monitorBuffer.debugQueuedPreviousAdvance = enabled
+            monitorBuffer.onDebugAdvanceBranch = { route, id, item in
+                guard previousRouteRows.count < 2 else { previousRouteOverflow = true; return }
+                previousRouteRows.append((route.rawValue, id, item))
+            }
+        }
+        defer { if queuedPreviousAdvance != nil { monitorBuffer?.onDebugAdvanceBranch = nil } }
         if let enabled = initialVideoPolling {
             service.debugInitialVideoPollingControl = enabled
             XCTAssertEqual(service.debugInitialVideoPollingControl, enabled)
@@ -4187,6 +4243,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             measurements.append(measurement)
             #if DEBUG
+            if queuedPreviousAdvance != nil, previousRouteResources.count < 3 {
+                let item = remainingWitness?.firstAlignedEnqueue(phase: phase)?.frame.ticket?.debugItemIdentity
+                previousRouteResources.append(item.flatMap { monitorBuffer?.debugResourceIdentity(for: $0) })
+            }
             if let enabled = initialVideoPolling, initialPollingWindows.count < 3 {
                 // Cache only three existing policy windows. Publish after cleanup;
                 // this adds no clock read, SDK getter or in-window logging.
@@ -4326,6 +4386,34 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         print("ProductionSelectionCleanupAcknowledgements schema=1 cleanupReturned=\(cleanupReturned) preparationAckPresent=\(preparationAck != nil) preparationAckValue=\(preparationAck.map { $0 ? "true" : "false" } ?? "unknown") decoderAckPresent=\(decoderAck != nil) decoderAckValue=\(decoderAck.map { $0 ? "true" : "false" } ?? "unknown") nativeRefillTrace=\(traceNativeRefill) fixtureRemoveAllowed=\(mayRemoveFixture) availabilityScope=after-cleanup-wait")
         #if DEBUG
         nativeWait?.dump(cleanupAcknowledged: mayRemoveFixture)
+        if let enabled = queuedPreviousAdvance {
+            print("QueuedPreviousAdvanceSummary schema=1 enabled=\(enabled) rows=\(previousRouteRows.count) capacity=2 overflow=\(previousRouteOverflow) cleanupAcknowledged=\(mayRemoveFixture) leadSeconds=0 extraSDKQueries=0 publication=after-cleanup")
+            XCTAssertTrue(mayRemoveFixture); XCTAssertFalse(previousRouteOverflow); XCTAssertEqual(previousRouteRows.count, 2)
+            XCTAssertEqual(previousRouteResources.count, 3)
+            XCTAssertTrue(previousRouteResources.allSatisfy { $0 != nil })
+            if previousRouteResources.count == 3 { XCTAssertEqual(previousRouteResources[0], previousRouteResources[2]) }
+            let original = remainingWitness?.firstAlignedEnqueue(phase: 0)
+            let returned = remainingWitness?.firstAlignedEnqueue(phase: 2)
+            XCTAssertNotNil(original); XCTAssertNotNil(returned)
+            XCTAssertEqual(original?.frame.ticket?.debugItemIdentity, returned?.frame.ticket?.debugItemIdentity)
+            XCTAssertEqual(original?.frame.output, returned?.frame.output)
+            if previousRouteRows.count == 2 {
+                XCTAssertEqual(previousRouteRows[0].route, PlaybackBuffer.DebugAdvanceRoute.queuedAdvance.rawValue)
+                XCTAssertEqual(previousRouteRows[1].route, enabled ? PlaybackBuffer.DebugAdvanceRoute.queuedAdvance.rawValue : PlaybackBuffer.DebugAdvanceRoute.previousReplacement.rawValue)
+                XCTAssertEqual(previousRouteRows.map(\.id), [fixture.bID, fixture.aID])
+                XCTAssertNotEqual(previousRouteRows[0].item, previousRouteRows[1].item)
+                for (ordinal, row) in previousRouteRows.enumerated() {
+                    let phase = ordinal + 1
+                    let handoff = handoffTrace?.initialHandoff(phase: phase)
+                    let enqueue = remainingWitness?.firstAlignedEnqueue(phase: phase)
+                    let joined = handoff?.item == row.item && enqueue?.frame.ticket?.debugItemIdentity == row.item
+                        && enqueue?.request == handoff?.request && enqueue?.generation == handoff?.request
+                    XCTAssertNotNil(handoff); XCTAssertNotNil(enqueue); XCTAssertTrue(joined,
+                        "Entering the route is insufficient: actual native start and aligned frame must adopt that exact item")
+                    print("QueuedPreviousAdvanceRow schema=2 enabled=\(enabled) ordinal=\(ordinal) route=\(row.route) item=\(UInt(bitPattern: row.item)) joinedToActualStartAndFrame=\(joined) queued=1 replacement=0 phase=\(phase)")
+                }
+            }
+        }
         if initialVideoPolling != nil {
             XCTAssertEqual(initialPollingWindows.count, measurements.count)
             for row in initialPollingWindows {
@@ -12010,6 +12098,9 @@ private final class PreparedNextPrerollCallback: @unchecked Sendable {
 /// last-false/first-true custom-compound poll pair per phase. Scalar identities only.
 @MainActor
 private final class RemainingLatencyWitness {
+    func firstAlignedEnqueue(phase: Int) -> PlaybackService.DebugAlignedVideoEnqueue? {
+        phases.indices.contains(phase) ? phases[phase].enqueue : nil
+    }
     private struct Poll {
         let entryNs: UInt64, observedNs: UInt64
         let mask: UInt16, evaluated: UInt16
@@ -12142,6 +12233,10 @@ private final class RemainingLatencyWitness {
 /// sampled only by the original rate command/position operation, never here.
 @MainActor
 private final class NativeClockHandoffTrace {
+    func initialHandoff(phase: Int) -> PlaybackService.DebugVideoRateHandoff? {
+        guard (0..<3).contains(phase) else { return nil }
+        return slots[phase * 2].handoff
+    }
     private struct Slot {
         var commands: UInt64 = 0
         var handoff: PlaybackService.DebugVideoRateHandoff?

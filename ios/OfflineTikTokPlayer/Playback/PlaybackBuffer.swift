@@ -26,6 +26,12 @@ final class PlaybackBuffer {
     let debugSuppressesPlayerRendering: Bool
     let debugNativeGeometry: Bool?
     var debugPreviousNeedsRewind: Bool? { previous?.needsRewind }
+    var debugQueuedPreviousAdvance: Bool?
+    func debugResourceIdentity(for item: ObjectIdentifier) -> ObjectIdentifier? {
+        videoResources.first {
+            $0.item.map(ObjectIdentifier.init) == item && $0.isAttached && !$0.isRetired
+        }.map(ObjectIdentifier.init)
+    }
     enum DebugAdvanceRoute: Int { case previousReplacement = 0, queuedAdvance = 1 }
     var onDebugAdvanceBranch: (@MainActor (DebugAdvanceRoute, String, ObjectIdentifier) -> Void)?
     #endif
@@ -39,6 +45,10 @@ final class PlaybackBuffer {
     var hasLoopReserve: Bool { loopReserve != nil }
     private var videoResources: [ContinuousPictureInPicture.PreparedVideoResource] {
         [active, previous, next, loopReserve].compactMap { $0?.videoResource }
+    }
+    private func sameOwner(_ first: Prepared?, _ second: Prepared?) -> Bool {
+        first?.item === second?.item && first?.mediaID == second?.mediaID
+            && first?.videoResource === second?.videoResource
     }
     func resource(for item: AVPlayerItem) -> ContinuousPictureInPicture.PreparedVideoResource? {
         videoResources.first { $0.item === item && $0.isAttached && !$0.isRetired }
@@ -100,12 +110,18 @@ final class PlaybackBuffer {
         player.automaticallyWaitsToMinimizeStalling = !usesExternalClock && !localWindow
     }
 
-    private func retainPrevious(before prepared: Prepared) {
-        if let active, active.mediaID != prepared.mediaID {
-            previous?.item.cancelPendingSeeks()
-            previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal,
-                                needsRewind: true, videoResource: active.videoResource)
+    @discardableResult
+    private func retainPrevious(before prepared: Prepared, ifEligible: () -> Bool = { true }) -> Bool {
+        guard ifEligible() else { return false }
+        if let outgoing = active, outgoing.mediaID != prepared.mediaID {
+            let oldPrevious = previous
+            oldPrevious?.item.cancelPendingSeeks()
+            guard ifEligible(), let live = active, live.item === outgoing.item,
+                  sameOwner(live, outgoing), sameOwner(previous, oldPrevious) else { return false }
+            previous = Prepared(mediaID: live.mediaID, item: live.item, isLocal: live.isLocal,
+                                needsRewind: true, videoResource: live.videoResource)
         }
+        return true
     }
 
     private func preparePreviousStart() {
@@ -130,7 +146,7 @@ final class PlaybackBuffer {
         let prepared: Prepared
         if let next, player.currentItem === next.item {
             prepared = next
-            retainPrevious(before: prepared)
+            guard retainPrevious(before: prepared) else { return }
             self.next = loopReserve
         } else if let reserve = loopReserve, player.currentItem === reserve.item {
             // Multiple currentItem changes can coalesce before MainActor KVO runs.
@@ -241,8 +257,9 @@ final class PlaybackBuffer {
         // Never undo that owner's move or remove/retire its item on this return path.
         let status = committed.item.status
         let items = player.items()
-        return status != .failed && items.count == 2 && items.first === current && items.last === committed.item
-            && player.currentItem === current && active?.item === current
+        let currentItem = player.currentItem
+        return ifEligible() && status != .failed && items.count == 2 && items.first === current && items.last === committed.item
+            && currentItem === current && active?.mediaID == currentID && active?.item === current
             && next?.mediaID == mediaID && next?.item === committed.item
             && next?.videoResource === committed.videoResource && loopReserve == nil
     }
@@ -314,30 +331,109 @@ final class PlaybackBuffer {
         updateEndAction()
     }
 
-    func advance(to mediaID: String, allowRemote: Bool = true) -> Prepared? {
+    /// Evict only the captured forward window, then transfer the live retained item.
+    /// An unsuccessful move may have committed; the caller must resolve afresh rather
+    /// than retry replacement with a captured Prepared value.
+    private func queuePrevious(_ candidate: Prepared, allowRemote: Bool,
+                               ifEligible: () -> Bool) -> Bool {
+        guard let outgoing = active else { return false }
+        let staged = next, reserve = loopReserve
+        let forward = [staged?.item, reserve?.item].compactMap { $0 }
+        @MainActor func ownsSource() -> Bool {
+            sameOwner(active, outgoing)
+                && previous?.item === candidate.item && previous?.mediaID == candidate.mediaID
+                && previous?.videoResource === candidate.videoResource
+                && (previous?.isLocal == true || allowRemote)
+        }
+        let items = player.items(), current = player.currentItem, status = candidate.item.status
+        guard ifEligible(), ownsSource(), status != .failed,
+              sameOwner(next, staged), sameOwner(loopReserve, reserve),
+              candidate.item !== outgoing.item, candidate.mediaID != outgoing.mediaID,
+              current === outgoing.item,
+              items.map(ObjectIdentifier.init) == ([outgoing.item] + forward).map(ObjectIdentifier.init) else { return false }
+        // Clear the old slots before SDK notifications can install a newer window.
+        next = nil; loopReserve = nil
+        var remaining = forward
+        for item in forward {
+            let items = player.items(), current = player.currentItem
+            guard ifEligible(), ownsSource(), next == nil, loopReserve == nil,
+                  current === outgoing.item,
+                  items.map(ObjectIdentifier.init) == ([outgoing.item] + remaining).map(ObjectIdentifier.init) else { return false }
+            player.remove(item)
+            remaining.removeFirst()
+        }
+        return promotePreviousToNext(mediaID: candidate.mediaID, after: outgoing.mediaID,
+            allowRemote: allowRemote, ifEligible: {
+                ifEligible() && self.sameOwner(self.active, outgoing)
+                    && (self.sameOwner(self.previous, candidate) || self.sameOwner(self.next, candidate))
+            })
+    }
+
+    func advance(to mediaID: String, allowRemote: Bool = true,
+                 ifEligible: () -> Bool = { true }) -> Prepared? {
         let oldResources = videoResources
         defer { retireReleased(oldResources) }
-        if !hasPrepared(mediaID), let prepared = previous, prepared.mediaID == mediaID, prepared.item.status != .failed,
-           prepared.isLocal || allowRemote {
+        guard ifEligible() else { return nil }
+        let alreadyQueued = hasPrepared(mediaID)
+        guard ifEligible() else { return nil }
+        if !alreadyQueued, let prepared = previous, prepared.mediaID == mediaID {
+            let status = prepared.item.status
+            guard ifEligible(), previous?.item === prepared.item, status != .failed,
+                  previous?.isLocal == true || allowRemote else { return nil }
             #if DEBUG
-            onDebugAdvanceBranch?(.previousReplacement, prepared.mediaID, ObjectIdentifier(prepared.item))
+            let queuedPrevious = usesExternalClock && debugQueuedPreviousAdvance != false
+            #else
+            let queuedPrevious = usesExternalClock
             #endif
-            player.pause()
-            previous = nil
-            replace(with: prepared.item, mediaID: mediaID, isLocal: prepared.isLocal,
-                    videoResource: prepared.videoResource)
-            return prepared
+            if queuedPrevious {
+                guard queuePrevious(prepared, allowRemote: allowRemote, ifEligible: ifEligible) else { return nil }
+            } else {
+                let outgoing = active
+                #if DEBUG
+                onDebugAdvanceBranch?(.previousReplacement, prepared.mediaID, ObjectIdentifier(prepared.item))
+                #endif
+                guard ifEligible(), sameOwner(active, outgoing), sameOwner(previous, prepared),
+                      previous?.isLocal == true || allowRemote else { return nil }
+                player.pause()
+                guard ifEligible(), sameOwner(active, outgoing), sameOwner(previous, prepared),
+                      previous?.isLocal == true || allowRemote, let committed = previous else { return nil }
+                previous = nil
+                guard replace(with: committed.item, mediaID: mediaID, isLocal: committed.isLocal,
+                    videoResource: committed.videoResource, ifEligible: ifEligible) else { return nil }
+                let current = player.currentItem
+                guard ifEligible(), current === committed.item, sameOwner(active, committed) else { return nil }
+                return committed
+            }
         }
-        guard let prepared = next, prepared.mediaID == mediaID, prepared.item.status != .failed,
-              prepared.isLocal || allowRemote,
-              player.currentItem === prepared.item || player.items().dropFirst().first === prepared.item else { return nil }
+        guard let prepared = next, prepared.mediaID == mediaID else { return nil }
+        let outgoing = active, reserve = loopReserve
         #if DEBUG
         onDebugAdvanceBranch?(.queuedAdvance, prepared.mediaID, ObjectIdentifier(prepared.item))
         #endif
-        retainPrevious(before: prepared); next = loopReserve; loopReserve = nil; active = prepared
-        if player.currentItem !== prepared.item { player.advanceToNextItem() }
+        let status = prepared.item.status, items = player.items(), current = player.currentItem
+        @MainActor func ownsAdvance() -> Bool {
+            sameOwner(active, outgoing) && next?.item === prepared.item
+                && next?.mediaID == mediaID && next?.videoResource === prepared.videoResource
+                && (next?.isLocal == true || allowRemote) && sameOwner(loopReserve, reserve)
+        }
+        guard ifEligible(), ownsAdvance(), status != .failed,
+              current === prepared.item || items.dropFirst().first === prepared.item,
+              retainPrevious(before: prepared, ifEligible: { ifEligible() && ownsAdvance() }),
+              ifEligible(), ownsAdvance() else { return nil }
+        // Cancellation and eligibility can advance the native queue reentrantly.
+        // Its pre-retention currentItem must never decide a second advance.
+        let commitItems = player.items(), commitCurrent = player.currentItem
+        guard ifEligible(), ownsAdvance(),
+              commitCurrent === prepared.item || commitItems.dropFirst().first === prepared.item,
+              let committed = next else { return nil }
+        next = loopReserve; loopReserve = nil; active = committed
+        if commitCurrent !== committed.item { player.advanceToNextItem() }
+        let advanced = player.currentItem
+        guard ifEligible(), advanced === committed.item, sameOwner(active, committed) else { return nil }
         updateEndAction()
         preparePreviousStart()
-        return prepared
+        let finalCurrent = player.currentItem
+        guard ifEligible(), finalCurrent === committed.item, sameOwner(active, committed) else { return nil }
+        return committed
     }
 }

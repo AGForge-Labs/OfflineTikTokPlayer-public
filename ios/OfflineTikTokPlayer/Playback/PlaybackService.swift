@@ -717,7 +717,10 @@ final class PlaybackService: NSObject {
         guard let next = queue.next(explicit: explicit) else { pause(); return }
         if explicit { intent.requestPlay(); activateAudio() }
         if next == previous, player.currentItem != nil {
-            if let prepared = buffer.advance(to: next) { loadCurrent(adopting: prepared) }
+            let request = generation
+            let prepared = buffer.advance(to: next, ifEligible: { self.generation == request && self.queue.currentID == next })
+            guard generation == request, queue.currentID == next else { return }
+            if let prepared { loadCurrent(adopting: prepared) }
             else { seek(0) }
             return
         }
@@ -844,14 +847,19 @@ final class PlaybackService: NSObject {
             selectContinuousAudio(id: id, position: position)
             resumeContinuousAudio()
         }
-        if !forceRemote, let id = queue.currentID, continuousAudio.entry(for: id) != nil,
-           let prepared = eligibleAdoption ?? buffer.advance(to: id, allowRemote: allowRemote) {
-            currentIsLocal = prepared.isLocal
-            resumeContinuousAudio()
-            recordPlaybackEvent("preparedAdoption")
-            observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
-            prepareUpcoming()
-            return
+        if !forceRemote, let id = queue.currentID, continuousAudio.entry(for: id) != nil {
+            let prepared = eligibleAdoption ?? buffer.advance(to: id, allowRemote: allowRemote,
+                ifEligible: { self.generation == request && self.queue.currentID == id })
+            // Retirement can notify a newer request even when advance returns nil.
+            guard generation == request, queue.currentID == id else { return }
+            if let prepared {
+                currentIsLocal = prepared.isLocal
+                resumeContinuousAudio()
+                recordPlaybackEvent("preparedAdoption")
+                observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
+                prepareUpcoming()
+                return
+            }
         }
         if !selectedAtRequest && !audioAlreadySelected { continuousAudio.clearSelection() }
         player.pause(); buffer.replace(with: nil)
@@ -1649,7 +1657,10 @@ final class PlaybackService: NSObject {
                         continuousAudio.suspend(); return
                     }
                     queue = following
-                    let video = buffer.advance(to: entry.id)
+                    let request = generation
+                    let video = buffer.advance(to: entry.id,
+                        ifEligible: { self.generation == request && self.queue.currentID == entry.id })
+                    guard generation == request, queue.currentID == entry.id else { return }
                     loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
                 } else if !ownedInitialVisit && !ownedPausedExplicitVisit {
                     #if DEBUG

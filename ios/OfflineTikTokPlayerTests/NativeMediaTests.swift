@@ -148,7 +148,7 @@ final class NativeMediaTests: XCTestCase {
             var eligibilityCalls = 0
             XCTAssertTrue(buffer.promotePreviousToNext(mediaID: "A", after: "B", allowRemote: false,
                 ifEligible: { eligibilityCalls += 1; return true }))
-            XCTAssertEqual(eligibilityCalls, 2, "Initial and post-canInsert precommit eligibility checks")
+            XCTAssertEqual(eligibilityCalls, 3, "Initial, post-canInsert and post-insert caller eligibility checks")
             XCTAssertTrue(buffer.player === player); XCTAssertTrue(player.currentItem === current)
             XCTAssertEqual(player.items().map(ObjectIdentifier.init), [current, previous].map(ObjectIdentifier.init))
             XCTAssertNil(buffer.previousMediaID, "Promotion transfers the slot; it must not leave a previous/next alias")
@@ -315,7 +315,7 @@ final class NativeMediaTests: XCTestCase {
         var allowedCalls = 0
         XCTAssertTrue(buffer.promotePreviousToNext(mediaID: "A", after: "B", allowRemote: true,
             ifEligible: { allowedCalls += 1; return true }))
-        XCTAssertEqual(allowedCalls, 2)
+        XCTAssertEqual(allowedCalls, 3)
         XCTAssertTrue(buffer.player === player); XCTAssertTrue(player.currentItem === current)
         XCTAssertEqual(player.items().map(ObjectIdentifier.init), [current, previous].map(ObjectIdentifier.init))
         XCTAssertNil(buffer.previousMediaID); XCTAssertEqual(buffer.nextMediaID, "A")
@@ -329,6 +329,207 @@ final class NativeMediaTests: XCTestCase {
         XCTAssertTrue(player.currentItem === previous); XCTAssertEqual(player.items().count, 1)
         XCTAssertEqual(player.rate, 0); XCTAssertEqual(player.actionAtItemEnd, .pause)
         XCTAssertFalse(player.automaticallyWaitsToMinimizeStalling)
+    }
+
+    func testExternalClockPreviousUsesQueuedAdvanceAndPreservesItsExactResource() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for rewind in [false, true] {
+            for withReserve in [false, true] {
+                let buffer = PlaybackBuffer(), current = AVPlayerItem(url: url), previous = AVPlayerItem(url: url)
+                let forward = AVPlayerItem(url: url), reserve = AVPlayerItem(url: url)
+                buffer.automaticAdvancementEnabled = false; buffer.usesExternalClock = true
+                let player = buffer.player
+                var resources: [ContinuousPictureInPicture.PreparedVideoResource] = []
+                for item in [previous, forward, reserve] {
+                    let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+                    resources.append(try XCTUnwrap(plan.install()))
+                }
+                let output = try XCTUnwrap(resources[0].output)
+                defer {
+                    buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious()
+                    for resource in resources { resource.retire() }
+                }
+                XCTAssertTrue(buffer.replace(with: current, mediaID: "B"))
+                XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: previous, isLocal: true,
+                    needsRewind: rewind, reachedEnd: !rewind, videoResource: resources[0])))
+                let forwardID = withReserve ? "B" : "C"
+                XCTAssertTrue(buffer.stage(.init(mediaID: forwardID, item: forward, isLocal: true,
+                    videoResource: resources[1]), after: "B"))
+                if withReserve {
+                    buffer.stageLoopReserve(.init(mediaID: "B", item: reserve, isLocal: true,
+                        videoResource: resources[2]))
+                } else { resources[2].retire() }
+                XCTAssertEqual(player.items().count, withReserve ? 3 : 2)
+                XCTAssertEqual(buffer.retainedItemCount, withReserve ? 4 : 3)
+                #if DEBUG
+                var routes: [PlaybackBuffer.DebugAdvanceRoute] = []
+                buffer.onDebugAdvanceBranch = { route, id, item in
+                    routes.append(route); XCTAssertEqual(id, "A"); XCTAssertEqual(item, ObjectIdentifier(previous))
+                }
+                #endif
+                let adopted = try XCTUnwrap(buffer.advance(to: "A", allowRemote: false))
+                XCTAssertTrue(adopted.item === previous); XCTAssertTrue(adopted.videoResource === resources[0])
+                XCTAssertTrue(adopted.isLocal); XCTAssertEqual(adopted.needsRewind, rewind)
+                XCTAssertEqual(adopted.reachedEnd, !rewind)
+                XCTAssertTrue(player === buffer.player); XCTAssertTrue(player.currentItem === previous)
+                XCTAssertEqual(player.items().map(ObjectIdentifier.init), [ObjectIdentifier(previous)])
+                XCTAssertEqual(buffer.previousMediaID, "B"); XCTAssertNil(buffer.nextMediaID)
+                XCTAssertFalse(buffer.hasLoopReserve); XCTAssertEqual(buffer.retainedItemCount, 2)
+                XCTAssertEqual(Set(buffer.retainedItems.map(ObjectIdentifier.init)), Set([current, previous].map(ObjectIdentifier.init)))
+                XCTAssertTrue(buffer.resource(for: previous) === resources[0]); XCTAssertTrue(resources[0].output === output)
+                XCTAssertEqual(previous.outputs.count, 1); XCTAssertTrue(previous.outputs.first === output)
+                XCTAssertTrue(resources[0].isAttached); XCTAssertFalse(resources[0].isRetired)
+                XCTAssertTrue(resources[1].isRetired); XCTAssertTrue(resources[2].isRetired)
+                XCTAssertTrue(forward.outputs.isEmpty); XCTAssertTrue(reserve.outputs.isEmpty)
+                XCTAssertEqual(player.rate, 0); XCTAssertEqual(player.actionAtItemEnd, .pause)
+                XCTAssertFalse(player.automaticallyWaitsToMinimizeStalling)
+                #if DEBUG
+                XCTAssertEqual(routes.map(\.rawValue), [PlaybackBuffer.DebugAdvanceRoute.queuedAdvance.rawValue])
+                #endif
+            }
+        }
+    }
+
+    func testPreviousQueuedAdvancePreservesNewOwnerDuringEvictionAndInsertion() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for checkpoint in 0..<4 {
+            let buffer = PlaybackBuffer(), current = AVPlayerItem(url: url), previous = AVPlayerItem(url: url)
+            let forward = AVPlayerItem(url: url), reserve = AVPlayerItem(url: url)
+            let replacement = AVPlayerItem(url: url), replacementNext = AVPlayerItem(url: url)
+            buffer.automaticAdvancementEnabled = false; buffer.usesExternalClock = true
+            defer { buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+            XCTAssertTrue(buffer.replace(with: current, mediaID: "B"))
+            XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: previous, isLocal: true)))
+            XCTAssertTrue(buffer.stage(.init(mediaID: "B", item: forward, isLocal: true), after: "B"))
+            buffer.stageLoopReserve(.init(mediaID: "B", item: reserve, isLocal: true))
+            XCTAssertEqual(buffer.player.items().count, 3)
+            var interventions = 0
+            #if DEBUG
+            var branches = 0
+            buffer.onDebugAdvanceBranch = { _, _, _ in branches += 1 }
+            #endif
+            let adopted = buffer.advance(to: "A", ifEligible: {
+                let trimming = buffer.nextMediaID == nil && !buffer.hasLoopReserve && buffer.previousMediaID == "A"
+                let inserted = buffer.nextMediaID == "A" && buffer.previousMediaID == nil
+                let trimPoint = trimming && (checkpoint == 0 || checkpoint == 1)
+                    && buffer.player.items().count == (checkpoint == 0 ? 3 : 2)
+                if interventions == 0 && (trimPoint || (checkpoint >= 2 && inserted)) {
+                    interventions += 1
+                    if checkpoint != 3 {
+                        XCTAssertTrue(buffer.replace(with: replacement, mediaID: "C"))
+                        XCTAssertTrue(buffer.stage(.init(mediaID: "D", item: replacementNext, isLocal: true), after: "C"))
+                    }
+                }
+                return checkpoint != 3 || interventions == 0
+            })
+            XCTAssertEqual(interventions, 1); XCTAssertNil(adopted)
+            #if DEBUG
+            XCTAssertEqual(branches, 0, "A partially committed promotion must never fall back to legacy replacement or stale advancement")
+            #endif
+            if checkpoint == 3 {
+                XCTAssertTrue(buffer.player.currentItem === current)
+                XCTAssertEqual(buffer.player.items().map(ObjectIdentifier.init), [current, previous].map(ObjectIdentifier.init))
+                XCTAssertNil(buffer.previousMediaID); XCTAssertEqual(buffer.nextMediaID, "A")
+            } else {
+                XCTAssertTrue(buffer.player.currentItem === replacement)
+                XCTAssertEqual(buffer.player.items().map(ObjectIdentifier.init), [replacement, replacementNext].map(ObjectIdentifier.init))
+                XCTAssertEqual(buffer.nextMediaID, "D"); XCTAssertEqual(buffer.previousMediaID, "B")
+                XCTAssertTrue(buffer.hasPrepared("D")); XCTAssertEqual(buffer.retainedItemCount, 3)
+            }
+            XCTAssertFalse(buffer.hasLoopReserve)
+        }
+    }
+
+    func testPreviousQueuedAdvanceRevalidatesSavedEligibilityAndLiveMetadata() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for changeLocality in [false, true] {
+            let buffer = PlaybackBuffer(), current = AVPlayerItem(url: url), previous = AVPlayerItem(url: url)
+            let forward = AVPlayerItem(url: url)
+            buffer.automaticAdvancementEnabled = false; buffer.usesExternalClock = true
+            defer { buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+            XCTAssertTrue(buffer.replace(with: current, mediaID: "B"))
+            XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: previous, isLocal: changeLocality,
+                needsRewind: true, reachedEnd: true)))
+            XCTAssertTrue(buffer.stage(.init(mediaID: "C", item: forward, isLocal: true), after: "B"))
+            var changed = false
+            XCTAssertNil(buffer.advance(to: "A", allowRemote: false, ifEligible: {
+                if changeLocality && !changed && buffer.nextMediaID == nil {
+                    changed = true; buffer.discardPrevious()
+                    XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: previous, isLocal: false,
+                        needsRewind: true, reachedEnd: true)))
+                }
+                return true
+            }))
+            XCTAssertEqual(changed, changeLocality); XCTAssertTrue(buffer.player.currentItem === current)
+            XCTAssertEqual(buffer.previousMediaID, "A")
+            if !changeLocality { XCTAssertTrue(buffer.hasPrepared("C")) }
+            else {
+                // Rejected transfer may have published eviction before refusing
+                // the changed live locality. Resolve that window explicitly;
+                // production's still-owned request enters its fresh resolver.
+                XCTAssertNil(buffer.nextMediaID)
+                buffer.discardNext()
+                XCTAssertEqual(buffer.player.items().map(ObjectIdentifier.init), [ObjectIdentifier(current)])
+            }
+            let accepted = try XCTUnwrap(buffer.advance(to: "A", allowRemote: true))
+            XCTAssertTrue(accepted.item === previous); XCTAssertFalse(accepted.isLocal)
+            XCTAssertTrue(accepted.needsRewind); XCTAssertTrue(accepted.reachedEnd)
+            XCTAssertTrue(buffer.player.currentItem === previous); XCTAssertEqual(buffer.previousMediaID, "B")
+            XCTAssertEqual(buffer.player.items().count, 1); XCTAssertEqual(buffer.retainedItemCount, 2)
+        }
+    }
+
+    func testAdvanceDoesNotSkipAnItemAlreadyMadeCurrentDuringRetention() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let buffer = PlaybackBuffer(), current = AVPlayerItem(url: url), next = AVPlayerItem(url: url)
+        let oldPrevious = AVPlayerItem(url: url)
+        buffer.automaticAdvancementEnabled = false; buffer.usesExternalClock = true
+        defer { buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+        XCTAssertTrue(buffer.replace(with: current, mediaID: "B"))
+        XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "old", item: oldPrevious, isLocal: true)))
+        XCTAssertTrue(buffer.stage(.init(mediaID: "A", item: next, isLocal: true), after: "B"))
+        var advanced = false
+        let adopted = buffer.advance(to: "A", ifEligible: {
+            if !advanced && buffer.previousMediaID == "B" {
+                advanced = true
+                // Actual native advancement at the post-retention eligibility
+                // checkpoint, with the same selected generation still eligible.
+                buffer.player.advanceToNextItem()
+                XCTAssertTrue(buffer.player.currentItem === next)
+            }
+            return true
+        })
+        XCTAssertTrue(advanced); XCTAssertTrue(adopted?.item === next)
+        XCTAssertTrue(buffer.player.currentItem === next)
+        XCTAssertEqual(buffer.player.items().map(ObjectIdentifier.init), [ObjectIdentifier(next)])
+        XCTAssertEqual(buffer.previousMediaID, "B"); XCTAssertNil(buffer.nextMediaID)
+        XCTAssertEqual(buffer.retainedItemCount, 2)
+    }
+
+    func testStandalonePreviousAndOrdinaryNextRetainTheirAdvanceRoutes() throws {
+        #if DEBUG
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for external in [false, true] {
+            let buffer = PlaybackBuffer(), current = AVPlayerItem(url: url), previous = AVPlayerItem(url: url)
+            let forward = AVPlayerItem(url: url)
+            buffer.automaticAdvancementEnabled = false; buffer.usesExternalClock = external
+            defer { buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious() }
+            XCTAssertTrue(buffer.replace(with: current, mediaID: "B"))
+            XCTAssertTrue(buffer.stagePrevious(.init(mediaID: "A", item: previous, isLocal: true)))
+            XCTAssertTrue(buffer.stage(.init(mediaID: "C", item: forward, isLocal: true), after: "B"))
+            var routes: [Int] = []
+            buffer.onDebugAdvanceBranch = { route, _, _ in routes.append(route.rawValue) }
+            let accepted = try XCTUnwrap(buffer.advance(to: external ? "C" : "A"))
+            XCTAssertTrue(accepted.item === (external ? forward : previous))
+            XCTAssertTrue(buffer.player.currentItem === accepted.item)
+            XCTAssertEqual(routes, [external ? PlaybackBuffer.DebugAdvanceRoute.queuedAdvance.rawValue
+                                            : PlaybackBuffer.DebugAdvanceRoute.previousReplacement.rawValue])
+            XCTAssertEqual(buffer.previousMediaID, "B"); XCTAssertNil(buffer.nextMediaID)
+            XCTAssertEqual(buffer.retainedItemCount, 2)
+        }
+        #else
+        XCTFail("Route identity requires DEBUG")
+        #endif
     }
 
     func testConfiguredQueuedHandoffAndRecordPlaybackClockLatency() async throws {
