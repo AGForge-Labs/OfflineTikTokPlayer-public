@@ -60,10 +60,54 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let stageCode: UInt64
         let sequenceOverflowed: Bool
     }
+    enum DebugWorkerActivityStage: UInt64, Sendable {
+        case none = 0, pumpEntered = 1, rendererSnapshotEntered = 2, rendererSnapshotReturned = 3
+        case fillEntered = 4, fillReturned = 5, converterEntered = 6, converterReturned = 7
+        case requestEntered = 8, requestReturned = 9, shutdownEntered = 10, shutdownReturned = 11
+        case closeAcceptanceEntered = 12, closeAcceptanceReturned = 13, pumpReturned = 14
+        case streamConstructionEntered = 15, streamConstructionReturned = 16
+        case streamReleaseEntered = 17, streamReleaseReturned = 18
+        case packetAcceptanceEntered = 19, packetAcceptanceReturned = 20, readEnqueued = 21
+        case acknowledgementEntered = 22, acknowledgementReturned = 23
+    }
+    struct DebugWorkerActivitySnapshot: Sendable {
+        let packedState: UInt64, sequence: UInt64, stageCode: UInt64, token: UInt64
+        let overflowed: Bool
+    }
     /// Three independent scalar records. Only the owning serial native lane
     /// writes its record. Readers load one packed word; leases/lanes/worker
     /// observations have no shared coherence or timing guarantee.
     final class DebugNativeLaneActivityRecorder: @unchecked Sendable {
+        /// One worker writer, one packed scalar read. Token/sequence saturation
+        /// invalidates diagnostics without changing decoding or wrapping identity.
+        fileprivate final class WorkerRecord: @unchecked Sendable {
+            private let packed = Atomic<UInt64>(0)
+            private var sequence: UInt64 = 0
+            private var overflowed = false
+            fileprivate var conversionGate: DebugNativeReadGate? // Worker only; calibration only.
+            fileprivate static let tokenMask: UInt64 = (1 << 24) - 1
+            fileprivate static let sequenceMask: UInt64 = (1 << 34) - 1
+            fileprivate func publish(_ stage: DebugWorkerActivityStage, token: Int = 0) {
+                if sequence == Self.sequenceMask { overflowed = true } else { sequence += 1 }
+                let valid = token >= 0 && UInt64(token) <= Self.tokenMask
+                if !valid { overflowed = true }
+                packed.store((sequence << 29) | ((valid ? UInt64(token) : 0) << 5)
+                    | stage.rawValue | (overflowed ? UInt64(1) << 63 : 0), ordering: .releasing)
+            }
+            fileprivate func beforeConversion(token: Int) {
+                publish(.converterEntered, token: token)
+                // Deliberate calibration hold is before the real SDK call.
+                conversionGate?.beforeCopy(token: token)
+            }
+            fileprivate func snapshot() -> DebugWorkerActivitySnapshot {
+                let value = packed.load(ordering: .acquiring)
+                return DebugWorkerActivitySnapshot(packedState: value,
+                    sequence: (value >> 29) & Self.sequenceMask, stageCode: value & 31,
+                    token: (value >> 5) & Self.tokenMask, overflowed: value & (UInt64(1) << 63) != 0)
+            }
+        }
+        fileprivate let worker = WorkerRecord()
+        func workerSnapshot() -> DebugWorkerActivitySnapshot { worker.snapshot() }
         fileprivate final class Record: @unchecked Sendable {
             private let packed = Atomic<UInt64>(0)
             private var sequence: UInt64 = 0 // Owning lane only.
@@ -213,6 +257,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     func debugSetNativeReadGate(_ gate: DebugNativeReadGate) {
         worker.async { [self] in debugNativeReadGate = gate }
     }
+    func debugSetWorkerConversionGate(_ gate: DebugNativeReadGate) {
+        worker.async { [self] in debugNativeLaneActivityRecorder?.worker.conversionGate = gate }
+    }
     #endif
 
     private final class Description: @unchecked Sendable {
@@ -260,6 +307,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         var requestedFrames = 0
         private(set) var reachedEnd = false
         var totalFrames: Int64
+        #if DEBUG
+        var debugToken = 0
+        #endif
 
         init(index: Int, lane: ReaderLane, totalFrames: Int64,
              request: @escaping @Sendable (ReaderLease) -> Void) {
@@ -641,6 +691,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     func shutdown() {
         worker.async { [self] in
+            #if DEBUG
+            let activity = debugNativeLaneActivityRecorder?.worker
+            activity?.publish(.shutdownEntered)
+            defer { activity?.publish(.shutdownReturned) }
+            #endif
             stopped = true
             timer?.setEventHandler {}; timer?.cancel(); timer = nil
             for index in preparations.indices { finishPreparation(at: index, failure: .cancelled) }
@@ -695,6 +750,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     func debugFailureState(_ completion: @escaping @Sendable (DebugFailureState) -> Void) {
         worker.async { [self] in
+            let activity = debugNativeLaneActivityRecorder?.worker
+            activity?.publish(.requestEntered)
+            defer { activity?.publish(.requestReturned) }
             let slotStates = (0..<3).map { index in
                 let slot = slots[index]
                 return DebugSlotState(index: index, token: slot?.token ?? 0, epoch: slot?.epoch ?? 0,
@@ -743,6 +801,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         worker.async { [self] in
             guard stopped else { completion(false); return }
             readerClosures.notify(queue: worker) { [self] in
+                let activity = debugNativeLaneActivityRecorder?.worker
+                activity?.publish(.acknowledgementEntered)
+                defer { activity?.publish(.acknowledgementReturned) }
                 completion(stopped && leases.allSatisfy { $0 == nil }
                     && preparations.allSatisfy { $0 == nil } && slots.allSatisfy { $0 == nil })
             }
@@ -758,6 +819,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
         leases[index] = lease
         #if DEBUG
+        lease.debugToken = description.debugReadToken
         peakLeasedReaders = max(peakLeasedReaders, leases.compactMap { $0 }.count)
         #endif
         readerClosures.enter()
@@ -783,10 +845,18 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
               !lease.reachedEnd, lease.failure == nil, lease.requestedFrames > 0 else { return }
         let requested = min(4_096, max(1, lease.requestedFrames))
         lease.requestedFrames = 0; lease.readPending = true
+        #if DEBUG
+        debugNativeLaneActivityRecorder?.worker.publish(.readEnqueued, token: lease.debugToken)
+        #endif
         lease.lane.read(maximumFrames: requested) { [weak self, weak lease] result in
             guard let self, let lease else { return }
             self.worker.async { [weak self, weak lease] in
                 guard let self, let lease, self.leases[lease.index] === lease, !lease.retired else { return }
+                #if DEBUG
+                let activity = self.debugNativeLaneActivityRecorder?.worker
+                activity?.publish(.packetAcceptanceEntered, token: lease.debugToken)
+                defer { activity?.publish(.packetAcceptanceReturned, token: lease.debugToken) }
+                #endif
                 lease.readPending = false
                 do {
                     switch result {
@@ -806,6 +876,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         // call returns. ReaderLane stores no completion/decoder owner cycle.
         lease.lane.close { [self, lease] in
             worker.async { [self, lease] in
+                #if DEBUG
+                let activity = debugNativeLaneActivityRecorder?.worker
+                activity?.publish(.closeAcceptanceEntered, token: lease.debugToken)
+                defer { activity?.publish(.closeAcceptanceReturned, token: lease.debugToken) }
+                #endif
                 if leases[lease.index] === lease { leases[lease.index] = nil }
                 readerClosures.leave()
                 schedulePump()
@@ -822,7 +897,13 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         #endif
         slots[index] = nil
         retireStream(slot.stream)
+        #if DEBUG
+        debugNativeLaneActivityRecorder?.worker.publish(.streamReleaseEntered, token: slot.token)
+        #endif
         slot.stream = nil
+        #if DEBUG
+        debugNativeLaneActivityRecorder?.worker.publish(.streamReleaseReturned, token: slot.token)
+        #endif
     }
 
     private func makeStream(description: Description, startFrame: Int64,
@@ -857,9 +938,20 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
 
     private func pump() {
+        #if DEBUG
+        let activity = debugNativeLaneActivityRecorder?.worker
+        activity?.publish(.pumpEntered)
+        defer { activity?.publish(.pumpReturned) }
+        #endif
         guard !stopped else { return }
         let more: Bool = autoreleasepool {
+            #if DEBUG
+            activity?.publish(.rendererSnapshotEntered)
+            #endif
             let active = renderer.snapshot.token
+            #if DEBUG
+            activity?.publish(.rendererSnapshotReturned, token: active)
+            #endif
             var more = false
             for index in slots.indices where preparations[index] == nil && slots[index]?.token == active {
                 more = serviceSlot(at: index, chunks: 8) || more
@@ -882,6 +974,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     private func serviceSlot(at index: Int, chunks: Int) -> Bool {
         guard let slot = slots[index] else { return false }
+        #if DEBUG
+        let activity = debugNativeLaneActivityRecorder?.worker
+        activity?.publish(.fillEntered, token: slot.token)
+        defer { activity?.publish(.fillReturned, token: slot.token) }
+        #endif
         if slot.cancellation.value.load(ordering: .acquiring) || slot.source.token != slot.token {
             retireSlot(at: index); return false
         }
@@ -1026,7 +1123,13 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let request = slot.source.streamRequest
         if request.epoch != slot.epoch {
             retireStream(slot.stream)
+            #if DEBUG
+            debugNativeLaneActivityRecorder?.worker.publish(.streamReleaseEntered, token: slot.token)
+            #endif
             slot.stream = nil
+            #if DEBUG
+            debugNativeLaneActivityRecorder?.worker.publish(.streamReleaseReturned, token: slot.token)
+            #endif
             if request.startFrame >= slot.source.totalFrames {
                 guard slot.source.beginStream(epoch: request.epoch) else { throw Failure.cancelled }
                 slot.epoch = request.epoch; slot.finished = true
@@ -1111,6 +1214,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         private var lastAboveThreshold: Int64?
         private var peak: Float = 0
         #if DEBUG
+        private let debugWorkerActivity: DebugNativeLaneActivityRecorder.WorkerRecord?
+        private let debugToken: Int
         var injectNextPositiveHaveDataAsInputRanDry = false
         var onPositiveInputRanDry: ((Int, Bool) -> Void)?
         var debugProgress: DebugStreamState {
@@ -1129,6 +1234,12 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             nativeRate = description.nativeRate
             self.shouldCancel = shouldCancel
             analysisValid = startFrame == 0
+            #if DEBUG
+            let activity = description.debugNativeLaneActivityRecorder?.worker
+            self.debugWorkerActivity = activity; self.debugToken = description.debugReadToken
+            activity?.publish(.streamConstructionEntered, token: description.debugReadToken)
+            defer { activity?.publish(.streamConstructionReturned, token: description.debugReadToken) }
+            #endif
             guard description.track != nil else {
                 self.native = nil; converter = nil; input = nil; output = nil; return
             }
@@ -1233,6 +1344,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 var conversionError: NSError?
                 let sourceTarget = totalFrames, rate = nativeRate
                 var suppliedSupport = supportFramesSupplied
+                #if DEBUG
+                debugWorkerActivity?.beforeConversion(token: debugToken)
+                #endif
                 let nativeStatus = converter.convert(to: output, error: &conversionError) { requested, status in
                     do {
                         guard requested > 0 else { status.pointee = .noDataNow; return nil }
@@ -1268,6 +1382,9 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         status.pointee = .endOfStream; return nil
                     }
                 }
+                #if DEBUG
+                debugWorkerActivity?.publish(.converterReturned, token: debugToken)
+                #endif
                 supportFramesSupplied = suppliedSupport
                 if let inputFailure { throw inputFailure }
                 guard nativeStatus != .error, conversionError == nil else { throw Failure.cannotDecode }

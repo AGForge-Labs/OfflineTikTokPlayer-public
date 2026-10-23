@@ -5,7 +5,89 @@ import Synchronization
 import PlayerCore
 @testable import OfflineTikTokPlayer
 
+#if DEBUG
+enum PCMWorkerBoundaryOwnership {
+    struct Retained: @unchecked Sendable {
+        let decoder: ContinuousPCMDecoder, renderer: ContinuousPCMRenderer
+        let gate: ContinuousPCMDecoder.DebugNativeReadGate, directory: URL
+    }
+    static let unresolved = Mutex<Retained?>(nil)
+    static var blocksFixtures: Bool { unresolved.withLock { $0 != nil } }
+}
+#endif
+
 final class ContinuousPCMDecoderTests: XCTestCase {
+    func testWorkerBoundaryReceiptSeparatesHeldConversionFromQueuedShutdown() async throws {
+        #if DEBUG
+        guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
+            XCTFail("A prior worker calibration did not acknowledge cleanup; no new calibration owners may be created")
+            throw ContinuousPCMDecoder.Failure.cannotDecode
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("worker-boundary.caf")
+        do { try writePCM(Self.mailboxPattern(frames: 8_193, identity: 1), to: url) }
+        catch { try? FileManager.default.removeItem(at: directory); throw error }
+        let renderer = ContinuousPCMRenderer(prefixFrames: 512, ringFrames: 1_024)
+        let recorder = ContinuousPCMDecoder.DebugNativeLaneActivityRecorder()
+        let decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: recorder)
+        let gate = ContinuousPCMDecoder.DebugNativeReadGate()
+        decoder.debugSetWorkerConversionGate(gate)
+        var bodyError: Error?
+        do {
+        _ = try await Self.mailboxPrepare(decoder, url: url, token: 1, slot: 0)
+        XCTAssertTrue(gate.arm(token: 1))
+        Self.mailboxAcknowledge(renderer, token: 1, frame: 2_049)
+        try await Self.mailboxWait(timeout: 1, "The actual worker conversion boundary must enter") { gate.didEnter }
+        guard gate.isHolding, !gate.didTimeOut else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+        let held = recorder.workerSnapshot()
+        XCTAssertFalse(held.overflowed); XCTAssertGreaterThan(held.sequence, 0)
+        XCTAssertEqual(held.token, 1)
+        XCTAssertEqual(held.stageCode, ContinuousPCMDecoder.DebugWorkerActivityStage.converterEntered.rawValue)
+        let reply = Mutex<Bool>(false), acknowledgement = Mutex<Bool?>(nil)
+        decoder.debugFailureState { _ in reply.withLock { $0 = true } }
+        decoder.shutdown(); decoder.debugAfterShutdown { value in acknowledgement.withLock { $0 = value } }
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertTrue(gate.isHolding); XCTAssertFalse(gate.didTimeOut)
+        XCTAssertEqual(recorder.workerSnapshot().packedState, held.packedState)
+        XCTAssertFalse(reply.withLock { $0 }); XCTAssertNil(acknowledgement.withLock { $0 })
+        gate.release()
+        try await Self.mailboxWait(timeout: 2, "Released worker must run queued request and actual reader cleanup") {
+            reply.withLock { $0 } && acknowledgement.withLock { $0 } != nil
+        }
+        XCTAssertEqual(acknowledgement.withLock { $0 }, true)
+        let closed = try await Self.mailboxStats(decoder)
+        Self.assertMailboxBounds(closed); XCTAssertTrue(closed.readerLeasesClosed)
+        XCTAssertEqual(closed.leasedReaders, 0); XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        XCTAssertFalse(gate.didTimeOut)
+        let after = recorder.workerSnapshot()
+        XCTAssertFalse(after.overflowed); XCTAssertGreaterThan(after.sequence, held.sequence)
+        print("PCMWorkerBoundaryCalibration schema=1 heldPacked=\(held.packedState) heldSequence=\(held.sequence) heldStage=\(held.stageCode) heldToken=\(held.token) laterPacked=\(after.packedState) laterSequence=\(after.sequence) laterStage=\(after.stageCode) actualQueuedRequest=true actualShutdownAcknowledged=\(acknowledgement.withLock { $0 } == true) gateMaximumSeconds=5 gateScope=before-real-converter-call sdkInternalWait=false publication=one-packed-word")
+        } catch { bodyError = error }
+        gate.release(); renderer.setPlaying(false); decoder.shutdown()
+        let cleanup = Mutex<Bool?>(nil)
+        decoder.debugAfterShutdown { value in cleanup.withLock { $0 = value } }
+        do {
+            try await Self.mailboxWait(timeout: 2, "Calibration must join actual decoder close before another fixture") {
+                cleanup.withLock { $0 } != nil
+            }
+            guard cleanup.withLock({ $0 }) == true else { throw ContinuousPCMDecoder.Failure.cannotDecode }
+        } catch {
+            PCMWorkerBoundaryOwnership.unresolved.withLock {
+                $0 = .init(decoder: decoder, renderer: renderer, gate: gate, directory: directory)
+            }
+            XCTFail("Worker calibration cleanup did not acknowledge; exact owners and fixture retained, later fixture creation blocked")
+            throw bodyError ?? error
+        }
+        print("PCMWorkerBoundaryCleanup schema=1 acknowledged=true fixtureRemoveAllowed=true originalBodyError=\(bodyError != nil) retainedUnresolved=false")
+        do { try FileManager.default.removeItem(at: directory) }
+        catch { XCTFail("Acknowledged calibration fixture removal failed"); throw bodyError ?? error }
+        if let bodyError { throw bodyError }
+        #else
+        XCTFail("Worker boundary calibration requires DEBUG")
+        #endif
+    }
+
     // Bounded native-reader lifecycle and complete-presentation regressions.
     // These tests use worker-coherent DEBUG counters; they do not
     // characterize SDK-internal cancellation, memory, thread count or wait causes.
