@@ -7,6 +7,10 @@ import CoreMedia
 import CoreFoundation
 import CoreVideo
 import PlayerCore
+#if DEBUG
+import Darwin
+import Synchronization
+#endif
 @testable import OfflineTikTokPlayer
 
 /// Service/render integration regressions. The opaque magenta poster deliberately differs from
@@ -770,12 +774,46 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             sourceCallbackExecutionTimingBenchmarkMode = timed
             let armID = UUID().uuidString.lowercased()
             sourceCallbackLedgerArmID = armID
-            print("SourceCallbackExecutionArm schema=1 armID=\(armID) ordinal=\(ordinal) ledger=true executionTiming=\(timed) clocksPerSourceCallback=\(timed ? 2 : 0) clock=mach_absolute_time endScope=before-final-ledger-publication numericDefault=true traceVideoSeeks=true traceClockHandoff=true acceptance=unchanged")
+            print("SourceCallbackExecutionArm schema=2 armID=\(armID) ordinal=\(ordinal) ledger=true executionTiming=\(timed) clocksPerSourceCallback=\(timed ? 2 : 0) clocksPerTapCallback=\(timed ? 3 : 0) disabledTapCallbacksRecorded=\(timed) clock=mach_absolute_time endScope=before-final-ledger-publication tapEndScope=before-trace-publication-unlock-and-SDK-return numericDefault=true traceVideoSeeks=true traceClockHandoff=true acceptance=unchanged")
             try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false, traceClockHandoff: true)
             print("SourceCallbackExecutionArmEnd schema=1 armID=\(armID) helperReturned=true")
         }
         #else
         XCTFail("Source callback execution timing requires DEBUG")
+        #endif
+    }
+
+    func testTapExecutionTraceRejectsMalformedClockOrderAndOverflow() {
+        #if DEBUG
+        let trace = ProductionSelectionTapExecutionTrace(capacity: 4, frameCapacity: 10)
+        trace.record(entryID: trace.begin(), entry: 100, acquired: 110, end: 120, enabled: false, first: 0, last: 0)
+        // Entry may precede the prior callback's end while waiting on the tap lock.
+        trace.record(entryID: trace.begin(), entry: 105, acquired: 125, end: 130, enabled: true, first: 0, last: 4)
+        let valid = trace.snapshot()
+        XCTAssertFalse(valid.failed); XCTAssertEqual(valid.observed, 2)
+        XCTAssertEqual(valid.entries.count, 2); XCTAssertEqual(valid.entries.last?.last, 4)
+        let malformed: [(UInt64, UInt64, UInt64)] = [(0, 1, 2), (3, 2, 4), (1, 4, 3)]
+        for triple in malformed {
+            let invalid = ProductionSelectionTapExecutionTrace(capacity: 1, frameCapacity: 10)
+            invalid.record(entryID: invalid.begin(), entry: triple.0, acquired: triple.1, end: triple.2,
+                           enabled: false, first: 0, last: 0)
+            XCTAssertTrue(invalid.snapshot().failed); XCTAssertEqual(invalid.snapshot().entries.count, 0)
+        }
+        let disabled = ProductionSelectionTapExecutionTrace(capacity: 1, frameCapacity: 10)
+        disabled.record(entryID: disabled.begin(), entry: 1, acquired: 2, end: 3, enabled: false, first: 0, last: 1)
+        XCTAssertTrue(disabled.snapshot().failed)
+        let overlap = ProductionSelectionTapExecutionTrace(capacity: 2, frameCapacity: 10)
+        overlap.record(entryID: overlap.begin(), entry: 1, acquired: 2, end: 5, enabled: true, first: 0, last: 1)
+        overlap.record(entryID: overlap.begin(), entry: 3, acquired: 4, end: 6, enabled: true, first: 1, last: 2)
+        XCTAssertTrue(overlap.snapshot().failed)
+        let full = ProductionSelectionTapExecutionTrace(capacity: 1, frameCapacity: 10)
+        full.record(entryID: full.begin(), entry: 1, acquired: 2, end: 3, enabled: true, first: 0, last: 1)
+        full.record(entryID: full.begin(), entry: 4, acquired: 5, end: 6, enabled: true, first: 1, last: 2)
+        let overflow = full.snapshot()
+        XCTAssertTrue(overflow.failed); XCTAssertEqual(overflow.observed, 2)
+        XCTAssertEqual(overflow.entries.count, 1); XCTAssertEqual(overflow.entries.first?.ordinal, 0)
+        #else
+        XCTFail("Tap execution calibration requires DEBUG")
         #endif
     }
 
@@ -2454,8 +2492,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #else
         let audio = ContinuousAudioPlayer()
         #endif
-        let tap = ProductionSelectionOutputTap()
         #if DEBUG
+        let tap = ProductionSelectionOutputTap(captureExecutionTime: sourceCallbackExecutionTimingBenchmarkMode)
         tap.callbackLedger = accounting?.callbackLedger
         let callbackLedgerGraph = sourceCallbackLedgerBenchmarkMode == true ? audio.graph : nil
         if sourceCallbackLedgerBenchmarkMode != nil {
@@ -2468,6 +2506,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertNil(nativeVideoGeometry); XCTAssertNil(traceFirstSourceFailure); XCTAssertNil(traceReturnedAProducerBoundary)
             XCTAssertFalse(auditSavedAAfterCleanup)
         }
+        #else
+        let tap = ProductionSelectionOutputTap()
         #endif
         let seeks = ProductionSelectionSeekRecorder()
         let startup = ProductionVideoStartupTrace(serviceTracing: traceVideoSeeks)
@@ -2827,6 +2867,32 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             for (ordinal, t) in prefix.tap.enumerated() {
                 print("TapCallbackReceipt schema=1 armID=\(arm) ordinal=\(ordinal) host=\(t.stamp.host) hostSeconds=\(AVAudioTime.seconds(forHostTime: t.stamp.host)) sample=\(t.stamp.sample) sampleRate=\(t.stamp.rate) bufferRate=\(t.bufferRate) valid=\(t.stamp.valid) first=\(t.first) end=\(t.end) inputFrames=\(t.inputFrames) channels=\(t.channels) flags=\(t.flags)")
+            }
+            if let execution = tap.executionSnapshot() {
+                let enabledEntries = execution.entries.filter(\.enabled)
+                print("TapExecutionSummary schema=1 armID=\(arm) enabled=\(timingExpected) enteredBefore=\(execution.enteredBefore) enteredAfter=\(execution.enteredAfter) observed=\(execution.observed) retained=\(execution.entries.count) enabledRecords=\(enabledEntries.count) bytes=\(execution.reservedBytes) stride=\(MemoryLayout<ProductionSelectionTapExecutionTrace.Entry>.stride) failed=\(execution.failed) capacity=4096 clocksPerCallback=\(timingExpected ? 3 : 0) disabledCallbacksIncluded=true endScope=before-trace-publication-unlock-and-SDK-return publication=after-cleanup coverageClosed=false formalRTJoin=false physicalOutput=false acceptance=unchanged")
+                XCTAssertFalse(execution.failed)
+                XCTAssertEqual(execution.enteredBefore, execution.enteredAfter)
+                XCTAssertEqual(execution.enteredAfter, execution.observed)
+                XCTAssertLessThan(bytes + execution.reservedBytes, 2 * 1024 * 1024)
+                if timingExpected {
+                    XCTAssertGreaterThan(execution.entries.count, 0)
+                    XCTAssertEqual(execution.observed, UInt64(execution.entries.count))
+                    XCTAssertEqual(Set(execution.entries.map(\.entryID)).count, execution.entries.count)
+                    XCTAssertTrue(execution.entries.allSatisfy { $0.entryID < execution.observed })
+                    XCTAssertTrue(execution.entries.contains { !$0.enabled })
+                    XCTAssertEqual(enabledEntries.count, prefix.tap.count)
+                    XCTAssertTrue(zip(enabledEntries, prefix.tap).allSatisfy {
+                        $0.first == Int($1.first) && $0.last == Int($1.end)
+                    }, "Each enabled timing entry must retain its exact node-local tap range")
+                } else {
+                    XCTAssertEqual(execution.observed, 0); XCTAssertTrue(execution.entries.isEmpty)
+                }
+                for e in execution.entries {
+                    print("TapExecutionReceipt schema=1 armID=\(arm) ordinal=\(e.ordinal) entryID=\(e.entryID) entryHost=\(e.entry) acquiredHost=\(e.acquired) endHost=\(e.end) entrySeconds=\(AVAudioTime.seconds(forHostTime: e.entry)) acquiredSeconds=\(AVAudioTime.seconds(forHostTime: e.acquired)) endSeconds=\(AVAudioTime.seconds(forHostTime: e.end)) enabled=\(e.enabled) first=\(e.first) end=\(e.last)")
+                }
+            } else if sourceCallbackExecutionTimingBenchmarkMode != nil {
+                XCTFail("Both execution-timing arms require equal fixed tap trace storage")
             }
         }
         if handoffTrace != nil {
@@ -8722,12 +8788,73 @@ private final class ProductionNativeRefillTrace: @unchecked Sendable {
 }
 #endif
 
+#if DEBUG
+/// Only append() writes this fixed arena, under the tap's existing lock. Snapshots
+/// are copied under that same lock after cleanup; neither proves an SDK RT join.
+private final class ProductionSelectionTapExecutionTrace {
+    struct Entry {
+        var ordinal: UInt64 = 0, entryID: UInt64 = 0, entry: UInt64 = 0, acquired: UInt64 = 0, end: UInt64 = 0
+        var first: Int = 0, last: Int = 0
+        var enabled = false
+    }
+    struct Snapshot {
+        let entries: [Entry], observed: UInt64, failed: Bool, reservedBytes: Int
+        let enteredBefore: UInt64, enteredAfter: UInt64
+    }
+    private let storage: UnsafeMutablePointer<Entry>
+    private let capacity: Int, frameCapacity: Int
+    private var count = 0
+    private var observed: UInt64 = 0
+    private var failed = false
+    private let entered = Atomic<UInt64>(0)
+    private let entryOverflow = Atomic<Bool>(false)
+    init(capacity: Int, frameCapacity: Int) {
+        precondition(capacity > 0 && frameCapacity > 0)
+        self.capacity = capacity; self.frameCapacity = frameCapacity
+        storage = .allocate(capacity: capacity)
+        storage.initialize(repeating: Entry(), count: capacity)
+    }
+    deinit { storage.deinitialize(count: capacity); storage.deallocate() }
+    func begin() -> UInt64 {
+        let value = entered.wrappingAdd(1, ordering: .relaxed).oldValue
+        if value >= UInt64(capacity) { entryOverflow.store(true, ordering: .relaxed) }
+        return value
+    }
+    func record(entryID: UInt64, entry: UInt64, acquired: UInt64, end: UInt64,
+                enabled: Bool, first: Int, last: Int) {
+        let next = observed.addingReportingOverflow(1)
+        observed = next.overflow ? .max : next.partialValue
+        guard !failed, !next.overflow, count < capacity, entryID < UInt64(capacity),
+              entry > 0, entry <= acquired, acquired <= end,
+              first >= 0, last >= first, last <= frameCapacity,
+              enabled || first == last else { failed = true; return }
+        if count > 0 {
+            let previous = storage[count - 1]
+            guard acquired >= previous.end, first >= previous.last else { failed = true; return }
+        }
+        storage[count] = Entry(ordinal: observed - 1, entryID: entryID, entry: entry, acquired: acquired,
+                               end: end, first: first, last: last, enabled: enabled)
+        count += 1
+    }
+    func snapshot() -> Snapshot {
+        let before = entered.load(ordering: .acquiring)
+        let entries = Array(UnsafeBufferPointer(start: storage, count: count))
+        return Snapshot(entries: entries, observed: observed,
+                 failed: failed || entryOverflow.load(ordering: .relaxed),
+                 reservedBytes: capacity * MemoryLayout<Entry>.stride,
+                 enteredBefore: before, enteredAfter: entered.load(ordering: .acquiring))
+    }
+}
+#endif
+
 /// Fixed 12-second storage for actual mixer PCM and its AVAudioTime host timeline.
 /// The tap is disabled during the first two 8-second renderer-only windows.
 private final class ProductionSelectionOutputTap: @unchecked Sendable {
     #if DEBUG
     // Set before tap installation; only append() writes its tap-owned prefix.
     var callbackLedger: ContinuousPCMRenderer.DebugSourceCallbackLedger?
+    private let captureExecutionTime: Bool
+    private let executionTrace: ProductionSelectionTapExecutionTrace?
     #endif
     struct Tone { let start: Double; let end: Double }
     #if DEBUG
@@ -8837,7 +8964,21 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     private var auditPending: ChannelRun?
     private var auditFirst: ChannelRun?, auditSecond: ChannelRun?, auditThird: ChannelRun?, auditFourth: ChannelRun?
 
+    #if DEBUG
+    init(captureExecutionTime: Bool? = nil) {
+        self.captureExecutionTime = captureExecutionTime == true
+        // Equal arenas in OFF and ON; ordinary tests allocate no timing arena.
+        executionTrace = captureExecutionTime.map { _ in
+            ProductionSelectionTapExecutionTrace(capacity: 4096, frameCapacity: 12 * 48_000)
+        }
+        values.reserveCapacity(capacity); hosts.reserveCapacity(capacity)
+    }
+    func executionSnapshot() -> ProductionSelectionTapExecutionTrace.Snapshot? {
+        lock.lock(); defer { lock.unlock() }; return executionTrace?.snapshot()
+    }
+    #else
     init() { values.reserveCapacity(capacity); hosts.reserveCapacity(capacity) }
+    #endif
     static func hostSeconds() -> Double { CMClockGetTime(CMClockGetHostTimeClock()).seconds }
     var count: Int { lock.lock(); defer { lock.unlock() }; return values.count }
     @discardableResult
@@ -8914,7 +9055,24 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     }
 
     func append(_ buffer: AVAudioPCMBuffer, time: AVAudioTime) {
+        #if DEBUG
+        let executionEntry = captureExecutionTime ? mach_absolute_time() : 0
+        let executionID = captureExecutionTime ? executionTrace!.begin() : 0
+        #endif
         lock.lock(); defer { lock.unlock() }
+        #if DEBUG
+        let executionAcquired = captureExecutionTime ? mach_absolute_time() : 0
+        let executionFirst = values.count, executionEnabled = enabled
+        // Registered before the legacy receipt defer: its work is included too.
+        // The marker excludes only this trace publication, unlock and SDK return.
+        defer {
+            if captureExecutionTime {
+                let executionEnd = mach_absolute_time()
+                executionTrace?.record(entryID: executionID, entry: executionEntry, acquired: executionAcquired,
+                    end: executionEnd, enabled: executionEnabled, first: executionFirst, last: values.count)
+            }
+        }
+        #endif
         guard enabled else { return }
         #if DEBUG
         let receiptFirst = values.count
