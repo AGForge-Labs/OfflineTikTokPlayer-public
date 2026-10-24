@@ -9873,7 +9873,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause() async throws {
         let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
+        #if DEBUG
+        // Reuse the existing packed stage records; no new SDK getter or clock.
+        let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: .init())
+        #else
         let audio = ContinuousAudioPlayer()
+        #endif
         let service = fixture.service(continuousAudio: audio)
         #if DEBUG
         service.debugInitialLoadPhaseEnabled = true
@@ -9891,7 +9896,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let load = service.debugInitialLoadPhaseState, prep = audio.debugPreparationState
             print("RapidPreparationFailure schema=1 preparedCount=\(service.preparedAudioCount) audioRunning=\(service.audioEngineRunning) wantsToPlay=\(service.wantsToPlay) loading=\(service.isLoading) videoReady=\(service.isVideoReady) loadRequest=\(load.request) generation=\(load.generation) loadPhase=\(load.phase.rawValue) activeCalls=\(prep.activeCalls) sharedTasks=\(prep.sharedTasks) reservedSlots=\(prep.reservedSlots) nextToken=\(prep.nextToken) counterOverflowed=\(prep.counterOverflowed) deadlineSeconds=3")
             await recordNaturalRunwayFailure(audio: audio, expectedToken: audio.snapshot.token,
-                                            stage: "rapid-initial-preparation")
+                                            stage: "rapid-initial-preparation", captureNativeLaneActivity: true)
             #endif
             throw error
         }

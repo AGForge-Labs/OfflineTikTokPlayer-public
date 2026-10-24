@@ -205,3 +205,36 @@ The exact expression independently fails local Swift type-checking as ambiguous.
 Four explicit Float-to-string closures and named strings now type-check and execute
 locally in Swift5 mode. This changes only failure logging, no player/source criteria.
 The native boundary diagnostic and full69-case profile still require SDK execution.
+
+
+### Native12: exact prepared head and four measured boundaries
+
+Public run40101087562/job120893198637 on806b5d8 completed in13m35s,
+owned full-test exit65/no timeout. All69 selected identities returned:
+123core,66native and1UI passed;2native cases failed. Original source/media and
+all timing/output assertions remain intact. This is a focused profile, not full
+Release or physical-phone acceptance.
+
+The new2.032s boundary case compares all12000 prepared B head frames against a
+complete1440000frame native reference: zero mismatched samples, zero source
+stereo-zero frames or sliding quiet windows. Four actual prepared transitions
+show zero source/tap stereo-zero frames, zero underruns, and readiness
+213.610/125.727/116.052/106.605ms. Source-to-tap runtime clock/frame calibration
+is still unverified; absence of the prior intermittent gap is inconclusive about
+its cause. Both original ongoing output audits are clean again (8.1s/8s).
+
+The traced benchmark fails an independent sampler gap316.688875ms against250ms;
+maximum PCM/wall skew is8.360125ms with no output silence/underruns. Rapid A/B/A
+fails its original3s initial-preparation guard: zero prepared sources, one pending
+first read, no packets, responsive decoder worker. Native API stage was not
+recorded, so an SDK wait is not established. Both Audio only cases and UI pass.
+
+Raw SHA2562e2cda6d883beaea7ad1d9760b6d5d98b8630fb4e1d586f3db77c6d9f388d541.
+Artifact12563580783/72340509bytes/SHA256
+d358aa836d1c07f8d6922115786beec95e6ca89686c069c9dd6775bbf989bd30 downloaded
+and checksum verified. No production repair or TestFlight release is inferred.
+
+Next source diagnostic reuses the existing packed native-lane activity recorder
+in the same rapid test. Failure-only before/after cached stage reads keep the
+original3s guard and all playback assertions, with no additional test identity,
+SDK getter, clock or runtime implementation change. No native13 run yet.
