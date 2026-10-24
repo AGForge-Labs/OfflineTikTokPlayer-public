@@ -671,7 +671,9 @@ Artifact12574132062/353921bytes/SHA256
 ZIP144entries verified. Raw job log SHA256
 ffc9d74de14ebc6820e3a704eb90c4df49f2b615500b1f1cacbec8ca8a6b21cc.
 
-Cold compilation consumed about10min before tests. Split the next manual unsigned
+Pre-test build and startup consumed about10min. Final build Touch20:09:42.793,
+first native case20:14:30.952; compile/build was about5m23 and later startup4m48.
+Split the next manual unsigned
 check into one build-for-testing job and one test-without-building job, each
 standard-public/macOS26/15min. Carry exact-source compiled products in a one-day
 artifact; verify source, Xcode/SDK/architecture, profile and every binary checksum
@@ -679,3 +681,22 @@ before extracting. Original73cases/assertions and per-case120s limits remain;
 new owned profile-build/profile-test phases each720s leave room for evidence.
 The old full/default/release command and original phase budgets stay unchanged.
 This changes check orchestration only, not playback, and cannot excuse failures.
+
+### Native26: build succeeds; new CLI handoff error reproduced and corrected
+
+Run40130132409/source88414a1: buildjob120979889642 succeeds4m48, owned build
+198625ms, exit0/no timeout,125core pass. Exact compiled-product bundle174files
+archives successfully. Testjob120980991483 fails19s before native execution:
+main() passed --products/--archive in the wrong order to unpack(). Its guard
+message referred to the wrong argument; this does not establish a stale folder.
+An actual CLI round-trip regression reproduces RED locally, then all8transport
+methods pass0.389s after explicit pack/unpack dispatch fixes the argument order.
+Identity/checksum/overwrite protections stay; app/core and73case manifest unchanged.
+
+All three artifacts downloaded/SHA/ZIP verified. Products12573834828/36219673bytes/
+083771874d406826830b5959b7da4c8de73c711742c3cc0f93176e9ee0556f83;
+build evidence12574114524/37619bytes/530d450a2dee63bc201884d7941850638b883c41d6c70e6bcdc29ad148aa6b83;
+empty native evidence12574757595/154bytes/96fed3f27968455d88f5d4fea77bec9e78e5de45653e40f9292f557a978e5552.
+Raw logs/result/screenshot/context retained. Actual xctestrun test/host paths use
+__TESTROOT__/__TESTHOST__, preserving product portability. No native acceptance,
+video/preparation repair, full Release or delivery claim from this failed handoff.

@@ -6,6 +6,8 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+import sys
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/native-profile-products.py"
 
@@ -44,6 +46,13 @@ class NativeProfileProductsTests(unittest.TestCase):
         self.assertEqual(app.stat().st_mode & 0o777, 0o755)
         self.assertTrue((self.target / "alias").is_symlink())
         self.assertEqual((self.target / "alias").read_text(), "synthetic xctestrun")
+
+    def test_actual_cli_round_trip_uses_the_correct_archive_and_destination(self):
+        for mode, products in (("pack", self.products), ("unpack", self.target)):
+            arguments = [str(SCRIPT), mode, "--products", str(products), "--archive", str(self.archive)]
+            with mock.patch.object(sys, "argv", arguments), mock.patch.object(self.module, "build_context", return_value=self.context):
+                self.module.main()
+        self.assertEqual((self.target / "Debug-iphonesimulator/Player.app/Player").read_bytes(), b"synthetic executable")
 
     def test_changed_source_toolchain_or_profile_fails_before_extraction(self):
         self.packed()

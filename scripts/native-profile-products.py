@@ -97,7 +97,10 @@ def main():
     parser.add_argument("--products", type=Path, required=True)
     parser.add_argument("--archive", type=Path, required=True)
     args = parser.parse_args(); root = Path(__file__).resolve().parents[1]
-    try: globals()[args.mode](args.products, args.archive, build_context(root))
+    try:
+        context = build_context(root)
+        if args.mode == "pack": pack(args.products, args.archive, context)
+        else: unpack(args.archive, args.products, context)
     except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
         parser.exit(1, "Unsigned build-product check failed: " + str(error) + "\n")
 
