@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=03eb42c4d2344990b43597fc279cf8cba4930ce8
-expected_ios_tree=9039a800b484a10de3ba5f46e49483dfda75c001
+expected_code_source=4019db3508537928273d89b8bc9e7e23f75a79da
+expected_ios_tree=5ad179beea2ef0b53374e1340ca5f731eee56c7a
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testNativeItemAudioTrackDisablingOffThenOn',
-    'testNativeItemAudioTrackDisablingOnThenOff',
-    'testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback',
-    'testRetainedNativeHostControlStaleRequestKeepsProductionArgument',
+    'testProductionNativeAudioSuppressionPreservesRetainedVideoAndPCM',
+    'testNativeAudioSuppressionRejectsSupersessionAtEveryPrewriteRead',
+    'testNativeAudioSuppressionCannotUndoPauseOrDeniedInterruptionResume',
+    'testProductionDefaultReadinessRequiresTheSelectedCPPOutput',
 )
 
 def require(condition, message):
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testNativeItemAudioTrackDisablingOffThenOn testNativeItemAudioTrackDisablingOnThenOff testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback testRetainedNativeHostControlStaleRequestKeepsProductionArgument) ;;
+  controls) cases=(testProductionNativeAudioSuppressionPreservesRetainedVideoAndPCM testNativeAudioSuppressionRejectsSupersessionAtEveryPrewriteRead testNativeAudioSuppressionCannotUndoPauseOrDeniedInterruptionResume testProductionDefaultReadinessRequiresTheSelectedCPPOutput) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
