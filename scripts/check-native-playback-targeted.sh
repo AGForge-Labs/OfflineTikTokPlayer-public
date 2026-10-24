@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=0b79bf2838c632a746428e39db27b7c32a300614
+expected_code_source=03eb42c4d2344990b43597fc279cf8cba4930ce8
 expected_ios_tree=9039a800b484a10de3ba5f46e49483dfda75c001
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -44,8 +44,8 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testIndependentNativeOwnerSpanTracingOffThenOn',
-    'testIndependentNativeOwnerSpanTracingOnThenOff',
+    'testNativeItemAudioTrackDisablingOffThenOn',
+    'testNativeItemAudioTrackDisablingOnThenOff',
     'testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback',
     'testRetainedNativeHostControlStaleRequestKeepsProductionArgument',
 )
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testIndependentNativeOwnerSpanTracingOffThenOn testIndependentNativeOwnerSpanTracingOnThenOff testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback testRetainedNativeHostControlStaleRequestKeepsProductionArgument) ;;
+  controls) cases=(testNativeItemAudioTrackDisablingOffThenOn testNativeItemAudioTrackDisablingOnThenOff testRetainedNativeHostControlExplicitSeekKeepsSynchronizedNumericFallback testRetainedNativeHostControlStaleRequestKeepsProductionArgument) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
