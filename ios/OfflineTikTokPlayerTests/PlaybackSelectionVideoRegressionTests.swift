@@ -1552,6 +1552,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testContinuousRepeatOneTenFullSourceLoopsMatchLiveMixer() async throws {
+        try await runLiveRepeatOneSourceComparison(traceSource: false)
+    }
+
+    func testRepeatOneSourceMixerDiagnostic() async throws {
+        try await runLiveRepeatOneSourceComparison(traceSource: true)
+    }
+
+    private func runLiveRepeatOneSourceComparison(traceSource: Bool) async throws {
         try recordRuntimeHost()
         #if DEBUG
         let calibrated = LoopPCMComparison.calibrationPasses()
@@ -1559,10 +1567,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         guard calibrated else { throw SelectionVideoTestFailure.timeout }
         let fixture = try await SelectionVideoFixture(test: self, shortLoopFixture: true)
         defer { fixture.remove() }
-        let audio = ContinuousAudioPlayer()
+        let accounting = traceSource
+            ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(captureCallbackLedger: true) : nil
+        let audio = ContinuousAudioPlayer(debugRenderAccounting: accounting)
         let service = fixture.service(continuousAudio: audio, actualSessionActivation: true)
         let screen = try SelectionVideoScreen(service: service)
         let tap = ProductionSelectionOutputTap(capacityFrames: 16 * 48_000)
+        tap.callbackLedger = accounting?.callbackLedger
         var installed = false, closed = false
         defer {
             if !closed {
@@ -1627,6 +1638,53 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let recorded = tap.samples(from: first, to: last)
         let validity = tap.validity()
         let match = LoopPCMComparison.compare(template: reference, recorded: recorded.values)
+        if let ledger = accounting?.callbackLedger {
+            let prefix = ledger.prefix()
+            func finiteJSON(_ value: Double) -> Any {
+                guard value.isFinite else { return NSNull() }
+                return value
+            }
+            // Immutable observed prefixes only. No callback join or cross-domain
+            // sample-time mapping is inferred from engine.stop or these stamps.
+            let sourceRows: [[String: Any]] = prefix.source.map { value in
+                ["ordinal": value.ordinal, "host": value.stamp.host, "sample": finiteJSON(value.stamp.sample),
+                 "stampValid": value.stamp.valid, "rate": finiteJSON(value.stamp.rate), "frames": value.frames,
+                 "pairs": value.pairs, "zeros": value.zeros, "nonfinite": value.nonfinite,
+                 "flags": value.flags, "token": value.token, "visit": value.visit,
+                 "copied": value.copied, "inactive": value.inactive, "paused": value.paused,
+                 "eof": value.eof, "underrun": value.underrun,
+                 "zeroRuns": [[value.first.first, value.first.end], [value.second.first, value.second.end],
+                              [value.third.first, value.third.end], [value.fourth.first, value.fourth.end]]]
+            }
+            let tapRows: [[String: Any]] = prefix.tap.map { value in
+                ["host": value.stamp.host, "sample": finiteJSON(value.stamp.sample), "stampValid": value.stamp.valid,
+                 "rate": finiteJSON(value.stamp.rate), "bufferRate": finiteJSON(value.bufferRate), "first": value.first,
+                 "end": value.end, "inputFrames": value.inputFrames, "channels": value.channels,
+                 "flags": value.flags]
+            }
+            let summary: [String: Any] = ["schema": 1, "source": sourceRows, "tap": tapRows,
+                "enteredBefore": prefix.enteredBefore, "enteredAfter": prefix.enteredAfter,
+                "completedBefore": prefix.completedBefore, "completedAfter": prefix.completedAfter,
+                "tapsBefore": prefix.tapsBefore, "tapsAfter": prefix.tapsAfter,
+                "failed": prefix.failed, "stableObservedPrefix": prefix.stableObservedPrefix,
+                "coverageClosed": prefix.coverageClosed, "recordedFrames": recorded.values.count,
+                "sourceFrames": reference.count, "recordedRate": finiteJSON(recorded.rate),
+                "recordedFirstHost": finiteJSON(recorded.hosts.first ?? -1), "recordedLastHost": finiteJSON(recorded.hosts.last ?? -1),
+                "stereoZeroFrames": channels.stereoZeroFrames, "matched": match.matched,
+                "comparedFrames": match.comparedFrames, "exactClockJoin": false, "formalRTJoin": false]
+            let metadata = XCTAttachment(data: try JSONSerialization.data(withJSONObject: summary, options: [.sortedKeys]),
+                uniformTypeIdentifier: "public.json")
+            metadata.name = "Synthetic-loop-source-mixer-ledger"; metadata.lifetime = .keepAlways; add(metadata)
+            print("LiveRepeatSourceMixerDiagnostic schema=1 sourceCallbacks=\(prefix.source.count) tapCallbacks=\(prefix.tap.count) sourceZeroPairs=\(prefix.source.reduce(UInt64(0)) { $0 + UInt64($1.zeros) }) mixerStereoZeroFrames=\(channels.stereoZeroFrames) stableObservedPrefix=\(prefix.stableObservedPrefix) ledgerFailed=\(prefix.failed) coverageClosed=\(prefix.coverageClosed) exactClockJoin=false formalRTJoin=false bytes=\(ledger.reservedPayloadBytes) sourceAccountingOnly=true defaultCaseAccounting=false runtimeUnchanged=true")
+        }
+        // Persist original default-case output too; all attachment work is after
+        // playback cleanup and cannot change the measured render window.
+        for (name, samples) in [("reference", reference), ("recorded", recorded.values)] {
+            let payload = samples.withUnsafeBytes { Data($0) }
+            let attachment = XCTAttachment(data: payload, uniformTypeIdentifier: "public.data")
+            attachment.name = "Synthetic-loop-" + name + "-float32le"
+            attachment.lifetime = .keepAlways; add(attachment)
+        }
         let wholeCycles = max(0, recorded.values.count / reference.count - 1)
         let hole = ProductionSelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
         var expectedZeros: Int? = nil
@@ -1638,7 +1696,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             expectedZeros = zeroCount
         }
-        print("LiveRepeatOnePCM schema=1 calibrated=\(calibrated) captured=\(captured) sourceFrames=\(entry.frames) referenceFrames=\(reference.count) recordedFrames=\(recorded.values.count) wholeCyclesAtLeast=\(wholeCycles) visitDelta=\(finalState.visit - firstState.visit) matched=\(match.matched) comparedFrames=\(match.comparedFrames) alignment=\(match.offset.map { String($0) } ?? "unavailable") candidates=\(match.candidates) overflow=\(match.overflow) rate=\(recorded.rate) stereoZeroFrames=\(channels.stereoZeroFrames) expectedProjectionZeroFrames=\(expectedZeros.map { String($0) } ?? "unavailable") underrunDelta=\(finalState.underrunFrames - firstState.underrunFrames) sameEngine=\(sameEngine) engineRunning=\(engineRunning) selectedA=\(selectedA) videoVisible=\(visible) videoAdvanced=\(videoAdvanced) maximumHoleMs=\(hole * 1000) scope=mono-projection tolerance=0.000001 source=complete-original-short-AAC reference=single-prepared-visit independentCodecProof=separate-AAC-SRC-tests physicalOutput=unverified cleanupAcknowledged=true capacityFrames=768000")
+        print("LiveRepeatOnePCM schema=1 calibrated=\(calibrated) captured=\(captured) sourceFrames=\(entry.frames) referenceFrames=\(reference.count) recordedFrames=\(recorded.values.count) wholeCyclesAtLeast=\(wholeCycles) visitDelta=\(finalState.visit - firstState.visit) matched=\(match.matched) comparedFrames=\(match.comparedFrames) alignment=\(match.offset.map { String($0) } ?? "unavailable") candidates=\(match.candidates) overflow=\(match.overflow) rate=\(recorded.rate) firstRecordedHost=\(recorded.hosts.first ?? -1) lastRecordedHost=\(recorded.hosts.last ?? -1) stereoZeroFrames=\(channels.stereoZeroFrames) expectedProjectionZeroFrames=\(expectedZeros.map { String($0) } ?? "unavailable") underrunDelta=\(finalState.underrunFrames - firstState.underrunFrames) sameEngine=\(sameEngine) engineRunning=\(engineRunning) selectedA=\(selectedA) videoVisible=\(visible) videoAdvanced=\(videoAdvanced) maximumHoleMs=\(hole * 1000) scope=mono-projection tolerance=0.000001 source=complete-original-short-AAC reference=single-prepared-visit independentCodecProof=separate-AAC-SRC-tests physicalOutput=unverified cleanupAcknowledged=true capacityFrames=768000")
         XCTAssertTrue(captured); XCTAssertGreaterThanOrEqual(wholeCycles, 10)
         XCTAssertEqual(recorded.rate, 48_000); XCTAssertEqual(recorded.values.count, last - first)
         XCTAssertLessThanOrEqual(hole, 0.5 / 48_000)

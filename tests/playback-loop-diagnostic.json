@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "cases": [
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testContinuousRepeatOneTenFullSourceLoopsMatchLiveMixer",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRepeatOneSourceMixerDiagnostic",
+    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable"
+  ]
+}

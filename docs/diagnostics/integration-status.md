@@ -784,3 +784,38 @@ reference. No extra profile identity, production buffer, tolerance or deadline.
 Restore the exact split build/test workflow from106f28c for the next iOS check.
 All74profile identities/full297source methods remain required; previous picture
 failures and silence witnesses remain open. No TestFlight delivery.
+
+
+### Native30:44.1k SRC passes; original live loop remains failed
+
+Run40134129680/source751464b completes failure12m36, build4m5/test8m23;
+ownedbuild180787ms/test476941ms, no timeout.125core pass. New stereo44100 full
+SRC/loops/rewind/production-buffer seeks pass6.944s, exact512-frame seek samples
+at28s/7s with352/129native copies and6912000bytes. Raw console has71passes/1fail;
+strict verifier also lacks four passing identities because of interleaved text.
+Preserve that incomplete strict tier rather than declaring whole74 green.
+
+The sole actual failed test is the original ten-loop live mixer comparison:
+633600frames recorded, only418624 matched,2068stereo-zero frames, zero added
+kernel underruns, same engine, videoVisible=false. Fixture is AAC44100mono and
+therefore remains outside the stereo reader admission. CoreAudio reports
+HALC_ProxyIOContext::IOWorkLoop skipping cycle due to overload during the recording.
+This is correlated host evidence, not established source/mixer causality.
+All three production selection cases and compositor A/B/A pass in this run;
+prior picture failures remain historical unresolved witnesses, not erased.
+
+Native evidence12576702356/73688584bytes/SHA256
+48c3a62be8fb13754f548b02b694f555c3b6f6778e72287dfd69e7000266e919,
+1706ZIPentries verified. RawlogSHA6bf14e2bf0a100b34e5b592a835e7fb5b7f283632bb0eee2fea46250d7b208bc;
+nativelogSHA2cfdd062e00b943c48f8ccab8033ee3625a673116e89e9131a098f1570a6c6ae.
+Both default/traced returned-A384000frame stereo audits still report0stereo zeros.
+No full Release/trueHTTP/phone or TestFlight acceptance.
+
+Next diagnostic reuses the exact live-loop helper, default source accounting off,
+plus one accounting-on identity. It preserves all original assertions/deadlines
+and the74-case acceptance profile. Synthetic reference/recording attachments are
+saved after owned cleanup; the accounting arm also saves existing fixed-capacity
+source/tap immutable prefixes. No new runtime probes, buffer sizes or clock joins.
+The manual public15min job runs those two native cases plus the existing UI
+smoke required by the strict profile validator; it is diagnostic only, not full
+acceptance. No validator rule is relaxed for the smaller check.
