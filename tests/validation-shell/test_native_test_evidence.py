@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -63,11 +64,15 @@ class NativeTestEvidenceTests(unittest.TestCase):
         cls.verifier = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.verifier)
 
-    def check_log(self, lines, *, root=ROOT, selection_only=False, invocation=None):
+    def check_log(self, lines, *, root=ROOT, selection_only=False, invocation=None, profile=None):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "xcodebuild.log"
             log.write_text("\n".join(lines) + "\n", encoding="utf-8")
             args = [sys.executable, str(SCRIPT), "--repo-root", str(root), "--log", str(log)]
+            if profile is not None:
+                profile_path = Path(directory) / "profile.json"
+                profile_path.write_text(json.dumps(dict(version=1, cases=profile)), encoding="utf-8")
+                args.extend(("--profile", str(profile_path)))
             if selection_only:
                 args.append("--selection-only")
             if invocation is not None:
@@ -79,6 +84,31 @@ class NativeTestEvidenceTests(unittest.TestCase):
         for identity in self.expected:
             lines.extend((case_line(identity, "started"), case_line(identity, timestamp=True)))
         return lines + ["** TEST SUCCEEDED **"]
+
+    def test_explicit_profile_requires_each_selected_case_and_does_not_claim_full_acceptance(self):
+        native = next(x for x in self.expected if x.startswith(TARGETS[0] + "."))
+        ui = next(x for x in self.expected if x.startswith(TARGETS[1] + "."))
+        profile = [native, ui]
+        lines = [line for identity in profile for line in (case_line(identity, "started"), case_line(identity))]
+        result = self.check_log(lines + ["** TEST SUCCEEDED **"], profile=profile)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fullAcceptance=false", result.stdout)
+        for missing in profile:
+            incomplete = [line for identity in profile if identity != missing
+                          for line in (case_line(identity, "started"), case_line(identity))]
+            result = self.check_log(incomplete + ["** TEST SUCCEEDED **"], profile=profile)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("missing passing cases", result.stderr)
+        other = next(x for x in self.expected if x not in profile)
+        result = self.check_log(lines + [case_line(other, "started"), case_line(other), "** TEST SUCCEEDED **"], profile=profile)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected", result.stderr)
+
+    def test_profile_cannot_claim_a_case_absent_from_the_current_source(self):
+        result = self.check_log(["** TEST SUCCEEDED **"],
+            profile=["OfflineTikTokPlayerTests.InventedTests/testImaginaryPlayback"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("absent from current source", result.stderr)
 
     def test_accepts_full_current_manifest_and_reports_each_identity(self):
         result = self.check_log(self.full_log())

@@ -2,7 +2,7 @@ name: Native render accounting fresh-host controls
 on:
   push:
     branches: [diagnostic/native-reader-isolation]
-    paths: ['.github/workflows/render-accounting-focus.yml', 'scripts/check-render-accounting-focus.sh', 'scripts/run-owned-xcodebuild.py']
+    paths: ['.github/workflows/render-accounting-focus.yml', 'scripts/check-render-accounting-focus.sh']
 permissions:
   contents: read
 jobs:

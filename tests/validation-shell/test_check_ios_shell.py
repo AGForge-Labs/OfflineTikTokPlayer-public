@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the native-check launcher with isolated fake tools, including Bash 3."""
 import os
+import json
 from pathlib import Path
 import signal
 import subprocess
@@ -20,6 +21,11 @@ class NativeLauncherTests(unittest.TestCase):
             (root / "scripts").mkdir()
             (root / "bin").mkdir()
             (root / "artifacts/native").mkdir(parents=True)
+            (root / "tests").mkdir()
+            profile = json.loads((ROOT / "tests/playback-acceptance.json").read_text())
+            (root / "tests/playback-acceptance.json").write_text(json.dumps(profile))
+            profile_flags = ["-only-testing:" + identity.replace(".", "/", 1) for identity in sorted(profile["cases"])]
+            (root / "profile-flags.txt").write_text("\n".join(profile_flags) + "\n")
             evidence_log = root / "artifacts/native/xcodebuild-test.log"
             evidence_log.write_text("** TEST SUCCEEDED ** stale previous evidence\n")
             if successful_output is not None:
@@ -60,6 +66,7 @@ if [ "$1" = scripts/run-owned-xcodebuild.py ]; then
   exit "$owned_status"
 fi
 case "$*" in
+  *verify-native-test-log.py*--print-xcode-tests*) cat "$LAUNCHER_TEST_ROOT/profile-flags.txt" ;;
   *verify-native-test-log.py*) printf '%s\\n' "$@" > "$LAUNCHER_TEST_ROOT/verifier.args" ;;
   *--resolve-destination*) printf '%s\\n' '00000000-0000-0000-0000-000000000001' ;;
   *--udid*) printf '%s\\n' "$@" > "$LAUNCHER_TEST_ROOT/capture.args"; echo $$ > "$LAUNCHER_TEST_ROOT/helper.pid"; exec sleep 60 ;;
@@ -106,6 +113,8 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
             environment.pop("LAUNCHER_TEST_UNBOUND_VALUE", None)
             result = subprocess.run(["/bin/bash", str(root / "scripts/check-ios.sh"), *arguments],
                 env=environment, text=True, capture_output=True, timeout=10)
+            if arguments == ("--playback-acceptance",):
+                self.assertEqual(result.returncode, status or tee_status, result.stdout + result.stderr)
             actual = (root / "xcode.args").read_text().splitlines() if (root / "xcode.args").exists() else []
             pid_file = root / "helper.pid"
             driver_command = ["swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-"]
@@ -158,6 +167,10 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
             self.assertIn('"phase":4,"deadlineSeconds":4500', evidence_log.read_text())
             self.assertEqual((root / "verifier.args").exists(), status == 0 and tee_status == 0,
                              "The strict verifier runs only after both command and tee succeed")
+            if arguments == ("--playback-acceptance",) and status == 0 and tee_status == 0:
+                self.assertEqual((root / "verifier.args").read_text().splitlines(),
+                    ["scripts/verify-native-test-log.py", "--log", "artifacts/native/xcodebuild-test.log",
+                     "--profile", "tests/playback-acceptance.json"])
             self.assertEqual(actual[-1], "test")
             for limit in ("-default-test-execution-time-allowance", "-maximum-test-execution-time-allowance"):
                 self.assertEqual(actual[actual.index(limit) + 1], "120")
@@ -184,6 +197,13 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
             "-only-testing:OfflineTikTokPlayerTests/ContinuousAudioPlayerTests",
             "-only-testing:OfflineTikTokPlayerTests/ContinuousPCMDecoderTests",
         })
+
+    def test_playback_profile_executes_and_verifies_the_same_explicit_methods(self):
+        arguments = self.exercise(("--playback-acceptance",))
+        profile = json.loads((ROOT / "tests/playback-acceptance.json").read_text())
+        expected = {"-only-testing:" + identity.replace(".", "/", 1) for identity in profile["cases"]}
+        self.assertEqual({arg for arg in arguments if arg.startswith("-only-testing:")}, expected)
+        self.assertTrue(all(arg.count("/") == 2 for arg in expected))
 
     def test_native_failure_survives_exit_cleanup(self):
         self.exercise(status=23)

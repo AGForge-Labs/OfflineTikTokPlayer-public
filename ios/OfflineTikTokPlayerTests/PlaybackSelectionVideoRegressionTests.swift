@@ -12446,6 +12446,13 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         }
         #endif
         guard enabled else { return }
+        // SDK format/layout getters are callback-invariant. Never query them in
+        // the 48 kHz per-frame observer loop; keep every sample and timestamp.
+        let format = buffer.format
+        let actualRate = format.sampleRate
+        let channelCount = Int(format.channelCount)
+        let interleaved = format.isInterleaved
+        let inputFrames = Int(buffer.frameLength)
         #if DEBUG
         let receiptFirst = values.count
         // Supplied timestamp fields, not a new native/current-clock query.
@@ -12454,23 +12461,22 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
             valid: (time.isHostTimeValid ? 1 : 0) | (time.isSampleTimeValid ? 2 : 0)) }
         defer {
             if let stamp = receiptStamp {
-                let input = Int(buffer.frameLength), admitted = values.count - receiptFirst
+                let input = inputFrames, admitted = values.count - receiptFirst
                 callbackLedger?.appendTap(.init(stamp: stamp, first: UInt32(receiptFirst), end: UInt32(values.count),
-                    inputFrames: UInt32(input), channels: buffer.format.channelCount,
-                    flags: (admitted == input && input > 0 ? 1 : 0) | (buffer.format.isInterleaved ? 2 : 0),
-                    bufferRate: buffer.format.sampleRate))
+                    inputFrames: UInt32(input), channels: AVAudioChannelCount(channelCount),
+                    flags: (admitted == input && input > 0 ? 1 : 0) | (interleaved ? 2 : 0),
+                    bufferRate: actualRate))
             }
         }
         #endif
-        guard time.isHostTimeValid, buffer.format.sampleRate.isFinite, buffer.format.sampleRate > 0,
-              buffer.format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData else {
+        guard time.isHostTimeValid, actualRate.isFinite, actualRate > 0,
+              format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData else {
             invalidTimestamps += 1
             #if DEBUG
             firstStereoZero?.rejectInput()
             #endif
             return
         }
-        let actualRate = buffer.format.sampleRate
         if rate == 0 { rate = actualRate }
         guard abs(actualRate - rate) < 0.1 else {
             invalidTimestamps += 1
@@ -12480,7 +12486,6 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
             return
         }
         let start = AVAudioTime.seconds(forHostTime: time.hostTime)
-        let channelCount = Int(buffer.format.channelCount)
         guard channelCount > 0, start.isFinite else {
             invalidTimestamps += 1
             #if DEBUG
@@ -12488,24 +12493,22 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
             #endif
             return
         }
-        let frames = min(Int(buffer.frameLength), capacity - values.count)
-        droppedFrames += Int(buffer.frameLength) - frames
+        let frames = min(inputFrames, capacity - values.count)
+        droppedFrames += inputFrames - frames
         #if DEBUG
-        if frames != Int(buffer.frameLength) { firstStereoZero?.rejectInput() }
+        if frames != inputFrames { firstStereoZero?.rejectInput() }
         #endif
+        if auditEnabled, frames > 0 {
+            auditLayout.observe(channelCount: channelCount, interleaved: interleaved,
+                                rate: actualRate, retainedFrames: frames)
+        }
         for frame in 0..<frames {
-            // Bind the first existing format read; retain the original right-side read below.
-            let interleaved = buffer.format.isInterleaved
             let left = channels[0][interleaved ? frame * channelCount : frame]
             let right = channelCount > 1
-                ? (buffer.format.isInterleaved ? channels[0][frame * channelCount + 1] : channels[1][frame]) : left
+                ? (interleaved ? channels[0][frame * channelCount + 1] : channels[1][frame]) : left
             let mono = (left + right) * 0.5
             let host = start + Double(frame) / actualRate
             if auditEnabled {
-                if frame == 0 {
-                    auditLayout.observe(channelCount: channelCount, interleaved: interleaved,
-                                        rate: actualRate, retainedFrames: frames)
-                }
                 auditChannels(left: left, right: right, mono: mono, frame: values.count, host: host, rate: actualRate)
             }
             #if DEBUG

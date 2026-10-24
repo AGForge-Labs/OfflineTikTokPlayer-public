@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "cases": [
+    "OfflineTikTokPlayerTests.ContinuousAudioGraphTests/testActualSourceNodeJoinsPreparedFramesInsideRenderBlocks",
+    "OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testPreparedAACAndALACVideosJoinInTheProductionGraphAndReverseWithoutExtraFrames",
+    "OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testStandaloneMP3KeepsCompleteDecodedSamplesThroughGraphLoopsNextAndPrevious",
+    "OfflineTikTokPlayerTests.ContinuousPCMDecoderTests/testRetainedPreviousPrewarmsItsStreamingHeadBeforeReturningAcrossThePrefix",
+    "OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testSameTokenRenderAnchorWaitsForFreshPublicationAfterRealPauseResume",
+    "OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testPausedPCMFrameTimelineMatchesTheNativeVideoSeekGrid",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testReturnedChannelAuditDistinguishesStereoSilenceFromAntiphaseCancellation",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNaturalBoundaryAtPositiveIncomingOffsetRevealsB",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testAudioOnlyAndForegroundRestoreSelectedBWithoutOverridingPause",
+    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable"
+  ]
+}

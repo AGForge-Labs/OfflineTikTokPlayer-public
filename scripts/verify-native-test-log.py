@@ -7,6 +7,7 @@ fresh file. Aggregate summaries and GitHub job status are not case evidence.
 """
 
 import argparse
+import json
 from collections import Counter, defaultdict
 from pathlib import Path
 import re
@@ -313,22 +314,55 @@ def verify_log(text, expected, *, invocation="test"):
         raise EvidenceError(f"Expected native={native} ui={len(expected) - native} total={len(expected)}\n- " + "\n- ".join(problems))
 
 
+def profile_manifest(path, source):
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(data, dict) or set(data) != {"version", "cases"}
+            or type(data["version"]) is not int or data["version"] != 1
+            or not isinstance(data["cases"], list) or not 1 <= len(data["cases"]) <= 64
+            or any(not isinstance(value, str) for value in data["cases"])):
+        raise EvidenceError("Invalid bounded playback profile")
+    selected = set(data["cases"])
+    if len(selected) != len(data["cases"]):
+        raise EvidenceError("Duplicate profile identity")
+    unknown = selected - source
+    if unknown:
+        raise EvidenceError("Profile cases absent from current source: " + ", ".join(sorted(unknown)))
+    if not all(any(value.startswith(target + ".") for value in selected) for target in TARGETS):
+        raise EvidenceError("Playback profile must include native and UI results")
+    return selected
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--log", required=True, type=Path, help="fresh, raw stdout/stderr log from one xcodebuild test invocation")
-    parser.add_argument("--selection-only", action="store_true", help="expect only the four explicit selection-regression classes; no UI tests")
+    parser.add_argument("--log", type=Path, help="fresh, raw stdout/stderr log from one xcodebuild test invocation")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--selection-only", action="store_true", help="expect only the four explicit selection-regression classes; no UI tests")
+    scope.add_argument("--profile", type=Path, help="explicit bounded native/UI identity profile; never full release acceptance")
+    parser.add_argument("--print-xcode-tests", action="store_true", help="validate the profile and print its exact xcodebuild selectors without running tests")
     parser.add_argument("--invocation", choices=("test", "test-without-building"), default="test",
                         help="exact xcodebuild action whose success marker must finish this log")
     args = parser.parse_args(argv)
+    if args.print_xcode_tests:
+        if not args.profile or args.log:
+            parser.error("--print-xcode-tests requires --profile and no --log")
+    elif args.log is None:
+        parser.error("--log is required when verifying evidence")
     try:
         expected = source_manifest(args.repo_root, args.selection_only)
+        if args.profile:
+            expected = profile_manifest(args.profile, expected)
+        if args.print_xcode_tests:
+            for identity in sorted(expected):
+                print("-only-testing:" + identity.replace(".", "/", 1))
+            return 0
         verify_log(args.log.read_text(encoding="utf-8", errors="replace"), expected, invocation=args.invocation)
-    except (OSError, UnicodeError, EvidenceError) as error:
+    except (OSError, UnicodeError, ValueError) as error:
         print(f"Native test evidence failed: {error}", file=sys.stderr)
         return 1
     native = sum(identity.startswith(TARGETS[0] + ".") for identity in expected)
-    print(f"Native test evidence verified: native={native} ui={len(expected) - native} total={len(expected)} mode={'selection-only' if args.selection_only else 'full'}")
+    mode = "playback-profile fullAcceptance=false" if args.profile else ("selection-only" if args.selection_only else "full")
+    print(f"Native test evidence verified: native={native} ui={len(expected) - native} total={len(expected)} mode={mode}")
     for identity in sorted(expected):
         print("PASS " + identity)
     return 0

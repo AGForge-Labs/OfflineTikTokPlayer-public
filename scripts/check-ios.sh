@@ -19,8 +19,15 @@ elif [ "$#" -eq 1 ] && [ "$1" = "--selection-only" ]; then
     -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests \
     -only-testing:OfflineTikTokPlayerTests/ContinuousAudioPlayerTests \
     -only-testing:OfflineTikTokPlayerTests/ContinuousPCMDecoderTests
+elif [ "$#" -eq 1 ] && [ "$1" = "--playback-acceptance" ]; then
+  validation_mode=playback-acceptance
+  profile_flags="$(python3 scripts/verify-native-test-log.py --profile tests/playback-acceptance.json --print-xcode-tests)"
+  set --
+  while IFS= read -r flag; do
+    set -- "$@" "$flag"
+  done <<< "$profile_flags"
 else
-  printf '%s\n' 'Usage: check-ios.sh [--selection-only]' >&2
+  printf '%s\n' 'Usage: check-ios.sh [--selection-only|--playback-acceptance]' >&2
   exit 2
 fi
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode 26 or later on macOS is required.' >&2; exit 2; }
@@ -70,6 +77,8 @@ if [ "${native_status[0]}" -ne 0 ]; then exit "${native_status[0]}"; fi
 if [ "${native_status[1]}" -ne 0 ]; then exit "${native_status[1]}"; fi
 if [ "$validation_mode" = selection-only ]; then
   python3 scripts/verify-native-test-log.py --log "$native_log" --selection-only
+elif [ "$validation_mode" = playback-acceptance ]; then
+  python3 scripts/verify-native-test-log.py --log "$native_log" --profile tests/playback-acceptance.json
 else
   python3 scripts/verify-native-test-log.py --log "$native_log"
 fi

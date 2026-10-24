@@ -886,14 +886,21 @@ final class ContinuousPictureInPicture: NSObject {
         let previous = playbackState.read()
         playbackState.update(position: position, duration: duration, isPlaying: isPlaying)
         if let timebase {
+            // The audio cursor and native video seek use a 48 kHz sample grid.
+            // A 60 kHz Double conversion can land one tick behind a paused seek,
+            // making its valid image fail the strict future-frame guard.
+            let frame = (position * 48_000).rounded()
+            let anchorTime = frame.isFinite && frame < Double(Int64.max)
+                ? CMTime(value: Int64(frame), timescale: 48_000)
+                : CMTime(seconds: position, preferredTimescale: 48_000)
             let current = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
             if forceAnchor || !current.isFinite || abs(current - position) > 0.08 {
                 flushForSeek()
                 guard !invalidated, presentationRevision == revision,
                       seekTicket == seek, activeSeekTicket == activeSeek else { return }
-                CMTimebaseSetTime(timebase, time: CMTime(seconds: position, preferredTimescale: 60_000))
+                CMTimebaseSetTime(timebase, time: anchorTime)
             } else if previous.isPlaying != isPlaying || !isPlaying {
-                CMTimebaseSetTime(timebase, time: CMTime(seconds: position, preferredTimescale: 60_000))
+                CMTimebaseSetTime(timebase, time: anchorTime)
             }
             CMTimebaseSetRate(timebase, rate: isPlaying ? 1 : 0)
         }

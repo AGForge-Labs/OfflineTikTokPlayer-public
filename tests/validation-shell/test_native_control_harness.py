@@ -176,7 +176,8 @@ class NativeControlHarnessTests(unittest.TestCase):
         capture_spec.loader.exec_module(capture)
         for requested, effective in ((None, 1200), ("60", 60), ("1800", 1800),
                                      ("1801", 1801), ("2400", 2400), ("2401", 2401),
-                                     ("3600", 3600), ("3601", 3600), ("99999", 3600)):
+                                     ("3600", 3600), ("3601", 3601), ("4800", 4800),
+                                     ("4801", 4800), ("99999", 4800)):
             with self.subTest(requested=requested):
                 argv = ["capture-helper", "--udid", SIMULATOR]
                 if requested is not None:

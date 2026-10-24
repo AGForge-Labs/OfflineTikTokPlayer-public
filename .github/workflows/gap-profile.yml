@@ -1,0 +1,39 @@
+name: Public focused playback checks
+on:
+  workflow_dispatch:
+    inputs:
+      approve_runner:
+        description: 'Run the unsigned source-only playback diagnostic on a standard public runner'
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: gap-profile-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ios:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && inputs.approve_runner }}
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Source and Xcode identity
+        run: |
+          git rev-parse HEAD
+          xcodebuild -version
+      - name: Focused unsigned playback checks
+        run: bash scripts/check-ios.sh --playback-acceptance
+      - name: Preserve synthetic native evidence briefly
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gap-profile-evidence
+          path: |
+            artifacts/native/xcodebuild-test.log
+            artifacts/native/*.xcresult
+          if-no-files-found: ignore
+          retention-days: 1

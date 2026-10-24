@@ -79,7 +79,7 @@ class RenderAccountingHarnessTests(unittest.TestCase):
         self.assertIn("steps.harness.outcome == 'success'", native_step)
         self.assertIn("steps.simulator_inventory.outcome == 'success'", native_step)
         paths = set(re.findall(r"'([^']+)'", re.search(r'^    paths: \[(.*?)\]$', text, re.MULTILINE).group(1)))
-        self.assertEqual(paths, {'.github/workflows/render-accounting-focus.yml', 'scripts/check-render-accounting-focus.sh', 'scripts/run-owned-xcodebuild.py'})
+        self.assertEqual(paths, {'.github/workflows/render-accounting-focus.yml', 'scripts/check-render-accounting-focus.sh'})
         for name in ('native-playback-targeted.yml', 'native-refill-focus.yml', 'native-reader-full-validation.yml'):
             old = (ROOT / '.github/workflows' / name).read_text()
             old_paths = set(re.findall(r"'([^']+)'", re.search(r'^    paths: \[(.*?)\]$', old, re.MULTILINE).group(1)))

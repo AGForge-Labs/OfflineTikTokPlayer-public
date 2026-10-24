@@ -20,13 +20,17 @@ final class PlayerShellTests: XCTestCase {
                        "Settings must dismiss before navigating to Downloads")
         let downloadsTab = app.buttons["tab.downloads"]
         XCTAssertTrue(downloadsTab.waitForExistence(timeout: 10))
-        let downloadsHittable = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true"),
-            object: downloadsTab)
-        XCTAssertEqual(XCTWaiter.wait(for: [downloadsHittable], timeout: 10), .completed,
-                       "Downloads tab must be hittable after Settings dismisses")
+        // Require the real action and its destination. The failed run's movie
+        // shows Settings already gone while a separate KVC predicate timed out.
         downloadsTab.tap()
-        XCTAssertTrue(app.navigationBars["Downloads"].waitForExistence(timeout: 10))
+        let reachedDownloads = app.navigationBars["Downloads"].waitForExistence(timeout: 10)
+        if !reachedDownloads {
+            print("DownloadsNavigationFailure " + app.debugDescription)
+            let failure = XCTAttachment(screenshot: app.screenshot())
+            failure.name = "After actual Downloads tap"; failure.lifetime = .keepAlways
+            add(failure)
+        }
+        XCTAssertTrue(reachedDownloads, "A real Downloads tap must open its screen after Settings closes")
         XCTAssertTrue(app.buttons["Shuffle downloaded videos"].waitForExistence(timeout: 10))
         let proof = XCTAttachment(screenshot: app.screenshot())
         proof.name = "Native downloads screen"; proof.lifetime = .keepAlways

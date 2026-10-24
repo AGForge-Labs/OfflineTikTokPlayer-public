@@ -10,6 +10,20 @@ import UIKit
 
 @MainActor
 final class ContinuousPictureInPictureTests: XCTestCase {
+    func testPausedPCMFrameTimelineMatchesTheNativeVideoSeekGrid() throws {
+        let bridge = ContinuousPictureInPicture()
+        defer { bridge.invalidate() }
+        let frames: [Int64] = [415_231, 415_232, 415_233, 180_864, 288_000]
+        for frame in frames {
+            let expected = CMTime(value: frame, timescale: 48_000)
+            bridge.updatePlayback(positionSeconds: expected.seconds, durationSeconds: 30, isPlaying: false)
+            let actual = try XCTUnwrap(bridge.timebasePositionSeconds)
+            XCTAssertEqual(actual, expected.seconds, accuracy: 0.000_000_001,
+                           "A paused PCM position must not be rounded behind the video's native seek target")
+            XCTAssertEqual(bridge.requestedPositionSeconds, expected.seconds)
+        }
+    }
+
     func testWholeFrameBoundaryTraceCoversActualObserverAndRejectsReentrantOwner() async throws {
         #if DEBUG
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
