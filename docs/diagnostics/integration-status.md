@@ -449,3 +449,50 @@ Local exact-helper Swift5 type check, syntax/project/source71/diff and3focused
 evidence tests (7.483s) pass. The broader release manifest still contains295native/
 UI identities and is unchanged. Native18/Release/streaming/phone acceptance and
 actual root-cause repair remain pending. No new TestFlight or signing.
+
+
+### Native18: actual sample-reader wait; bounded alternative capability study
+
+Native18 terminal failure13m1total/12m56job, owned696727ms/exit65/no timeout.
+Source public060dafab978b3d62abe292d37e921c68c9aaa5d5;123core/64native/1UI pass,
+six native cases fail, all71 selected identities return. One exact slow-preparation
+pass is split by adjacent stdout/stderr; result metadata records the reconstruction,
+and original raw bytes remain untouched. Strict live ten-loop case again matches
+all633600mono-projection frames,11visits,zero stereo-zero/underrun/drop/time faults.
+Known wait calibration passes0.258s with its controlled gate, separate from the real wait.
+
+Actual failure-only own-thread sample now qualifies lane0/copy7: beforeWord=afterWord116,
+runState3, matching context/register checks. Bounded best-effort stack is
+__psynch_cvwait -> _pthread_cond_wait -> WaitOnCondition -> FigSemaphoreWaitRelative
+-> assetReader_ExtractAndRetainNextSampleBuffer -> AVAssetReaderOutput/
+AVAssetReaderTrackOutput.copyNextSampleBuffer -> native ReaderLane.read.
+This establishes a waiting sample-reader location at observation, not its producer
+or underlying cause. Stack coherence remains false; kernel get_state may briefly stop.
+Worker replies before/after failed3s close, but read stays pending; no source publishes,
+close is not acknowledged, fixtures retained. Four later owners are refused correctly
+and are not new playback measurements. Natural boundary/final-underrun gate not reached.
+Initial cached coverage maxGap333.609ms also exceeds250ms. Default B video357.202ms
+fails250ms; actual returned-A8s384000frames/400tones/zero fault audit stays clean.
+
+Raw18 SHA25600e969b84fd6d763f3b29531301176becf348517c98ad40bbefface71d5e0aed.
+Artifact12570928233/71702787bytes/SHA25625d3e5ec0e167c0e8ef663673bb14193b668c5ec02dd849beeff2c51e4e20111
+downloaded/checksum/ZIP verified1650entries. Saved result JSON and gap-public18-result.png.
+
+Full source audit falsifies the tentative missing-autorelease-pool explanation:
+ReaderLane.start/read/close already wrap native work in explicit pools, completions
+run after draining, and native samples are deep-copied into owned Float arrays.
+Do not add redundant pools or guessed buffer increases. The loadCurrent prepared
+fast path also can promote a cached entry; do not claim streaming never promotes.
+Native-only HTTP/PCM boundary fidelity remains unqualified.
+
+Next limited capability comparison: one test opens the same complete30s native48k
+stereo MP4 with AVAudioFile, reads fixed4096frame buffers through EOF, closes it
+before independently decoding the full original via existing AVAssetReader reference,
+and compares every stereo sample at1e-6 with exact length/no trimming. Original3s
+prefix budget remains. No production reader change. Profile72 retains every71case;
+source-validator missing-case RED observed before insertion. Native capability result
+is pending; no speculative replacement or TikTok/phone equivalence claim. Existing
+source app/core trees, media, workflows, release controls and authorization unchanged.
+
+
+Local exact-method Swift5 type-only check, Swift syntax, project/profile72 and Windows Git diff checks pass. WSL Git cannot resolve the Windows managed-worktree pointer; no Git repair attempted. The new comparison runs before the earlier decoder cases and changes reader warm history; neither a pass nor later nonrecurrence establishes causality. Existing native calibration and all71profile identities remain. Full source manifest now296; full release gate still requires all current cases. Native19 not yet launched. No new TestFlight.

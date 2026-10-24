@@ -1241,6 +1241,77 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         print("PCM_PREWARM_ABA oldEpoch=\(oldEpoch) warmEpoch=\(warmRequest.epoch) returnedEpoch=\(returnedEpoch) readyFrames=\(readyFrames) renderedFrames=\(rendered) underrunDelta=\(underrunDelta) retainedBytes=\(retainedBytes)")
     }
 
+    /// Capability comparison only. No production decoder selection changes.
+    func testAVAudioFileMatchesCompleteNative48kMoviePresentation() async throws {
+        #if DEBUG
+        guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
+            XCTFail("An unresolved reader close blocks new native decoder comparisons")
+            throw ContinuousPCMDecoder.Failure.cannotDecode
+        }
+        #endif
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let expectedFrames: Int64 = 30 * 48_000
+        typealias DecodedFile = (samples: [Float], fileFrames: Int64, openMs: Double,
+                                 firstReadMs: Double, prefixMs: Double, totalMs: Double, reads: Int)
+        // Close the alternative reader before opening the existing reference.
+        // Only the copied sample array and scalar metrics leave this pool.
+        let decoded: DecodedFile = try autoreleasepool { () throws -> DecodedFile in
+            let start = DispatchTime.now().uptimeNanoseconds
+            func milliseconds() -> Double {
+                Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            }
+            let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: true)
+            let openMs = milliseconds(), format = file.processingFormat
+            guard format.sampleRate == 48_000, format.channelCount == 2,
+                  format.commonFormat == .pcmFormatFloat32, format.isInterleaved else {
+                XCTFail("The capability comparison requires native interleaved stereo Float32")
+                throw ContinuousPCMDecoder.Failure.unsupportedPCM
+            }
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_096))
+            var samples: [Float] = []
+            samples.reserveCapacity(Int(expectedFrames) * 2)
+            var firstReadMs = -1.0, prefixMs = -1.0, reads = 0
+            while true {
+                buffer.frameLength = 0
+                try file.read(into: buffer, frameCount: 4_096)
+                reads += 1
+                if firstReadMs < 0 { firstReadMs = milliseconds() }
+                let frames = Int(buffer.frameLength)
+                if frames == 0 { break }
+                guard samples.count / 2 + frames <= Int(expectedFrames) + 4_096 else {
+                    XCTFail("Unexpected extra presentation exceeds the bounded capability comparison")
+                    throw ContinuousPCMDecoder.Failure.invalidTimeline
+                }
+                let channels = try XCTUnwrap(buffer.floatChannelData)
+                samples.append(contentsOf: UnsafeBufferPointer(start: channels[0], count: frames * 2))
+                if prefixMs < 0, samples.count / 2 >= 96_000 { prefixMs = milliseconds() }
+            }
+            return (samples, file.length, openMs, firstReadMs, prefixMs, milliseconds(), reads)
+        }
+        let reference = try await independentlyDecode(AVURLAsset(url: url),
+                                                     diagnosticName: "audio-file-full-native48k-reference")
+        var firstMismatch: Int?, nonfinite = 0
+        var maximumDifference: Float = 0
+        for index in 0..<min(decoded.samples.count, reference.count) {
+            let actual = decoded.samples[index], expected = reference[index]
+            let finite = actual.isFinite && expected.isFinite
+            let difference: Float = finite ? abs(actual - expected) : .infinity
+            if !finite { nonfinite += 1 }
+            if difference > 0.000_001, firstMismatch == nil { firstMismatch = index }
+            maximumDifference = max(maximumDifference, difference)
+        }
+        print("AudioFileCapability schema=1 fixture=complete-native48k-30s-mp4 fileFrames=\(decoded.fileFrames) decodedFrames=\(decoded.samples.count / 2) referenceFrames=\(reference.count / 2) openMs=\(decoded.openMs) firstReadMs=\(decoded.firstReadMs) prefixMs=\(decoded.prefixMs) totalMs=\(decoded.totalMs) reads=\(decoded.reads) firstMismatch=\(firstMismatch.map { String($0) } ?? "none") maximumDifference=\(maximumDifference) nonfinite=\(nonfinite) tolerance=0.000001 productionChanged=false physicalOutput=unverified")
+        XCTAssertEqual(reference.count, Int(expectedFrames) * 2)
+        XCTAssertEqual(decoded.fileFrames, expectedFrames)
+        XCTAssertEqual(decoded.samples.count, reference.count, "Do not trim priming, padding or missing frames to obtain agreement")
+        XCTAssertEqual(nonfinite, 0)
+        XCTAssertNil(firstMismatch, "The alternative must preserve every original stereo sample")
+        XCTAssertGreaterThanOrEqual(decoded.prefixMs, 0)
+        XCTAssertLessThanOrEqual(decoded.prefixMs, 3_000, "Keep the existing initial preparation budget")
+        XCTAssertLessThanOrEqual(decoded.firstReadMs, 3_000)
+    }
+
+
     func testDistantNative48kSeeksBoundDecodeWorkAndMatchFullSourceSamples() async throws {
         #if DEBUG
         guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
