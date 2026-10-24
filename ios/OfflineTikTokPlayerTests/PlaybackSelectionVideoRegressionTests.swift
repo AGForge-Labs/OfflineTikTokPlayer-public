@@ -9603,11 +9603,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         // not this later dump time, determine each phase's coverage.
         defer { for observation in observations { observation.probe.dumpAndAssert(reached: observation.reached) } }
         #endif
-        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceNativeLaneActivity) { fixture, audio, service, screen in
+        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceNativeLaneActivity, captureInitialNativeActivity: true) { fixture, audio, service, screen in
         #if DEBUG
-        service.debugInitialLoadPhaseEnabled = traceNativeLaneActivity
-        let preparationProbe = traceNativeLaneActivity
-            ? NaturalNativeRunwayProbe(phase: "initial-preparation", minimumFailureSeconds: nil) : nil
+        service.debugInitialLoadPhaseEnabled = true
+        // Initial preparation can fail before the later traced/rapid case runs.
+        // Reuse cached stage records at100ms; the default stream probe stays off.
+        let preparationProbe: NaturalNativeRunwayProbe? =
+            NaturalNativeRunwayProbe(phase: "initial-preparation", minimumFailureSeconds: nil)
         preparationProbe?.sample(audio: audio, service: service, renderer: service.audioSnapshot, force: true)
         #endif
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -9629,7 +9631,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTFail("Both complete Saved sources must be ready")
             #if DEBUG
             await recordNaturalRunwayFailure(audio: audio,
-                expectedToken: audio.entry(for: fixture.aID)?.token ?? 0, stage: "initial-preparation")
+                expectedToken: audio.entry(for: fixture.aID)?.token ?? 0, stage: "initial-preparation", captureNativeLaneActivity: true)
             #endif
             return
         }
@@ -9684,7 +9686,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     /// Cleanup runs on normal return and on a retained original error. File removal
     /// requires both existing acknowledgements; failure retains only this fixture.
-    private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, buffer: PlaybackBuffer? = nil, recordHost: Bool = true,
+    private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, captureInitialNativeActivity: Bool = false,
+        buffer: PlaybackBuffer? = nil, recordHost: Bool = true,
         seekVideo: PlaybackService.SeekVideo? = nil,
         additionalCleanupAcknowledged: @MainActor () -> Bool = { @MainActor in true },
         cleanupReceipt: (@MainActor (Bool) -> Void)? = nil, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
@@ -9696,7 +9699,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         let fixture = try await SelectionVideoFixture(test: self)
         #if DEBUG
-        let activity = traceNativeLaneActivity ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+        let activity = traceNativeLaneActivity || captureInitialNativeActivity
+            ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: activity)
         #else
         let audio = ContinuousAudioPlayer()
@@ -9742,6 +9746,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let canRemove = returned && preparation.result == true && decoder.result == true
             && additionalCleanupAcknowledged()
         print("NaturalFixtureCleanup schema=1 ownedTasksJoined=\(preparation.result == true) decoderClosed=\(decoder.result == true) removeAllowed=\(canRemove) originalErrorRetained=\(originalError != nil) syntheticFilesRetained=\(!canRemove) sdkInternalQuiescence=unverified olderCancelledTasks=unverified")
+        if !canRemove, captureInitialNativeActivity {
+            // canRemove is already frozen false. This extra failure evidence
+            // cannot convert a late close into a passing original3s guard.
+            await recordNaturalRunwayFailure(audio: audio, expectedToken: audio.snapshot.token,
+                stage: "initial-owner-close-after-failed-guard", captureNativeLaneActivity: true)
+        }
         XCTAssertTrue(canRemove, "Owned task and decoder close acknowledgements must precede synthetic file removal")
         cleanupReceipt?(canRemove)
         if canRemove { fixture.remove() }
@@ -9833,20 +9843,26 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         stage: String = "seek-runway", captureNativeLaneActivity: Bool = false) async {
         // Called only after the unchanged preparation or runway guard has failed.
         let before = naturalFailureEndpoints(audio: audio, phase: stage + "-before-worker", expectedToken: expectedToken)
+        let nativeBeforeBeginNs = captureNativeLaneActivity ? DispatchTime.now().uptimeNanoseconds : 0
         let nativeBefore = captureNativeLaneActivity
             ? (0..<3).map { audio.debugNativeLaneActivitySnapshot(at: $0) } : []
+        let nativeBeforeEndNs = captureNativeLaneActivity ? DispatchTime.now().uptimeNanoseconds : 0
         let mailbox = NaturalFailureStateMailbox()
         audio.debugDecoderFailureState { mailbox.complete($0) }
         let returned = await waitUntil(timeout: 1) { mailbox.result != nil }
         let state = mailbox.result
+        let nativeAfterBeginNs = captureNativeLaneActivity ? DispatchTime.now().uptimeNanoseconds : 0
         let nativeAfter = captureNativeLaneActivity
             ? (0..<3).map { audio.debugNativeLaneActivitySnapshot(at: $0) } : []
+        let nativeAfterEndNs = captureNativeLaneActivity ? DispatchTime.now().uptimeNanoseconds : 0
         let after = naturalFailureEndpoints(audio: audio, phase: stage + "-after-worker", expectedToken: expectedToken)
         for row in before { print(row) }
         let nativeAvailable = captureNativeLaneActivity && nativeBefore.count == 3 && nativeAfter.count == 3
             && nativeBefore.allSatisfy { $0 != nil } && nativeAfter.allSatisfy { $0 != nil }
         print("NaturalFailureWorker schema=1 stage=\(stage) returnedWithinOneSecond=\(returned) snapshotAvailable=\(state != nil) nativePhaseAvailable=\(nativeAvailable) sdkWaitEstablished=false")
         if captureNativeLaneActivity {
+            print("NaturalFailureObservationWindow schema=1 stage=\(stage) endpoint=before-worker beginNs=\(nativeBeforeBeginNs) endNs=\(nativeBeforeEndNs) clock=DispatchTime nativeExecutionTiming=false jointSnapshot=false")
+            print("NaturalFailureObservationWindow schema=1 stage=\(stage) endpoint=after-worker beginNs=\(nativeAfterBeginNs) endNs=\(nativeAfterEndNs) clock=DispatchTime nativeExecutionTiming=false jointSnapshot=false")
             for (endpoint, values) in [("before-worker", nativeBefore), ("after-worker", nativeAfter)] {
                 for (lane, value) in values.enumerated() {
                     print("NaturalFailureNativeLane schema=1 stage=\(stage) endpoint=\(endpoint) lane=\(lane) recordAvailable=\(value != nil) packedState=\(value.map { String($0.packedState) } ?? "unavailable") copySequence=\(value.map { String($0.copySequence) } ?? "unavailable") stageCode=\(value.map { String($0.stageCode) } ?? "unavailable") overflow=\(value.map { String($0.sequenceOverflowed) } ?? "unavailable") coherence=independent-lane-record noExecutionTimestamp=true sdkWaitEstablished=false")

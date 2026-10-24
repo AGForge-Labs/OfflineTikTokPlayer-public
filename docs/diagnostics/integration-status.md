@@ -238,3 +238,41 @@ Next source diagnostic reuses the existing packed native-lane activity recorder
 in the same rapid test. Failure-only before/after cached stage reads keep the
 original3s guard and all playback assertions, with no additional test identity,
 SDK getter, clock or runtime implementation change. No native13 run yet.
+
+
+### Native13: earlier first-read failure prevents later instrumentation
+
+Public run40102767694/job120898141094 on611d0af completed in12m40s,
+owned full-test658958ms/exit65/no timeout.123core/63native/1UI passed.
+The original natural-transition case fails its3s initial-preparation guard with
+zero prepared sources, one pending first read/no packets and a responsive worker.
+Its original3s owned close guard also fails. Synthetic media is retained and the
+existing fail-closed admission correctly prevents four later owners, including
+the rapid test that would have captured the native stage. These are not four new
+audio/pixel measurements. The exact pending native API stage remains unknown.
+
+The default uninstrumented benchmark still passes: B154.912ms/A157.865ms,
+8seconds/384000frames/400correct tones, zero observed stereo-zero/quiet/drop/
+timestamp-error/underrun frames. This clean window does not erase prior failures.
+No causal production repair, Release build or physical-phone acceptance is proven.
+
+Raw SHA2561af3affee37d4f5932c49a88990e161d8d734e92d2ab0d050c8456c49eb6faf7.
+Artifact12564185627/66334018bytes/SHA256
+e7a182bf0525cd7cb30961c1541a595e233fa03c56def47e00cdbc25eaba9b21 downloaded
+and checksum verified (1626entries/no named images).
+
+Next diagnostic moves existing cached initial-stage capture into that earlier
+natural path. Native/worker packed records are observed at the existing100ms
+cadence; failure-only endpoint observations now include their DispatchTime bounds.
+A failed close may collect one additional bounded worker reply after canRemove
+is already frozen false; this cannot turn late cleanup into a pass. App/core,
+media, all69 identities and original3s/250ms/output assertions are unchanged.
+Default stream tracing remains off; no SDK getter or clock is added to a native
+or real-time callback. Local syntax/project/profile/diff checks pass. No native14
+run or TestFlight delivery has been inferred from these source checks.
+
+Coverage audit also finds that current service repeat-one tests observe visits
+and underruns while exact decoded sample concatenation is tested in the offline
+graph. Before whole-goal acceptance, live mixer output across repeated complete
+service loops still needs direct comparison, separately from the phone's ten-loop
+acceptance check. No existing loop test or source duration is weakened.
