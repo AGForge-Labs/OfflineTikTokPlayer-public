@@ -622,3 +622,26 @@ remains, plus the existing edited-offset/4800leading-silence regression. Full na
 manifest remains296, with125portable tests. App runtime is now a candidate change,
 not a causal-fix or TestFlight claim. Original waits,740ms silence,250ms video/3s
 preparation failures and full release/HTTP/phone acceptance remain open until checked.
+
+### Native24: actual optimized reader component passes before iOS run
+
+Run40127633775/job120972364243 on publicb240b5b86d5d3309ace0e7615f8fb16101b9d505
+succeeds. It compiles the exact NativeAudioFileReader.swift and real core
+AudioFilePresentation.swift with-O, without DEBUG, in the small Mac program.
+The actual reader opens through all strict gates and compares every1440000frame
+against the complete independent source,352reads,maximumDifference0,no nonfinite
+or mismatch,EOFread0/reachedEndtrue. Forward28s and backward7s targets each compare
+512frames after the original2s preroll,24reads apiece,zero sample difference,correct
+cursor and no falseEOF. CAF controls and direct file modes remain exact. No trimming,
+padding,tolerance/buffer/deadline change or whole-source runtime array was introduced.
+
+Artifact12572679324/1037bytes/SHA256
+7c2f7c769526f11952113ee7eb0fe5294d55b7871f9c8182455f29b75e0503cb
+downloaded/checksum/ZIP verified. Raw log/resultJSON saved. Full app, DEBUG hooks,
+metadata adapter, pipeline/HTTP/background/PiP, Release app and phone acceptance
+remain unqualified by this smaller component check. Earlier real failures remain.
+
+Restore the original manual standard-public15min unsigned focused iOS workflow
+byte-for-byte from its preserved pre-capability backup. Next native profile73 keeps
+all72earlier cases and adds the existing edited-offset case. Core125local already
+passes; full current-source native manifest296 is retained. No signing/new TestFlight.

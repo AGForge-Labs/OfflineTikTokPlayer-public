@@ -45,11 +45,11 @@
 **Interfaces:** Private NativePCMReading exposes totalFrames:Int64, reachedEnd:Bool and read(into:AVAudioPCMBuffer,maximumFrames:Int)throws->Int. ReaderLane owns the selected implementation and its existing4096frame buffer. NativeReader continues unchanged behind that interface. Description carries only preloaded, validated timing eligibility.
 
 - [x] Pin policy rejection for scaled/offset/trimmed/incomplete layouts and mismatched packet tables. Canonical RED observed; two focused tests and full125core pass. Metadata adapter separately rejects unknown/multiple/empty/non-AAC/non-native layouts.
-- [ ] Restrict initial admission to one enabled native48k stereo AAC track and one complete unscaled segment. Match segment source start to codec priming and the full valid-frame interval to declared native presentation.
-- [ ] Validate AudioFile packet table, file.length and exact requested Float32 processing format before choosing this path; otherwise use existing NativeReader.
-- [ ] Run AVAudioFile open/seek/read/release only in the same ReaderLane. Preserve debug copy-gate/stage semantics and true close acknowledgement.
-- [ ] Bound each read by min(4096,maximumFrames,remainingDeclaredFrames); return0 only at the exact declared endpoint. Ordinary read errors, zero progress and unexpected position/count fail.
-- [ ] Never decode the entire video into runtime memory; keep owned packet transfer and all existing ring/prefix budgets.
+- [x] Restrict initial admission to one enabled native48k stereo AAC track and one complete unscaled segment. Match segment source start to codec priming and the full valid-frame interval to declared native presentation.
+- [x] Validate AudioFile packet table, file.length and exact requested Float32 processing format before choosing this path; otherwise use existing NativeReader.
+- [x] Keep AVAudioFile ownership on ReaderLane; preserve debug copy-gate/stages. Source implementation complete; full iOS ownership/close validation remains Task3.
+- [x] Bound each read by min(4096,maximumFrames,remainingDeclaredFrames); return0 only at the exact declared endpoint. Ordinary read errors, zero progress and unexpected position/count fail. Actual optimized component passes Mac24.
+- [x] Runtime retains owned4096frame packets and all existing ring/prefix budgets; only synthetic reference tests hold complete PCM arrays.
 
 Ruling: Put the small lane-owned SDK reader in its own source file behind NativePCMReading. This keeps its responsibility focused and permits compiling and exercising the exact component source in a small Mac probe before a full iOS build. AudioFilePresentation.matches(primingFrames:validFrames:presentationFrames:) is the pure policy. NativeAudioFileReader.open(url:totalFrames:readStartFrame:matchesPacketTable:) consumes the validated mapping and owns its file; ReaderLane still owns its lifetime. No broad decoder restructure.
 
