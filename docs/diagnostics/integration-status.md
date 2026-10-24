@@ -48,3 +48,15 @@ source-complete PCM performance and real-phone/OnTrac acceptance remain required
 Public integration run2 stopped at an NSObject/Observation initialization compile error;
 run3 compiled the app but stopped at two test-only compile errors. All three were corrected
 without changing output or pixel assertions. No runtime acceptance is inferred from them.
+
+Public run4 on069bbe9 compiled both native targets and passed119core/55native/1UI,
+but10native cases failed. The first camera test overlapped native owners between its
+three arms and exceeded the unchanged3-second close deadline. Fail-closed admission
+then blocked the remaining selection/stream tests, including the actual gap audit.
+This run supplies no new gap measurement. Its full raw log/result bundle are retained.
+
+The next test-only correction explicitly joins each camera/relaunch owner before
+constructing another, stops the engine before cancelling its settling poll, cancels
+the display monitor and awaits CPP video preparation as well as decoder closure.
+Fixture acknowledgement additionally requires the engine stopped; no assertion,
+case, close deadline or gap criterion is relaxed. Native execution is pending.

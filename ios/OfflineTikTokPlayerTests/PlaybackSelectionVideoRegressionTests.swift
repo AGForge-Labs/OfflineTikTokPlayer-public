@@ -12948,32 +12948,42 @@ final class SelectionVideoFixture {
         else { try await closeAfterTest() }
     }
 
+    /// A multi-arm test must close one owner before constructing its next owner.
+    func closePlayback(_ service: PlaybackService) async throws {
+        guard services.contains(where: { $0 === service }) else { return }
+        let reply = SelectionFixtureCloseReply()
+        #if DEBUG
+        service.debugCloseOwnedPlayback { success in
+            Task { @MainActor in reply.value = success }
+        }
+        #else
+        XCTFail("Native fixture ownership checks require the diagnostic build")
+        throw SelectionVideoTestFailure.timeout
+        #endif
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while reply.value == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        guard reply.value == true, !service.audioEngineRunning else {
+            Self.cleanupFailed = true
+            XCTFail("Fixture media cannot be deleted before owned tasks, engine and decoder readers close")
+            throw SelectionVideoTestFailure.timeout
+        }
+        services.removeAll { $0 === service }
+    }
+
+    func close() async throws {
+        removalRequested = true
+        if closeTask == nil { closeTask = Task { [self] in try await closeAfterTest() } }
+        try await awaitOwnedClose()
+    }
+
     private func closeAfterTest() async throws {
         guard !closed else { return }
-        for service in services {
-            let reply = SelectionFixtureCloseReply()
-            #if DEBUG
-            service.debugCloseOwnedPlayback { success in
-                Task { @MainActor in reply.value = success }
-            }
-            #else
-            XCTFail("Native fixture ownership checks require the diagnostic build")
-            throw SelectionVideoTestFailure.timeout
-            #endif
-            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-            while reply.value == nil, ContinuousClock.now < deadline {
-                try await Task.sleep(for: .milliseconds(5))
-            }
-            guard reply.value == true else {
-                Self.cleanupFailed = true
-                XCTFail("Fixture media cannot be deleted before its owned playback tasks and decoder readers close")
-                throw SelectionVideoTestFailure.timeout
-            }
-        }
-        services.removeAll()
+        while let service = services.first { try await closePlayback(service) }
         closed = true
         if removalRequested { removeImmediately() }
-        print("SelectionFixtureCleanup schema=1 tasksJoined=true decoderClosed=true mediaRemovalRequested=\(removalRequested) nativeQuiescenceClaimed=false")
+        print("SelectionFixtureCleanup schema=2 tasksJoined=true videoPreparationJoined=true engineStopped=true decoderClosed=true mediaRemovalRequested=\(removalRequested) nativeQuiescenceClaimed=false")
     }
 
     /// This verifies encoded fixture identity independently of PlaybackService and its token.

@@ -22,7 +22,6 @@ final class AudioOnlyContinuityTests: XCTestCase {
                 bookmarkURL: fixture.bookmark, activateSession: {}, continuousAudio: audio, preferences: preferences))
         }
         let service = makeService()
-        defer { service.pause() }
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.bID)
         try await until { service.audioSnapshot.frame > 2_400 }
@@ -43,9 +42,11 @@ final class AudioOnlyContinuityTests: XCTestCase {
         try await until { !service.audioEngineRunning }
         service.persist()
         let position = service.clock.position
+        // Simulate a relaunch by closing the original owner before restoring.
+        // Keep its fixture files until the restored owner has also finished.
+        try await fixture.closePlayback(service)
         let restoredAudio = ContinuousAudioPlayer()
         let restored = makeService(audio: restoredAudio)
-        defer { restored.pause() }
         XCTAssertTrue(restored.isAudioOnly)
         XCTAssertTrue(restored.surface.isHidden)
         restored.restore()
@@ -79,7 +80,6 @@ final class AudioOnlyContinuityTests: XCTestCase {
             defer { fixture.remove() }
             let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
                 bookmarkURL: fixture.bookmark, activateSession: {}, preferences: preferences))
-            defer { service.pause() }
             service.isInteractingWithFeed = true
             service.start(playlistIDs: [fixture.playlist], at: fixture.bID)
             try await until { service.audioSnapshot.frame > 2_400 }
@@ -105,6 +105,8 @@ final class AudioOnlyContinuityTests: XCTestCase {
             }
             XCTAssertTrue(service.isAudioOnly)
             XCTAssertEqual(service.queue.currentID, fixture.bID)
+            // Scope-exit defer cannot await; serialize these real native owners explicitly.
+            try await fixture.close()
         }
     }
 

@@ -756,12 +756,20 @@ final class PlaybackService: NSObject {
         timeControlObservation = nil
         for token in notifications { NotificationCenter.default.removeObserver(token) }
         notifications.removeAll()
-        continuousPiP.invalidate()
+        frameMonitor.cancel(); frameMonitorOwner = nil
+        let videoPreparation = continuousPiP.debugInvalidateAndCapturePreparation()
+        // The poll that normally pauses the engine is about to be cancelled.
+        // Stop this owned engine explicitly rather than relying on later deinit.
+        continuousAudio.graph.engine.stop()
         buffer.didAdvance = nil
         buffer.replace(with: nil); buffer.discardPrevious()
         surface.playerLayer.player = nil
         debugStopPreparation { [self] in
-            Task { @MainActor in continuousAudio.debugShutdown(completion) }
+            Task { @MainActor in
+                if let videoPreparation { await videoPreparation.value }
+                let engineStopped = !continuousAudio.graph.engine.isRunning
+                continuousAudio.debugShutdown { success in completion(success && engineStopped) }
+            }
         }
     }
 

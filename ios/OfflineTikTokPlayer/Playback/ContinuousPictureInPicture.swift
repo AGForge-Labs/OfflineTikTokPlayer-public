@@ -984,6 +984,15 @@ final class ContinuousPictureInPicture: NSObject {
         if playbackState.read().isPlaying && currentItem != nil { startFrameTimer() }
     }
 
+    #if DEBUG
+    /// Test teardown must await the cancelled metadata/composition owner as well.
+    func debugInvalidateAndCapturePreparation() -> Task<Void, Never>? {
+        let owned = preparationTask
+        invalidate()
+        return owned
+    }
+    #endif
+
     /// Release on the control thread. No audio session or audio renderer is touched.
     func invalidate() {
         guard !invalidated else { return }
