@@ -734,3 +734,28 @@ RED, while complete independent SDK references establish any viable extension.
 No runtime change yet. Temporary manual/public15min API-only workflow clearly
 excludes iOS acceptance; preserve/restore the full split-check workflow afterwards.
 All73profile identities and full296source methods stay in source unchanged.
+
+### Native28: complete native44.1k API references establish the extension
+
+Run40132783759/job120987876956/source dc381716 is the pre-implementation RED.
+Both synthetic inputs decode all1323000native stereo frames with maximumDifference0
+in both AVAudioFile modes against complete independent AVAssetReader references.
+FFmpeg AAC maps sourceStart1024/44100,valid1323000/remainder8; Apple AAC maps
+2112/44100,valid1323000/remainder968. Both target the complete30s presentation at0.
+CAF controls pass. The actual48k-only component rejects both, as expected; no iOS
+or playback acceptance from this macOS API-only check. Artifact12575543240/1183bytes/
+SHAf44d39b890b26f7169fd3b8b7ed31a06afaf2aea0e660640e24d80ff16af1910 verified.
+
+Candidate extension: accept explicit44100 or48000stereo AAC native processing
+format and complete native-frame endpoint. Resampled readers must start0; the
+existing native48k seek preroll stays. Metadata mappings use the selected native
+grid and require an exact whole endpoint before packet-table matching. Renderer
+endpoint stays48k; existing explicit converter/history/flush,4096-frame packets,
+ring/prefix/lease bounds, streaming/cache intent and lane-owned close stay unchanged.
+No content trim, fabricated agreement padding, weaker tolerance or deadline.
+One new iOS regression admits the representative stereo AAC, compares complete
+post-SRC output through two graph loops and rewind, and acknowledges decoder close.
+Every previous73profile identity remains; new profile74/full source297. Local
+Swift parsing, generatedproject and profile checks pass; SDK component GREEN and
+iOS SRC/graph/Release/HTTP/phone acceptance remain pending. Prior picture failures
+and exact-silence witnesses remain open, with no new TestFlight.

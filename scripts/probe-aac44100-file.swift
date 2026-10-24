@@ -228,7 +228,7 @@ struct AudioFileCapabilityProbe {
             "scope": "actual-native-aac-file-reader", "playbackAcceptance": false]
         do {
             let metrics: [String: Any] = try autoreleasepool { () throws -> [String: Any] in
-                guard let reader = NativeAudioFileReader.open(url: url, totalFrames: 1_323_000,
+                guard let reader = NativeAudioFileReader.open(url: url, sampleRate: 44_100, totalFrames: 1_323_000,
                     readStartFrame: start, matchesPacketTable: { priming, valid in
                         layout.matches(primingFrames: priming, validFrames: valid, presentationFrames: 1_323_000)
                     }),

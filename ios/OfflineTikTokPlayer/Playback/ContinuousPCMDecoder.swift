@@ -466,13 +466,16 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         debugActivity = description.debugNativeLaneActivityRecorder?.record(at: index)
                         debugActivity?.publish(.construction)
                         #endif
+                        // The lane's input endpoint is native-rate; Description.totalFrames
+                        // remains the48kHz renderer endpoint after explicit conversion.
+                        let nativePresentationFrames = try ContinuousPCMDecoder.frame(description.endTime, rate: description.nativeRate)
                         let created: any NativePCMReading
                         if let layout = description.filePresentation,
-                           let fileReader = NativeAudioFileReader.open(url: description.asset.url,
-                               totalFrames: description.totalFrames, readStartFrame: readStartFrame,
+                           let fileReader = NativeAudioFileReader.open(url: description.asset.url, sampleRate: description.nativeRate,
+                               totalFrames: nativePresentationFrames, readStartFrame: readStartFrame,
                                matchesPacketTable: { priming, valid in
                                    layout.matches(primingFrames: priming, validFrames: valid,
-                                       presentationFrames: description.totalFrames)
+                                       presentationFrames: nativePresentationFrames)
                                }) {
                             #if DEBUG
                             let activity = debugActivity, gate = description.debugReadGate
@@ -727,14 +730,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                   asbd.pointee.mSampleRate.isFinite, asbd.pointee.mSampleRate > 0,
                   (1...8).contains(asbd.pointee.mChannelsPerFrame) else { throw Failure.unsupportedPCM }
             nativeRate = asbd.pointee.mSampleRate; nativeChannels = asbd.pointee.mChannelsPerFrame
-            canUseAudioFile = selectedIsEnabled && formats.count == 1 && nativeRate == 48_000 && nativeChannels == 2
+            canUseAudioFile = selectedIsEnabled && formats.count == 1 && (nativeRate == 44_100 || nativeRate == 48_000) && nativeChannels == 2
                 && asbd.pointee.mFormatID == kAudioFormatMPEG4AAC
         }
         // Only exact, single, unscaled native-grid AAC mappings can opt in.
         // The lane then checks these primitives against the actual codec packet table.
         func exactAudioFrame(_ time: CMTime) -> Int64? {
             guard time.isNumeric, CMTimeCompare(time, .zero) >= 0 else { return nil }
-            let scaled = CMTimeConvertScale(time, timescale: 48_000, method: .roundHalfAwayFromZero)
+            let scaled = CMTimeConvertScale(time, timescale: CMTimeScale(nativeRate), method: .roundHalfAwayFromZero)
             guard scaled.isNumeric, CMTimeCompare(time, scaled) == 0 else { return nil }
             return scaled.value
         }
@@ -746,7 +749,8 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
            let sourceStart = exactAudioFrame(segment.timeMapping.source.start),
            let sourceFrames = exactAudioFrame(segment.timeMapping.source.duration),
            let targetStart = exactAudioFrame(segment.timeMapping.target.start),
-           let targetFrames = exactAudioFrame(segment.timeMapping.target.duration) {
+           let targetFrames = exactAudioFrame(segment.timeMapping.target.duration),
+           let nativeEnd = exactAudioFrame(end), targetFrames == nativeEnd {
             filePresentation = AudioFilePresentation(sourceStart: sourceStart, sourceFrames: sourceFrames,
                 targetStart: targetStart, targetFrames: targetFrames)
         } else { filePresentation = nil }

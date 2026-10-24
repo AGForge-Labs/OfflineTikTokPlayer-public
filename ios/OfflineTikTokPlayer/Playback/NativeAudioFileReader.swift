@@ -4,12 +4,13 @@ import AudioToolbox
 
 /// Implementations and their SDK objects stay on their owning native-reader lane.
 protocol NativePCMReading: AnyObject {
+    // Frames are on the native input grid, before the existing explicit converter.
     var totalFrames: Int64 { get }
     var reachedEnd: Bool { get }
     func read(into destination: AVAudioPCMBuffer, maximumFrames: Int) throws -> Int
 }
 
-/// Restricted to a complete, unedited native 48 kHz stereo AAC presentation.
+/// Restricted to a complete, unedited native44.1 or48kHz stereo AAC presentation.
 /// The caller validates the asset's mapping against the codec packet table.
 final class NativeAudioFileReader: NativePCMReading {
     enum Failure: Error { case invalidFormat, invalidPosition, emptyRead }
@@ -22,9 +23,11 @@ final class NativeAudioFileReader: NativePCMReading {
     var afterRead: (() -> Void)?
     #endif
 
-    static func open(url: URL, totalFrames: Int64, readStartFrame: Int64,
+    static func open(url: URL, sampleRate: Double = 48_000, totalFrames: Int64, readStartFrame: Int64,
                      matchesPacketTable: (Int64, Int64) -> Bool) -> NativeAudioFileReader? {
-        guard url.isFileURL, totalFrames > 0, readStartFrame >= 0, readStartFrame <= totalFrames else { return nil }
+        guard sampleRate == 44_100 || sampleRate == 48_000,
+              readStartFrame == 0 || sampleRate == 48_000,
+              url.isFileURL, totalFrames > 0, readStartFrame >= 0, readStartFrame <= totalFrames else { return nil }
         var identifier: AudioFileID?
         guard AudioFileOpenURL(url as CFURL, .readPermission, 0, &identifier) == noErr,
               let identifier else { return nil }
@@ -38,9 +41,9 @@ final class NativeAudioFileReader: NativePCMReading {
               matchesPacketTable(Int64(table.mPrimingFrames), table.mNumberValidFrames),
               let file = try? AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: true),
               file.length == totalFrames,
-              file.fileFormat.sampleRate == 48_000, file.fileFormat.channelCount == 2,
+              file.fileFormat.sampleRate == sampleRate, file.fileFormat.channelCount == 2,
               file.fileFormat.streamDescription.pointee.mFormatID == kAudioFormatMPEG4AAC,
-              let expected = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+              let expected = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
                   channels: 2, interleaved: true),
               file.processingFormat.isEqual(expected) else { return nil }
         file.framePosition = readStartFrame

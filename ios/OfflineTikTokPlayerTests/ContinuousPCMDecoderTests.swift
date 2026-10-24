@@ -1242,6 +1242,68 @@ final class ContinuousPCMDecoderTests: XCTestCase {
     }
 
     /// Capability comparison only. No production decoder selection changes.
+    func testNative44100StereoAACPreservesCompleteSRCThroughLoopsAndRewind() async throws {
+        #if DEBUG
+        guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
+            XCTFail("An unresolved reader close blocks new decoder owners")
+            throw ContinuousPCMDecoder.Failure.cannotDecode
+        }
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-aac44100-stereo", withExtension: "mp4"))
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let formats = try await track.load(.formatDescriptions)
+        let asbd = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(try XCTUnwrap(formats.first)))
+        XCTAssertEqual(asbd.pointee.mSampleRate, 44_100)
+        XCTAssertEqual(asbd.pointee.mChannelsPerFrame, 2)
+        let segments = try await track.load(.segments)
+        XCTAssertEqual(segments.count, 1)
+        let mapping = try XCTUnwrap(segments.first).timeMapping
+        func nativeFrame(_ time: CMTime) -> Int64 {
+            let value = CMTimeConvertScale(time, timescale: 44_100, method: .roundHalfAwayFromZero)
+            XCTAssertEqual(CMTimeCompare(time, value), 0)
+            return value.value
+        }
+        let layout = AudioFilePresentation(sourceStart: nativeFrame(mapping.source.start),
+            sourceFrames: nativeFrame(mapping.source.duration), targetStart: nativeFrame(mapping.target.start),
+            targetFrames: nativeFrame(mapping.target.duration))
+        try autoreleasepool {
+            let reader = try XCTUnwrap(NativeAudioFileReader.open(url: url, sampleRate: 44_100,
+                totalFrames: 1_323_000, readStartFrame: 0, matchesPacketTable: { priming, valid in
+                    layout.matches(primingFrames: priming, validFrames: valid, presentationFrames: 1_323_000)
+                }))
+            XCTAssertEqual(reader.totalFrames, 1_323_000, "Reader endpoint stays on the native input grid")
+            XCTAssertFalse(reader.reachedEnd)
+        }
+        // Independent complete decode/conversion includes the original SRC history
+        // and flushed tail. No native reader override or sample trimming is used.
+        let expected = try await independentlyDecode(asset, diagnosticName: "native44100-stereo-full-SRC")
+        XCTAssertEqual(expected.count, 1_440_000 * 2)
+        let renderer = ContinuousPCMRenderer(prefixFrames: expected.count / 2 + 1, ringFrames: 512)
+        let decoder = ContinuousPCMDecoder(renderer: renderer)
+        defer { decoder.shutdown() }
+        var bodyError: Error?
+        do {
+            let prepared = try await Self.mailboxPrepare(decoder, url: url, token: 1, slot: 0)
+            XCTAssertEqual(prepared.totalFrames, 1_440_000, "Renderer endpoint stays on the48k output grid")
+            renderer.setSuccessor(token: 1, for: 1)
+            renderer.select(token: 1, frame: 0); renderer.setPlaying(true)
+            let graph = ContinuousAudioGraph(renderer: renderer)
+            try graph.engine.enableManualRenderingMode(.offline, format: graph.format, maximumFrameCount: 257)
+            try graph.engine.start()
+            defer { graph.engine.stop() }
+            assertSamples(try render(graph, frames: expected.count), equal: expected + expected)
+            renderer.select(token: 1, frame: 0)
+            assertSamples(try render(graph, frames: 401), equal: Array(expected.prefix(802)))
+            XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        } catch { bodyError = error }
+        _ = try await Self.mailboxShutdown(decoder)
+        if let bodyError { throw bodyError }
+        #else
+        XCTFail("Native input and SRC qualification requires the existing debug mailboxes")
+        #endif
+    }
+
     func testAVAudioFileMatchesCompleteNative48kMoviePresentation() async throws {
         #if DEBUG
         guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
