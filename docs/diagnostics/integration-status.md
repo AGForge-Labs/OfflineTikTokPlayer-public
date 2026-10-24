@@ -329,3 +329,20 @@ and historical packed decoder stages. Default uninstrumented mode stays unchange
 This is diagnostic source, not a causal audio repair. App/core implementation,
 source media, original assertions, release scope and delivered build are unchanged.
 No native15 or TestFlight delivery has been inferred from local checks.
+
+
+### Native15: loop-test compile failure, no new audio result
+
+Run40107069237/job120910858608 on87c966e ends in3m20s (job3m16s).
+123core tests pass, but native/UI cases do not execute. The Apple compiler
+rejects two new nested collection expressions in the live-loop test as too
+expensive to type-check. The correction replaces only those expressions with
+explicit Float and Int loops; exact replacements type-check and execute in
+Swift5 mode locally with known mono and zero-count results. No sample, deadline,
+assertion, existing case, profile, media, app/core or workflow changes.
+Current syntax/project/70-case validation passes; native execution is pending.
+Raw SHA2563de61530628b7460877cc52fded098da1ebb3c02d260c34bceb18f3d8fd06677.
+Artifact12565635699/95245bytes/SHA256
+ba9f4643dd8e86b0797bea9ab6907586b122ab92c3539bafac839e33d9ea301c
+downloaded and verified (18entries). All earlier audio failures remain open.
+No TestFlight or phone acceptance is implied by this compiler correction.

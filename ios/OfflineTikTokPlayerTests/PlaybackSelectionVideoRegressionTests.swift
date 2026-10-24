@@ -1584,7 +1584,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         prepared.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: Int(entry.frames)) }
         XCTAssertEqual(audio.renderer.snapshot.frame, entry.frames)
         XCTAssertEqual(audio.renderer.snapshot.underrunFrames, 0)
-        let reference = stride(from: 0, to: prepared.count, by: 2).map { (prepared[$0] + prepared[$0 + 1]) * 0.5 }
+        var reference: [Float] = []
+        reference.reserveCapacity(prepared.count / 2)
+        for stereoIndex in stride(from: 0, to: prepared.count, by: 2) {
+            let stereoSum: Float = prepared[stereoIndex] + prepared[stereoIndex + 1]
+            let monoSample: Float = stereoSum * Float(0.5)
+            reference.append(monoSample)
+        }
         XCTAssertTrue(reference.allSatisfy { $0.isFinite })
         audio.renderer.setPlaying(false); audio.renderer.select(token: 0)
         var clear = [Float](repeating: .nan, count: 2)
@@ -1620,8 +1626,14 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let match = LoopPCMComparison.compare(template: reference, recorded: recorded.values)
         let wholeCycles = max(0, recorded.values.count / reference.count - 1)
         let hole = ProductionSelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
-        let expectedZeros = match.offset.map { offset in
-            recorded.values.indices.reduce(0) { $0 + (reference[(offset + $1) % reference.count] == 0 ? 1 : 0) }
+        var expectedZeros: Int? = nil
+        if let offset = match.offset {
+            var zeroCount: Int = 0
+            for recordedIndex in recorded.values.indices {
+                let referenceIndex: Int = (offset + recordedIndex) % reference.count
+                if reference[referenceIndex] == Float.zero { zeroCount += 1 }
+            }
+            expectedZeros = zeroCount
         }
         print("LiveRepeatOnePCM schema=1 calibrated=\(calibrated) captured=\(captured) sourceFrames=\(entry.frames) referenceFrames=\(reference.count) recordedFrames=\(recorded.values.count) wholeCyclesAtLeast=\(wholeCycles) visitDelta=\(finalState.visit - firstState.visit) matched=\(match.matched) comparedFrames=\(match.comparedFrames) alignment=\(match.offset.map { String($0) } ?? "unavailable") candidates=\(match.candidates) overflow=\(match.overflow) rate=\(recorded.rate) stereoZeroFrames=\(channels.stereoZeroFrames) expectedProjectionZeroFrames=\(expectedZeros.map { String($0) } ?? "unavailable") underrunDelta=\(finalState.underrunFrames - firstState.underrunFrames) sameEngine=\(sameEngine) engineRunning=\(engineRunning) selectedA=\(selectedA) videoVisible=\(visible) videoAdvanced=\(videoAdvanced) maximumHoleMs=\(hole * 1000) scope=mono-projection tolerance=0.000001 source=complete-original-short-AAC reference=single-prepared-visit independentCodecProof=separate-AAC-SRC-tests physicalOutput=unverified cleanupAcknowledged=true capacityFrames=768000")
         XCTAssertTrue(captured); XCTAssertGreaterThanOrEqual(wholeCycles, 10)
