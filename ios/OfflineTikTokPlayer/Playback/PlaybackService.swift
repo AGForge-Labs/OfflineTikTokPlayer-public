@@ -590,8 +590,9 @@ final class PlaybackService: NSObject {
         self.preferences = preferences
         automaticPiP = preferences.bool(forKey: "automaticPiP")
         speakerSound = preferences.object(forKey: "speakerSound") as? Bool ?? true
-        audioOnly = preferences.bool(forKey: "audioOnly")
-        presentationPolicy = PlaybackPresentationPolicy(audioOnly: audioOnly)
+        let restoredAudioOnly = preferences.bool(forKey: "audioOnly")
+        audioOnly = restoredAudioOnly
+        presentationPolicy = PlaybackPresentationPolicy(audioOnly: restoredAudioOnly)
         super.init()
         self.continuousAudio.onSourceSilence { [weak self] _, analysis in
             Task { @MainActor in self?.recordDiagnostic(.sourceTimelineAnalyzed, sourceSilence: analysis) }
