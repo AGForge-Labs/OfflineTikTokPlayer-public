@@ -496,3 +496,36 @@ source app/core trees, media, workflows, release controls and authorization unch
 
 
 Local exact-method Swift5 type-only check, Swift syntax, project/profile72 and Windows Git diff checks pass. WSL Git cannot resolve the Windows managed-worktree pointer; no Git repair attempted. The new comparison runs before the earlier decoder cases and changes reader warm history; neither a pass nor later nonrecurrence establishes causality. Existing native calibration and all71profile identities remain. Full source manifest now296; full release gate still requires all current cases. Native19 not yet launched. No new TestFlight.
+
+
+### Native19: reject unqualified alternative; isolate API capability cheaply
+
+Native19 terminal failure13m35total/13m31job; public60e55d2dc1ad40d18a0b87846514d49c227cccf0,
+owned738648ms/exit65/no timeout.123core/67native/1UI pass, four native cases fail,
+all72identities return. New AVAudioFile comparison fails0.769s with caught nilError
+inside the pooled alternate-decode block, before any completed data/reference comparison.
+Individual SDK phase is not recorded, so unsupported movie format is not proven and
+the alternative is not adopted. Existing initial decoder ownership guard is intact.
+
+Strict live ten-loop case passes again with633600matching mono-projection frames,
+zero stereo-zero/underrun/drop/time faults. Natural boundary passes19.565s this time:
+initial preparation2.581975s, coverage max109.239ms, final underruns remain70144 from
+runway baseline (zero added; exact stereo silence unmeasured), original cleanup ack
+passes. This nonrecurrence does not repair earlier3s native-copy waits or740ms silence.
+
+Prepared B video272.565875ms and traced B276.685167ms exceed250ms; rapid A/B/A misses
+its3s initial preparation. Two actual returned-A8s384000frame/400tone windows and four
+prepared tap boundaries remain zero exact stereo-zero/underrun/drop/time faults.
+Raw SHA256385f2240d52ddaf875f97053192e24c8584c0e9c7b6e12acc405fdd6d1973334.
+Artifact12572183749/72009958bytes/SHA25621fe4cd80f5512282714a0d96764d6751bc2c680e77362ab6f41a1e0fb19fab4
+downloaded/checksum/ZIP verified1660entries; result JSON and UI screenshot saved.
+
+Next single-variable API investigation uses a small standalone macOS program instead
+of rebuilding the full iOS app. Same original MP4, default versus configured-interleaved
+AVAudioFile initializers, a generated exact stereo CAF control, bounded4096frame reads
+to EOF, labelled open/format/buffer/read failure stage and exact frame count. It never
+claims movie sample fidelity or iOS/physical playback acceptance. No production edit.
+The temporary diagnostic-branch workflow executes only this named macOS capability
+probe with no iOS tests; original profile72/full release gate remain intact and the
+manual standard-public15min/no-secret controls stay. Restore its original focused-check
+command after the probe; don't interpret this smaller experiment as a green full run.
