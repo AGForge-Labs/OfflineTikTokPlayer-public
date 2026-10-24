@@ -11,6 +11,20 @@ struct AudioFileCapabilityProbe {
         print("AudioFileProbe " + String(decoding: data, as: UTF8.self))
     }
 
+    static func packetTable(url: URL) -> [String: Any] {
+        var identifier: AudioFileID?
+        let opened = AudioFileOpenURL(url as CFURL, .readPermission, 0, &identifier)
+        guard opened == noErr, let identifier else { return ["openStatus": opened] }
+        defer { AudioFileClose(identifier) }
+        var table = AudioFilePacketTableInfo()
+        var size = UInt32(MemoryLayout<AudioFilePacketTableInfo>.size)
+        let status = AudioFileGetProperty(identifier, kAudioFilePropertyPacketTableInfo, &size, &table)
+        return ["openStatus": opened, "packetTableStatus": status,
+            "validFrames": table.mNumberValidFrames, "primingFrames": table.mPrimingFrames,
+            "remainderFrames": table.mRemainderFrames, "tableBytes": size]
+    }
+
+
     /// Independent native-only reference for this unchanged 48 kHz fixture.
     /// Reject edits/trim/layout surprises rather than trimming samples to agree.
     static func nativeReference(url: URL) async throws -> [Float] {
@@ -26,6 +40,16 @@ struct AudioFileCapabilityProbe {
         guard CMTimeConvertScale(duration, timescale: 48_000, method: .roundHalfAwayFromZero).value == 1_440_000 else {
             throw NSError(domain: "ProbeReferenceLength", code: 1)
         }
+        let segments = try await track.load(.segments)
+        let mappings: [[String: Any]] = segments.map { segment in
+            ["empty": segment.isEmpty, "sourceStart": segment.timeMapping.source.start.seconds,
+             "sourceDuration": segment.timeMapping.source.duration.seconds,
+             "targetStart": segment.timeMapping.target.start.seconds,
+             "targetDuration": segment.timeMapping.target.duration.seconds]
+        }
+        try report(["schema": 1, "metadata": true, "fixture": "original-native48k-mp4",
+            "audioTracks": tracks.count, "segments": mappings, "packetTable": packetTable(url: url),
+            "iOSQualification": false, "playbackAcceptance": false])
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true,

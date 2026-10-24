@@ -567,3 +567,22 @@ compares both movie modes with a complete independent native48k AVAssetReader
 reference, rejects unexpected trim/gaps/format/layout/length and compares every
 stereo sample without padding or trimming. Exact CAF controls remain. This is
 macOS API/sample fidelity only; no iOS/phone acceptance or production decoder change.
+
+### Native22: complete native48k stereo equality, macOS API proof only
+
+Run40125724752/job120966589326 on public3d50c6d succeeds31s total/26s job.
+Both default and configured AVAudioFile modes decode all1440000frames in352reads,
+complete against an independent AVAssetReader native reference, maximum sample
+difference0/no mismatch/nonfinite. Read times1084.261ms and1358.060ms for the entire
+30s; exact stereo CAF controls pass. No source trim/padding or tolerance relaxation.
+Artifact12573700766/746bytes/SHA256d572e9a89a19f80bb627dffb218d4d20e95669315586700f46f7c81763f8ba0e
+downloaded/checksum/ZIP verified. Saved raw/result JSON/UI screenshot. This is not
+iOS, live graph, cold HTTP, physical output, whole profile or release acceptance.
+
+Before the production candidate, retain the precise original track segment mapping
+and AudioFilePacketTableInfo priming/valid/remainder fields in the same small probe.
+This read-only metadata measurement establishes a conservative eligibility check
+rather than assuming AVAudioFile applies every possible movie edit. Full sample
+comparison/controls/read bounds remain identical. Candidate scope is initially
+simple native48k stereo AAC only, with other layouts/edits/codecs preserving the
+existing native reader. Original whole-goal scope remains; this is not its completion.
