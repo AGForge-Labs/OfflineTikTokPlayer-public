@@ -57,10 +57,24 @@ Ruling: Put the small lane-owned SDK reader in its own source file behind Native
 
 **Files:** ContinuousPCMDecoderTests.swift; existing selection-video tests; tests/playback-acceptance.json; temporary public workflow.
 
-- [ ] Reuse complete independent native48k sample comparison and distant seek/retained head regressions.
-- [ ] Include the existing edited-offset test so leading presentation silence is exercised with the fallback.
-- [ ] Restore the public workflow's original focused iOS command byte-for-byte from artifacts/gap-profile-before-audio-file-probe.yml after small API experiments.
-- [ ] Run one changed-source native profile; preserve every prior case and original budgets.
-- [ ] Preserve failures and distinguish app/runtime repair from simulator nonrecurrence or changed sampler history.
+- [x] Reuse complete independent native48k sample comparison and distant seek/retained head regressions. Native25 comparison and both seeks pass with exact samples; pipeline seeks26copies each.
+- [x] Include the existing edited-offset test so leading presentation silence is exercised with the fallback. Native25 passes.
+- [x] Restore the public workflow's original focused iOS command byte-for-byte from artifacts/gap-profile-before-audio-file-probe.yml after small API experiments. Done before Native25; Task4 responds to its later measured job timeout.
+- [x] Run one changed-source native profile; preserve every prior case and original budgets. Native25 fails/cancels, not accepted.
+- [x] Preserve failures and distinguish app/runtime repair from simulator nonrecurrence or changed sampler history. Native25 raw logs, partial result bundle, verified artifact and screenshot retained.
 - [ ] Complete full Release/current-source gate and native build before any owner-only delivery.
 - [ ] Full original HTTP/cache/background/PiP and owner's phone acceptance remain open. No goal completion based on a smaller green probe.
+
+### Task 4: Keep cold compilation inside its own check budget
+
+Native25 compiled successfully but cold compilation used about10min, leaving the
+15min job unable to finish all73cases. Three real failures remain preserved;
+this infrastructure change does not fix or excuse them.
+
+- [ ] Build once with the existing unsigned build-for-testing action in a manual standard-public15min job.
+- [ ] Carry only compiled synthetic test products to a second15min job, preserving executable permissions in a one-day artifact.
+- [ ] Fail closed on source SHA, toolchain, architecture, profile or compiled-product checksum mismatch before test-without-building.
+- [ ] Add one fixed720s owned profile-test phase. Keep every original phase, case deadline, native assertion and all73profile identities unchanged.
+- [ ] Prove bundle tampering/stale source and wrong CLI actions fail locally before spending runner time.
+- [ ] Use the existing exact native-log verifier with invocation=test-without-building; no full-release acceptance from this profile.
+- [ ] Run the revised unsigned check once; retain failures and full original source296/native release/phone obligations.

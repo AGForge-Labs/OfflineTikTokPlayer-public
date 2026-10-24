@@ -645,3 +645,37 @@ Restore the original manual standard-public15min unsigned focused iOS workflow
 byte-for-byte from its preserved pre-capability backup. Next native profile73 keeps
 all72earlier cases and adds the existing edited-offset case. Core125local already
 passes; full current-source native manifest296 is retained. No signing/new TestFlight.
+
+### Native25: iOS decoder proof and bounded-check exhaustion
+
+Public3de1b5c/run40128027553/job120973541645 is cancelled at the15min job limit.
+The provider reports17m8total/17m3job including orphan cleanup after cancellation.
+Core125passes. The app's optimized DEBUG source and metadata adapter compile;
+60native cases finish57pass/3fail, with13of73 lacking completion and UI not begun.
+Complete native48k AVAudioFile comparison passes2.313s, all1440000stereo frames,
+maximumDifference0; distant28s/7s pipeline seeks each use26copies, exact512frames,
+full endpoint and unchanged memory. Leading4800frame presentation silence and
+retained-source regressions pass. Strict ten full short-AAC live loops again match
+all633600frames, zero added underruns/exact stereo-zero frames, same engine.
+
+Unresolved: defaultB video317.093625ms>250; natural3s initial both-source guard
+misses readiness with2345.760167ms sampler gap, no later pending read/SDK wait
+established and real decoder close acknowledged; compositor capture rejected3.
+One8s returned-A audit and four prepared tap boundaries show no exact stereo
+silence, but the traced production case is interrupted and has no terminal result.
+The original740ms silence witness, other formats, full source296/Release, trueHTTP
+and phone acceptance remain open. No new TestFlight or all-gap repair claim.
+
+Artifact12574132062/353921bytes/SHA256
+3f0e47825670ca48d1a848fb340c636a78eadfb684e8979c51c3d79b3035d02c,
+ZIP144entries verified. Raw job log SHA256
+ffc9d74de14ebc6820e3a704eb90c4df49f2b615500b1f1cacbec8ca8a6b21cc.
+
+Cold compilation consumed about10min before tests. Split the next manual unsigned
+check into one build-for-testing job and one test-without-building job, each
+standard-public/macOS26/15min. Carry exact-source compiled products in a one-day
+artifact; verify source, Xcode/SDK/architecture, profile and every binary checksum
+before extracting. Original73cases/assertions and per-case120s limits remain;
+new owned profile-build/profile-test phases each720s leave room for evidence.
+The old full/default/release command and original phase budgets stay unchanged.
+This changes check orchestration only, not playback, and cannot excuse failures.

@@ -15,7 +15,7 @@ import time
 # playback cases and the owned-group cleanup policy keep their existing limits.
 # The prior 55-minute full run ended before its smaller source inventory completed.
 PHASES = {"build": (0, 1080), "case-01": (1, 300), "case-02": (2, 300), "driver": (3, 60),
-          "full-test": (4, 4500)}
+          "full-test": (4, 4500), "profile-build": (5, 720), "profile-test": (6, 720)}
 MAX_SESSION_SECONDS = max(seconds for _, seconds in PHASES.values())
 DRIVER_COMMAND = ("xcrun", "swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-")
 
@@ -167,7 +167,7 @@ def main():
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     phase, seconds = PHASES[args.phase]
-    mode = "build-for-testing" if phase == 0 else "test" if phase == 4 else "test-without-building"
+    mode = "build-for-testing" if args.phase in ("build", "profile-build") else "test" if phase == 4 else "test-without-building"
     if os.name != "posix": parser.error("Only fixed POSIX SDK phases are supported")
     if phase == 3:
         if tuple(command) != DRIVER_COMMAND: parser.error("Only the exact read-only Swift driver probe is supported")

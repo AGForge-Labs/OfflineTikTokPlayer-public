@@ -214,7 +214,8 @@ class OwnedXcodebuildDeadlineTests(unittest.TestCase):
 
     def test_full_test_cli_uses_only_the_fixed_combined_action_and_budget(self):
         expected = {"build": (0, 1080), "case-01": (1, 300), "case-02": (2, 300),
-                    "driver": (3, 60), "full-test": (4, 4500)}
+                    "driver": (3, 60), "full-test": (4, 4500),
+                    "profile-build": (5, 720), "profile-test": (6, 720)}
         self.assertEqual(self.module.PHASES, expected)
         self.assertEqual(self.module.MAX_SESSION_SECONDS, 4500)
         command = ["xcodebuild", "-project", "owned.xcodeproj", "-jobs", "1", "test"]
@@ -237,6 +238,22 @@ class OwnedXcodebuildDeadlineTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as failure: self.module.main()
                 self.assertEqual(failure.exception.code, 2)
                 lookup.assert_not_called(); run.assert_not_called()
+
+    def test_split_profile_cli_has_fixed_actions_and_twelve_minute_budgets(self):
+        for phase, number, action in (("profile-build", 5, "build-for-testing"), ("profile-test", 6, "test-without-building")):
+            with self.subTest(phase=phase):
+                command = ["xcodebuild", action]
+                with mock.patch.object(sys, "argv", [str(SCRIPT), "--phase", phase, "--"] + command), \
+                     mock.patch.object(self.module.shutil, "which", return_value="/owned/xcodebuild"), \
+                     mock.patch.object(self.module.signal, "signal"), \
+                     mock.patch.object(self.module, "run_owned", return_value={"wrapperExit": 0}) as run:
+                    self.assertEqual(self.module.main(), 0)
+                    self.assertEqual(run.call_args.args[:3], (["/owned/xcodebuild", action], 720, number))
+                for rejected in ("test", "archive", "build", "clean", "build-for-testing" if action == "test-without-building" else "test-without-building"):
+                    with mock.patch.object(sys, "argv", [str(SCRIPT), "--phase", phase, "--", "xcodebuild", rejected]), \
+                         mock.patch.object(self.module.shutil, "which") as lookup:
+                        with self.assertRaises(SystemExit): self.module.main()
+                        lookup.assert_not_called()
 
     def test_guardian_admits_the_full_window_but_rejects_any_larger_window(self):
         # No child, signal or real wait: prove the guardian reaches its control
