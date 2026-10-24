@@ -35,3 +35,11 @@
 - [ ] Reject unqualified capability. If supported,design the minimal bounded production pool and add actual app-handoff regressions before promotion;do not claim app readiness or a silence fix from helper capability.
 
 Deliver the concrete decision,exact sources/diffs and verification evidence. No completion or release claim from partial,clean-nonrecurring or helper-only evidence.
+
+### Task3: Attribute the unmeasured capability boundary without changing ownership
+
+- [x] Reconcile40042486706:114Core,5native2pass/3fail,4assertions;all4helper arms decoded/advanced and ACK;no preroll benefit established;fallback host contracts GREEN. Preserve historical silence and all app acceptance failures.
+- [ ] Add two matched tracingOFF/ON orders with prerollOFF throughout;retain original ownership SDK operations. Bound recording to4phases x9scalar aggregates,no RT work.
+- [ ] Capture image-completed/deadline and cleanup/probe/A checkpoints before XCTest assertion reporting;preserve all actual frame/audio/progress/resource/callback limits.
+- [ ] Serial syntax/project/inventory/preserved-source/whitespace checks and read-only review;freeze exact source. Route unchanged default plus only the two new attribution cases;do not repeat unchanged fallback contracts.
+- [ ] Recover structured and exact span/deadline receipts. Require a failure joined to its actual operation or explicitly conclude no cause established. Compare OFF/ON timing for tracing effects. Select the smallest supported intervention;do not promote helper-only evidence into app acceptance.
