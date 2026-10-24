@@ -566,7 +566,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                 #endif
                 autoreleasepool {
                     buffer = nil
-                    reader = nil // NativeReader.deinit/cancelReading run only here.
+                    reader = nil // SDK reader release/cancellation runs only on this lane.
                 }
                 #if DEBUG
                 debugActivity?.publish(.closeReturned)
@@ -710,6 +710,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         for track in tracks where selected == nil {
             if try await track.load(.isEnabled) { selected = track }
         }
+        let selectedIsEnabled = selected != nil
         selected = selected ?? tracks.first
         var end = duration
         if let selected {
@@ -726,7 +727,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                   asbd.pointee.mSampleRate.isFinite, asbd.pointee.mSampleRate > 0,
                   (1...8).contains(asbd.pointee.mChannelsPerFrame) else { throw Failure.unsupportedPCM }
             nativeRate = asbd.pointee.mSampleRate; nativeChannels = asbd.pointee.mChannelsPerFrame
-            canUseAudioFile = formats.count == 1 && nativeRate == 48_000 && nativeChannels == 2
+            canUseAudioFile = selectedIsEnabled && formats.count == 1 && nativeRate == 48_000 && nativeChannels == 2
                 && asbd.pointee.mFormatID == kAudioFormatMPEG4AAC
         }
         // Only exact, single, unscaled native-grid AAC mappings can opt in.
