@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   ios:
-    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && inputs.approve_runner }}
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.ref == 'refs/heads/diagnostic/gapless-profile' && inputs.approve_runner }}
     runs-on: macos-26
     timeout-minutes: 15
     steps:
