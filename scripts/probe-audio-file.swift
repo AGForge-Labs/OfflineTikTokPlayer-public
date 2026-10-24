@@ -42,7 +42,18 @@ struct AudioFileCapabilityProbe {
                 for _ in 0..<400 {
                     stage = "read"
                     buffer.frameLength = 0
-                    try file.read(into: buffer, frameCount: 4_096)
+                    row["beforeReadPosition"] = file.framePosition
+                    row["declaredFrames"] = file.length
+                    row["successfullyCopiedFrames"] = totalFrames
+                    row["successfulReads"] = reads
+                    row["requestedFrames"] = 4_096
+                    do {
+                        try file.read(into: buffer, frameCount: 4_096)
+                    } catch {
+                        row["afterFailedReadPosition"] = file.framePosition
+                        row["failedReadBufferFrames"] = buffer.frameLength
+                        throw error
+                    }
                     reads += 1
                     let frames = Int(buffer.frameLength)
                     if frames == 0 { eof = true; break }

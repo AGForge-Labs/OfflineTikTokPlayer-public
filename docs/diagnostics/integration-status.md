@@ -529,3 +529,21 @@ The temporary diagnostic-branch workflow executes only this named macOS capabili
 probe with no iOS tests; original profile72/full release gate remain intact and the
 manual standard-public15min/no-secret controls stay. Restore its original focused-check
 command after the probe; don't interpret this smaller experiment as a green full run.
+
+
+### Native20: fast capability probe localizes failure to reads
+
+Run40125063944/job120964613051, public354ffa74be1c733d0b81ffd21232f566b2b64619,
+completes37s total/33s job, exit1. Program compiles and all four attempts execute.
+Both original movie modes and both known-good generated stereo CAF controls throw
+Foundation._GenericObjCError code0 at stage=read, so unsupported movie format is not
+established. No sample-fidelity comparison or iOS/phone qualification. Artifact
+12572074889/609bytes/SHA2566dcfb857d8a503e06f87eba6f043d32efe910c6b7e30328b003df63cc019b0e2
+is downloaded/checksum/ZIP verified; log and UI receipt saved. No iOS app rebuild.
+
+Next observation keeps the same read behavior and records successful-read/frame
+counts, precise file positions before/after a failed call and its buffer frame count.
+This will distinguish a first-read problem from a partial/extra EOF read; no EOF
+error is ignored and no expected source length/sample threshold is changed. The
+official read-count documentation requires matching processing format but supplies
+no EOF guarantee. No production or test/profile/media/workflow change.
