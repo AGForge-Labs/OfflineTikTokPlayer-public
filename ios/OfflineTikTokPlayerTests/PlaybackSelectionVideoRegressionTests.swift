@@ -3608,7 +3608,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let recorded = tap.samples(from: first, to: last), samples = result.samples
         let validity = tap.validity()
         let tone = ProductionSelectionOutputTap.toneBlocks(recorded.values, rate: recorded.rate, frequency: 440)
-        let tolerance = 2 * Double(max(1, service.audioRenderQuantumFrames)) / 48_000 + 0.005
+        let tolerance = min(2 * Double(max(1, service.audioRenderQuantumFrames)) / 48_000 + 0.005,
+                            2 * 512.0 / 48_000 + 0.005)
         XCTAssertGreaterThanOrEqual(samples.count, 5); XCTAssertLessThanOrEqual(samples.count, 128)
         XCTAssertLessThanOrEqual(samples.first.map { Double($0.end - result.origin) / 1_000_000_000 } ?? .infinity, 0.25)
         XCTAssertGreaterThanOrEqual(samples.last.map { Double($0.end - result.origin) / 1_000_000_000 } ?? -1, 0.75)
@@ -3642,6 +3643,117 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertLessThanOrEqual(abs(frame - state.requested), 0.080)
             XCTAssertLessThanOrEqual(abs(copied - frame), 0.080)
         } else { XCTFail("Playing A must retain coherent custom progress through helper work") }
+    }
+
+    func testActualSessionActivationPreservesProductionSelectionAndContinuity() async throws {
+        try await runProductionSelectionBenchmark(traceVideoSeeks: false, actualSessionActivation: true)
+    }
+
+    func testPlaybackIOPreferenceTenThenTwentyWithActualActivation() async throws {
+        try await runPlaybackIOPreferenceComparison([0.010, 0.020], order: "ten-then-twenty")
+    }
+
+    func testPlaybackIOPreferenceTwentyThenTenWithActualActivation() async throws {
+        try await runPlaybackIOPreferenceComparison([0.020, 0.010], order: "twenty-then-ten")
+    }
+
+    private func runPlaybackIOPreferenceComparison(_ durations: [TimeInterval], order: String) async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        defer {
+            sourceCallbackLedgerBenchmarkMode = nil; sourceCallbackExecutionTimingBenchmarkMode = nil
+            sourceCallbackLedgerArmID = nil
+        }
+        guard !Self.targetedFixtureOwnershipLost, !PCMWorkerBoundaryOwnership.blocksFixtures else {
+            XCTFail("No session preference trial may follow unacknowledged fixture or worker cleanup")
+            throw SelectionVideoTestFailure.timeout
+        }
+        let session = AVAudioSession.sharedInstance()
+        let priorPreference = session.preferredIOBufferDuration
+        guard priorPreference.isFinite, priorPreference > 0 else {
+            XCTFail("The prior preference must be restorable before changing shared session state")
+            throw SelectionVideoTestFailure.timeout
+        }
+        defer {
+            if !Self.targetedFixtureOwnershipLost && !PCMWorkerBoundaryOwnership.blocksFixtures {
+                do {
+                    try session.setPreferredIOBufferDuration(priorPreference)
+                    let restored = session.preferredIOBufferDuration
+                    XCTAssertEqual(restored, priorPreference, accuracy: 0.000001)
+                    print("PlaybackIOPreferenceRestore schema=1 cleanupAcknowledged=true priorPreferredSeconds=\(priorPreference) restoredPreferredSeconds=\(restored) matched=\(abs(restored - priorPreference) <= 0.000001) actualHardwareRestored=unclaimed explicitSessionCycle=false")
+                } catch {
+                    XCTFail("Restoring the shared I/O preference failed with code \((error as NSError).code)")
+                }
+            } else {
+                XCTFail("Preference restoration withheld because fixture or worker cleanup was not acknowledged")
+                print("PlaybackIOPreferenceRestore schema=1 cleanupAcknowledged=false restored=false reason=uncertain-owners noSDKRequest=true")
+            }
+        }
+        for (ordinal, seconds) in durations.enumerated() {
+            let armID = UUID().uuidString.lowercased()
+            sourceCallbackLedgerBenchmarkMode = true; sourceCallbackExecutionTimingBenchmarkMode = true
+            sourceCallbackLedgerArmID = armID
+            print("PlaybackIOPreferenceArm schema=1 armID=\(armID) order=\(order) ordinal=\(ordinal) requestedSeconds=\(seconds) actualActivation=true callbackLedger=constant-on executionTiming=constant-on zeroProbe=constant-on requestedIsActual=false mediaPolicy=unchanged originalGuards=unchanged progressCeilingMs=26.333333333333332")
+            try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
+                traceClockHandoff: true, firstZeroSourceCallbacks: true,
+                actualSessionActivation: true, requestedIOBufferDuration: seconds)
+            print("PlaybackIOPreferenceArmEnd schema=1 armID=\(armID) helperReturned=true requestedSeconds=\(seconds) requestedIsActual=false")
+        }
+        #else
+        XCTFail("Actual I/O preference callback coverage requires DEBUG")
+        #endif
+    }
+
+    func testLargeOfflineRenderRequestsPreserveFullBoundariesAndPCMStorage() throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder()
+        let renderer = ContinuousPCMRenderer(sampleRate: 48_000, channels: 2,
+            prefixFrames: 1_024, ringFrames: 1_024, debugRenderAccounting: accounting)
+        let first = (0..<769).flatMap { frame -> [Float] in
+            let value = Float(frame % 17 + 1) / 64
+            return [value, -value]
+        }
+        let second = (0..<511).flatMap { frame -> [Float] in
+            let value = Float(frame % 11 + 1) / 32
+            return [-value, value]
+        }
+        XCTAssertTrue(first.withUnsafeBufferPointer { renderer.source(at: 0).prepare(token: 1, totalFrames: 769, prefix: $0) })
+        XCTAssertTrue(second.withUnsafeBufferPointer { renderer.source(at: 1).prepare(token: 2, totalFrames: 511, prefix: $0) })
+        renderer.setSuccessor(token: 2, for: 1); renderer.setSuccessor(token: 1, for: 2)
+        renderer.select(token: 1, frame: 0); renderer.setSpeakerEnabled(false); renderer.setPlaying(true)
+        let bytes = renderer.retainedPCMMemoryBytes, cycle = first + second
+        let graph = ContinuousAudioGraph(renderer: renderer)
+        defer { graph.engine.stop() }
+        try graph.engine.enableManualRenderingMode(.offline, format: graph.format, maximumFrameCount: 2_048)
+        try graph.engine.start()
+        let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: graph.format, frameCapacity: 2_048))
+        var rendered = 0
+        for requested: AVAudioFrameCount in [1_024, 1_537, 513, 1_024] {
+            XCTAssertEqual(try graph.engine.renderOffline(requested, to: output), .success)
+            XCTAssertEqual(output.frameLength, requested)
+            let channels = try XCTUnwrap(output.floatChannelData)
+            for frame in 0..<Int(requested) {
+                let index = (rendered + frame) * 2 % cycle.count
+                XCTAssertEqual(channels[0][frame], cycle[index], accuracy: 0.000001)
+                XCTAssertEqual(channels[1][frame], cycle[index + 1], accuracy: 0.000001)
+            }
+            rendered += Int(requested)
+            XCTAssertEqual(renderer.retainedPCMMemoryBytes, bytes)
+        }
+        XCTAssertEqual(rendered, 4_098); XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        let counters = try XCTUnwrap(accounting.snapshot())
+        XCTAssertFalse(counters.overflowed)
+        XCTAssertEqual(counters.sourceCallbacksEntered, counters.sourceCallbacksCompleted)
+        XCTAssertEqual(counters.sourceFramesRequested, counters.sourceFramesCompleted)
+        XCTAssertEqual(counters.sourceFramesCompleted, counters.kernelFramesRequested)
+        XCTAssertEqual(counters.kernelFramesRequested, counters.copiedPCMFrames)
+        XCTAssertGreaterThanOrEqual(counters.copiedPCMFrames, UInt64(rendered))
+        XCTAssertEqual(counters.invalidLayoutFrames, 0); XCTAssertEqual(counters.underrunFrames, 0)
+        print("LargeOfflineRenderBoundary schema=1 outputFrames=\(rendered) maximumRequestFrames=1537 maximumActualSourceFrames=\(graph.maximumRenderFrameCount) retainedPCMBytes=\(bytes) expectedFullTailsAndHeads=true allOutputSamplesChecked=true physicalOutput=false sourceCallbackQuantumScope=observed-not-assumed")
+        #else
+        XCTFail("Actual source-node large-render regression requires DEBUG")
+        #endif
     }
 
     func testProductionNativeAudioSuppressionPreservesRetainedVideoAndPCM() async throws {
@@ -4373,8 +4485,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 nativeReaderWaitSampling: Bool? = nil,
                                                 initialVideoPolling: Bool? = nil,
                                                 queuedPreviousAdvance: Bool? = nil,
-                                                readyNotificationTiming: Bool? = nil) async throws {
+                                                readyNotificationTiming: Bool? = nil,
+                                                actualSessionActivation: Bool = false,
+                                                requestedIOBufferDuration: TimeInterval? = nil) async throws {
         if recordHost { try recordRuntimeHost() }
+        if actualSessionActivation {
+            print("PlaybackIOSessionScope schema=1 actualSystemActivation=true requestedSeconds=\(requestedIOBufferDuration.map { String($0) } ?? "unchanged") requestBeforeCurrentSetActiveCall=\(requestedIOBufferDuration != nil) priorSessionState=not-queried explicitSessionCycle=false actualValues=existing-cached-journal noNewRealtimeQueries=true productionIOPolicy=unchanged")
+        }
+        if let duration = requestedIOBufferDuration {
+            guard actualSessionActivation, duration == 0.010 || duration == 0.020 else {
+                XCTFail("I/O preference trials require actual activation and an explicit 10 or 20 ms request")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
         if nativeInitialStartUsesSynchronizedHost != nil && initialNativeStartCurrentItemTime != true {
             XCTFail("Host comparison requires the existing eligible current-item-time control")
             throw SelectionVideoTestFailure.timeout
@@ -4855,9 +4978,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
         let service: PlaybackService
         if traceVideoSeeks {
-            service = fixture.service(buffer: monitorBuffer, continuousAudio: audio, seekVideo: seeks.seek)
+            service = fixture.service(buffer: monitorBuffer, continuousAudio: audio, seekVideo: seeks.seek,
+                actualSessionActivation: actualSessionActivation)
         } else {
-            service = fixture.service(buffer: monitorBuffer, continuousAudio: audio)
+            service = fixture.service(buffer: monitorBuffer, continuousAudio: audio,
+                actualSessionActivation: actualSessionActivation)
         }
         #if DEBUG
         if let enabled = readyNotificationTiming { service.debugReadyNotificationTiming = enabled }
@@ -5180,7 +5305,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 }
                 #endif
                 switch phase {
-                case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+                case 0:
+                    if let duration = requestedIOBufferDuration {
+                        // This trial-only request precedes real activation and all audible output.
+                        // It is included in cold startup; existing warm measurements stay untouched.
+                        try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(duration)
+                    }
+                    service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
                 case 1: service.next()
                 default:
                     #if DEBUG
@@ -6266,7 +6397,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let skew = zip(samples, samples.dropFirst()).map { before, after in
             abs(Double(after.audio.frame - before.audio.frame) / 48_000 - Double(after.end - before.end) / 1_000_000_000)
         }.max() ?? .infinity
-        let tolerance = 2 * Double(max(1, value.quantum)) / 48_000 + 0.005
+        let tolerance = min(2 * Double(max(1, value.quantum)) / 48_000 + 0.005,
+                            2 * 512.0 / 48_000 + 0.005)
         print("ProductionSelectionStream phase=\(value.phase) seconds=8 samples=\(samples.count) rendererCoherentSamples=\(samples.count) firstMs=\((elapsed.first ?? .infinity) * 1_000) lastMs=\((elapsed.last ?? -1) * 1_000) maximumGapMs=\((gaps.max() ?? .infinity) * 1_000) maximumAcquisitionMs=\(acquisition * 1_000) wallSeconds=\(wall) pcmSeconds=\(pcm) maximumSkewMs=\(skew * 1_000) toleranceMs=\(tolerance * 1_000) quantum=\(value.quantum) dropped=\(result.dropped) acquisitionOutstanding=\(result.acquisitionOutstanding) baselineToken=\(value.baseline.token) finalToken=\(value.final.token) baselineVisit=\(value.baseline.visit) finalVisit=\(value.final.visit) baselineFrame=\(value.baseline.frame) finalFrame=\(value.final.frame) baselineUnderruns=\(value.baseline.underrunFrames) finalUnderruns=\(value.final.underrunFrames) retainedPCMBytes=\(value.memoryBytes) sameStorage=\(value.sameStorage) producerTracing=absent")
         #if DEBUG
         if result.snapshotReadWitnessEnabled {
@@ -11305,7 +11437,8 @@ private final class SelectionPreviousBundleControl {
         let samples = result.samples
         let wall = Double(end.returned - start.returned) / 1_000_000_000
         let pcm = Double(end.audio.frame - start.audio.frame) / 48_000
-        let tolerance = 2 * Double(max(1, leadQuantum)) / 48_000 + 0.005
+        let tolerance = min(2 * Double(max(1, leadQuantum)) / 48_000 + 0.005,
+                            2 * 512.0 / 48_000 + 0.005)
         let endpointAcquisitions: [Double] = [start, end].map { endpoint in
             let span: UInt64 = endpoint.returned - endpoint.entry
             return Double(span) / 1_000_000_000.0
@@ -12753,15 +12886,19 @@ final class SelectionVideoFixture {
     }
 
     func service(buffer: PlaybackBuffer? = nil, continuousAudio: ContinuousAudioPlayer? = nil,
-                 seekVideo: PlaybackService.SeekVideo? = nil) -> PlaybackService {
+                 seekVideo: PlaybackService.SeekVideo? = nil,
+                 actualSessionActivation: Bool = false) -> PlaybackService {
+        let activate: () throws -> Void = {
+            if actualSessionActivation { try AVAudioSession.sharedInstance().setActive(true) }
+        }
         let result: PlaybackService
         if let seekVideo {
             result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
-                                     bookmarkURL: bookmark, activateSession: {}, buffer: buffer,
+                                     bookmarkURL: bookmark, activateSession: activate, buffer: buffer,
                                      continuousAudio: continuousAudio, seekVideo: seekVideo)
         } else {
             result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
-                                     bookmarkURL: bookmark, activateSession: {}, buffer: buffer, continuousAudio: continuousAudio)
+                                     bookmarkURL: bookmark, activateSession: activate, buffer: buffer, continuousAudio: continuousAudio)
         }
         result.speakerSound = false
         result.automaticPiP = false

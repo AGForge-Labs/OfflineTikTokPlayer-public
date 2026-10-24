@@ -1,0 +1,10 @@
+# Playback I/O margin implementation
+
+Root is sole editor/executor; reused queued_start_review is read-only. Current400540 failure and cached10ms I/O values are baseline RED evidence, not a claim that a new test already ran on Windows/baseline.
+
+1. Preserve exact600-frame/phase0 failures and existing actual-I/O journal rows; verify Graph/renderer equivalence to the retained780-frame source-gap evidence.
+2. Before production edit, add an actual large offline render/full-tail/head/storage regression and cap all dynamic progress limits at the original26.333333ms ceiling.
+3. The existing fixture stubs explicit activation. Keep old defaults, add opt-in real session activation to the fixture/benchmark, and compare10ms/20ms in both orders using constant existing callback traces. Add a real-activation stock case with no I/O override. Request inside the cold command before activation; preserve warm measurement/cleanup code. Restore the prior preferred duration outside measurement after acknowledged arm cleanup; on uncertain cleanup withhold the SDK request and fail explicitly. Do not change production I/O yet; the unpublished proposed App patch is retained locally.
+4. Serial DEBUG/Release syntax/project/inventory/source/whitespace checks and independent read-only review; freeze exact test-only source. New large-render test is capacity/continuity coverage, not a claimed baseline failure.
+5. Run one free standard unsigned Mac worker/jobs1: unchanged default, large offline regression, real-activation stock control, and counterbalanced I/O trials. Preserve all timing,identity,output,resource,coverage and cleanup gates. No audio-track comparison repeat or new real-time instrumentation.
+6. Recover structured receipts, actual I/O readback/callback quantum and the callback/tap interval at any real zero. Make one bounded policy decision: no buffering benefit if ignored, no universal fix from nonrecurrence. Only a supported result permits the optional20ms production request, followed by final-source pause/interruption/native/UI/unsignedRelease and device verification. Continue remaining Next/gap repair. No release.
