@@ -2,8 +2,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=217b9fae2c604e1a9f6de8197dc2ca9085ca30ae
-expected_ios_tree=5ad179beea2ef0b53374e1340ca5f731eee56c7a
+expected_code_source=542e67586f52fc422279d60453fe66510edc647b
+expected_ios_tree=10f43d3541dea3b5f8720a6e1835eb9656809fa3
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
     ''|*PENDING*|*[!0-9a-f]*) printf '%s\n' 'Final committed source pins required.' >&2; return 2 ;;
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testNativeReaderWaitSamplingOffFirst',
-    'testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption',
-    'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
-    'testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption',
+    'testActualSessionActivationPreservesProductionSelectionAndContinuity',
+    'testPlaybackIOPreferenceTenThenTwentyWithActualActivation',
+    'testPlaybackIOPreferenceTwentyThenTenWithActualActivation',
+    'testLargeOfflineRenderRequestsPreserveFullBoundariesAndPCMStorage',
 )
 
 def require(condition, message):
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testNativeReaderWaitSamplingOffFirst testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption) ;;
+  controls) cases=(testActualSessionActivationPreservesProductionSelectionAndContinuity testPlaybackIOPreferenceTenThenTwentyWithActualActivation testPlaybackIOPreferenceTwentyThenTenWithActualActivation testLargeOfflineRenderRequestsPreserveFullBoundariesAndPCMStorage) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
