@@ -36,9 +36,27 @@ final class PlaybackContinuityTests: XCTestCase {
         let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
             bookmarkURL: fixture.bookmark, activateSession: {})
         defer { service.pause() }
+        var requestedDuringReady = false
+        var readySeekFromVersion = 0
+        var hostStartsDuringPendingSeek = 0
+        service.onPlaybackEvent = { [weak service] event in
+            guard let service else { return }
+            if event.name == "itemReady", !requestedDuringReady {
+                requestedDuringReady = true
+                readySeekFromVersion = service.audioSnapshot.selectionVersion
+                // Run synchronously inside the ready callback, before its zero
+                // startup decision. The audio acknowledgement is still pending.
+                service.seek(0.4)
+            } else if event.name == "videoHostClockStarted", requestedDuringReady {
+                hostStartsDuringPendingSeek += 1
+            }
+        }
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.ids[0])
-        try await until { service.audioSnapshot.frame > 2_400 }
+        try await until { requestedDuringReady && service.audioSnapshot.selectionVersion >= readySeekFromVersion + 2
+            && service.audioSnapshot.frame > 2_400 }
+        XCTAssertEqual(hostStartsDuringPendingSeek, 0,
+                       "A pending explicit playing seek must suppress the zero-position startup anchor")
         let priorVersion = service.audioSnapshot.selectionVersion
         service.seek(0.8)
         let requestedAt = ProcessInfo.processInfo.systemUptime
