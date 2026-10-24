@@ -5,7 +5,7 @@ import Synchronization
 import PlayerCore
 
 /// One serial worker owns converters, preparation and renderer publication.
-/// Three fixed native-reader lanes own every AVAssetReader operation. Leases
+/// Three fixed native-reader lanes own every native file/asset-reader operation. Leases
 /// include retired/blocked sessions; a permit is reusable only after lane close.
 /// Each lease has one mailbox/pending packet slot (<=128 KiB at eight channels).
 /// Budget two owned payloads per lease for an old local Array binding overlapping
@@ -330,6 +330,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let endTime: CMTime
         let nativeRate: Double
         let nativeChannels: UInt32
+        let filePresentation: AudioFilePresentation?
         #if DEBUG
         var debugReadToken = 0
         var debugAdmissionAssetID = 0
@@ -338,18 +339,20 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?
         #endif
         #if DEBUG
-        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32,
+        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32, filePresentation: AudioFilePresentation?,
              debugNativeLaneActivityRecorder: DebugNativeLaneActivityRecorder?) {
             self.debugNativeLaneActivityRecorder = debugNativeLaneActivityRecorder
             self.asset = asset; self.track = track; self.totalFrames = totalFrames
             self.endTime = endTime
             self.nativeRate = nativeRate; self.nativeChannels = nativeChannels
+            self.filePresentation = filePresentation
         }
         #else
-        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32) {
+        init(asset: AVURLAsset, track: AVAssetTrack?, totalFrames: Int64, endTime: CMTime, nativeRate: Double, nativeChannels: UInt32, filePresentation: AudioFilePresentation?) {
             self.asset = asset; self.track = track; self.totalFrames = totalFrames
             self.endTime = endTime
             self.nativeRate = nativeRate; self.nativeChannels = nativeChannels
+            self.filePresentation = filePresentation
         }
         #endif
     }
@@ -440,7 +443,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     /// cancellation is attempted. Completions transfer owned scalar/Float data.
     private final class ReaderLane: @unchecked Sendable {
         private let queue: DispatchQueue
-        private var reader: NativeReader?
+        private var reader: (any NativePCMReading)?
         private var buffer: AVAudioPCMBuffer?
         #if DEBUG
         private let index: Int
@@ -462,10 +465,38 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         #if DEBUG
                         debugActivity = description.debugNativeLaneActivityRecorder?.record(at: index)
                         debugActivity?.publish(.construction)
-                        let created = try NativeReader(description: description, readStartFrame: readStartFrame, debugActivity: debugActivity)
+                        #endif
+                        let created: any NativePCMReading
+                        if let layout = description.filePresentation,
+                           let fileReader = NativeAudioFileReader.open(url: description.asset.url,
+                               totalFrames: description.totalFrames, readStartFrame: readStartFrame,
+                               matchesPacketTable: { priming, valid in
+                                   layout.matches(primingFrames: priming, validFrames: valid,
+                                       presentationFrames: description.totalFrames)
+                               }) {
+                            #if DEBUG
+                            let activity = debugActivity, gate = description.debugReadGate
+                            let token = description.debugReadToken, laneIndex = index
+                            fileReader.beforeRead = {
+                                activity?.recordExecutingThreadBeforeGate()
+                                gate?.beforeCopy(token: token, laneIndex: laneIndex)
+                                activity?.enterCopy()
+                            }
+                            fileReader.afterRead = {
+                                activity?.publish(.copyReturned)
+                                activity?.publish(.parser)
+                            }
+                            #endif
+                            created = fileReader
+                        } else {
+                            #if DEBUG
+                            created = try NativeReader(description: description, readStartFrame: readStartFrame, debugActivity: debugActivity)
+                            #else
+                            created = try NativeReader(description: description, readStartFrame: readStartFrame)
+                            #endif
+                        }
+                        #if DEBUG
                         debugActivity?.publish(.constructionReturned)
-                        #else
-                        let created = try NativeReader(description: description, readStartFrame: readStartFrame)
                         #endif
                         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                             sampleRate: description.nativeRate, channels: description.nativeChannels,
@@ -688,20 +719,43 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         let frames = try Self.frame(end)
         guard frames > 0 else { throw Failure.invalidTimeline }
         var nativeRate = 48_000.0, nativeChannels: UInt32 = 2
+        var canUseAudioFile = false
         if let selected {
             let formats = try await selected.load(.formatDescriptions)
             guard let format = formats.first, let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format),
                   asbd.pointee.mSampleRate.isFinite, asbd.pointee.mSampleRate > 0,
                   (1...8).contains(asbd.pointee.mChannelsPerFrame) else { throw Failure.unsupportedPCM }
             nativeRate = asbd.pointee.mSampleRate; nativeChannels = asbd.pointee.mChannelsPerFrame
+            canUseAudioFile = formats.count == 1 && nativeRate == 48_000 && nativeChannels == 2
+                && asbd.pointee.mFormatID == kAudioFormatMPEG4AAC
         }
+        // Only exact, single, unscaled native-grid AAC mappings can opt in.
+        // The lane then checks these primitives against the actual codec packet table.
+        func exactAudioFrame(_ time: CMTime) -> Int64? {
+            guard time.isNumeric, CMTimeCompare(time, .zero) >= 0 else { return nil }
+            let scaled = CMTimeConvertScale(time, timescale: 48_000, method: .roundHalfAwayFromZero)
+            guard scaled.isNumeric, CMTimeCompare(time, scaled) == 0 else { return nil }
+            return scaled.value
+        }
+        let filePresentation: AudioFilePresentation?
+        if canUseAudioFile, tracks.count == 1, let selected,
+           let segments = try? await selected.load(.segments), segments.count == 1,
+           let segment = segments.first, !segment.isEmpty,
+           CMTimeCompare(segment.timeMapping.source.duration, segment.timeMapping.target.duration) == 0,
+           let sourceStart = exactAudioFrame(segment.timeMapping.source.start),
+           let sourceFrames = exactAudioFrame(segment.timeMapping.source.duration),
+           let targetStart = exactAudioFrame(segment.timeMapping.target.start),
+           let targetFrames = exactAudioFrame(segment.timeMapping.target.duration) {
+            filePresentation = AudioFilePresentation(sourceStart: sourceStart, sourceFrames: sourceFrames,
+                targetStart: targetStart, targetFrames: targetFrames)
+        } else { filePresentation = nil }
         #if DEBUG
         let description = Description(asset: asset, track: selected, totalFrames: frames, endTime: end,
-            nativeRate: nativeRate, nativeChannels: nativeChannels,
+            nativeRate: nativeRate, nativeChannels: nativeChannels, filePresentation: filePresentation,
             debugNativeLaneActivityRecorder: debugNativeLaneActivityRecorder)
         #else
         let description = Description(asset: asset, track: selected, totalFrames: frames, endTime: end,
-            nativeRate: nativeRate, nativeChannels: nativeChannels)
+            nativeRate: nativeRate, nativeChannels: nativeChannels, filePresentation: filePresentation)
         #endif
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler {
@@ -1524,7 +1578,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     /// Preserve native PCM sample counts; only explicit codec trim attachments
     /// may remove samples. Timestamps place edits/gaps on the source timeline.
-    private final class NativeReader {
+    private final class NativeReader: NativePCMReading {
         private let reader: AVAssetReader
         private let output: AVAssetReaderTrackOutput
         #if DEBUG

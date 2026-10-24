@@ -201,6 +201,72 @@ struct AudioFileCapabilityProbe {
         return row["qualified"] as? Bool == true
     }
 
+    static func candidate(url: URL, reference: [Float], start: Int64, target: Int64,
+                          compareFrames: Int64) -> Bool {
+        var row: [String: Any] = ["schema": 1, "candidate": true, "startFrame": start,
+            "targetFrame": target, "compareFrames": compareFrames, "iOSQualification": false,
+            "scope": "actual-native-aac-file-reader", "playbackAcceptance": false]
+        do {
+            let metrics: [String: Any] = try autoreleasepool { () throws -> [String: Any] in
+                let layout = AudioFilePresentation(sourceStart: 1_024, sourceFrames: 1_440_000,
+                    targetStart: 0, targetFrames: 1_440_000)
+                guard let reader = NativeAudioFileReader.open(url: url, totalFrames: 1_440_000,
+                    readStartFrame: start, matchesPacketTable: { priming, valid in
+                        layout.matches(primingFrames: priming, validFrames: valid, presentationFrames: 1_440_000)
+                    }),
+                    let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                        channels: 2, interleaved: true),
+                    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_096) else {
+                    throw NSError(domain: "CandidateOpen", code: 1)
+                }
+                let end = target + compareFrames
+                var cursor = start, compared: Int64 = 0, reads = 0, nonfinite = 0
+                var firstMismatch = -1
+                var maximumDifference: Float = 0
+                while cursor < end {
+                    let count = try reader.read(into: buffer, maximumFrames: Int(min(4_096, end - cursor)))
+                    reads += 1
+                    guard count > 0, let channels = buffer.floatChannelData else {
+                        throw NSError(domain: "CandidateRead", code: 1)
+                    }
+                    let from = max(cursor, target)
+                    let through = min(cursor + Int64(count), end)
+                    if from < through {
+                        for frame in from..<through {
+                            for channel in 0..<2 {
+                                let index = Int(frame) * 2 + channel
+                                let actual = channels[0][Int(frame - cursor) * 2 + channel]
+                                let expected = reference[index]
+                                let difference: Float = actual.isFinite ? abs(actual - expected) : .infinity
+                                if !actual.isFinite { nonfinite += 1 }
+                                if difference.isFinite { maximumDifference = max(maximumDifference, difference) }
+                                if difference > 0.000_001, firstMismatch < 0 { firstMismatch = index }
+                            }
+                        }
+                        compared += through - from
+                    }
+                    cursor += Int64(count)
+                }
+                var eofRead = -1
+                let shouldEnd = end == 1_440_000
+                if shouldEnd { eofRead = try reader.read(into: buffer, maximumFrames: 4_096) }
+                let qualified = cursor == end && compared == compareFrames && firstMismatch < 0
+                    && nonfinite == 0 && reader.reachedEnd == shouldEnd && (!shouldEnd || eofRead == 0)
+                    && (start == 0 || reads <= 192)
+                return ["qualified": qualified, "cursor": cursor, "comparedFrames": compared,
+                    "reads": reads, "firstMismatchSample": firstMismatch, "maximumDifference": maximumDifference,
+                    "nonfiniteSamples": nonfinite, "eofRead": eofRead, "reachedEnd": reader.reachedEnd,
+                    "referenceFrames": reference.count / 2, "tolerance": 0.000_001]
+            }
+            row.merge(metrics) { _, new in new }
+        } catch {
+            row["qualified"] = false
+            row["error"] = String(describing: error)
+        }
+        do { try report(row) } catch { return false }
+        return row["qualified"] as? Bool == true
+    }
+
     static func main() async throws {
         let directory = URL(fileURLWithPath: "artifacts/native", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -230,9 +296,14 @@ struct AudioFileCapabilityProbe {
             movies.append(attempt(label: "original-30s-native48k-stereo-mp4", url: movie,
                 configured: configured, expectedFrames: 1_440_000, exactControl: false, reference: reference))
         }
+        let candidates = [
+            candidate(url: movie, reference: reference, start: 0, target: 0, compareFrames: 1_440_000),
+            candidate(url: movie, reference: reference, start: 26 * 48_000, target: 28 * 48_000, compareFrames: 512),
+            candidate(url: movie, reference: reference, start: 5 * 48_000, target: 7 * 48_000, compareFrames: 512)
+        ]
         try report(["schema": 1, "summary": true, "controlsQualified": controls.allSatisfy { $0 },
             "movieModesQualified": movies, "scope": "macOS-complete-native48k-stereo-reference",
-            "iOSQualification": false, "movieFidelityCompared": true, "playbackAcceptance": false])
-        exit(controls.allSatisfy { $0 } && movies.allSatisfy { $0 } ? EXIT_SUCCESS : EXIT_FAILURE)
+            "iOSQualification": false, "movieFidelityCompared": true, "candidateQualified": candidates.allSatisfy { $0 }, "playbackAcceptance": false])
+        exit(controls.allSatisfy { $0 } && movies.allSatisfy { $0 } && candidates.allSatisfy { $0 } ? EXIT_SUCCESS : EXIT_FAILURE)
     }
 }

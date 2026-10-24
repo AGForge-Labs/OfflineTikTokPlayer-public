@@ -586,3 +586,39 @@ rather than assuming AVAudioFile applies every possible movie edit. Full sample
 comparison/controls/read bounds remain identical. Candidate scope is initially
 simple native48k stereo AAC only, with other layouts/edits/codecs preserving the
 existing native reader. Original whole-goal scope remains; this is not its completion.
+
+### Candidate: conservative native AAC file-reader path
+
+Mac23 run40126190417/job120968010697 on ef41840 succeeds. Complete sample equality
+remains maxDifference0; one audio segment has sourceStart1024/48000, source/target
+duration30,targetStart0. CoreAudio packetTable status0, valid1440000/priming1024/
+remainder768. Artifact12573241910/885bytes/
+b1e94470f3c40c9e21386e8173c8277372ab5d4b37715c6e746026c67ebef5c7 verified.
+
+AudioFilePresentation canonical RED observed with always-rejecting API scaffold;
+nine edit/offset/incomplete cases already reject. Implemented exact native-frame/
+codec-priming/valid-frame agreement, focused2tests and complete125core pass locally
+(1.403s test runtime). This is source/policy evidence, not Apple graph qualification.
+
+New NativeAudioFileReader.swift owns only a native48k stereo AAC file in the same
+ReaderLane. Exact one-track/single-format/unscaled/nonempty/native-grid metadata,
+packet-table agreement, precise complete endpoint and exact processing format are
+required. Unknown/edited/other-format sources retain NativeReader unchanged.
+Open/seek/read/release stay lane-owned; no reader or borrowed buffer crosses it.
+Read count is bounded4096/remaining, positive progress/position checked, zero only
+at declaredEOF, no sample padding/trimming. Existing C++prefix/ring/leases and
+owned packet budgets unchanged. Debug read gate/stages are preserved with closures
+that retain only existing record/gate/scalar values, never a lane/reader cycle.
+No cloud/Saved/cache, playback intent, queue, DSP, background or PiP policy changes.
+
+Ruling: separate the actual SDK reader source so the small Mac probe compiles and
+exercises that exact component plus the real pure policy, optimized without DEBUG,
+before the full iOS check. Probe compares complete1440000frames plus distant28s/7s
+seeks with original2s preroll, <=192read work, exactEOF and1e-6 samples. Metadata
+adapter/full app/DEBUG hooks are not proven by this smaller component check.
+
+Local Swift syntax, generated project and profile73 checks pass. Every prior72case
+remains, plus the existing edited-offset/4800leading-silence regression. Full native
+manifest remains296, with125portable tests. App runtime is now a candidate change,
+not a causal-fix or TestFlight claim. Original waits,740ms silence,250ms video/3s
+preparation failures and full release/HTTP/phone acceptance remain open until checked.

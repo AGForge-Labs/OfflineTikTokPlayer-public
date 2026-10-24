@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   ios:
-    name: macOS audio-file API probe only
+    name: macOS AAC reader component only
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.ref == 'refs/heads/diagnostic/gapless-profile' && inputs.approve_runner }}
     runs-on: macos-26
     timeout-minutes: 15
@@ -26,11 +26,11 @@ jobs:
         run: |
           git rev-parse HEAD
           xcodebuild -version
-      - name: Standalone macOS API probe (not iOS playback acceptance)
+      - name: Actual AAC reader component (not iOS playback acceptance)
         run: |
           set -euo pipefail
           mkdir -p artifacts/native
-          swiftc -parse-as-library -swift-version 5 scripts/probe-audio-file.swift -o artifacts/native/audio-file-probe
+          swiftc -O -parse-as-library -swift-version 5 scripts/probe-audio-file.swift ios/OfflineTikTokPlayer/Playback/NativeAudioFileReader.swift ios/PlayerCore/Sources/PlayerCore/AudioFilePresentation.swift -o artifacts/native/audio-file-probe
           artifacts/native/audio-file-probe 2>&1 | tee artifacts/native/audio-file-probe.log
       - name: Preserve synthetic native evidence briefly
         if: always()
