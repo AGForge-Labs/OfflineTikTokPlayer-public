@@ -1103,6 +1103,7 @@
 					"@executable_path/Frameworks",
 				);
 				"GENERATE_INFOPLIST_FILE" = "YES";
+				"OTHER_SWIFT_FLAGS" = "$(inherited) $(PLAYBACK_TEST_SWIFT_FLAGS)";
 				"TEST_HOST" = "$(BUILT_PRODUCTS_DIR)/OfflineTikTokPlayer.app/OfflineTikTokPlayer";
 				"BUNDLE_LOADER" = "$(TEST_HOST)";
 				"SWIFT_OBJC_BRIDGING_HEADER" = "OfflineTikTokPlayerTests/PrerollNativeAttachProbe.h";
@@ -1130,6 +1131,7 @@
 					"@executable_path/Frameworks",
 				);
 				"GENERATE_INFOPLIST_FILE" = "YES";
+				"OTHER_SWIFT_FLAGS" = "$(inherited) $(PLAYBACK_TEST_SWIFT_FLAGS)";
 				"TEST_HOST" = "$(BUILT_PRODUCTS_DIR)/OfflineTikTokPlayer.app/OfflineTikTokPlayer";
 				"BUNDLE_LOADER" = "$(TEST_HOST)";
 				"SWIFT_OBJC_BRIDGING_HEADER" = "OfflineTikTokPlayerTests/PrerollNativeAttachProbe.h";
@@ -1218,6 +1220,7 @@
 					"@executable_path/Frameworks",
 				);
 				"GENERATE_INFOPLIST_FILE" = "YES";
+				"OTHER_SWIFT_FLAGS" = "$(inherited) $(PLAYBACK_TEST_SWIFT_FLAGS)";
 				"TEST_TARGET_NAME" = "OfflineTikTokPlayer";
 				"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
 				"ONLY_ACTIVE_ARCH" = "YES";
@@ -1241,6 +1244,7 @@
 					"@executable_path/Frameworks",
 				);
 				"GENERATE_INFOPLIST_FILE" = "YES";
+				"OTHER_SWIFT_FLAGS" = "$(inherited) $(PLAYBACK_TEST_SWIFT_FLAGS)";
 				"TEST_TARGET_NAME" = "OfflineTikTokPlayer";
 				"SWIFT_OPTIMIZATION_LEVEL" = "-O";
 				"ONLY_ACTIVE_ARCH" = "NO";

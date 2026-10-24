@@ -1547,7 +1547,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     /// Real mixer output and actual custom-layer submission, without screenshot or SDK-position probes.
     /// This is selected-frame readiness evidence, not compositor pixels or physical speaker output.
     func testProductionSelectionLatencyAndStreamingContinuityWithoutCapture() async throws {
-        try await runProductionSelectionBenchmark(traceVideoSeeks: true)
+        // Reuse existing ordinary-clock observers; no new native getters or case.
+        try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true)
     }
 
     func testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture() async throws {
@@ -9747,13 +9748,28 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause() async throws {
         let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
-        let service = fixture.service()
+        let audio = ContinuousAudioPlayer()
+        let service = fixture.service(continuousAudio: audio)
+        #if DEBUG
+        service.debugInitialLoadPhaseEnabled = true
+        #endif
         let screen = try SelectionVideoScreen(service: service)
         defer { service.pause(); screen.close() }
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
-        try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 },
-                          "Both Saved sources must be prepared before rapid supersession")
+        do {
+            try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 },
+                              "Both Saved sources must be prepared before rapid supersession")
+        } catch {
+            #if DEBUG
+            // Failure-only snapshots preserve the original three-second guard.
+            let load = service.debugInitialLoadPhaseState, prep = audio.debugPreparationState
+            print("RapidPreparationFailure schema=1 preparedCount=\(service.preparedAudioCount) audioRunning=\(service.audioEngineRunning) wantsToPlay=\(service.wantsToPlay) loading=\(service.isLoading) videoReady=\(service.isVideoReady) loadRequest=\(load.request) generation=\(load.generation) loadPhase=\(load.phase.rawValue) activeCalls=\(prep.activeCalls) sharedTasks=\(prep.sharedTasks) reservedSlots=\(prep.reservedSlots) nextToken=\(prep.nextToken) counterOverflowed=\(prep.counterOverflowed) deadlineSeconds=3")
+            await recordNaturalRunwayFailure(audio: audio, expectedToken: audio.snapshot.token,
+                                            stage: "rapid-initial-preparation")
+            #endif
+            throw error
+        }
         await assertMovingVisibleVideo(service, screen: screen, identity: .a, label: "rapid-baseline-A")
         let aToken = service.audioSnapshot.token
         let priorSelectionVersion = service.audioSnapshot.selectionVersion

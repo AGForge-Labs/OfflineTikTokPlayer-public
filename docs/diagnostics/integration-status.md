@@ -136,3 +136,23 @@ and unoptimized profile modes remain unchanged. Actual SDK compiler flags must b
 read back before treating a result as optimized; a clean comparison would not prove
 causality or replace full Release/device acceptance. App/media code is unchanged.
 Apple performance guidance: https://developer.apple.com/documentation/xcode/writing-and-running-performance-tests
+
+
+Run8 on898a16a reached the15-minute provider cap. All68 identities emitted results,
+but the owned command/verifier did not complete: whole-run acceptance failed.
+123core/65native/1UI passed; two native cases failed. Both actual8-second audio
+windows recorded384000frames/400tones and zero stereo-zero/quiet/drop/underrun
+results. Default B193.175ms and returnedA88.613ms pass; traced B392.476ms fails250ms;
+rapid A/B/A initial preparation fails the original3s guard. Earlier zero-output
+failures remain valid evidence. This is not a new TestFlight or phone result.
+
+The next check keeps production Swift unchanged and the exact68-case profile.
+App and PlayerCore retain-O/DEBUG; only test targets receive an appended-Onone
+flag to avoid spending roughly184s optimizing test harnesses. Actual returned
+compiler commands must verify that scope/order. Default modes do not request
+the test-only override. The existing traced benchmark enables its already-defined
+ordinary-clock observer bundle without additional SDK reads or a new case.
+The original rapid case now prints existing load/preparation/worker state only
+once its unchanged3s predicate fails. No startup-policy, source sample, silence,
+progress, compositor or timeout criterion is relaxed. Public source/free unsigned
+checks remain the only newly authorized hosted actions.

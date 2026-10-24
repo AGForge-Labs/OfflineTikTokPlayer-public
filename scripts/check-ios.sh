@@ -36,8 +36,8 @@ fi
 # retains DEBUG hooks and exactly the same source-validated cases/assertions.
 # Actual compiler commands must be checked before claiming optimized evidence.
 if [ "$optimized_playback" -eq 1 ]; then
-  set -- "$@" SWIFT_OPTIMIZATION_LEVEL=-O
-  printf '%s\n' 'NativePlaybackBuildMode schema=1 optimized=true requestedSwiftOptimization=-O debugHooks=retained caseProfile=unchanged acceptance=unchanged'
+  set -- "$@" SWIFT_OPTIMIZATION_LEVEL=-O PLAYBACK_TEST_SWIFT_FLAGS=-Onone
+  printf '%s\n' 'NativePlaybackBuildMode schema=2 optimized=true requestedSwiftOptimization=-O testOnlySwiftFlags=-Onone debugHooks=retained caseProfile=unchanged acceptance=unchanged'
 fi
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode 26 or later on macOS is required.' >&2; exit 2; }
 # Print the selected driver's plan only; no compilation is executed by this probe.

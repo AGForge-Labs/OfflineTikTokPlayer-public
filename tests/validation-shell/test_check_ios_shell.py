@@ -176,7 +176,9 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
                 self.assertEqual(actual[actual.index(limit) + 1], "120")
             if arguments == ("--optimized-playback-acceptance",):
                 self.assertEqual(actual.count("SWIFT_OPTIMIZATION_LEVEL=-O"), 1)
+                self.assertEqual(actual.count("PLAYBACK_TEST_SWIFT_FLAGS=-Onone"), 1)
             else:
+                self.assertFalse(any(arg.startswith("PLAYBACK_TEST_SWIFT_FLAGS=") for arg in actual))
                 self.assertFalse(any(arg.startswith("SWIFT_OPTIMIZATION_LEVEL=") for arg in actual),
                     "Existing full/profile modes must keep their original configuration")
             self.assertIn("CODE_SIGNING_ALLOWED=NO", actual)
@@ -216,6 +218,25 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
         expected = {"-only-testing:" + identity.replace(".", "/", 1) for identity in profile["cases"]}
         self.assertEqual({arg for arg in arguments if arg.startswith("-only-testing:")}, expected)
         self.assertEqual(arguments.count("SWIFT_OPTIMIZATION_LEVEL=-O"), 1)
+
+    def test_codegen_override_is_scoped_to_test_targets(self):
+        import importlib.util
+        from unittest.mock import patch
+        spec = importlib.util.spec_from_file_location("project_generator", ROOT / "scripts/generate-ios-project.py")
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        # Inspect the generated build graph, without editing the checked-in project.
+        with patch.object(generator, "encode", side_effect=json.dumps):
+            raw, _ = generator.generate()
+        objects = json.loads(raw.split("\n", 1)[1])["objects"]
+        for target in ("project", generator.APP, generator.APP + "Tests", generator.APP + "UITests"):
+            for configuration in ("Debug", "Release"):
+                settings = objects[generator.identity("config:" + target + configuration)]["buildSettings"]
+                if target.endswith("Tests"):
+                    self.assertEqual(settings.get("OTHER_SWIFT_FLAGS"), "$(inherited) $(PLAYBACK_TEST_SWIFT_FLAGS)")
+                else:
+                    self.assertNotIn("PLAYBACK_TEST_SWIFT_FLAGS", json.dumps(settings))
+                self.assertEqual(settings["SWIFT_OPTIMIZATION_LEVEL"], "-Onone" if configuration == "Debug" else "-O")
 
     def test_optimized_profile_preserves_native_and_output_failures(self):
         self.exercise(("--optimized-playback-acceptance",), status=65)

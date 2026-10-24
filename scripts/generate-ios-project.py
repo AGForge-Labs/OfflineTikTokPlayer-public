@@ -86,6 +86,9 @@ def generate():
                             CODE_SIGN_ENTITLEMENTS=APP + "/Support/OfflineTikTokPlayer.entitlements",
                             ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon", ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME="AccentColor")
         else:
+            # Opt-in diagnostics may avoid optimizing test harnesses. PlayerCore
+            # and application targets never inherit this test-only driver flag.
+            settings["OTHER_SWIFT_FLAGS"] = "$(inherited) $(PLAYBACK_TEST_SWIFT_FLAGS)"
             proxy = add("proxy:" + name, "PBXContainerItemProxy", containerPortal=identity("project"), proxyType=1,
                         remoteGlobalIDString=identity("target:" + APP), remoteInfo=APP)
             deps = [add("dependency:" + name, "PBXTargetDependency", target=identity("target:" + APP), targetProxy=proxy)]
