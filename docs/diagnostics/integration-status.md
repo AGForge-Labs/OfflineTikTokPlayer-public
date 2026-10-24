@@ -276,3 +276,56 @@ and underruns while exact decoded sample concatenation is tested in the offline
 graph. Before whole-goal acceptance, live mixer output across repeated complete
 service loops still needs direct comparison, separately from the phone's ten-loop
 acceptance check. No existing loop test or source duration is weakened.
+
+
+### Native14: real returned-A starvation captured
+
+Public run40104440764/job120903091224 on0ac8f07 completed in12m49s,
+owned full-test705121ms/exit65/no timeout.123core/67native/1UI passed.
+Only the traced production-selection case fails (14assertions). The original
+natural preparation/close and rapid cases pass this time, so their earlier
+timeouts remain intermittent and unresolved; the new initial coverage records
+411.329ms to prepared with5bounded samples and no dropped observations.
+
+The traced returned-A8.1s output has35520 consecutive exact stereo-zero frames
+(740ms), at retained frames353280-388800, and only368/405correct tone blocks.
+The renderer reports real starvation: phase2baseline12800/final50688underruns,
+113.633125ms maximum PCM/wall skew, and51200cumulative final underruns. The
+selection window also has250ms quiet; a separate B sampler gap260.847ms fails
+its unchanged250ms bound. These are distinct measurements, not one inferred gap.
+
+The default benchmark stays clean (B168.533ms/A133.383ms,8s384000frames/400tones,
+zero stereo-zero/quiet/drop/timestamp-error/underrun). Four prepared boundaries
+are also clean; complete native B/reference head still match12000frames exactly.
+Those passes do not erase the real traced starvation or earlier zero-output runs.
+No production cause is established yet; do not increase buffers merely to hide
+the finite8s audit or relax existing silence, sample-progress or deadline guards.
+
+Raw SHA2565de2db7b0f9544b7b3dccbc594effe6439d27a5fe12e3aea2900692fe2250412.
+Artifact12564656465/65269419bytes/SHA256
+894a4ceed757d08859df84d212a06fb1a208bcd594a5d4c503e76fa0badb3e61 downloaded
+and checksum verified (1652entries/no named images).
+
+Next70-case candidate retains all69 cases and adds one live repeat-one test.
+It uses the existing unmodified1.2s AAC fixture, a complete single prepared visit
+as reference, and at least ten complete cycles through the same live mixer and
+visible service. All retained mono-projection samples must match a cyclic source
+reference within1e-6; no samples are trimmed. Native stereo-zero counts, sample
+timestamps, visit progress, underruns and stable engine identity also remain
+required. Independent AAC/SRC tests provide separate codec-reference proof.
+Only this case requests a bounded16s tap arena; original cases keep12s and all
+30s A/B fixtures are unchanged. The exact source comparator is locally calibrated
+against shifted phase, encoded zeros, one-frame insertion/deletion/zero replacement,
+nonfinite values and a silent reference. Missing-method RED preceded implementation;
+local syntax/project/profile,17launcher and3focused evidence checks pass. Native
+SDK compilation/execution and physical output are still unverified.
+
+The exact failing clock-observer bundle now reuses the existing first-source-copy
+failure recorder and packed worker/native-lane activity records. Its existing
+100ms render sampler already has fields for these cached values; no extra sampler,
+SDK getter, callback clock or new renderer site is added. Failure-only output after
+cleanup identifies the original guard operands (including access/epoch/read/write)
+and historical packed decoder stages. Default uninstrumented mode stays unchanged.
+This is diagnostic source, not a causal audio repair. App/core implementation,
+source media, original assertions, release scope and delivered build are unchanged.
+No native15 or TestFlight delivery has been inferred from local checks.

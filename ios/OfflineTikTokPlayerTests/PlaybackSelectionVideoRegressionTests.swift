@@ -1551,6 +1551,98 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true)
     }
 
+    func testContinuousRepeatOneTenFullSourceLoopsMatchLiveMixer() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        let calibrated = LoopPCMComparison.calibrationPasses()
+        XCTAssertTrue(calibrated, "The loop oracle must reject a single inserted, dropped or replaced frame")
+        guard calibrated else { throw SelectionVideoTestFailure.timeout }
+        let fixture = try await SelectionVideoFixture(test: self, shortLoopFixture: true)
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        let service = fixture.service(continuousAudio: audio, actualSessionActivation: true)
+        let screen = try SelectionVideoScreen(service: service)
+        let tap = ProductionSelectionOutputTap(capacityFrames: 16 * 48_000)
+        var installed = false, closed = false
+        defer {
+            if !closed {
+                service.pause(); screen.close()
+                if installed { audio.graph.engine.mainMixerNode.removeTap(onBus: 0) }
+            }
+        }
+        audio.setWindow(Set(fixture.ids))
+        let entry = try await audio.prepare(id: fixture.aID, url: try XCTUnwrap(fixture.savedURLs[fixture.aID]))
+        _ = try await audio.prepare(id: fixture.bID, url: try XCTUnwrap(fixture.savedURLs[fixture.bID]))
+        // One complete prepared visit is the reference; it does not execute a loop.
+        // Existing independent AAC/SRC tests separately validate this fixture's PCM.
+        XCTAssertEqual(entry.frames, 57_600, "Keep the entire declared1.2s AAC presentation")
+        guard entry.frames == 57_600, !audio.graph.engine.isRunning else {
+            throw SelectionVideoTestFailure.timeout
+        }
+        var prepared = [Float](repeating: .nan, count: Int(entry.frames) * 2)
+        audio.renderer.select(token: entry.token); audio.renderer.setPlaying(true)
+        prepared.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: Int(entry.frames)) }
+        XCTAssertEqual(audio.renderer.snapshot.frame, entry.frames)
+        XCTAssertEqual(audio.renderer.snapshot.underrunFrames, 0)
+        let reference = stride(from: 0, to: prepared.count, by: 2).map { (prepared[$0] + prepared[$0 + 1]) * 0.5 }
+        XCTAssertTrue(reference.allSatisfy { $0.isFinite })
+        audio.renderer.setPlaying(false); audio.renderer.select(token: 0)
+        var clear = [Float](repeating: .nan, count: 2)
+        clear.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 1) }
+        XCTAssertEqual(audio.renderer.snapshot.token, 0)
+        audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { samples, time in
+            tap.append(samples, time: time)
+        }
+        installed = true
+        service.cycleRepeat(); service.cycleRepeat()
+        service.isInteractingWithFeed = false
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2
+            && service.isVideoReady && !service.isLoading }, "The original3s startup guard applies before live loops")
+        let firstState = audio.snapshot
+        let engine = ObjectIdentifier(audio.graph.engine)
+        let submitted = service.submittedVideoFrameCount
+        let first = tap.begin(auditChannels: true)
+        // Eleven source periods contain at least ten whole cycles at any start phase.
+        let requestedFrames = Int(entry.frames) * 11
+        let captured = await waitUntil(timeout: 15) { tap.count - first >= requestedFrames }
+        let last = tap.stop(), finalState = audio.snapshot
+        let channels = tap.channelAudit()
+        let sameEngine = engine == ObjectIdentifier(audio.graph.engine)
+        let engineRunning = audio.graph.engine.isRunning
+        let selectedA = service.queue.currentID == fixture.aID
+        let visible = service.isVideoReady && screen.customVideoLayer?.isReadyForDisplay == true
+        let videoAdvanced = service.submittedVideoFrameCount > submitted
+        service.pause(); audio.graph.engine.mainMixerNode.removeTap(onBus: 0); installed = false
+        screen.close(); try await fixture.closePlayback(service); closed = true
+        let recorded = tap.samples(from: first, to: last)
+        let validity = tap.validity()
+        let match = LoopPCMComparison.compare(template: reference, recorded: recorded.values)
+        let wholeCycles = max(0, recorded.values.count / reference.count - 1)
+        let hole = ProductionSelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
+        let expectedZeros = match.offset.map { offset in
+            recorded.values.indices.reduce(0) { $0 + (reference[(offset + $1) % reference.count] == 0 ? 1 : 0) }
+        }
+        print("LiveRepeatOnePCM schema=1 calibrated=\(calibrated) captured=\(captured) sourceFrames=\(entry.frames) referenceFrames=\(reference.count) recordedFrames=\(recorded.values.count) wholeCyclesAtLeast=\(wholeCycles) visitDelta=\(finalState.visit - firstState.visit) matched=\(match.matched) comparedFrames=\(match.comparedFrames) alignment=\(match.offset.map { String($0) } ?? "unavailable") candidates=\(match.candidates) overflow=\(match.overflow) rate=\(recorded.rate) stereoZeroFrames=\(channels.stereoZeroFrames) expectedProjectionZeroFrames=\(expectedZeros.map { String($0) } ?? "unavailable") underrunDelta=\(finalState.underrunFrames - firstState.underrunFrames) sameEngine=\(sameEngine) engineRunning=\(engineRunning) selectedA=\(selectedA) videoVisible=\(visible) videoAdvanced=\(videoAdvanced) maximumHoleMs=\(hole * 1000) scope=mono-projection tolerance=0.000001 source=complete-original-short-AAC reference=single-prepared-visit independentCodecProof=separate-AAC-SRC-tests physicalOutput=unverified cleanupAcknowledged=true capacityFrames=768000")
+        XCTAssertTrue(captured); XCTAssertGreaterThanOrEqual(wholeCycles, 10)
+        XCTAssertEqual(recorded.rate, 48_000); XCTAssertEqual(recorded.values.count, last - first)
+        XCTAssertLessThanOrEqual(hole, 0.5 / 48_000)
+        XCTAssertTrue(match.inputValid && match.matched); XCTAssertFalse(match.overflow)
+        XCTAssertEqual(match.comparedFrames, recorded.values.count)
+        XCTAssertEqual(validity.droppedFrames, 0); XCTAssertEqual(validity.invalidTimestamps, 0)
+        XCTAssertTrue(sameEngine && engineRunning && selectedA && visible && videoAdvanced)
+        XCTAssertEqual(finalState.token, entry.token)
+        XCTAssertGreaterThanOrEqual(finalState.visit - firstState.visit, 10)
+        XCTAssertEqual(finalState.underrunFrames, firstState.underrunFrames)
+        XCTAssertTrue(channels.stereoZeroEvidenceQualified); XCTAssertFalse(channels.overflow)
+        XCTAssertEqual(channels.observedFrames, recorded.values.count)
+        if let expectedZeros { XCTAssertLessThanOrEqual(channels.stereoZeroFrames, expectedZeros) }
+        else { XCTFail("A qualified full-output match is required before classifying encoded silence") }
+        #else
+        XCTFail("Live loop measurement requires DEBUG")
+        #endif
+    }
+
     func testPreparedNextSourceAndMixerBoundary() async throws {
         try recordRuntimeHost()
         #if DEBUG
@@ -4992,7 +5084,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
         #if DEBUG
         let nativeWait = nativeReaderWaitSampling.map { NativeReaderWaitObservation(enabled: $0) }
-        let nativeActivity = traceNativeRefill || traceReturnedAProducerBoundary == true || returnedZeroEventMode != nil
+        let nativeActivity = traceNativeRefill || traceClockHandoff == true
+            || traceReturnedAProducerBoundary == true || returnedZeroEventMode != nil
             ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder(beforeCopyThread: nativeWait.map { probe in
                 { @Sendable lane, sequence in probe.note(lane: lane, sequence: sequence) }
             }) : nil
@@ -5000,7 +5093,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             ContinuousPCMDecoder.DebugReaderAdmissionRecorder(excludesSameAsset: $0)
         }
         let admissionReply = Mutex<ContinuousPCMDecoder.DebugReaderAdmissionState?>(nil)
-        let firstFailure = traceFirstSourceFailure == true || traceReturnedAProducerBoundary == true
+        let firstFailure = traceFirstSourceFailure == true || traceClockHandoff == true
+            || traceReturnedAProducerBoundary == true
             ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
         let acceptedPCMOrigin = acceptedPCMOriginBenchmarkMode
         let originRecorder = acceptedPCMOrigin == true ? DebugAcceptedPCMOriginRecorder() : nil
@@ -5152,7 +5246,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 usesSynchronizedHostTime: nativeInitialStartUsesSynchronizedHost ?? true)
         }
         if let enabled = traceClockHandoff {
-            print("NativeClockHandoffInstrumentationBundle schema=3 enabled=\(enabled) actualRateAndOrdinaryRead=true snapshotReadReceipt=\(enabled) firstAlignedEnqueue=\(enabled) compoundPollPair=\(enabled) firstPositiveExistingRead=\(enabled) addedReadValueCapacity=6 noNewReadCalls=true noNewClockSites=true observersBundled=true individualObserverAttribution=false acceptance=unchanged")
+            print("NativeClockHandoffInstrumentationBundle schema=4 enabled=\(enabled) cachedDecoderActivity=\(enabled) firstSourceFailure=\(enabled) actualRateAndOrdinaryRead=true snapshotReadReceipt=\(enabled) firstAlignedEnqueue=\(enabled) compoundPollPair=\(enabled) firstPositiveExistingRead=\(enabled) addedReadValueCapacity=6 noNewReadCalls=true noNewClockSites=true observersBundled=true individualObserverAttribution=false acceptance=unchanged")
             XCTAssertEqual(traceVideoSeeks, enabled); XCTAssertFalse(traceNativeRefill)
             XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(traceDefaultFrameMonitor)
             XCTAssertNil(frameMonitorAlternative); XCTAssertNil(renderAccounting)
@@ -5714,8 +5808,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 XCTAssertNil(nativeTrace); XCTAssertNil(nativeActivity); XCTAssertNil(firstFailure)
             }
         }
+        dumpClockBundleDecoderActivity(streams, firstFailure: firstFailure,
+            enabled: traceClockHandoff == true, cleanupAcknowledged: mayRemoveFixture)
         dumpFirstSourceCopyFailure(firstFailure,
-            enabled: traceReturnedAProducerBoundary == nil ? traceFirstSourceFailure : traceReturnedAProducerBoundary,
+            enabled: traceReturnedAProducerBoundary == nil ? (traceFirstSourceFailure ?? traceClockHandoff) : traceReturnedAProducerBoundary,
             cleanupAcknowledged: mayRemoveFixture)
         #endif
         print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
@@ -5971,6 +6067,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     #if DEBUG
+    private func dumpClockBundleDecoderActivity(_ streams: [ProductionSelectionStream],
+        firstFailure: ContinuousPCMRenderer.DebugFirstFailureRecorder?, enabled: Bool,
+        cleanupAcknowledged: Bool) {
+        guard enabled else { return }
+        let failure = firstFailure?.snapshot()
+        let starved = streams.contains { $0.final.underrunFrames > $0.baseline.underrunFrames }
+            || failure?.earlierVisitFailureObserved == true || failure?.laterVisitFailureObserved == true
+            || failure?.event != nil
+        print("ClockBundleDecoderScope schema=1 enabled=true starvationObserved=\(starved) windows=\(streams.count) maximumSamplesPerWindow=128 reads=existing-cached-atomic-records extraSampler=false extraSDKQueries=0 nativeExecutionTiming=false cleanupAcknowledged=\(cleanupAcknowledged) internalSDKWaitProven=false sourceTapFrameJoin=false noFailure=inconclusive")
+        guard starved else { return }
+        for stream in streams {
+            for (ordinal, sample) in stream.result.samples.enumerated() {
+                let worker = sample.workerActivity
+                print("ClockBundleDecoderWorker schema=1 phase=\(stream.phase) ordinal=\(ordinal) beginNs=\(sample.begin) endNs=\(sample.end) token=\(sample.audio.token) visit=\(sample.audio.visit) frame=\(sample.audio.frame) underrunFrames=\(sample.audio.underrunFrames) available=\(worker != nil) packedState=\(worker?.packedState ?? 0) stage=\(worker?.stageCode ?? 0) sequence=\(worker?.sequence ?? 0) workerToken=\(worker?.token ?? 0) overflow=\(worker?.overflowed ?? false) coherence=independent-cached-records")
+                XCTAssertNotNil(worker)
+                for (lane, value) in [sample.lane0, sample.lane1, sample.lane2].enumerated() {
+                    print("ClockBundleDecoderLane schema=1 phase=\(stream.phase) ordinal=\(ordinal) lane=\(lane) available=\(value != nil) packedState=\(value?.packedState ?? 0) stage=\(value?.stageCode ?? 0) copySequence=\(value?.copySequence ?? 0) overflow=\(value?.sequenceOverflowed ?? false) coherence=one-packed-word nativeExecutionTiming=false")
+                    XCTAssertNotNil(value)
+                }
+            }
+        }
+    }
+
     private func dumpFirstSourceCopyFailure(_ recorder: ContinuousPCMRenderer.DebugFirstFailureRecorder?,
                                            enabled: Bool?, cleanupAcknowledged: Bool) {
         guard let recorder else {
@@ -11783,6 +11902,77 @@ private final class ProductionSelectionSourceBoundary {
     #endif
 }
 
+// Test oracle only. No player code or audio transport is changed by this file.
+private struct LoopPCMComparison {
+    static func calibrationPasses() -> Bool {
+        var reference: [Float] = (0..<193).map { Float(($0 * 17) % 103 - 51) / 128 }
+        reference[0] = 0; reference[1] = 0; reference[192] = 0
+        let cycles = Array(repeating: reference, count: 14).flatMap { $0 }
+        let actual = Array(cycles.dropFirst(17).prefix(reference.count * 11))
+        let good = compare(template: reference, recorded: actual)
+        guard good.inputValid, good.matched, good.offset == 17,
+              good.comparedFrames == actual.count else { return false }
+        var insertion = actual
+        insertion.insert(0, at: reference.count * 3 - 17); insertion.removeLast()
+        var deletion = actual
+        deletion.remove(at: reference.count * 4 - 17); deletion.append(actual.last!)
+        var zeroReplacement = actual
+        zeroReplacement[reference.count * 5 - 17 + 2] = 0
+        var corrupt = actual; corrupt[50] = .nan
+        return !compare(template: reference, recorded: insertion).matched
+            && !compare(template: reference, recorded: deletion).matched
+            && !compare(template: reference, recorded: zeroReplacement).matched
+            && !compare(template: reference, recorded: corrupt).inputValid
+            && !compare(template: [0,0,0], recorded: [Float](repeating: 0, count: 20)).inputValid
+    }
+    struct Report {
+        let inputValid: Bool
+        let matched: Bool
+        let offset: Int?
+        let comparedFrames: Int
+        let candidates: Int
+        let overflow: Bool
+    }
+    static func compare(template: [Float], recorded: [Float]) -> Report {
+        let tolerance: Float = 0.000001
+        func report(_ valid: Bool, _ matched: Bool = false, _ offset: Int? = nil,
+                    _ compared: Int = 0, _ candidates: Int = 0, _ overflow: Bool = false) -> Report {
+            Report(inputValid: valid, matched: matched, offset: offset,
+                   comparedFrames: compared, candidates: candidates, overflow: overflow)
+        }
+        guard !template.isEmpty, template.count <= 96_000,
+              recorded.count >= template.count * 2, recorded.count <= 16 * 48_000,
+              template.allSatisfy({ $0.isFinite }), recorded.allSatisfy({ $0.isFinite }),
+              let peak = template.map({ abs($0) }).max(), peak > 0.01 else { return report(false) }
+        let signatureFrames = min(1_024, template.count)
+        var candidates: [Int] = []
+        candidates.reserveCapacity(128)
+        for offset in template.indices {
+            var matches = true
+            for frame in 0..<signatureFrames {
+                if abs(recorded[frame] - template[(offset + frame) % template.count]) > tolerance {
+                    matches = false; break
+                }
+            }
+            if matches {
+                guard candidates.count < 128 else { return report(true, false, nil, 0, 128, true) }
+                candidates.append(offset)
+            }
+        }
+        var maximumCompared = 0
+        for offset in candidates {
+            var compared = 0
+            for frame in recorded.indices {
+                if abs(recorded[frame] - template[(offset + frame) % template.count]) > tolerance { break }
+                compared += 1
+            }
+            maximumCompared = max(maximumCompared, compared)
+            if compared == recorded.count { return report(true, true, offset, compared, candidates.count) }
+        }
+        return report(true, false, nil, maximumCompared, candidates.count)
+    }
+}
+
 private struct ProductionSelectionMeasurement {
     let phase: Int
     let prepared: Bool
@@ -12420,7 +12610,8 @@ private final class ProductionSelectionTapExecutionTrace {
 }
 #endif
 
-/// Fixed 12-second storage for actual mixer PCM and its AVAudioTime host timeline.
+/// Bounded mixer PCM and host timestamps. Existing cases retain their12s arena;
+/// the explicit complete-loop measurement uses16s without timing-trace storage.
 /// The tap is disabled during the first two 8-second renderer-only windows.
 private final class ProductionSelectionOutputTap: @unchecked Sendable {
     #if DEBUG
@@ -12520,7 +12711,7 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         }
     }
     private let lock = NSLock()
-    private let capacity = 12 * 48_000
+    private let capacity: Int
     private var values: [Float] = []
     private var hosts: [Double] = []
     private var rate = 0.0
@@ -12539,7 +12730,10 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
     private var auditFirst: ChannelRun?, auditSecond: ChannelRun?, auditThird: ChannelRun?, auditFourth: ChannelRun?
 
     #if DEBUG
-    init(captureExecutionTime: Bool? = nil) {
+    init(captureExecutionTime: Bool? = nil, capacityFrames: Int = 12 * 48_000) {
+        precondition((12 * 48_000...16 * 48_000).contains(capacityFrames))
+        precondition(captureExecutionTime == nil || capacityFrames == 12 * 48_000)
+        capacity = capacityFrames
         self.captureExecutionTime = captureExecutionTime == true
         // Equal arenas in OFF and ON; ordinary tests allocate no timing arena.
         executionTrace = captureExecutionTime.map { _ in
@@ -12556,7 +12750,7 @@ private final class ProductionSelectionOutputTap: @unchecked Sendable {
         firstStereoZero = event; return true
     }
     #else
-    init() { values.reserveCapacity(capacity); hosts.reserveCapacity(capacity) }
+    init() { capacity = 12 * 48_000; values.reserveCapacity(capacity); hosts.reserveCapacity(capacity) }
     #endif
     static func hostSeconds() -> Double { CMClockGetTime(CMClockGetHostTimeClock()).seconds }
     var count: Int { lock.lock(); defer { lock.unlock() }; return values.count }
@@ -13077,7 +13271,7 @@ final class SelectionVideoFixture {
     private var closeTask: Task<Void, Error>?
     private var closed = false
 
-    init(test: XCTestCase) async throws {
+    init(test: XCTestCase, shortLoopFixture: Bool = false) async throws {
         guard !Self.cleanupFailed else { throw SelectionVideoTestFailure.timeout }
         owningTest = test
         let ownedTemporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -13099,10 +13293,10 @@ final class SelectionVideoFixture {
         do {
             for (index, identity) in [SelectionVideoIdentity.a, .b].enumerated() {
                 let source = try XCTUnwrap(Bundle(for: PlaybackSelectionVideoRegressionTests.self)
-                    .url(forResource: "test-selection-" + identity.rawValue, withExtension: "mp4"))
+                    .url(forResource: shortLoopFixture ? "test-video" : "test-selection-" + identity.rawValue, withExtension: "mp4"))
                 _ = try await downloads.importLocal(source, mediaID: ids[index])
             }
-            let records = ids.map { MediaRecord(id: $0, title: "Generated selection fixture", creator: "Test", duration: Self.duration) }
+            let records = ids.map { MediaRecord(id: $0, title: "Generated selection fixture", creator: "Test", duration: shortLoopFixture ? 1.2 : Self.duration) }
             try library.install(LibraryCatalog(libraryID: "local:selection-regression", media: records,
                                                playlists: [PlaylistRecord(id: playlist, name: "Generated", itemIDs: ids)]))
             for record in records {
