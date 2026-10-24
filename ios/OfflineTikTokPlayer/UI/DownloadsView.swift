@@ -12,7 +12,7 @@ struct DownloadsView: View {
                         Spacer()
                         Text("on your iPhone").foregroundStyle(.secondary)
                     }.font(.subheadline)
-                    Button { app.playback.start(playlistIDs: [], shuffle: true, offlineOnly: true); if app.playback.current != nil { app.tab = .player } } label: {
+                    Button { app.playback.start(playlistIDs: [], shuffle: true, offlineOnly: true); if app.playback.current != nil, !app.playback.isAudioOnly { app.tab = .player } } label: {
                         Label("Shuffle downloaded videos", systemImage: "shuffle")
                     }
                     if app.downloads.wifiOnly && !app.network.isWiFi { Text("Downloads wait for Wi-Fi. Saved videos can play now.").font(.caption).foregroundStyle(.secondary) }

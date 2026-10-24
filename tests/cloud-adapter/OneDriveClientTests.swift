@@ -31,8 +31,132 @@ private final class FixtureProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private final class RequestState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: [String: Any] = [:]
+    func set(_ value: [String: Any]) { lock.lock(); defer { lock.unlock() }; self.value = value }
+    func get() -> [String: Any] { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 @MainActor
 final class OneDriveClientTests: XCTestCase {
+    func testPhoneRefreshWritesOnlyAppFolderAndWaitsForMatchingCompletedReply() async throws {
+        let state = RequestState()
+        let drive = client { request in
+            if request.httpMethod == "PUT" {
+                XCTAssertEqual(request.url!.path, "/v1.0/me/drive/special/approot:/refresh-request.json:/content")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-token")
+                let data = try Self.body(request)
+                state.set(try JSONSerialization.jsonObject(with: data) as! [String: Any])
+                return (200, try JSONSerialization.data(withJSONObject: ["size": data.count]))
+            }
+            if request.url!.host == "graph.microsoft.com" {
+                XCTAssertEqual(request.url!.path, "/v1.0/me/drive/special/approot:/refresh-status.json")
+                return (200, Data(#"{"id":"reply","size":800,"@microsoft.graph.downloadUrl":"https://content.example.test/reply"}"#.utf8))
+            }
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            var reply = state.get()
+            XCTAssertEqual(reply["version"] as? Int, 1)
+            XCTAssertEqual(reply["libraryId"] as? String, "private")
+            XCTAssertNotNil(UUID(uuidString: reply["requestId"] as! String))
+            reply["updatedAt"] = Date().timeIntervalSince1970
+            reply["phase"] = "completed"; reply["newItems"] = 4
+            return (200, try JSONSerialization.data(withJSONObject: reply))
+        }
+        let notice = try await drive.requestTikTokRefresh(libraryID: "private", wait: .seconds(1), pollEvery: .zero)
+        XCTAssertTrue(notice.contains("4"))
+    }
+
+    func testNoReplyLeavesAQueuedCheckInsteadOfClaimingAnImport() async throws {
+        let drive = client { request in
+            if request.httpMethod == "PUT" { return (200, try JSONSerialization.data(withJSONObject: ["size": Self.body(request).count])) }
+            return (404, Data())
+        }
+        let notice = try await drive.requestTikTokRefresh(libraryID: "private", wait: .zero, pollEvery: .zero)
+        XCTAssertTrue(notice.lowercased().contains("queued"))
+        XCTAssertTrue(notice.contains("PC"))
+    }
+
+    func testMatchingReplyAcceptsASmallDifferenceBetweenPhoneAndPCClocks() async throws {
+        let state = RequestState()
+        let drive = client { request in
+            if request.httpMethod == "PUT" {
+                let data = try Self.body(request)
+                state.set(try JSONSerialization.jsonObject(with: data) as! [String: Any])
+                return (200, try JSONSerialization.data(withJSONObject: ["size": data.count]))
+            }
+            if request.url!.host == "graph.microsoft.com" {
+                return (200, Data(#"{"id":"reply","size":800,"@microsoft.graph.downloadUrl":"https://content.example.test/reply"}"#.utf8))
+            }
+            var reply = state.get()
+            reply["updatedAt"] = (reply["requestedAt"] as! Double) - 30
+            reply["phase"] = "completed"; reply["newItems"] = 0
+            return (200, try JSONSerialization.data(withJSONObject: reply))
+        }
+        let notice = try await drive.requestTikTokRefresh(libraryID: "private", wait: .milliseconds(20), pollEvery: .milliseconds(5))
+        XCTAssertTrue(notice.contains("No new videos"))
+    }
+
+    func testStaleAndWrongLibraryRepliesCannotReportCompletion() async throws {
+        let state = RequestState()
+        let drive = client { request in
+            if request.httpMethod == "PUT" {
+                let data = try Self.body(request)
+                state.set(try JSONSerialization.jsonObject(with: data) as! [String: Any])
+                return (200, try JSONSerialization.data(withJSONObject: ["size": data.count]))
+            }
+            if request.url!.host == "graph.microsoft.com" {
+                return (200, Data(#"{"id":"reply","size":800,"@microsoft.graph.downloadUrl":"https://content.example.test/reply"}"#.utf8))
+            }
+            var reply = state.get()
+            reply["libraryId"] = "other-library"
+            reply["requestId"] = UUID().uuidString
+            reply["updatedAt"] = 0
+            reply["phase"] = "completed"; reply["newItems"] = 999
+            return (200, try JSONSerialization.data(withJSONObject: reply))
+        }
+        let notice = try await drive.requestTikTokRefresh(libraryID: "private", wait: .milliseconds(20), pollEvery: .milliseconds(5))
+        XCTAssertTrue(notice.lowercased().contains("queued"))
+    }
+
+    func testHelperFailureIsReportedWithoutServiceUrls() async throws {
+        let state = RequestState()
+        let drive = client { request in
+            if request.httpMethod == "PUT" {
+                let data = try Self.body(request)
+                state.set(try JSONSerialization.jsonObject(with: data) as! [String: Any])
+                return (200, try JSONSerialization.data(withJSONObject: ["size": data.count]))
+            }
+            if request.url!.host == "graph.microsoft.com" {
+                return (200, Data(#"{"id":"reply","size":800,"@microsoft.graph.downloadUrl":"https://content.example.test/reply"}"#.utf8))
+            }
+            var reply = state.get()
+            reply["updatedAt"] = Date().timeIntervalSince1970
+            reply["phase"] = "failed"; reply["error"] = "Sign in https://service.test/?token=secret"
+            return (200, try JSONSerialization.data(withJSONObject: reply))
+        }
+        do {
+            _ = try await drive.requestTikTokRefresh(libraryID: "private", wait: .seconds(1), pollEvery: .zero)
+            XCTFail("An unsuccessful source import must not be reported as completed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Sign in"))
+            XCTAssertFalse(error.localizedDescription.contains("secret"))
+        }
+    }
+
+    private nonisolated static func body(_ request: URLRequest) throws -> Data {
+        if let data = request.httpBody { return data }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open(); defer { stream.close() }
+        var result = Data(), bytes = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&bytes, maxLength: bytes.count)
+            if count < 0 { throw stream.streamError! }
+            if count == 0 { break }; result.append(contentsOf: bytes.prefix(count))
+        }
+        return result
+    }
+
     private func client(_ handler: @escaping FixtureProtocol.Handler) -> OneDriveClient {
         FixtureProtocol.use(handler)
         let configuration = URLSessionConfiguration.ephemeral

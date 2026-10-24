@@ -4838,7 +4838,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             return
         }
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         #if DEBUG
         // Freeze the exact Saved A URL before measured playback; no extra decode here.
         let fullSourceAReferenceURL = auditSavedAAfterCleanup ? fixture.savedURLs[fixture.aID] : nil
@@ -6574,7 +6574,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     #endif
 
     func testGeneratedSavedFixturesDecodeToExpectedDistinctTones() async throws {
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         for (id, expected, other) in [(fixture.aID, 440.0, 880.0), (fixture.bID, 880.0, 440.0)] {
             let samples = try await fixture.decodedTone(id: id)
@@ -6599,7 +6599,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testRestoredOffsetRevealsTheSelectedPausedFrame() async throws {
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         try JSONEncoder().encode(PlaybackBookmark(
             queue: PlaybackQueue(ids: fixture.ids, startAt: fixture.bID), position: 0.4))
@@ -7302,7 +7302,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testDownloadFixtureOwnerIsReleasedAfterRemoval() async throws {
         weak var owner: OfflineDownloads?
-        var fixture: SelectionVideoFixture? = try await SelectionVideoFixture()
+        var fixture: SelectionVideoFixture? = try await SelectionVideoFixture(test: self)
         defer { fixture?.remove() }
         owner = fixture?.downloads
         XCTAssertNotNil(owner)
@@ -7317,9 +7317,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testDownloadFixturesKeepIndependentSourceFilesAndRecords() async throws {
-        let first = try await SelectionVideoFixture()
+        let first = try await SelectionVideoFixture(test: self)
         defer { first.remove() }
-        let second = try await SelectionVideoFixture()
+        let second = try await SelectionVideoFixture(test: self)
         defer { second.remove() }
         let firstA = try XCTUnwrap(first.savedURLs[first.aID])
         let secondA = try XCTUnwrap(second.savedURLs[second.aID])
@@ -7337,9 +7337,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testDownloadFixtureLedgerReloadUsesOwnedVerifiedFilesWithoutTransferSession() async throws {
         #if DEBUG
-        let first = try await SelectionVideoFixture()
+        let first = try await SelectionVideoFixture(test: self)
         defer { first.remove() }
-        let second = try await SelectionVideoFixture()
+        let second = try await SelectionVideoFixture(test: self)
         defer { second.remove() }
         func savedIDs(_ root: URL) throws -> Set<String> {
             let data = try Data(contentsOf: root.appendingPathComponent("downloads.json"))
@@ -8519,7 +8519,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testPausedRestoreBlocksFrameAcquisitionUntilTheRealSeekCompletionIsReleased() async throws {
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         try JSONEncoder().encode(PlaybackBookmark(
             queue: PlaybackQueue(ids: fixture.ids, startAt: fixture.bID), position: 0.4))
@@ -8573,7 +8573,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testPreparedRewoundBUncoversItsOwnMovingVideo() async throws {
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         let buffer = PlaybackBuffer()
         let service = fixture.service(buffer: buffer)
@@ -8612,7 +8612,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             return
         }
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         let service = fixture.service()
         let screen = try SelectionVideoScreen(service: service)
@@ -9568,7 +9568,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTFail("A previous targeted fixture did not acknowledge cleanup; no new owners may be created")
             throw SelectionVideoTestFailure.timeout
         }
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         #if DEBUG
         let activity = traceNativeLaneActivity ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: activity)
@@ -9745,7 +9745,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     #endif
 
     func testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause() async throws {
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         let service = fixture.service()
         let screen = try SelectionVideoScreen(service: service)
@@ -9783,7 +9783,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     func testAudioOnlyAndForegroundRestoreSelectedBWithoutOverridingPause() async throws {
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         let service = fixture.service()
         let screen = try SelectionVideoScreen(service: service)
@@ -9793,6 +9793,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await require({ service.audioSnapshot.frame > 2_400 }, "B must be rendered before hiding video")
         let bToken = service.audioSnapshot.token
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "B-before-audio-only")
+        service.pause(); service.seek(1)
+        try await require({ !service.clock.isSeeking && !service.audioEngineRunning },
+                          "The Audio only check needs a settled B position after compositor proof")
+        service.play()
+        try await require({ service.audioSnapshot.frame > 50_400 && service.wantsToPlay },
+                          "B must advance from its complete source before changing presentation")
         service.audioOnly = true
         XCTAssertTrue(service.surface.isHidden)
         let before = service.audioSnapshot.frame
@@ -12840,6 +12846,9 @@ private enum SelectionVideoTestFailure: Error {
 }
 
 @MainActor
+private final class SelectionFixtureCloseReply { var value: Bool? }
+
+@MainActor
 final class SelectionVideoFixture {
     static let duration = 30.0
     let temporary: URL
@@ -12854,8 +12863,19 @@ final class SelectionVideoFixture {
     private(set) var savedURLs: [String: URL] = [:]
     private let previousSpeakerSound = UserDefaults.standard.object(forKey: "speakerSound")
     private let previousAutomaticPiP = UserDefaults.standard.object(forKey: "automaticPiP")
+    private let previousAudioOnly = UserDefaults.standard.object(forKey: "audioOnly")
 
-    init() async throws {
+    private static var cleanupFailed = false
+    private weak var owningTest: XCTestCase?
+    private var services: [PlaybackService] = []
+    private var teardownRegistered = false
+    private var removalRequested = false
+    private var closeTask: Task<Void, Error>?
+    private var closed = false
+
+    init(test: XCTestCase) async throws {
+        guard !Self.cleanupFailed else { throw SelectionVideoTestFailure.timeout }
+        owningTest = test
         let ownedTemporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         temporary = ownedTemporary
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
@@ -12903,9 +12923,53 @@ final class SelectionVideoFixture {
             result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
                                      bookmarkURL: bookmark, activateSession: activate, buffer: buffer, continuousAudio: continuousAudio)
         }
+        result.setAudioOnly(false)
         result.speakerSound = false
         result.automaticPiP = false
-        return result
+        return own(result)
+    }
+
+    /// XCTest awaits this owner's teardown before starting the next test.
+    @discardableResult
+    func own(_ service: PlaybackService) -> PlaybackService {
+        precondition(owningTest != nil)
+        services.append(service)
+        if !teardownRegistered {
+            teardownRegistered = true
+            owningTest?.addTeardownBlock { [self] in
+                if let closeTask { try await closeTask.value }
+                else { try await closeAfterTest() }
+            }
+        }
+        return service
+    }
+
+    private func closeAfterTest() async throws {
+        guard !closed else { return }
+        for service in services {
+            let reply = SelectionFixtureCloseReply()
+            #if DEBUG
+            service.debugCloseOwnedPlayback { success in
+                Task { @MainActor in reply.value = success }
+            }
+            #else
+            XCTFail("Native fixture ownership checks require the diagnostic build")
+            throw SelectionVideoTestFailure.timeout
+            #endif
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            while reply.value == nil, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            guard reply.value == true else {
+                Self.cleanupFailed = true
+                XCTFail("Fixture media cannot be deleted before its owned playback tasks and decoder readers close")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
+        services.removeAll()
+        closed = true
+        if removalRequested { removeImmediately() }
+        print("SelectionFixtureCleanup schema=1 tasksJoined=true decoderClosed=true mediaRemovalRequested=\(removalRequested) nativeQuiescenceClaimed=false")
     }
 
     /// This verifies encoded fixture identity independently of PlaybackService and its token.
@@ -12946,6 +13010,18 @@ final class SelectionVideoFixture {
     }
 
     func remove() {
+        if teardownRegistered, !closed {
+            removalRequested = true
+            restorePreferences()
+            // Start closing at the original scope exit, then require its result
+            // in XCTest teardown. Matched arms need not retain earlier players.
+            if closeTask == nil { closeTask = Task { [self] in try await closeAfterTest() } }
+            return
+        }
+        removeImmediately()
+    }
+
+    private func removeImmediately() {
         for id in ids { downloads.remove(id) }
         Self.removeOwnedTemporary(temporary)
         restorePreferences()
@@ -12971,6 +13047,8 @@ final class SelectionVideoFixture {
         else { UserDefaults.standard.removeObject(forKey: "speakerSound") }
         if let previousAutomaticPiP { UserDefaults.standard.set(previousAutomaticPiP, forKey: "automaticPiP") }
         else { UserDefaults.standard.removeObject(forKey: "automaticPiP") }
+        if let previousAudioOnly { UserDefaults.standard.set(previousAudioOnly, forKey: "audioOnly") }
+        else { UserDefaults.standard.removeObject(forKey: "audioOnly") }
     }
 
 }

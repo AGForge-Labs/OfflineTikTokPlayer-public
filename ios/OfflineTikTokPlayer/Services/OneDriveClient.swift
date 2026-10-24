@@ -16,12 +16,14 @@ actor OneDriveClient {
     private let cache = AssetURLCache()
     init(account: MicrosoftAccount, session: URLSession = .shared) { self.account = account; self.session = session }
 
-    private func graph(_ path: String, query: [URLQueryItem] = []) async throws -> Data {
+    private func graph(_ path: String, query: [URLQueryItem] = [], method: String = "GET", body: Data? = nil) async throws -> Data {
         var components = URLComponents(string: "https://graph.microsoft.com/v1.0" + path)!
         components.queryItems = query.isEmpty ? nil : query
         for attempt in 0..<3 {
             var request = URLRequest(url: components.url!)
             request.timeoutInterval = 15
+            request.httpMethod = method; request.httpBody = body
+            if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
             request.setValue("Bearer " + (try await account.token(forceRefresh: attempt > 0)), forHTTPHeaderField: "Authorization")
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { throw AppError.message("OneDrive returned no response.") }
@@ -67,6 +69,72 @@ actor OneDriveClient {
         return try LibraryCatalog.decode(data)
     }
 
+    /// Ask the PC that owns the TikTok session; never move that session to the phone.
+    func requestTikTokRefresh(libraryID: String, wait: Duration = .seconds(120), pollEvery: Duration = .seconds(3)) async throws -> String {
+        guard !libraryID.isEmpty, !libraryID.hasPrefix("local:") else {
+            throw AppError.message("Connect your private OneDrive library first.")
+        }
+        let request = ImportRequest(libraryId: libraryID, requestedAt: Date().timeIntervalSince1970)
+        let content = try JSONEncoder().encode(request)
+        struct WrittenFile: Decodable { let size: Int }
+        let written = try JSONDecoder().decode(WrittenFile.self, from: await graph(
+            "/me/drive/special/approot:/refresh-request.json:/content", method: "PUT", body: content))
+        guard written.size == content.count else { throw AppError.message("OneDrive did not confirm the TikTok check request. Try again.") }
+        let deadline = ContinuousClock.now.advanced(by: wait)
+        while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
+            if let data = try await refreshReply(), let reply = try? JSONDecoder().decode(ImportStatus.self, from: data),
+               reply.version == 1, reply.requestId == request.requestId, reply.libraryId == libraryID,
+               reply.requestedAt == request.requestedAt, reply.updatedAt.isFinite,
+               reply.updatedAt >= request.requestedAt - 300, reply.updatedAt <= Date().timeIntervalSince1970 + 300 {
+                if reply.phase == "completed", let count = reply.newItems, (0...1_000_000).contains(count) {
+                    return count == 0 ? "TikTok checked. No new videos found." : "Imported \(count) new video\(count == 1 ? "" : "s") from TikTok."
+                }
+                if reply.phase == "failed" {
+                    let reason = String((reply.error ?? "Retry in the Windows helper.").prefix(700))
+                        .replacingOccurrences(of: "https?://\\S+", with: "[service URL]", options: .regularExpression)
+                    throw AppError.message("TikTok check did not finish: " + reason)
+                }
+            }
+            try await Task.sleep(for: max(.zero, min(pollEvery, ContinuousClock.now.duration(to: deadline))))
+        }
+        return "TikTok check queued for your PC. Keep the helper running and your PC awake; reopen the app after it finishes."
+    }
+
+    private func refreshReply() async throws -> Data? {
+        let data: Data
+        do { data = try await graph("/me/drive/special/approot:/refresh-status.json") }
+        catch let error as GraphFailure where error.statusCode == 404 { return nil }
+        let item = try JSONDecoder().decode(DriveItem.self, from: data)
+        guard let size = item.size, (1...8192).contains(size), let url = item.downloadURL, url.scheme == "https" else {
+            throw AppError.message("The helper's refresh reply is invalid. Retry in the Windows helper.")
+        }
+        var download = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        download.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        let (content, response) = try await session.data(for: download)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200, content.count <= 8192 else {
+            throw AppError.message("The helper's refresh reply could not be read. Try again shortly.")
+        }
+        return content
+    }
+
+    private struct ImportRequest: Encodable {
+        let version = 1
+        let requestId = UUID().uuidString
+        let libraryId: String
+        let requestedAt: Double
+    }
+    private struct ImportStatus: Decodable {
+        let version: Int
+        let requestId: String
+        let libraryId: String
+        let requestedAt: Double
+        let updatedAt: Double
+        let phase: String
+        let newItems: Int?
+        let error: String?
+    }
+
     func quota() async throws -> String {
         struct Drive: Decodable { struct Quota: Decodable { let remaining: Int64? }; let quota: Quota? }
         do {
@@ -84,6 +152,7 @@ actor OneDriveClient {
         let id: String
         let name: String?
         let downloadURL: URL?
-        enum CodingKeys: String, CodingKey { case id, name, downloadURL = "@microsoft.graph.downloadUrl" }
+        let size: Int?
+        enum CodingKeys: String, CodingKey { case id, name, size, downloadURL = "@microsoft.graph.downloadUrl" }
     }
 }

@@ -5,7 +5,7 @@ struct MiniPlayer: View {
     var body: some View {
         if let item = app.playback.current {
             HStack(spacing: 12) {
-                Button { app.tab = .player } label: {
+                Button { app.playback.setAudioOnly(false); app.tab = .player } label: {
                     HStack {
                         MediaThumbnail(item: item).frame(width: 45, height: 48).clipShape(.rect(cornerRadius: 6))
                         VStack(alignment: .leading, spacing: 3) {

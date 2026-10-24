@@ -1156,7 +1156,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
 
     @MainActor
     func testRetainedPreviousPrewarmsItsStreamingHeadBeforeReturningAcrossThePrefix() async throws {
-        let fixture = try await SelectionVideoFixture()
+        let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
         let renderer = ContinuousPCMRenderer()
         let decoder = ContinuousPCMDecoder(renderer: renderer)

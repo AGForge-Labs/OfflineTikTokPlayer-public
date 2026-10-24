@@ -9,30 +9,52 @@ import PlayerCore
 final class LibraryRepository {
     private(set) var catalog: LibraryCatalog
     private(set) var isRefreshing = false
+    private(set) var refreshStatus: String?
     var message: String?
     private let fetchCatalog: @MainActor () async throws -> LibraryCatalog
+    private let requestImport: @MainActor (String) async throws -> String
     private let url: URL
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var reportRefreshErrors = false
+    @ObservationIgnored private var requestTikTokCheck = false
 
     init(cloud: OneDriveClient, catalogURL: URL = AppFiles.root.appendingPathComponent("catalog.json"),
-         fetchCatalog: (@MainActor () async throws -> LibraryCatalog)? = nil) {
+         fetchCatalog: (@MainActor () async throws -> LibraryCatalog)? = nil,
+         requestImport: (@MainActor (String) async throws -> String)? = nil) {
         self.url = catalogURL
         self.fetchCatalog = fetchCatalog ?? { try await cloud.catalog() }
+        self.requestImport = requestImport ?? { try await cloud.requestTikTokRefresh(libraryID: $0) }
         if let data = try? Data(contentsOf: url), let saved = try? LibraryCatalog.decode(data) { catalog = saved }
         else { catalog = try! LibraryCatalog(libraryID: "local:" + UUID().uuidString, media: [], playlists: []) }
     }
 
-    func refresh(silently: Bool = false) async {
+    func refresh(silently: Bool = false, checkTikTok: Bool = false) async {
         if !silently { reportRefreshErrors = true }
+        if checkTikTok { requestTikTokCheck = true }
         if let refreshTask { await refreshTask.value; return }
         isRefreshing = true
+        refreshStatus = "Refreshing your library…"
         reportRefreshErrors = !silently
         // The operation belongs to the repository, so an inactive SwiftUI scene
         // cannot cancel it and discard the next foreground caller's refresh.
         let task = Task { [self] in
-            defer { isRefreshing = false; refreshTask = nil; reportRefreshErrors = false }
-            do { try install(await fetchCatalog()); message = nil }
+            defer { isRefreshing = false; refreshStatus = nil; refreshTask = nil; reportRefreshErrors = false; requestTikTokCheck = false }
+            do {
+                try install(await fetchCatalog()); message = nil
+                if requestTikTokCheck {
+                    refreshStatus = "Checking TikTok and importing new videos with your PC…"
+                    let notice: String
+                    do { notice = try await requestImport(catalog.libraryID) }
+                    catch {
+                        // A partly successful import may still have published useful media.
+                        if let latest = try? await fetchCatalog() { try? install(latest) }
+                        throw error
+                    }
+                    refreshStatus = "Loading your updated playlists…"
+                    try install(await fetchCatalog())
+                    message = notice
+                }
+            }
             catch is CancellationError { }
             catch { if reportRefreshErrors { message = "Could not refresh: \(error.localizedDescription)" } }
         }

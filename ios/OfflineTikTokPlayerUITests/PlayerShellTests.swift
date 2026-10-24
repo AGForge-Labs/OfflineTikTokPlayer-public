@@ -7,6 +7,22 @@ final class PlayerShellTests: XCTestCase {
         app.launch()
         app.buttons["tab.library"].tap()
         XCTAssertTrue(app.navigationBars["Library"].waitForExistence(timeout: 5))
+        // The native borderless List button exposes its rendered label; wrappers
+        // can carry a different accessibility identifier from that actual button.
+        let audioOnly = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Audio only'")).firstMatch
+        XCTAssertTrue(audioOnly.waitForExistence(timeout: 5))
+        if audioOnly.label == "Audio only, On" {
+            audioOnly.tap()
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'Audio only, Off'"), object: audioOnly)], timeout: 5), .completed)
+        }
+        audioOnly.tap()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'Audio only, On'"), object: audioOnly)], timeout: 5), .completed)
+        let audioProof = XCTAttachment(screenshot: app.screenshot())
+        audioProof.name = "Library Audio only switch"; audioProof.lifetime = .keepAlways
+        add(audioProof)
+        app.buttons["tab.player"].tap()
+        app.buttons["tab.library"].tap()
+        XCTAssertEqual(audioOnly.label, "Audio only, Off", "Opening Player explicitly restores video")
         app.buttons["Settings"].firstMatch.tap()
         XCTAssertTrue(app.switches["Wi-Fi only"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.switches["Automatic Picture in Picture"].exists)

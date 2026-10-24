@@ -32,7 +32,16 @@ struct SettingsView: View {
                     } label: {
                         HStack { Text("Connect Microsoft account"); if connecting { Spacer(); ProgressView() } }
                     }.disabled(connecting)
-                    Button("Refresh library") { Task { await app.library.refresh() } }.disabled(app.library.isRefreshing)
+                    Button { Task { await app.library.refresh(checkTikTok: true) } } label: {
+                        HStack {
+                            Text("Refresh library")
+                            if app.library.isRefreshing { Spacer(); ProgressView() }
+                        }
+                    }.disabled(app.library.isRefreshing)
+                    Text("Refresh checks your watched TikTok playlists using your PC. Keep the Windows helper running and your PC awake.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let progress = app.library.refreshStatus { Text(progress).font(.footnote) }
+                    if let message = app.library.message { Text(message).font(.footnote).foregroundStyle(.secondary) }
                     Text("The app requests access to its own OneDrive folder. Your downloaded videos keep playing without signing in.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let status { Text(status).font(.footnote).foregroundStyle(.secondary) }

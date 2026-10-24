@@ -46,7 +46,10 @@ struct RootView: View {
     }
 
     private func tab(_ tab: AppTab, icon: String) -> some View {
-        Button { app.tab = tab } label: {
+        Button {
+            if tab == .player { app.playback.setAudioOnly(false) }
+            app.tab = tab
+        } label: {
             VStack(spacing: 4) {
                 Image(systemName: icon).font(.system(size: 21, weight: .semibold))
                 Text(tab.rawValue).font(.caption2.weight(.semibold))

@@ -389,17 +389,21 @@ final class PlaybackService: NSObject {
         didSet { updateAudioSuccessor() }
     }
     var speakerSound: Bool {
-        didSet { UserDefaults.standard.set(speakerSound, forKey: "speakerSound"); refreshAudioProcessing() }
+        didSet { preferences.set(speakerSound, forKey: "speakerSound"); refreshAudioProcessing() }
     }
     var automaticPiP: Bool {
-        didSet { pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture; UserDefaults.standard.set(automaticPiP, forKey: "automaticPiP") }
+        didSet { pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture; preferences.set(automaticPiP, forKey: "automaticPiP") }
     }
-    var audioOnly = false {
+    var audioOnly: Bool {
         didSet {
+            guard oldValue != audioOnly else { return }
+            preferences.set(audioOnly, forKey: "audioOnly")
             applyPresentation(presentationPolicy.setAudioOnly(audioOnly))
             recordDiagnostic(audioOnly ? .audioOnlySelected : .videoSelected)
+            updateNowPlaying()
         }
     }
+    var isAudioOnly: Bool { audioOnly }
     @ObservationIgnored private var presentationPolicy = PlaybackPresentationPolicy()
     @ObservationIgnored private var diagnostics = PlaybackDiagnosticJournal(capacity: 128)
     #if DEBUG
@@ -556,6 +560,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var reachedPreparedEnd = false
     @ObservationIgnored private var lastBookmark = Date.distantPast
     private let bookmarkURL: URL
+    @ObservationIgnored private let preferences: UserDefaults
     @ObservationIgnored private let activateSession: () throws -> Void
 
     var current: MediaRecord? { queue.currentID.flatMap { library.catalog.mediaByID[$0] } }
@@ -573,7 +578,7 @@ final class PlaybackService: NSObject {
          },
          seekVideo: @escaping SeekVideo = { player, time, completion in
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
-         }) {
+         }, preferences: UserDefaults = .standard) {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.continuousAudio = continuousAudio ?? ContinuousAudioPlayer()
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
@@ -582,8 +587,11 @@ final class PlaybackService: NSObject {
         self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
         self.seekVideo = seekVideo
         mediaCache = PlaybackCacheLoader.make(cloud: cloud)
-        automaticPiP = UserDefaults.standard.bool(forKey: "automaticPiP")
-        speakerSound = UserDefaults.standard.object(forKey: "speakerSound") as? Bool ?? true
+        self.preferences = preferences
+        automaticPiP = preferences.bool(forKey: "automaticPiP")
+        speakerSound = preferences.object(forKey: "speakerSound") as? Bool ?? true
+        audioOnly = preferences.bool(forKey: "audioOnly")
+        presentationPolicy = PlaybackPresentationPolicy(audioOnly: audioOnly)
         super.init()
         self.continuousAudio.onSourceSilence { [weak self] _, analysis in
             Task { @MainActor in self?.recordDiagnostic(.sourceTimelineAnalyzed, sourceSilence: analysis) }
@@ -651,6 +659,7 @@ final class PlaybackService: NSObject {
         continuousPiP.onEvent = { [weak self] event, code in self?.handlePiPEvent(event, code: code) }
         continuousPiP.onCurrentFrameInvalidated = { [weak self] in self?.invalidateVideoReadiness() }
         continuousPiP.onCurrentFrameStateChanged = { [weak self] in self?.ensureCurrentFrameMonitor() }
+        if audioOnly { applyPresentation(PlaybackPresentationPolicy.Actions()) }
         configureAudio(); installObservers(); installRemoteControls()
         audioPollTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -729,8 +738,24 @@ final class PlaybackService: NSObject {
     }
 
     #if DEBUG
-    /// Test teardown only. Join the currently owned tasks as well as the decoder's
-    /// queued cleanup; neither acknowledgement proves SDK-internal quiescence.
+    /// Test-owned lifetime: retire visual callbacks, join preparation tasks and
+    /// close decoder leases before a fixture is allowed to remove its media.
+    func debugCloseOwnedPlayback(_ completion: @escaping @Sendable (Bool) -> Void) {
+        pause()
+        if let timeObserver { player.removeTimeObserver(timeObserver); self.timeObserver = nil }
+        timeControlObservation = nil
+        for token in notifications { NotificationCenter.default.removeObserver(token) }
+        notifications.removeAll()
+        continuousPiP.invalidate()
+        buffer.didAdvance = nil
+        buffer.replace(with: nil); buffer.discardPrevious()
+        surface.playerLayer.player = nil
+        debugStopPreparation { [self] in
+            Task { @MainActor in continuousAudio.debugShutdown(completion) }
+        }
+    }
+
+    /// Join owned tasks. Acknowledgement does not prove SDK-internal quiescence.
     func debugStopPreparation(_ completion: @escaping @Sendable () -> Void) {
         generation += 1; warmRevision += 1
         pendingInitialClockBinding = nil; statusHandledGeneration = nil
@@ -2303,8 +2328,10 @@ final class PlaybackService: NSObject {
         }
     }
 
+    func setAudioOnly(_ enabled: Bool) { audioOnly = enabled }
+
     func startPiP() {
-        audioOnly = false
+        setAudioOnly(false)
         guard let pip, pip.isPictureInPicturePossible else { message = "Play a video on this screen before opening Picture in Picture."; return }
         if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() }
     }
@@ -2615,7 +2642,7 @@ final class PlaybackService: NSObject {
             MPMediaItemPropertyTitle: item.title, MPMediaItemPropertyArtist: item.creator,
             MPMediaItemPropertyPlaybackDuration: clock.duration, MPNowPlayingInfoPropertyElapsedPlaybackTime: clock.position,
             MPNowPlayingInfoPropertyPlaybackRate: intent.canPlay ? 1.0 : 0.0,
-            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.video.rawValue
+            MPNowPlayingInfoPropertyMediaType: (isAudioOnly ? MPNowPlayingInfoMediaType.audio : .video).rawValue
         ]
     }
 }

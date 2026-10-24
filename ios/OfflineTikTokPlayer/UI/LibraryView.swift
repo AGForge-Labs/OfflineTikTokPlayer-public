@@ -20,6 +20,19 @@ struct LibraryView: View {
                     }.listRowBackground(Color.clear).listRowInsets(EdgeInsets())
                     if !selected.isEmpty { Text("\(selected.count) selected · shared videos play once").font(.caption).foregroundStyle(.secondary) }
                 }
+                Section {
+                    Button { app.playback.setAudioOnly(!app.playback.isAudioOnly) } label: {
+                        HStack {
+                            Label("Audio only", systemImage: "headphones")
+                            Spacer()
+                            Text(app.playback.isAudioOnly ? "On" : "Off").foregroundStyle(app.playback.isAudioOnly ? Color.cyan : Color.gray)
+                        }.frame(maxWidth: .infinity, minHeight: 44).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless).foregroundStyle(.primary)
+                    .accessibilityIdentifier("library.audioOnly")
+                } footer: {
+                    Text("Listen in the background without the floating video. Turn off to watch again.")
+                }
                 if query.isEmpty {
                     Section("Your playlists") {
                         if app.library.catalog.playlists.isEmpty {
@@ -50,13 +63,14 @@ struct LibraryView: View {
                         ForEach(matches) { item in MediaRow(item: item, playlistIDs: []) }
                     }
                 }
+                if let status = app.library.refreshStatus { Section { Label(status, systemImage: "arrow.triangle.2.circlepath").font(.footnote) } }
                 if let message = app.library.message { Section { Text(message).foregroundStyle(.secondary).font(.footnote) } }
             }
             .navigationTitle("Library")
             .searchable(text: $query, prompt: "Title or creator")
             .onChange(of: query) { _, _ in updateMatches() }
             .onChange(of: app.library.catalog.updatedAt) { _, _ in updateMatches() }
-            .refreshable { await app.library.refresh() }
+            .refreshable { await app.library.refresh(checkTikTok: true) }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button { importing = true } label: { Image(systemName: "plus") }.accessibilityLabel("Import videos or catalog") }
                 ToolbarItem(placement: .topBarTrailing) { Button { app.sheet = .settings } label: { Image(systemName: "gearshape") }.accessibilityLabel("Settings") }
@@ -70,7 +84,7 @@ struct LibraryView: View {
     private func updateMatches() { matches = app.library.catalog.search(query) }
     private func play(shuffle: Bool) {
         app.playback.start(playlistIDs: app.library.catalog.playlists.filter { selected.contains($0.id) }.map(\.id), shuffle: shuffle)
-        if app.playback.current != nil { app.tab = .player }
+        if app.playback.current != nil, !app.playback.isAudioOnly { app.tab = .player }
     }
 }
 
@@ -111,7 +125,7 @@ private struct PlaylistView: View {
         return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
     private func updateMatches() { matches = app.library.catalog.search(query, within: playlist.itemIDs) }
-    private func play(shuffle: Bool) { app.playback.start(playlistIDs: [playlist.id], shuffle: shuffle); if app.playback.current != nil { app.tab = .player } }
+    private func play(shuffle: Bool) { app.playback.start(playlistIDs: [playlist.id], shuffle: shuffle); if app.playback.current != nil, !app.playback.isAudioOnly { app.tab = .player } }
 }
 
 struct MediaRow: View {
@@ -126,7 +140,7 @@ struct MediaRow: View {
             Button {
                 guard playable else { app.alert = "This post does not have an archived video yet. Its place in your playlist is preserved."; return }
                 app.playback.start(playlistIDs: playlistIDs, at: item.id, shuffle: app.playback.queue.isShuffled)
-                app.tab = .player
+                if !app.playback.isAudioOnly { app.tab = .player }
             } label: {
                 HStack(spacing: 12) {
                     MediaThumbnail(item: item).frame(width: 55, height: 72).clipShape(.rect(cornerRadius: 7))

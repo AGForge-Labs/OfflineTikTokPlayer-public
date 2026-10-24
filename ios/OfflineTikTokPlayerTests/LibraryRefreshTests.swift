@@ -8,6 +8,76 @@ import PlayerCore
 
 @MainActor
 final class LibraryRefreshTests: XCTestCase {
+    func testManualTikTokCheckPublishesThenReloadsAndPreservesPhoneImports() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var imported = false
+        var calls = 0
+        let library = LibraryRepository(cloud: OneDriveClient(account: MicrosoftAccount()), catalogURL: url,
+            fetchCatalog: {
+                calls += 1
+                return try LibraryCatalog(libraryID: "private", media: imported ? [MediaRecord(id: "new", title: "New")] : [], playlists: [])
+            }, requestImport: { id in
+                XCTAssertEqual(id, "private")
+                imported = true
+                return "Imported 1 new video."
+            })
+        try library.install(LibraryCatalog(libraryID: "private", media: [MediaRecord(id: "local:mine", title: "Mine")], playlists: []))
+        await library.refresh(checkTikTok: true)
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(library.catalog.media.map(\.id), ["new", "local:mine"])
+        XCTAssertEqual(library.message, "Imported 1 new video.")
+        XCTAssertFalse(library.isRefreshing)
+        XCTAssertNil(library.refreshStatus)
+    }
+
+    func testManualTikTokRequestJoiningForegroundRefreshRunsOnce() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var first: CheckedContinuation<LibraryCatalog, Error>?
+        var imported: CheckedContinuation<String, Error>?
+        var fetches = 0
+        var requests = 0
+        let library = LibraryRepository(cloud: OneDriveClient(account: MicrosoftAccount()), catalogURL: url,
+            fetchCatalog: {
+                fetches += 1
+                if fetches == 1 { return try await withCheckedThrowingContinuation { first = $0 } }
+                return try LibraryCatalog(libraryID: "private", media: [], playlists: [])
+            }, requestImport: { _ in
+                requests += 1
+                return try await withCheckedThrowingContinuation { imported = $0 }
+            })
+        let automatic = Task { await library.refresh(silently: true) }
+        while first == nil { await Task.yield() }
+        let manual = Task { await library.refresh(checkTikTok: true) }
+        for _ in 0..<10 { await Task.yield() }
+        first?.resume(returning: try LibraryCatalog(libraryID: "private", media: [], playlists: []))
+        while imported == nil { await Task.yield() }
+        let duplicate = Task { await library.refresh(checkTikTok: true) }
+        for _ in 0..<10 { await Task.yield() }
+        imported?.resume(returning: "No new videos found.")
+        await automatic.value; await manual.value; await duplicate.value
+        XCTAssertEqual(requests, 1)
+        XCTAssertEqual(fetches, 2)
+        XCTAssertEqual(library.message, "No new videos found.")
+    }
+
+    func testFailedTikTokImportStillReloadsPublishedCatalogAndKeepsLocalCopies() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var fetches = 0
+        let library = LibraryRepository(cloud: OneDriveClient(account: MicrosoftAccount()), catalogURL: url,
+            fetchCatalog: {
+                fetches += 1
+                return try LibraryCatalog(libraryID: "private", media: [MediaRecord(id: "cloud", title: "Archived")], playlists: [])
+            }, requestImport: { _ in throw AppError.message("Sign in to TikTok in the Windows helper.") })
+        try library.install(LibraryCatalog(libraryID: "private", media: [MediaRecord(id: "local:mine", title: "Mine")], playlists: []))
+        await library.refresh(checkTikTok: true)
+        XCTAssertEqual(fetches, 2)
+        XCTAssertEqual(library.catalog.media.map(\.id), ["cloud", "local:mine"])
+        XCTAssertTrue(library.message?.contains("Sign in to TikTok") == true)
+    }
+
     func testSilentFailureKeepsTheCachedLibraryAndManualErrorStillAppears() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
         defer { try? FileManager.default.removeItem(at: url) }
