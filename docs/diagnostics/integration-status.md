@@ -759,3 +759,28 @@ Every previous73profile identity remains; new profile74/full source297. Local
 Swift parsing, generatedproject and profile checks pass; SDK component GREEN and
 iOS SRC/graph/Release/HTTP/phone acceptance remain pending. Prior picture failures
 and exact-silence witnesses remain open, with no new TestFlight.
+
+
+### Native29: actual44.1k component is sample-exact on macOS
+
+Run40133874973/job120991155065/source1dce6d753df530c08d803ee4bfda0fd18263c654
+completes success36s total/31s job. The exact optimized/noDEBUG component admits
+both synthetic FFmpeg MP4 and Apple M4A, copies all1323000native stereo frames,
+matches independent complete AVAssetReader samples with maximumDifference0 and
+returns0 only at exact EOF. Both SDK processing modes and CAF controls also pass.
+Artifact12576760251/1174bytes/SHA256
+cbda420fa2558701576b6d525527004ffc025253f6899fcef1c63af8fdb10f34,
+one ZIP entry verified. This is macOS leaf-component evidence, not full iOS/SRC,
+Release, HTTP/cache, library-wide or physical-phone acceptance.
+
+Bounded source review of3084d00..8390d33 finds no Critical/Important issue in
+native-grid endpoints, strict eligibility, SRC history/flush and same-lane close.
+Its coverage limitation is addressed in the existing new native test identity:
+after two complete graph loops/rewind with a full test prefix, a separately joined
+decoder uses production96000prefix/192000ring/6912000bytes and actually refills
+after28s and7s seeks, comparing output against the same complete independent SRC
+reference. No extra profile identity, production buffer, tolerance or deadline.
+
+Restore the exact split build/test workflow from106f28c for the next iOS check.
+All74profile identities/full297source methods remain required; previous picture
+failures and silence witnesses remain open. No TestFlight delivery.

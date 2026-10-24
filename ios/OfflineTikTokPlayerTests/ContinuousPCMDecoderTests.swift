@@ -1241,7 +1241,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         print("PCM_PREWARM_ABA oldEpoch=\(oldEpoch) warmEpoch=\(warmRequest.epoch) returnedEpoch=\(returnedEpoch) readyFrames=\(readyFrames) renderedFrames=\(rendered) underrunDelta=\(underrunDelta) retainedBytes=\(retainedBytes)")
     }
 
-    /// Capability comparison only. No production decoder selection changes.
+    /// Complete SRC fidelity plus production-sized refill and reader reopening.
     func testNative44100StereoAACPreservesCompleteSRCThroughLoopsAndRewind() async throws {
         #if DEBUG
         guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
@@ -1299,6 +1299,55 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         } catch { bodyError = error }
         _ = try await Self.mailboxShutdown(decoder)
         if let bodyError { throw bodyError }
+
+        // The complete-prefix graph comparison above isolates SRC fidelity. Now
+        // use the real two-second prefix/four-second ring and reopen the reader
+        // for distant seeks. Resampled input must reconstruct its history from
+        // zero before producing the requested output; no native48k seek shortcut.
+        let boundedRenderer = ContinuousPCMRenderer(prefixFrames: 96_000, ringFrames: 192_000)
+        let activity = ContinuousPCMDecoder.DebugNativeLaneActivityRecorder()
+        let boundedDecoder = ContinuousPCMDecoder(renderer: boundedRenderer,
+            debugNativeLaneActivityRecorder: activity)
+        defer { boundedDecoder.shutdown() }
+        var boundedError: Error?
+        do {
+            let prepared = try await Self.mailboxPrepare(boundedDecoder, url: url, token: 1, slot: 0)
+            XCTAssertEqual(prepared.totalFrames, 1_440_000)
+            let source = boundedRenderer.source(at: 0), initial = source.streamRequest
+            _ = try await Self.mailboxStateUntil(boundedDecoder, timeout: 3) { state in
+                source.availableStreamFrames(for: initial.epoch) == 192_000
+                    && state.leases.allSatisfy { !$0.readPending && !$0.starting }
+            }
+            let memory = boundedRenderer.retainedPCMMemoryBytes
+            XCTAssertEqual(memory, 6_912_000)
+            for target: Int64 in [28 * 48_000, 7 * 48_000] {
+                let beforeCopies = (0..<3).compactMap { activity.snapshot(at: $0)?.copySequence }.reduce(0, +)
+                Self.mailboxAcknowledge(boundedRenderer, token: 1, frame: target)
+                let request = source.streamRequest
+                XCTAssertEqual(request.startFrame, target)
+                let readyFrames = Int(min(Int64(192_000), prepared.totalFrames - target))
+                _ = try await Self.mailboxStateUntil(boundedDecoder, timeout: 3) { state in
+                    source.availableStreamFrames(for: request.epoch) == readyFrames
+                        && state.leases.allSatisfy { !$0.readPending && !$0.starting }
+                }
+                let afterCopies = (0..<3).compactMap { activity.snapshot(at: $0)?.copySequence }.reduce(0, +)
+                XCTAssertGreaterThan(afterCopies, beforeCopies, "A distant seek must actually reopen/refill the reader")
+                let beforeUnderruns = boundedRenderer.snapshot.underrunFrames
+                boundedRenderer.setPlaying(true)
+                var samples = [Float](repeating: .nan, count: 512 * 2)
+                samples.withUnsafeMutableBufferPointer { boundedRenderer.render(interleaved: $0, frameCount: 512) }
+                boundedRenderer.setPlaying(false)
+                let reference = Array(expected[Int(target) * 2..<Int(target + 512) * 2])
+                assertSamples(samples, equal: reference)
+                XCTAssertEqual(boundedRenderer.snapshot.frame, target + 512)
+                XCTAssertEqual(boundedRenderer.snapshot.underrunFrames, beforeUnderruns)
+                XCTAssertEqual(source.totalFrames, prepared.totalFrames)
+                XCTAssertEqual(boundedRenderer.retainedPCMMemoryBytes, memory)
+                print("PCM_NATIVE44100_SRC_SEEK targetFrame=\(target) nativeCopies=\(afterCopies - beforeCopies) readyFrames=\(readyFrames) exactSamples=\(samples == reference) completeFrames=\(source.totalFrames) memoryBytes=\(memory)")
+            }
+        } catch { boundedError = error }
+        _ = try await Self.mailboxShutdown(boundedDecoder)
+        if let boundedError { throw boundedError }
         #else
         XCTFail("Native input and SRC qualification requires the existing debug mailboxes")
         #endif
