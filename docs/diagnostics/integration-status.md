@@ -700,3 +700,37 @@ empty native evidence12574757595/154bytes/96fed3f27968455d88f5d4fea77bec9e78e5de
 Raw logs/result/screenshot/context retained. Actual xctestrun test/host paths use
 __TESTROOT__/__TESTHOST__, preserving product portability. No native acceptance,
 video/preparation repair, full Release or delivery claim from this failed handoff.
+
+### Native27: full focused check completes with remaining picture failures
+
+Run40130855404/source106f28c completes failure17m57total. Build6m36/core125pass;
+testjob11m13, owned297818ms build/620371ms test, no timeout. Same-run174compiled
+files pass exact-source/SDK/profile/checksum verification. Native console contains
+69native passes/2fails/1UIpass plus one manual nativepass1.649s whose class name is
+interleaved with two SDK messages. Keep that manual tier separate: strict verifier
+still rejects it along with the two real failed cases and failed-run marker.
+Expected73identities accounted for, whole run red. No parser tolerance change.
+
+Two compositorcaptures reject3. Prepared B302.191125ms exceeds250ms; default B
+237.667584ms and traced B153.035292ms pass. Cold default picture1616.294542ms is
+within its3s guard and is not an instant-picture result. Both returned-A8s audits
+have384000frames/400tones/zero exact stereo silence or underruns; four prepared
+tap boundaries are also clean. Strict633600frame ten-loop comparison matches.
+Natural baseline/final underruns1536/1536, no added underruns; exact stereo silence
+there is unmeasured. Whole native48k1440000frame reference and two26-copy distant
+seeks remain exact. Earlier real silence witnesses, full296/Release/trueHTTP and
+phone acceptance remain open. No TestFlight delivery.
+
+Evidence12575197291/71035985bytes/SHA256
+b5303d6a1a71e9a572e063bb7bc3bb9be468a9303e3e5964ff27d8ae194b0da4,
+1650ZIPentries verified. RawjobSHA256
+20bbb2bae1024e6dbfdb8ed79fdfa39eb19fdd2ad04e827de94c8cff2b1383e2.
+
+Next: small native44.1k stereo AAC API proof. The actual reader still admits only
+48k; no broader-format repair claim is supported by that restriction. Synthetic
+FFmpeg AAC video and Apple AAC audio exercise full native samples and codec
+priming/mapping. Current component rejection is the expected pre-implementation
+RED, while complete independent SDK references establish any viable extension.
+No runtime change yet. Temporary manual/public15min API-only workflow clearly
+excludes iOS acceptance; preserve/restore the full split-check workflow afterwards.
+All73profile identities and full296source methods stay in source unchanged.

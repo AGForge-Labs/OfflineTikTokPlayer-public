@@ -516,6 +516,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "823D92756EFEACD3CFB746BD";
 		};
+		"B0DBFA187C12371B0D325011" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-aac44100-stereo.mp4";
+			"sourceTree" = "<group>";
+		};
+		"9FAA440B8218F93BDF1E002E" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "B0DBFA187C12371B0D325011";
+		};
 		"A8F6764A13156B91EFA7EB79" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "file";
@@ -549,6 +559,7 @@
 		"49D98E474BBBDF405BABEA93" = {
 			"isa" = "PBXGroup";
 			"children" = (
+				"B0DBFA187C12371B0D325011",
 				"A8F6764A13156B91EFA7EB79",
 				"E9555D2EA4D7A1795504F02E",
 				"1F42C7A72E48159A7F757E9D",
@@ -1090,6 +1101,7 @@
 			"isa" = "PBXResourcesBuildPhase";
 			"buildActionMask" = 2147483647;
 			"files" = (
+				"9FAA440B8218F93BDF1E002E",
 				"768C483BD57061BC08CB7E54",
 				"494447A8A2A13E1E9DC6CC13",
 				"2D6F617377A1E9DB15C50254",

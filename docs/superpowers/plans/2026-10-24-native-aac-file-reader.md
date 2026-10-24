@@ -71,10 +71,24 @@ Native25 compiled successfully but cold compilation used about10min, leaving the
 15min job unable to finish all73cases. Three real failures remain preserved;
 this infrastructure change does not fix or excuse them.
 
-- [ ] Build once with the existing unsigned build-for-testing action in a manual standard-public15min job.
-- [ ] Carry only compiled synthetic test products to a second15min job, preserving executable permissions in a one-day artifact.
-- [ ] Fail closed on source SHA, toolchain, architecture, profile or compiled-product checksum mismatch before test-without-building.
-- [ ] Add one fixed720s owned profile-test phase. Keep every original phase, case deadline, native assertion and all73profile identities unchanged.
-- [ ] Prove bundle tampering/stale source and wrong CLI actions fail locally before spending runner time.
-- [ ] Use the existing exact native-log verifier with invocation=test-without-building; no full-release acceptance from this profile.
-- [ ] Run the revised unsigned check once; retain failures and full original source296/native release/phone obligations.
+- [x] Build once per run with the existing unsigned build-for-testing action in a manual standard-public15min job. Native26/27 builds pass.
+- [x] Carry only compiled synthetic test products to a second15min job, preserving executable permissions in a one-day artifact. Native27 validates174files.
+- [x] Fail closed on source SHA, toolchain, architecture, profile or compiled-product checksum mismatch before test-without-building.
+- [x] Add fixed720s owned profile-build/profile-test phases. Keep every original phase, case deadline, native assertion and all73profile identities unchanged.
+- [x] Prove bundle tampering/stale source and wrong CLI actions fail locally before spending runner time.74local suite pass; additional actual CLI regression reproduces Native26 failure, then8transport methods pass.
+- [x] Use the existing exact native-log verifier with invocation=test-without-building; no full-release acceptance from this profile. Native27 stays red, including its unsupported class-name splice.
+- [x] Run the corrected-source unsigned check; retain failures and full original source296/native release/phone obligations. Native27 completes without timeout but has two real failed cases; no new TestFlight.
+
+### Task 5: Cover the archive's native 44.1 kHz stereo AAC format
+
+A current local header sample confirms44.1kHz stereo AAC, whereas the first reader
+candidate admits only48kHz stereo AAC. Native27 runs the unchanged first candidate;
+its result cannot establish coverage of the archive's dominant input format.
+
+- [ ] Prove whole-source44.1kHz stereo samples, codec priming/remainder and asset segment mapping with small synthetic Mac API experiments before another full iOS build.
+- [ ] Use native-frame counts throughout the lane reader: NativePCMReading.totalFrames already has native-rate semantics. Description.totalFrames remains the48kHz renderer endpoint.
+- [ ] Let NativeAudioFileReader accept an explicit supported native rate; preserve readStartFrame=0 for all resampled inputs and the existing48kHz distant-seek policy.
+- [ ] Validate every mapping primitive on the selected native sample grid and agree with the complete native endpoint and codec packet table. Unknowns/edits/non-AAC/mono/other rates keep the original reader.
+- [ ] Retain the existing explicit AVAudioConverter, its complete history/flush behavior, all4096-frame packet/ring/prefix budgets and same-lane close ownership.
+- [ ] Prove complete post-conversion samples and end frames, repeat/next/previous and retained-source restoration for the representative stereo AAC input. Keep every prior native identity and timing/silence guard.
+- [ ] Distinguish native-format eligibility from actual HTTP/cache integration, full Release and phone acceptance; all remain required.
