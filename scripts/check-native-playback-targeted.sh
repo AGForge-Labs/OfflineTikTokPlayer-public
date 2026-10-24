@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
-expected_code_source=4019db3508537928273d89b8bc9e7e23f75a79da
+expected_code_source=217b9fae2c604e1a9f6de8197dc2ca9085ca30ae
 expected_ios_tree=5ad179beea2ef0b53374e1340ca5f731eee56c7a
 verify_source() {
   case "$expected_code_source$expected_ios_tree" in
@@ -44,10 +44,10 @@ BUNDLE = 'dev.galaxybigbird.OfflineTikTokPlayer'
 EXECUTABLE = 'OfflineTikTokPlayer'
 PREFIX = 'OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/'
 CASES = (
-    'testProductionNativeAudioSuppressionPreservesRetainedVideoAndPCM',
-    'testNativeAudioSuppressionRejectsSupersessionAtEveryPrewriteRead',
-    'testNativeAudioSuppressionCannotUndoPauseOrDeniedInterruptionResume',
-    'testProductionDefaultReadinessRequiresTheSelectedCPPOutput',
+    'testNativeReaderWaitSamplingOffFirst',
+    'testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption',
+    'testNaturalBoundaryAtPositiveIncomingOffsetRevealsB',
+    'testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption',
 )
 
 def require(condition, message):
@@ -322,7 +322,7 @@ case "$mode" in
   benchmark) cases=(
     OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture
   ) ;;
-  controls) cases=(testProductionNativeAudioSuppressionPreservesRetainedVideoAndPCM testNativeAudioSuppressionRejectsSupersessionAtEveryPrewriteRead testNativeAudioSuppressionCannotUndoPauseOrDeniedInterruptionResume testProductionDefaultReadinessRequiresTheSelectedCPPOutput) ;;
+  controls) cases=(testNativeReaderWaitSamplingOffFirst testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption testNaturalBoundaryAtPositiveIncomingOffsetRevealsB testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption) ;;
   *) printf '%s\n' 'Unknown targeted validation scope.' >&2; exit 2 ;;
 esac
 export SWIFTC_MAXIMUM_DETERMINISM=1
