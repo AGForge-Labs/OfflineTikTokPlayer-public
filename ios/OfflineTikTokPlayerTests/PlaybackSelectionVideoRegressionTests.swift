@@ -1570,6 +1570,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 if installed { audio.graph.engine.mainMixerNode.removeTap(onBus: 0) }
             }
         }
+        // Repeat configuration refreshes the empty queue's window. Do this
+        // before creating the reference so its exact preparation stays pinned.
+        service.cycleRepeat(); service.cycleRepeat()
+        XCTAssertEqual(service.queue.repeatMode, .one)
         audio.setWindow(Set(fixture.ids))
         let entry = try await audio.prepare(id: fixture.aID, url: try XCTUnwrap(fixture.savedURLs[fixture.aID]))
         _ = try await audio.prepare(id: fixture.bID, url: try XCTUnwrap(fixture.savedURLs[fixture.bID]))
@@ -1600,7 +1604,6 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             tap.append(samples, time: time)
         }
         installed = true
-        service.cycleRepeat(); service.cycleRepeat()
         service.isInteractingWithFeed = false
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2
@@ -9812,6 +9815,19 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             && service.clock.position > 0 }, "The service must adopt naturally rendered B at a positive offset")
         assertSelection(service, fixture: fixture, id: fixture.bID)
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "natural-B-positive-offset")
+        let final = service.audioSnapshot
+        print("NaturalBoundaryPCMCompletion schema=1 baselineUnderrunFrames=\(sample.underrunFrames) finalUnderrunFrames=\(final.underrunFrames) addedUnderrunFrames=\(final.underrunFrames - sample.underrunFrames) token=\(final.token) visit=\(final.visit) frame=\(final.frame) exactStereoSilence=unmeasured scope=renderer-counters physicalOutput=unverified")
+        XCTAssertEqual(final.underrunFrames, sample.underrunFrames,
+            "Natural transition and visible playback must not introduce PCM underruns")
+        #if DEBUG
+        if final.underrunFrames != sample.underrunFrames {
+            // Original playback/capture guards have already finished. Retain the
+            // real first render failure and one bounded worker reply before close.
+            await recordNaturalRunwayFailure(audio: audio,
+                expectedToken: audio.entry(for: fixture.bID)?.token ?? final.token,
+                stage: "natural-after-visible-playback", captureNativeLaneActivity: true)
+        }
+        #endif
         }
     }
 
@@ -9832,7 +9848,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         let activity = traceNativeLaneActivity || captureInitialNativeActivity
             ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
-        let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: activity)
+        let firstFailure = captureInitialNativeActivity
+            ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
+        let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: activity, debugFirstFailure: firstFailure)
         #else
         let audio = ContinuousAudioPlayer()
         #endif
@@ -9885,6 +9903,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         XCTAssertTrue(canRemove, "Owned task and decoder close acknowledgements must precede synthetic file removal")
         cleanupReceipt?(canRemove)
+        if captureInitialNativeActivity {
+            dumpFirstSourceCopyFailure(firstFailure, enabled: true, cleanupAcknowledged: canRemove)
+        }
         if canRemove { fixture.remove() }
         else { Self.targetedFixtureOwnershipLost = true; fixture.restorePreferences() }
         #else

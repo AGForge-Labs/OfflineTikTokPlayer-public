@@ -346,3 +346,53 @@ Artifact12565635699/95245bytes/SHA256
 ba9f4643dd8e86b0797bea9ab6907586b122ab92c3539bafac839e33d9ea301c
 downloaded and verified (18entries). All earlier audio failures remain open.
 No TestFlight or phone acceptance is implied by this compiler correction.
+
+
+### Native16: full live-loop sample match, two remaining failed cases
+
+Run40117015366/job120940281474 on publicc054acd completes in9m7s
+(job9m3s), owned481949ms/exit65/no timeout.123core/67native/1UI pass;
+all70 selected identities return. Two native cases fail, so the profile is
+not accepted and no whole-goal or delivery claim follows.
+
+The new live repeat-one measurement captures633600frames of the original
+57600frame/1.2s AAC source. At least ten complete loops and11actual visits
+match every mono-projection sample at1e-6 (alignment4800, one candidate).
+Zero actual stereo-zero frames, underrun delta, drops or timestamp errors;
+one stable running engine, selected A and visible/advancing video. The case
+still fails strict token equality3!=1: its post-reference cycleRepeat calls
+prepareUpcoming on the empty queue, which clears the unselected preparation
+window. The correction moves repeat configuration before preparing the
+reference; finalState.token==entry.token stays unchanged and repeat-one is
+explicitly asserted. No source samples or acceptance tolerance change.
+
+The original natural boundary case times out its screenshot command after
+31.644s (errorCode3). It also has real renderer starvation: runway baseline
+3072, before-capture3072, after-capture901888, an added898816underrun frames.
+These are counters, not a measured contiguous actual-stereo silence duration.
+Its existing screenshot error remains a failure; no retry or deadline increase.
+Do not dismiss this as only infrastructure or infer that screenshot and decoder
+stalls have a common cause. First render-guard operands and cached native/worker
+state were unavailable for this exact natural failure.
+
+The existing natural case now asserts no new underruns after its seek runway
+through the natural transition and visible motion check. On failure only, it
+uses the existing bounded1s worker-state reply before close. The already enabled
+natural activity recorder also retains the existing visit3 first-source failure,
+dumped after the original owned cleanup. No extra sampler/SDK query/hot clock,
+production code, native read policy, media,70-case membership or original assertion
+is removed or relaxed. Known native16 counters provide the failing audio witness.
+
+Default and traced returned-A8s outputs each match400/400tone blocks with zero
+stereo-zero/quiet/drop/timestamp-error/underrun. Their B/A readiness is
+118.117/110.710ms and138.970/109.385ms. Four prepared boundary windows have
+zero source/tap stereo-zero/underrun; readiness129.210/113.943/43.741/113.866ms.
+Earlier intermittent zero-output/preparation/close failures remain unresolved.
+This non-recurrence is inconclusive; no causal production repair is claimed.
+
+Raw SHA256b4e410789871b07dff341db858a8ed45b93f33ac0bc7b4a75494032b2b604d59.
+Artifact12570326447/73581030bytes/SHA256
+60583b75d7d469fe5e79d24233f1387cb76f388e170cf5e30e76ca4e10085715
+downloaded/checksum verified (1744entries). Local syntax/project/70-case source
+checks pass for the corrected test source. Native17, full Release/HTTP and
+physical-phone acceptance remain pending. No new TestFlight or signing.
