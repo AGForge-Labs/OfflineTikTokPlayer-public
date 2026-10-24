@@ -1271,13 +1271,15 @@ final class ContinuousPCMDecoderTests: XCTestCase {
             var samples: [Float] = []
             samples.reserveCapacity(Int(expectedFrames) * 2)
             var firstReadMs = -1.0, prefixMs = -1.0, reads = 0
-            while true {
+            while file.framePosition < file.length {
+                guard file.framePosition >= 0 else { throw ContinuousPCMDecoder.Failure.invalidTimeline }
+                let requested = AVAudioFrameCount(min(4_096, file.length - file.framePosition))
                 buffer.frameLength = 0
-                try file.read(into: buffer, frameCount: 4_096)
+                try file.read(into: buffer, frameCount: requested)
                 reads += 1
                 if firstReadMs < 0 { firstReadMs = milliseconds() }
                 let frames = Int(buffer.frameLength)
-                if frames == 0 { break }
+                guard frames > 0 else { throw ContinuousPCMDecoder.Failure.cannotDecode }
                 guard samples.count / 2 + frames <= Int(expectedFrames) + 4_096 else {
                     XCTFail("Unexpected extra presentation exceeds the bounded capability comparison")
                     throw ContinuousPCMDecoder.Failure.invalidTimeline
@@ -1286,6 +1288,7 @@ final class ContinuousPCMDecoderTests: XCTestCase {
                 samples.append(contentsOf: UnsafeBufferPointer(start: channels[0], count: frames * 2))
                 if prefixMs < 0, samples.count / 2 >= 96_000 { prefixMs = milliseconds() }
             }
+            XCTAssertEqual(file.framePosition, file.length)
             return (samples, file.length, openMs, firstReadMs, prefixMs, milliseconds(), reads)
         }
         let reference = try await independentlyDecode(AVURLAsset(url: url),

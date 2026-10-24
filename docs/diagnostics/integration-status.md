@@ -547,3 +547,23 @@ This will distinguish a first-read problem from a partial/extra EOF read; no EOF
 error is ignored and no expected source length/sample threshold is changed. The
 official read-count documentation requires matching processing format but supplies
 no EOF guarantee. No production or test/profile/media/workflow change.
+
+### Native21: complete data precedes an extra EOF-read error
+
+Run40125365524/job120965525397 on publicd56160c records both movie modes have
+already copied every1440000frame in352successful reads. Failing call starts and
+ends at frame1440000==file.length with buffer.frameLength0; both known CAF controls
+similarly complete4800frames/two reads before the extra call fails. Foundation
+nilError therefore does not reject this decoder or its complete output. Artifact
+12573585169/726bytes/SHA256b6513c2e43d81b51b9078cb6339053236788cc701321e1eccb8a72f5df08e208
+downloaded/checksum/ZIP verified; raw log/result metadata saved. This is a defect
+in the new comparison's EOF assumption, separate from the original playback wait.
+
+Read only through the API's precise file length and require actual positive reads;
+an early or ordinary read error still fails. Original expected length, every
+stereo sample and1e-6 tolerance remain. Same correction in the unaccepted iOS
+capability case; profile72 retains all identities. Standalone Mac probe additionally
+compares both movie modes with a complete independent native48k AVAssetReader
+reference, rejects unexpected trim/gaps/format/layout/length and compares every
+stereo sample without padding or trimming. Exact CAF controls remain. This is
+macOS API/sample fidelity only; no iOS/phone acceptance or production decoder change.
