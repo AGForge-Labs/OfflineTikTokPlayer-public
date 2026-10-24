@@ -819,3 +819,32 @@ source/tap immutable prefixes. No new runtime probes, buffer sizes or clock join
 The manual public15min job runs those two native cases plus the existing UI
 smoke required by the strict profile validator; it is diagnostic only, not full
 acceptance. No validator rule is relaxed for the smaller check.
+
+
+### Native31: clean paired loop windows; Native30 cause remains open
+
+Run40135830452/job120997027386/sourcef5595c5 completes success10m2total/9m57job.
+Ownedbuild269399ms/test279691ms, no timeout. The strict source-identity verifier
+accepts exactly2native and1UI results. Both original-default and accounting-on
+loops record633600frames (at least10whole cycles), match the full prepared mono
+reference at every compared frame, have0stereo-zero/added-underrun frames, retain
+the same engine, and keep video visible/advancing. Default17.488s, diagnostic14.145s,
+UI47.539s. These are two clean simulator recording windows, not a runtime repair
+or erasure of Native30's real intermittent live-loop failure.
+
+The source/tap recorder reports1249source/132tap callbacks,917504fixed payload
+bytes, stable observed prefix and no ledger failure. Its cumulative source prefix
+contains512zero pairs while the measured mixer window contains0; the two scopes
+are not an exact clock join. coverageClosed=false/formalRTJoin=false remain.
+Do not classify Native30's zeros as downstream based on this clean recording.
+Complete synthetic reference/recording and scalar prefixes are retained in xcresult;
+they were not independently exported/decoded on Windows.
+
+Artifact12577590221/1113766bytes/SHA256
+9f11117b0c8f0481a3dc14b5ca4d403be132a8e37cc7b1fa55080e35dfb85e90,
+59ZIPentries verified. RawlogSHAdb4398c746c71afbe7fcee01c0be566d28ecb2f0027db4e91883347d5d6b81ca;
+nativelogSHAb76c0c3b02b45b7a028eac65e97afed7a4bd0cf8c3a9cf498a9d56ef3e3df312.
+Restore the unchanged74-case split workflow byte-for-byte from751464b after this
+diagnostic. App/core source remains identical to Native30. Full298source/Release,
+real HTTP/cache, historical failure resolution and physical-phone acceptance are
+still open. No new TestFlight and no complete-gaplessness claim.
