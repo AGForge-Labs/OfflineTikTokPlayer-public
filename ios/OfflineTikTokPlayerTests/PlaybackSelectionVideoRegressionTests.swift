@@ -1551,6 +1551,97 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true)
     }
 
+    func testPreparedNextSourceAndMixerBoundary() async throws {
+        try recordRuntimeHost()
+        #if DEBUG
+        let fixture = try await SelectionVideoFixture(test: self)
+        var mayRemoveFixture = true
+        defer { if mayRemoveFixture { fixture.remove() } }
+        let accounting = ContinuousPCMRenderer.DebugRenderAccountingRecorder(captureSourceOutput: true)
+        let audio = ContinuousAudioPlayer(debugRenderAccounting: accounting)
+        let buffer = PlaybackBuffer()
+        let service = fixture.service(buffer: buffer, continuousAudio: audio)
+        let screen = try SelectionVideoScreen(service: service)
+        let tap = ProductionSelectionOutputTap()
+        var tapInstalled = false, playbackClosed = false
+        defer {
+            if !playbackClosed {
+                service.pause(); screen.close()
+                if tapInstalled { audio.graph.engine.mainMixerNode.removeTap(onBus: 0) }
+            }
+        }
+        // The engine is stopped: this is the sole render writer. Sample the actual
+        // prepared B head before the normal graph owns rendering, then clear it.
+        audio.setWindow(Set(fixture.ids))
+        let b = try await audio.prepare(id: fixture.bID, url: try XCTUnwrap(fixture.savedURLs[fixture.bID]))
+        _ = try await audio.prepare(id: fixture.aID, url: try XCTUnwrap(fixture.savedURLs[fixture.aID]))
+        XCTAssertFalse(audio.graph.engine.isRunning)
+        guard !audio.graph.engine.isRunning else { throw SelectionVideoTestFailure.timeout }
+        var head = [Float](repeating: .nan, count: 12_000 * 2)
+        audio.renderer.select(token: b.token); audio.renderer.setPlaying(true)
+        head.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 12_000) }
+        XCTAssertEqual(audio.renderer.snapshot.token, b.token)
+        XCTAssertEqual(audio.renderer.snapshot.frame, 12_000)
+        XCTAssertEqual(audio.renderer.snapshot.underrunFrames, 0)
+        audio.renderer.setPlaying(false); audio.renderer.select(token: 0)
+        var clear = [Float](repeating: .nan, count: 2)
+        clear.withUnsafeMutableBufferPointer { audio.renderer.render(interleaved: $0, frameCount: 1) }
+        XCTAssertEqual(audio.renderer.snapshot.token, 0)
+        audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { samples, time in
+            tap.append(samples, time: time)
+        }
+        tapInstalled = true
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await require({ service.audioSnapshot.frame > 2_400 && service.preparedAudioCount == 2 },
+                          "Both actual Saved sources must be playing/prepared before the boundary probe")
+        var results: [(ProductionSelectionMeasurement, ProductionSelectionSourceBoundary)] = []
+        results.reserveCapacity(4)
+        for ordinal in 0..<4 {
+            let next = ordinal % 2 == 0
+            let id = next ? fixture.bID : fixture.aID
+            try await require({ buffer.hasPrepared(id) || buffer.previousMediaID == id },
+                              "The original three-second preparation guard applies to each probe")
+            let boundary = ProductionSelectionSourceBoundary(accounting)
+            let measurement = try await measureProductionSelection(service, screen: screen,
+                fixture: fixture, audio: audio, tap: tap, seeks: ProductionSelectionSeekRecorder(),
+                startup: ProductionVideoStartupTrace(serviceTracing: false), phase: next ? 1 : 2,
+                id: id, frequency: next ? 880 : 440, prepared: true, preparedBefore: true,
+                sourceBoundary: boundary, command: { if next { service.next() } else { service.previous() } })
+            results.append((measurement, boundary))
+        }
+        service.pause(); tap.stop()
+        audio.graph.engine.mainMixerNode.removeTap(onBus: 0); tapInstalled = false
+        screen.close()
+        try await fixture.closePlayback(service)
+        playbackClosed = true
+        for (ordinal, result) in results.enumerated() {
+            // Keep the original250ms/zero-quiet/tone/identity/underrun assertions.
+            assertProductionSelection(result.0, tap: tap)
+            result.1.dump(ordinal: ordinal, measurement: result.0, tap: tap)
+        }
+        // Independent complete native decode, with explicit codec trims and exact
+        // timeline validation. This does not use the old0.5s tone-only reference.
+        do {
+            let reference = try await auditFullSavedAReference(
+                try XCTUnwrap(fixture.savedURLs[fixture.bID]), expectedHead: head)
+            print("PreparedNextNativeReference schema=1 source=Saved-B frames=\(reference.frames) comparedHeadFrames=\(reference.comparedHeadFrames) headMismatchedSamples=\(reference.headMismatchedSamples) nativeStereoZeroFrames=\(reference.stereoZeroFrames) nativeSlidingQuietWindows=\(reference.quietWindows) headCapacityBytes=96000 engineStopped=true cleanupAcknowledged=true originalSourceUnchanged=true")
+            if let frame = reference.firstHeadMismatchFrame {
+                print("PreparedNextNativeHeadMismatch schema=1 frame=\(frame) preparedLeft=\(reference.firstHeadPreparedLeft.map(String.init) ?? "unavailable") preparedRight=\(reference.firstHeadPreparedRight.map(String.init) ?? "unavailable") referenceLeft=\(reference.firstHeadReferenceLeft.map(String.init) ?? "unavailable") referenceRight=\(reference.firstHeadReferenceRight.map(String.init) ?? "unavailable")")
+            }
+            XCTAssertEqual(reference.comparedHeadFrames, 12_000)
+            XCTAssertEqual(reference.headMismatchedSamples, 0)
+        } catch {
+            mayRemoveFixture = false; fixture.restorePreferences()
+            Self.targetedFixtureOwnershipLost = true
+            print("PreparedNextNativeReference schema=1 completed=false fixtureRetained=true interpretation=unavailable")
+            throw error
+        }
+        #else
+        XCTFail("The bounded source/mixer boundary probe requires DEBUG")
+        #endif
+    }
+
     func testDefaultProductionSelectionLatencyAndStreamingContinuityWithoutCapture() async throws {
         try await runProductionSelectionBenchmark(traceVideoSeeks: false)
     }
@@ -5941,6 +6032,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         var firstTrim: FullSourceReferenceTrim?, maximumTrim: FullSourceReferenceTrim?
         var stereoZeroFrames: Int64 = 0
         var quietWindows: Int64 = 0
+        var comparedHeadFrames = 0, headMismatchedSamples = 0
+        var firstHeadMismatchFrame: Int64?
+        var firstHeadReferenceLeft: Float?, firstHeadReferenceRight: Float?
+        var firstHeadPreparedLeft: Float?, firstHeadPreparedRight: Float?
         var stereoRuns = FullSourceReferenceRuns()
         var quietRuns = FullSourceReferenceRuns()
         private var stereoStart: Int64?
@@ -6024,7 +6119,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     /// An edited-presentation reference decode, separate from runtime decoder
     /// state. Explicit metadata only; no inferred trim or mixer-frame join.
-    private func auditFullSavedAReference(_ savedURL: URL) async throws -> FullSourceReferenceAudit {
+    private func auditFullSavedAReference(_ savedURL: URL, expectedHead: [Float]? = nil) async throws -> FullSourceReferenceAudit {
+        if let expectedHead {
+            guard expectedHead.count == 24_000, expectedHead.allSatisfy({ $0.isFinite }) else {
+                throw FullSourceReferenceFailure.quality("Prepared-head comparison exceeds its fixed250ms budget")
+            }
+        }
         try Task.checkCancellation()
         let asset = AVURLAsset(url: savedURL)
         let tracks = try await asset.loadTracks(withMediaType: .audio)
@@ -6161,6 +6261,20 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     throw FullSourceReferenceFailure.quality("Nonfinite raw reference PCM")
                 }
                 if frame >= firstPresented, frame < endPresented {
+                    if let expectedHead, audit.frames < Int64(expectedHead.count / 2) {
+                        let index = Int(audit.frames) * 2
+                        audit.comparedHeadFrames += 1
+                        let leftMismatch = left.bitPattern != expectedHead[index].bitPattern
+                        let rightMismatch = right.bitPattern != expectedHead[index + 1].bitPattern
+                        if (leftMismatch || rightMismatch), audit.firstHeadMismatchFrame == nil {
+                            audit.firstHeadMismatchFrame = audit.frames
+                            audit.firstHeadReferenceLeft = left; audit.firstHeadReferenceRight = right
+                            audit.firstHeadPreparedLeft = expectedHead[index]
+                            audit.firstHeadPreparedRight = expectedHead[index + 1]
+                        }
+                        if leftMismatch { audit.headMismatchedSamples += 1 }
+                        if rightMismatch { audit.headMismatchedSamples += 1 }
+                    }
                     try audit.consume(left: left, right: right)
                 }
             }
@@ -6201,8 +6315,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         fixture: SelectionVideoFixture, audio: ContinuousAudioPlayer, tap: ProductionSelectionOutputTap,
         seeks: ProductionSelectionSeekRecorder, startup: ProductionVideoStartupTrace, phase: Int, id: String, frequency: Double,
         prepared: Bool, preparedBefore: Bool, preCommandQualification: (() throws -> Void)? = nil,
+        sourceBoundary: ProductionSelectionSourceBoundary? = nil,
         command: () throws -> Void) async throws -> ProductionSelectionMeasurement {
-        let first = tap.begin()
+        #if DEBUG
+        sourceBoundary?.begin()
+        #endif
+        let first = tap.begin(auditChannels: sourceBoundary != nil)
         if prepared { try? await Task.sleep(for: .milliseconds(120)) }
         // Nil preserves the original path. Qualification may query SDK ownership,
         // so it must finish before the original baseline and command origin.
@@ -6291,6 +6409,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         pollSummary?.loopExited(phase: phase, at: DispatchTime.now().uptimeNanoseconds, nextCursor: cursor)
         #endif
         let last = tap.stop()
+        #if DEBUG
+        sourceBoundary?.finish(tap: tap)
+        #endif
         let finalState = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
         startup.finishPhase(state: finalState, beforeVisit: before.visit, beforeSubmitted: submitted)
         return ProductionSelectionMeasurement(phase: phase, prepared: prepared, preparedBefore: preparedBefore,
@@ -11593,6 +11714,48 @@ private struct ProductionSelectionState {
         expectedToken > 0 && audio.token == expectedToken && !audio.ended && metadataMatches
             && assetMatches && sourceIDMatches && engineRunning && wantsPlaying
     }
+}
+
+@MainActor
+private final class ProductionSelectionSourceBoundary {
+    #if DEBUG
+    private let accounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder
+    private var before: ContinuousPCMRenderer.DebugRenderAccountingSnapshot?
+    private var after: ContinuousPCMRenderer.DebugRenderAccountingSnapshot?
+    private var channels: ProductionSelectionOutputTap.ChannelAudit?
+    init(_ accounting: ContinuousPCMRenderer.DebugRenderAccountingRecorder) { self.accounting = accounting }
+    func begin() { before = accounting.snapshot() }
+    func finish(tap: ProductionSelectionOutputTap) {
+        after = accounting.snapshot(); channels = tap.channelAudit()
+    }
+    func dump(ordinal: Int, measurement: ProductionSelectionMeasurement, tap: ProductionSelectionOutputTap) {
+        let recorded = tap.samples(from: measurement.first, to: measurement.last)
+        let span = before.flatMap { first in after?.sourceOutputSpan(since: first) }
+        print("SelectionBoundaryScope schema=1 ordinal=\(ordinal) phase=\(measurement.phase) sourceBeforeAvailable=\(before != nil) sourceAfterAvailable=\(after != nil) sourceSpanAvailable=\(span != nil) tapFirst=\(measurement.first) tapLast=\(measurement.last) retainedTapFrames=\(recorded.values.count) runtimeFrameJoin=false sourceToTapClockCalibration=unverified collectors=existing sourceNodePCMRetained=false preparedHeadRetainedBytes=96000 acceptance=unchanged")
+        if let before, let after, let span {
+            func delta(_ key: KeyPath<ContinuousPCMRenderer.DebugRenderAccountingSnapshot, UInt64>) -> String {
+                let a = before[keyPath: key], b = after[keyPath: key]
+                return b >= a ? String(b - a) : "unavailable"
+            }
+            print("SelectionBoundarySource schema=1 ordinal=\(ordinal) callbacks=\(span.callbacks) frames=\(span.frames) stereoZeroFrames=\(span.stereoZeroFrames) nonfiniteFrames=\(span.nonfiniteFrames) beforeHost=\(before.sourceOutput.lastHostTime) afterHost=\(after.sourceOutput.lastHostTime) beforeHostValid=\(before.sourceOutput.lastHostTimeValid) afterHostValid=\(after.sourceOutput.lastHostTimeValid)")
+            print("SelectionBoundaryKernel schema=1 ordinal=\(ordinal) copied=\(delta(\.copiedPCMFrames)) paused=\(delta(\.pausedPositiveTokenFrames)) inactive=\(delta(\.inactiveFrames)) eof=\(delta(\.eofRemainderFrames)) underrun=\(delta(\.underrunFrames)) sourceRequested=\(delta(\.sourceFramesRequested)) sourceCompleted=\(delta(\.sourceFramesCompleted)) beforeInFlight=\(before.sourceCallbacksEntered > before.sourceCallbacksCompleted) afterInFlight=\(after.sourceCallbacksEntered > after.sourceCallbacksCompleted) jointSnapshot=false")
+            XCTAssertFalse(before.overflowed); XCTAssertFalse(after.overflowed)
+            XCTAssertGreaterThan(span.frames, 0); XCTAssertEqual(span.nonfiniteFrames, 0)
+        }
+        if let channels {
+            print("SelectionBoundaryTap schema=1 ordinal=\(ordinal) frames=\(channels.observedFrames) monoZeroFrames=\(channels.monoZeroFrames) stereoZeroFrames=\(channels.stereoZeroFrames) qualifiedRuns=\(channels.qualifiedRuns) retainedRuns=\(channels.retainedRuns) droppedRuns=\(channels.droppedRuns) stereoEvidenceQualified=\(channels.stereoZeroEvidenceQualified) layoutChanged=\(channels.layout.changed)")
+            for index in 0..<channels.retainedRuns {
+                guard let run = channels.run(at: index) else { continue }
+                print("SelectionBoundaryTapRun schema=1 ordinal=\(ordinal) run=\(index) first=\(run.firstFrame) end=\(run.endFrame) frames=\(run.frames) stereoZeroFrames=\(run.stereoZeroFrames) leftSquareSum=\(run.leftSquareSum) rightSquareSum=\(run.rightSquareSum)")
+            }
+            XCTAssertEqual(channels.observedFrames, measurement.last - measurement.first)
+            XCTAssertEqual(channels.firstFrame, measurement.first)
+            XCTAssertEqual(channels.droppedRuns, 0); XCTAssertFalse(channels.overflow)
+            XCTAssertTrue(channels.stereoZeroEvidenceQualified)
+        }
+        XCTAssertNotNil(before); XCTAssertNotNil(after); XCTAssertNotNil(span); XCTAssertNotNil(channels)
+    }
+    #endif
 }
 
 private struct ProductionSelectionMeasurement {

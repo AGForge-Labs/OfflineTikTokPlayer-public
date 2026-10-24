@@ -173,3 +173,27 @@ late completion can turn it into a pass. One bounded1s evidence response is sepa
 from playback acceptance. Existing native APIs and Mutex transport are reused;
 no production Swift or profile identity/threshold changes. Native syntax/project
 and exact68-case manifest validation pass locally. No new startup policy is added.
+
+
+Run10 on e5367af ends failure in12m57s:123core/66native/1UI pass, one traced Next
+case fails video274.253ms and a10ms mono-RMS-zero interval4.069-14.069ms after Next.
+The renderer reports zero new underruns. Exact stereo silence during that selection
+is not measured by the separate clean returned-A8s stereo audits. Native9 Audio only
+timeouts do not recur, so their cause remains unproven. No new release is qualified.
+
+Before another check, the profile adds one bounded source/mixer diagnostic and keeps
+all68 original identities. Four prepared Next/Previous transitions use the unchanged
+measurement/assertion helper with the same3s setup,250ms video and zero-quiet limits.
+Existing source-output counters and existing stereo tap audit cover each selection
+window, including its120ms lead. They do not claim calibrated source-to-tap frame
+identity. Default cases pass nil and retain their original callback behavior.
+
+Before starting the engine, the sole manual render owner copies12000frames of the
+actual prepared B head into a96KB buffer. After original playback assertions and
+acknowledged shutdown, the existing complete30s native reference reader compares
+that head sample-for-sample, with explicit codec trims and exact timeline coverage.
+This closes the old0.5-0.75s tone-reference gap without changing media or trimming
+source samples. Native compilation/results remain pending. The absent new identity
+was rejected before implementation; local syntax/project/source-profile and launcher
+checks pass. Production Swift is unchanged; manual standard-public unsigned15min
+scope, Release qualification and phone acceptance remain separate.
