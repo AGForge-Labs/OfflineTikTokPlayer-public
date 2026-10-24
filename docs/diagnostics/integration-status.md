@@ -115,3 +115,24 @@ unchanged endpoint/memory, then explicitly awaits reader closure. It requires SD
 execution. The68-case profile retains all67 prior identities, including all three
 failed cases. No compositor fixture, threshold, test timeout or full-suite mode
 is changed. No new TestFlight delivery or phone acceptance is claimed.
+
+
+Public run7 on0554d09 is terminal failure10m49s:123core/64native/1UI pass,
+three native cases/13assertions fail. The distant AAC seek regression passes4.203s,
+with bit-identical compared samples at28s/7s and15/14 native reads, unchanged complete
+endpoint/storage. The original natural-boundary case now passes17.463s; actual
+A/B/A compositor pixels pass12.758s. Native streaming Pause/navigation remain green.
+Default and traced returned-A audits fail again: actual stereo-zero runs2764frames
+(57.583ms) and2104/780/732frames (43.833/16.250/15.250ms),398of400tones in each.
+Both report zero renderer underruns, with clock-progress lag. Default prepared B
+video-ready273.178ms also exceeds250ms; rapid A/B/A fails its original setup bound.
+Every failure and all thresholds remain preserved; no new release is qualified.
+
+Actual compiler commands show PlayerCore and app both compiled with-Onone/DEBUG.
+Shipping Release is configured with-O. The next explicit optimized comparison runs
+the same68-case manifest with SWIFT_OPTIMIZATION_LEVEL=-O, retaining DEBUG hooks,
+serial compilation, cleanup, verification and all original assertions. Default full
+and unoptimized profile modes remain unchanged. Actual SDK compiler flags must be
+read back before treating a result as optimized; a clean comparison would not prove
+causality or replace full Release/device acceptance. App/media code is unchanged.
+Apple performance guidance: https://developer.apple.com/documentation/xcode/writing-and-running-performance-tests

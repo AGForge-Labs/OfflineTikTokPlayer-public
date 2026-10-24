@@ -113,7 +113,7 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
             environment.pop("LAUNCHER_TEST_UNBOUND_VALUE", None)
             result = subprocess.run(["/bin/bash", str(root / "scripts/check-ios.sh"), *arguments],
                 env=environment, text=True, capture_output=True, timeout=10)
-            if arguments == ("--playback-acceptance",):
+            if arguments in (("--playback-acceptance",), ("--optimized-playback-acceptance",)):
                 self.assertEqual(result.returncode, status or tee_status, result.stdout + result.stderr)
             actual = (root / "xcode.args").read_text().splitlines() if (root / "xcode.args").exists() else []
             pid_file = root / "helper.pid"
@@ -167,13 +167,18 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
             self.assertIn('"phase":4,"deadlineSeconds":4500', evidence_log.read_text())
             self.assertEqual((root / "verifier.args").exists(), status == 0 and tee_status == 0,
                              "The strict verifier runs only after both command and tee succeed")
-            if arguments == ("--playback-acceptance",) and status == 0 and tee_status == 0:
+            if arguments in (("--playback-acceptance",), ("--optimized-playback-acceptance",)) and status == 0 and tee_status == 0:
                 self.assertEqual((root / "verifier.args").read_text().splitlines(),
                     ["scripts/verify-native-test-log.py", "--log", "artifacts/native/xcodebuild-test.log",
                      "--profile", "tests/playback-acceptance.json"])
             self.assertEqual(actual[-1], "test")
             for limit in ("-default-test-execution-time-allowance", "-maximum-test-execution-time-allowance"):
                 self.assertEqual(actual[actual.index(limit) + 1], "120")
+            if arguments == ("--optimized-playback-acceptance",):
+                self.assertEqual(actual.count("SWIFT_OPTIMIZATION_LEVEL=-O"), 1)
+            else:
+                self.assertFalse(any(arg.startswith("SWIFT_OPTIMIZATION_LEVEL=") for arg in actual),
+                    "Existing full/profile modes must keep their original configuration")
             self.assertIn("CODE_SIGNING_ALLOWED=NO", actual)
             self.assertIn("SWIFTC_MAXIMUM_DETERMINISM=1", actual)
             self.assertIn("SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO", actual)
@@ -204,6 +209,20 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
         expected = {"-only-testing:" + identity.replace(".", "/", 1) for identity in profile["cases"]}
         self.assertEqual({arg for arg in arguments if arg.startswith("-only-testing:")}, expected)
         self.assertTrue(all(arg.count("/") == 2 for arg in expected))
+
+    def test_optimized_profile_keeps_all_cases_and_requests_codegen(self):
+        arguments = self.exercise(("--optimized-playback-acceptance",))
+        profile = json.loads((ROOT / "tests/playback-acceptance.json").read_text())
+        expected = {"-only-testing:" + identity.replace(".", "/", 1) for identity in profile["cases"]}
+        self.assertEqual({arg for arg in arguments if arg.startswith("-only-testing:")}, expected)
+        self.assertEqual(arguments.count("SWIFT_OPTIMIZATION_LEVEL=-O"), 1)
+
+    def test_optimized_profile_preserves_native_and_output_failures(self):
+        self.exercise(("--optimized-playback-acceptance",), status=65)
+        self.exercise(("--optimized-playback-acceptance",), tee_status=17)
+
+    def test_optimized_preflight_failure_prevents_native_launch(self):
+        self.exercise(("--optimized-playback-acceptance",), status=23, preflight_failure=True)
 
     def test_native_failure_survives_exit_cleanup(self):
         self.exercise(status=23)

@@ -10,6 +10,7 @@ native_log="artifacts/native/xcodebuild-test.log"
 : > "$native_log"
 validation_complete=0
 validation_mode=full
+optimized_playback=0
 if [ "$#" -eq 0 ]; then
   set --
 elif [ "$#" -eq 1 ] && [ "$1" = "--selection-only" ]; then
@@ -19,16 +20,24 @@ elif [ "$#" -eq 1 ] && [ "$1" = "--selection-only" ]; then
     -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests \
     -only-testing:OfflineTikTokPlayerTests/ContinuousAudioPlayerTests \
     -only-testing:OfflineTikTokPlayerTests/ContinuousPCMDecoderTests
-elif [ "$#" -eq 1 ] && [ "$1" = "--playback-acceptance" ]; then
+elif [ "$#" -eq 1 ] && { [ "$1" = "--playback-acceptance" ] || [ "$1" = "--optimized-playback-acceptance" ]; }; then
   validation_mode=playback-acceptance
+  if [ "$1" = "--optimized-playback-acceptance" ]; then optimized_playback=1; fi
   profile_flags="$(python3 scripts/verify-native-test-log.py --profile tests/playback-acceptance.json --print-xcode-tests)"
   set --
   while IFS= read -r flag; do
     set -- "$@" "$flag"
   done <<< "$profile_flags"
 else
-  printf '%s\n' 'Usage: check-ios.sh [--selection-only|--playback-acceptance]' >&2
+  printf '%s\n' 'Usage: check-ios.sh [--selection-only|--playback-acceptance|--optimized-playback-acceptance]' >&2
   exit 2
+fi
+# Keep the default full/profile configuration intact. This explicit comparison
+# retains DEBUG hooks and exactly the same source-validated cases/assertions.
+# Actual compiler commands must be checked before claiming optimized evidence.
+if [ "$optimized_playback" -eq 1 ]; then
+  set -- "$@" SWIFT_OPTIMIZATION_LEVEL=-O
+  printf '%s\n' 'NativePlaybackBuildMode schema=1 optimized=true requestedSwiftOptimization=-O debugHooks=retained caseProfile=unchanged acceptance=unchanged'
 fi
 command -v xcodebuild >/dev/null || { printf '%s\n' 'Xcode 26 or later on macOS is required.' >&2; exit 2; }
 # Print the selected driver's plan only; no compilation is executed by this probe.
