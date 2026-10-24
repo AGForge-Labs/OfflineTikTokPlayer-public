@@ -9794,7 +9794,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let bToken = service.audioSnapshot.token
         await assertMovingVisibleVideo(service, screen: screen, identity: .b, label: "B-before-audio-only")
         service.pause(); service.seek(1)
-        try await require({ !service.clock.isSeeking && !service.audioEngineRunning },
+        try await require({ abs(service.clock.position - 1) <= 1.0 / 48_000 && !service.audioEngineRunning },
                           "The Audio only check needs a settled B position after compositor proof")
         service.play()
         try await require({ service.audioSnapshot.frame > 50_400 && service.wantsToPlay },
@@ -12937,11 +12937,15 @@ final class SelectionVideoFixture {
         if !teardownRegistered {
             teardownRegistered = true
             owningTest?.addTeardownBlock { [self] in
-                if let closeTask { try await closeTask.value }
-                else { try await closeAfterTest() }
+                try await awaitOwnedClose()
             }
         }
         return service
+    }
+
+    private func awaitOwnedClose() async throws {
+        if let closeTask { try await closeTask.value }
+        else { try await closeAfterTest() }
     }
 
     private func closeAfterTest() async throws {

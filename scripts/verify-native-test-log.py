@@ -318,7 +318,7 @@ def profile_manifest(path, source):
     data = json.loads(path.read_text(encoding="utf-8"))
     if (not isinstance(data, dict) or set(data) != {"version", "cases"}
             or type(data["version"]) is not int or data["version"] != 1
-            or not isinstance(data["cases"], list) or not 1 <= len(data["cases"]) <= 64
+            or not isinstance(data["cases"], list) or not 1 <= len(data["cases"]) <= 80
             or any(not isinstance(value, str) for value in data["cases"])):
         raise EvidenceError("Invalid bounded playback profile")
     selected = set(data["cases"])

@@ -20,6 +20,8 @@
     "OfflineTikTokPlayerTests.LibraryRefreshTests/testManualTikTokRequestJoiningForegroundRefreshRunsOnce",
     "OfflineTikTokPlayerTests.LibraryRefreshTests/testQuickBackgroundAndForegroundDoesNotLoseTheRefresh",
     "OfflineTikTokPlayerTests.LibraryRefreshTests/testSilentFailureKeepsTheCachedLibraryAndManualErrorStillAppears",
+    "OfflineTikTokPlayerTests.NativeStreamingPlaybackTests/testStreamingAudioOnlySeeksAndHonorsCameraPermissionAndExplicitPause",
+    "OfflineTikTokPlayerTests.NativeStreamingPlaybackTests/testUncachedCloudSelectionPlaysAndNavigatesWithoutAnOfflineCopy",
     "OfflineTikTokPlayerTests.PlaybackContinuityTests/testAudioSeekCompletesWithoutWaitingForMutedVideoAndPauseWins",
     "OfflineTikTokPlayerTests.PlaybackContinuityTests/testCoalescedAndDrainedLoopBoundariesReconcileActualCurrentItem",
     "OfflineTikTokPlayerTests.PlaybackContinuityTests/testFeedGestureDefersAutomaticBoundaryAndPauseIsNotLost",

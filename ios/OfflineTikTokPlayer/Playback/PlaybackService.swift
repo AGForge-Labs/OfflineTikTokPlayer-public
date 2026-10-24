@@ -499,6 +499,9 @@ final class PlaybackService: NSObject {
     var audioEngineRunning: Bool { continuousAudio.graph.engine.isRunning }
     var audioRenderQuantumFrames: Int { continuousAudio.graph.maximumRenderFrameCount }
     @ObservationIgnored private let mediaCache: PlaybackMediaCache?
+    @ObservationIgnored private let resolveRemote: (AssetReference) async throws -> URL
+    @ObservationIgnored private var usesNativeAudio = false
+    @ObservationIgnored private var nativeSeekTicket: UInt64?
     @ObservationIgnored private var warmTask: Task<Void, Never>?
     @ObservationIgnored private var warmRevision = 0
     @ObservationIgnored private weak var observedItem: AVPlayerItem?
@@ -578,7 +581,9 @@ final class PlaybackService: NSObject {
          },
          seekVideo: @escaping SeekVideo = { player, time, completion in
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
-         }, preferences: UserDefaults = .standard) {
+         }, preferences: UserDefaults = .standard,
+         mediaCache: PlaybackMediaCache? = nil,
+         resolveRemote: ((AssetReference) async throws -> URL)? = nil) {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.continuousAudio = continuousAudio ?? ContinuousAudioPlayer()
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
@@ -586,7 +591,8 @@ final class PlaybackService: NSObject {
         self.speakerAudio = speakerAudio ?? SpeakerAudioController()
         self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
         self.seekVideo = seekVideo
-        mediaCache = PlaybackCacheLoader.make(cloud: cloud)
+        self.mediaCache = mediaCache ?? PlaybackCacheLoader.make(cloud: cloud)
+        self.resolveRemote = resolveRemote ?? { try await cloud.downloadURL($0) }
         self.preferences = preferences
         automaticPiP = preferences.bool(forKey: "automaticPiP")
         speakerSound = preferences.object(forKey: "speakerSound") as? Bool ?? true
@@ -642,7 +648,7 @@ final class PlaybackService: NSObject {
             self.pipSkipCompletion = completion
             self.pipSkipDeadline = ProcessInfo.processInfo.systemUptime + 1
             self.seek(self.clock.position + seconds)
-            if self.pendingAudioSeek == nil { self.completePiPSkip() }
+            if self.pendingAudioSeek == nil && self.nativeSeekTicket == nil { self.completePiPSkip() }
         }
         continuousPiP.onRestoreUI = { [weak self] completion in
             guard let self, let restore = self.requestPlayerUI else { completion(false); return }
@@ -716,10 +722,13 @@ final class PlaybackService: NSObject {
         recordDiagnostic(.playRequested)
         resumeContinuousAudio()
         if intent.canPlay, resumeAfterPreparedEnd() { return }
-        if player.currentItem == nil || !continuousAudio.isSelected { loadCurrent(position: clock.position) }
+        if player.currentItem == nil || (!continuousAudio.isSelected && !usesNativeAudio) { loadCurrent(position: clock.position) }
         else {
             if clock.duration > 0, clock.position >= clock.duration { seek(0) }
-            else if intent.canPlay, videoAllowed { player.play() }
+            else if intent.canPlay {
+                if usesNativeAudio { restoreNativePresentation() }
+                else if videoAllowed { player.play() }
+            }
             prepareUpcoming()
             if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { armStallRecovery() }
         }
@@ -821,6 +830,10 @@ final class PlaybackService: NSObject {
         explicitVideoSeekGeneration = generation
         pendingInitialZeroStart = nil
         initialZeroVisitOwnership = nil
+        if usesNativeAudio {
+            seekNativeAudio(seconds)
+            return
+        }
         let pausedVisitBaseline = !intent.canPlay && continuousAudio.isSelected ? continuousAudio.snapshot : nil
         if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
            let version = continuousAudio.seek(seek.target) {
@@ -874,7 +887,7 @@ final class PlaybackService: NSObject {
                              audioAlreadySelected: Bool = false, preferRetainedPreviousStart: Bool = false) {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
-        pendingAudioSeek = nil; completePiPSkip()
+        pendingAudioSeek = nil; nativeSeekTicket = nil; completePiPSkip()
         pendingInitialClockBinding = nil; statusHandledGeneration = nil
         pausedExplicitVisitOwnership = nil
         pendingInitialZeroStart = nil
@@ -929,6 +942,21 @@ final class PlaybackService: NSObject {
                 return
             }
         }
+        if !forceRemote, !selectedAtRequest, !audioAlreadySelected, let id = queue.currentID,
+           eligibleAdoption?.isLocal == false || buffer.hasRemotePreparation(for: id) {
+            let prepared = eligibleAdoption ?? buffer.advance(to: id, allowRemote: allowRemote,
+                ifEligible: { self.generation == request && self.queue.currentID == id })
+            guard generation == request, queue.currentID == id else { return }
+            if let prepared, !prepared.isLocal {
+                continuousAudio.clearSelection()
+                setNativeAudioOwner(true)
+                guard generation == request, queue.currentID == id else { return }
+                currentIsLocal = false; audioLoadingID = nil
+                observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
+                prepareUpcoming(); persist()
+                return
+            }
+        }
         if !selectedAtRequest && !audioAlreadySelected { continuousAudio.clearSelection() }
         player.pause(); buffer.replace(with: nil)
         loadTask = Task { [weak self] in
@@ -945,43 +973,42 @@ final class PlaybackService: NSObject {
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.cachedLookupAndResolution, request: request)
                     #endif
-                    let cached: URL?
-                    if let asset = item.asset { cached = await self.mediaCache?.file(for: asset) } else { cached = nil }
-                    var local = saved ?? cached
-                    // AVAssetReader prepares only verified local media. A cold
-                    // network selection must download before it can be gapless.
-                    if local == nil, let asset = item.asset, self.downloads.network.isConnected {
-                        let pinned = [self.current, self.previousID.flatMap { self.library.catalog.mediaByID[$0] },
-                                      self.nextID.flatMap { self.library.catalog.mediaByID[$0] }].compactMap { $0?.asset }
-                        await self.mediaCache?.setWindow(pinned, revision: self.warmRevision)
-                        local = await self.mediaCache?.prefetch(asset, revision: self.warmRevision)
-                    }
-                    let url: URL
-                    if let local { url = local }
-                    else {
-                        throw AppError.message("This video must finish preparing before playback.")
-                    }
+                    let source = try await PlaybackMediaSource.resolve(saved: saved, asset: item.asset,
+                        cache: self.mediaCache, allowRemote: self.downloads.network.isConnected,
+                        forceRemote: forceRemote, remoteURL: self.resolveRemote)
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.localResolved, request: request)
                     #endif
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
-                    self.currentIsLocal = local != nil
-                    let playerItem = AVPlayerItem(url: url)
+                    self.currentIsLocal = source.usesPCM
+                    let playerItem = AVPlayerItem(url: source.url)
                     playerItem.preferredForwardBufferDuration = 8
-                    #if DEBUG
-                    self.debugMarkInitialLoadPhase(.audioPrepare, request: request)
-                    #endif
-                    _ = try await self.continuousAudio.prepare(id: item.id, url: url, currentPriority: true)
-                    #if DEBUG
-                    self.debugMarkInitialLoadPhase(.audioPrepared, request: request)
-                    #endif
-                    try Task.checkCancellation()
-                    guard self.generation == request else { return }
-                    if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
-                    self.resumeContinuousAudio()
-                    self.recordPlaybackEvent("coldAudioPrepared")
-                    // Audio starts first; video setup still commits before this item joins the queue.
+                    if source.usesPCM {
+                        #if DEBUG
+                        self.debugMarkInitialLoadPhase(.audioPrepare, request: request)
+                        #endif
+                        _ = try await self.continuousAudio.prepare(id: item.id, url: source.url, currentPriority: true)
+                        #if DEBUG
+                        self.debugMarkInitialLoadPhase(.audioPrepared, request: request)
+                        #endif
+                        try Task.checkCancellation()
+                        guard self.generation == request else { return }
+                        self.setNativeAudioOwner(false)
+                        guard self.generation == request else { return }
+                        if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
+                        self.resumeContinuousAudio()
+                        self.recordPlaybackEvent("coldAudioPrepared")
+                    } else {
+                        // A valid stream must not be rejected by optional full-file caching.
+                        // Native AVPlayer owns its audio/clock; the local PCM reader is not fed HTTP.
+                        self.continuousAudio.clearSelection()
+                        self.setNativeAudioOwner(true)
+                        guard self.generation == request else { return }
+                        self.audioLoadingID = nil
+                        self.recordPlaybackEvent("nativeStreamSelected")
+                    }
+                    // Prepared PCM starts first; streamed audio starts when the native item is ready.
                     #if DEBUG
                     let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: playerItem)
                     #else
@@ -991,7 +1018,7 @@ final class PlaybackService: NSObject {
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.bufferReplaceAndObserve, request: request)
                     #endif
-                    guard self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil,
+                    guard self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: source.usesPCM,
                         videoPreparation: videoPreparation, ifEligible: {
                             !Task.isCancelled && self.generation == request
                         }) else { return }
@@ -1040,6 +1067,76 @@ final class PlaybackService: NSObject {
             self.isLoading = false; self.pause()
             self.message = "No available videos in this queue. Connect to your library or choose downloaded videos."
         }
+    }
+
+    /// The fallback preserves streaming and Audio only when full-file PCM preparation is
+    /// unavailable. Its boundaries still need gapless validation; it is not PCM acceptance.
+    private func setNativeAudioOwner(_ enabled: Bool) {
+        let request = generation
+        usesNativeAudio = enabled
+        buffer.usesExternalClock = !enabled
+        guard generation == request, usesNativeAudio == enabled else { return }
+        player.isMuted = !enabled
+        guard generation == request, usesNativeAudio == enabled else { return }
+        surface.playerLayer.player = enabled && !videoAllowed ? nil : player
+        guard generation == request, usesNativeAudio == enabled else { return }
+        refreshAudioProcessing()
+    }
+
+    private func enableNativeItemAudio(on item: AVPlayerItem, request: Int) -> Bool {
+        @MainActor func owns() -> Bool { generation == request && observedItem === item && player.currentItem === item }
+        guard owns() else { return false }
+        let tracks = item.tracks.filter { $0.assetTrack?.mediaType == .audio }
+        guard owns() else { return false }
+        // A retained muted-video item may have had its unused native audio disabled.
+        // Preserve an existing default choice; re-enable one track only when all are off.
+        let enabled = tracks.contains { $0.isEnabled }
+        guard owns() else { return false }
+        if !enabled, let first = tracks.first {
+            first.isEnabled = true
+            guard owns() else { return false }
+        }
+        return true
+    }
+
+    private func restoreNativePresentation() {
+        guard usesNativeAudio, nativeSeekTicket == nil, readyGeneration == generation,
+              let item = observedItem, player.currentItem === item else { return }
+        let request = generation
+        if let presentation = videoPresentation, presentation.request == request {
+            if continuousPiP.installTimeline(presentation.ticket, positionSeconds: clock.position,
+                durationSeconds: clock.duration, isPlaying: intent.canPlay) {
+                _ = continuousPiP.activate(presentation.ticket)
+            }
+        }
+        guard usesNativeAudio, generation == request, observedItem === item, player.currentItem === item else { return }
+        if videoAllowed { monitorFirstFrame(item, request: request) }
+        guard usesNativeAudio, generation == request, observedItem === item, player.currentItem === item else { return }
+        if intent.canPlay { player.play() } else { player.pause() }
+        updateNowPlaying()
+    }
+
+    private func seekNativeAudio(_ seconds: Double) {
+        guard usesNativeAudio, let item = observedItem, player.currentItem === item,
+              let seek = clock.beginSeek(to: seconds) else { return }
+        let request = generation, ticket = continuousPiP.beginSeek()
+        guard generation == request, usesNativeAudio, observedItem === item, player.currentItem === item else { return }
+        nativeSeekTicket = ticket
+        recordDiagnostic(.seekRequested)
+        seekPlayer(player, CMTime(seconds: seek.target, preferredTimescale: 48_000)) { [weak self, weak item] finished in
+            Task { @MainActor in
+                guard let self, let item, self.usesNativeAudio, self.generation == request,
+                      self.observedItem === item, self.player.currentItem === item,
+                      self.nativeSeekTicket == ticket else { return }
+                self.nativeSeekTicket = nil
+                self.continuousPiP.completeSeek(ticket)
+                guard self.clock.completeSeek(seek, actualPosition: item.currentTime().seconds) else { return }
+                if finished { self.recordPlaybackEvent("seekCompleted") }
+                self.restoreNativePresentation()
+                self.persist(); self.completePiPSkip()
+            }
+        }
+        persist(); updateNowPlaying()
     }
 
     /// PCM owns audible content. Suppress unused native item audio while
@@ -1165,6 +1262,19 @@ final class PlaybackService: NSObject {
                 guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
                 if playerItem.status == .readyToPlay {
                     guard self.statusHandledGeneration != request else { return }
+                    if self.usesNativeAudio {
+                        guard self.enableNativeItemAudio(on: playerItem, request: request) else { return }
+                        self.statusHandledGeneration = request
+                        self.readyGeneration = request
+                        self.clock.updateDuration(playerItem.duration.seconds)
+                        self.isLoading = false; self.audioLoadingID = nil
+                        self.refreshAudioProcessing()
+                        guard self.generation == request, self.observedItem === playerItem else { return }
+                        self.recordPlaybackEvent("itemReady")
+                        if position > 0 || rewind { self.seekNativeAudio(position) }
+                        else { self.restoreNativePresentation() }
+                        return
+                    }
                     guard self.disableUnusedNativeAudio(on: playerItem, request: request) else { return }
                     self.statusHandledGeneration = request
                     #if DEBUG
@@ -1613,6 +1723,13 @@ final class PlaybackService: NSObject {
             let pinned = ([active, previous].compactMap { $0 } + upcoming).compactMap(\.asset)
             await self.mediaCache?.setWindow(pinned, revision: revision)
             guard !Task.isCancelled, self.generation == request else { return }
+            if self.usesNativeAudio {
+                while !Task.isCancelled, self.generation == request, self.intent.canPlay,
+                      self.readyGeneration != request || self.clock.position < 0.05 {
+                    do { try await Task.sleep(for: .milliseconds(20)) } catch { return }
+                }
+                guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+            }
             // Repeat-one uses the current prefix for its natural boundary; its
             // explicit Next still needs the second slot, including Saved media
             // that the later network-prefetch loop deliberately skips.
@@ -1630,7 +1747,7 @@ final class PlaybackService: NSObject {
                 if let asset = next.asset { cached = await self.mediaCache?.file(for: asset) } else { cached = nil }
                 var url = saved ?? cached
                 if url == nil, self.downloads.network.isConnected, let asset = next.asset {
-                    url = try? await self.cloud.downloadURL(asset)
+                    url = try? await self.resolveRemote(asset)
                 }
                 guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                 if let url {
@@ -1638,7 +1755,7 @@ final class PlaybackService: NSObject {
                     // Never infer a trim point from a silent tail or catalog duration.
                     let playerItem = AVPlayerItem(url: url)
                     playerItem.preferredForwardBufferDuration = 8
-                    if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
+                    if saved != nil || cached != nil { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     #if DEBUG
                     let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: playerItem)
@@ -1659,14 +1776,14 @@ final class PlaybackService: NSObject {
                 let cached = if let asset = previous.asset { await self.mediaCache?.file(for: asset) } else { nil as URL? }
                 var url = saved ?? cached
                 if url == nil, self.downloads.network.isConnected, let asset = previous.asset {
-                    url = try? await self.cloud.downloadURL(asset)
+                    url = try? await self.resolveRemote(asset)
                 }
                 guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                 if let url {
                     let item = AVPlayerItem(url: url)
                     item.preferredForwardBufferDuration = 8
                     _ = await PlaybackPreparation.value(within: .milliseconds(500)) { try? await item.asset.load(.isPlayable) }
-                    if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
+                    if saved != nil || cached != nil { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     #if DEBUG
                     let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: item)
@@ -1683,7 +1800,10 @@ final class PlaybackService: NSObject {
             }
             guard self.downloads.network.isConnected, self.wantsToPlay else { return }
             // A small rolling window also keeps recently played clips ready for a downward swipe.
-            for item in Array(upcoming.prefix(1)) + [previous].compactMap({ $0 }) + Array(upcoming.dropFirst()) + [active].compactMap({ $0 }) {
+            let warmOrder = self.usesNativeAudio
+                ? [active].compactMap({ $0 }) + upcoming + [previous].compactMap({ $0 })
+                : Array(upcoming.prefix(1)) + [previous].compactMap({ $0 }) + Array(upcoming.dropFirst()) + [active].compactMap({ $0 })
+            for item in warmOrder {
                 guard !Task.isCancelled, self.warmRevision == revision else { return }
                 guard let asset = item.asset else { continue }
                 if await self.downloads.localURL(for: item) != nil { continue }
@@ -1715,6 +1835,9 @@ final class PlaybackService: NSObject {
     }
 
     private func selectContinuousAudio(id: String, position: Double) {
+        let request = generation
+        setNativeAudioOwner(false)
+        guard generation == request, queue.currentID == id else { return }
         initialZeroVisitOwnership = nil
         let baseline = continuousAudio.snapshot
         audioVisit = baseline.visit; audioToken = baseline.token
@@ -1753,7 +1876,7 @@ final class PlaybackService: NSObject {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         continuousAudio.settlePausedState()
-        guard audioLoadingID == nil else { return }
+        guard !usesNativeAudio, audioLoadingID == nil else { return }
         let sample = continuousAudio.snapshot
         // A natural boundary can publish an older visit after a selection is
         // requested. It must not replace the requested source/queue before that
@@ -1866,7 +1989,12 @@ final class PlaybackService: NSObject {
         guard player.currentItem === item else { return }
         guard !continuousAudio.isSelected else { return }
         // Read the current item now: an already queued callback can belong to the old item.
-        clock.sample(position: item.currentTime().seconds)
+        let position = item.currentTime().seconds
+        clock.sample(position: position)
+        if usesNativeAudio, nativeSeekTicket == nil {
+            continuousPiP.updatePlayback(positionSeconds: position, durationSeconds: clock.duration,
+                isPlaying: intent.canPlay && player.rate > 0)
+        }
         if firstProgressGeneration != generation, item.currentTime().seconds >= 0.05 {
             firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
         }
@@ -1993,6 +2121,10 @@ final class PlaybackService: NSObject {
     }
 
     private func synchronizeVideoToAudio(force: Bool = false) {
+        if usesNativeAudio {
+            if force { restoreNativePresentation() }
+            return
+        }
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         if force { transferInitialClockBinding(retainActivation: false) }
@@ -2389,7 +2521,10 @@ final class PlaybackService: NSObject {
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
             activateAudio()
             resumeContinuousAudio()
-            if intent.canPlay, !resumeAfterPreparedEnd(), videoAllowed { player.play() }
+            if intent.canPlay, !resumeAfterPreparedEnd() {
+                if usesNativeAudio { restoreNativePresentation() }
+                else if videoAllowed { player.play() }
+            }
         }
         updateNowPlaying()
     }
@@ -2404,9 +2539,10 @@ final class PlaybackService: NSObject {
     }
 
     private func refreshAudioProcessing() {
-        // Video is always muted; applying item taps as well would duplicate DSP.
-        speakerAudio.update(items: buffer.retainedItems, enabled: false)
-        continuousAudio.setSpeakerEnabled(SpeakerAudioMix.shouldEnhance(enabled: speakerSound, routes: audioRoutes()))
+        let enhance = SpeakerAudioMix.shouldEnhance(enabled: speakerSound, routes: audioRoutes())
+        // Exactly one audible transport owns speaker processing.
+        speakerAudio.update(items: buffer.retainedItems, enabled: usesNativeAudio && enhance)
+        continuousAudio.setSpeakerEnabled(!usesNativeAudio && enhance)
     }
 
     private func applyPresentation(_ actions: PlaybackPresentationPolicy.Actions) {
@@ -2418,9 +2554,14 @@ final class PlaybackService: NSObject {
         if !videoAllowed {
             initialPollWindow.withdraw(request: generation)
             transferInitialClockBinding(retainActivation: true)
-            player.pause(); continuousPiP.suspendFrameFeed()
+            if usesNativeAudio { surface.playerLayer.player = nil }
+            else { player.pause() }
+            continuousPiP.suspendFrameFeed()
         }
-        else { continuousPiP.resumeFrameFeed() }
+        else {
+            surface.playerLayer.player = player
+            continuousPiP.resumeFrameFeed()
+        }
         if actions.restoreInlineVideo {
             #if DEBUG
             synchronizeVideoToAudio(force: true, reason: .surfaceRestore)

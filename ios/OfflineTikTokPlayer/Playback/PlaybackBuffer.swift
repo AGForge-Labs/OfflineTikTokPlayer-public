@@ -75,6 +75,11 @@ final class PlaybackBuffer {
             if !videoResources.contains(where: { $0 === resource }) { resource.retire() }
         }
     }
+    /// Metadata only; the consuming advance still validates the live item/owner.
+    func hasRemotePreparation(for mediaID: String) -> Bool {
+        [next, loopReserve, previous].compactMap { $0 }.contains { $0.mediaID == mediaID && !$0.isLocal }
+    }
+
     func hasPrepared(_ mediaID: String) -> Bool {
         guard let next else { return false }
         return next.mediaID == mediaID && next.item.status != .failed && player.items().dropFirst().first === next.item

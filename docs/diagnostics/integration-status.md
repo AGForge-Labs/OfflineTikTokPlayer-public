@@ -1,9 +1,9 @@
 # PCM player integration candidate
 
-This candidate combines the continuous PCM experiment with the already-delivered
+This private candidate combines the continuous PCM experiment with the already-delivered
 Library Audio only control and phone-requested TikTok refresh. It is not a delivered build.
 
-The existing focused profile now requires 63 native results and one UI result, including
+The existing focused profile now requires 65 native results and one UI result, including
 every original diagnostic case plus complete relevant service, presentation, library,
 speaker and feed suites. All portable core tests still run. Missing, failed, skipped,
 duplicate or unexpected case evidence remains a failure. The ordinary full-suite mode
@@ -24,14 +24,27 @@ execution; real OnTrac scanning/photos and real-phone gaplessness remain pending
 it is not a checksum assertion for this subsequent integration. The Git commit and its
 current native job receipt identify the integrated source.
 
-Whole-branch source review is complete. The mandatory full-file cache dependency remains
-a release blocker for valid cloud assets that exceed or cannot enter its 256MiB budget.
-The owner-only delivered19.1 is unchanged; this branch is unsigned diagnostic source.
 
-The prior public run40084532134 failed five selected native cases. Its exact frame-grid
-regression and actual UI Downloads navigation passed. Audio underruns remain failed
-evidence. The Audio only test exhausted its30-second clip during slow compositor capture;
-the setup now explicitly settles an earlier position after preserving that motion proof.
-Fixture owners now join their service tasks and decoder shutdown before deleting media,
-and XCTest awaits completion before starting another case. These changes need native
-execution and do not establish a production audio fix or phone acceptance.
+The review's mandatory full-file dependency has a source correction pending native
+validation. Ready Saved/verified cache files retain the PCM engine. Cache misses resolve
+a fresh cloud URL immediately and use the existing AVPlayer for its audio and clock;
+the local-file PCM reader is never fed an unsupported remote URL. The selected stream's
+initial buffer precedes optional neighbour warming. A rejected optional cache transfer
+does not reject the selected video or enlarge the 256MiB temporary-cache budget.
+
+Native streaming ownership preserves Audio only without pausing its audio, detaches
+the inline layer, and preserves seek, pause, queue and interruption rules. Speaker DSP
+belongs to exactly one audible transport. Previously prepared remote items are retained
+through handoff. Two native regressions exercise this path using original synthetic
+files returned by a fake cloud resolver; they do not prove HTTP/network or phone behavior.
+
+Five real-cache/source regressions first failed with the missing resolver and now pass;
+all119 portable core tests passed. Fifteen focused evidence/launcher tests passed. Native
+SDK compilation and actual output remain pending. Previous failed output witnesses,
+the complete ordinary test mode and every existing64 profile identity are preserved;
+the two new native cases bring the profile to66. Native streaming boundary gaplessness,
+source-complete PCM performance and real-phone/OnTrac acceptance remain required.
+
+Public integration run2 stopped at an NSObject/Observation initialization compile error;
+run3 compiled the app but stopped at two test-only compile errors. All three were corrected
+without changing output or pixel assertions. No runtime acceptance is inferred from them.
