@@ -156,3 +156,20 @@ The original rapid case now prints existing load/preparation/worker state only
 once its unchanged3s predicate fails. No startup-policy, source sample, silence,
 progress, compositor or timeout criterion is relaxed. Public source/free unsigned
 checks remain the only newly authorized hosted actions.
+
+Run9 on14d93c4 completes within the cap (10m58total, owned command exit65/no timeout).
+123core/65native/1UI pass. Both unchanged actual8-second audits capture384000frames,
+400tones and zero stereo-zero/quiet/drop/timestamp errors/underruns. Default/traced
+Bvideo125.771/146.668ms and returnedA111.089/90.308ms pass; rapid A/B/A now passes.
+Same-source fresh-host passes do not repair the older intermittent failures.
+Two original Library Audio only tests fail four5s playback-condition assertions:
+camera/permission and persisted paused restore. Owned fixture close ACKs succeed.
+The build remains failed; no new delivery or phone/full Release claim.
+
+The next diagnostic labels the seven existing waits in those two tests and reports
+original call-site failures, plus cached player/owned decoder state only after the
+original5s condition fails. Its result is frozen before collecting evidence; no
+late completion can turn it into a pass. One bounded1s evidence response is separate
+from playback acceptance. Existing native APIs and Mutex transport are reused;
+no production Swift or profile identity/threshold changes. Native syntax/project
+and exact68-case manifest validation pass locally. No new startup policy is added.
