@@ -183,7 +183,7 @@ def main():
     except ValueError:
         parser.error("--udid must be a Simulator UUID")
     started = time.monotonic()
-    lifetime = min(3600, arguments.lifetime)
+    lifetime = min(4800, arguments.lifetime)
     deadline = started + lifetime
     DEADLINE = deadline
     capture_lifecycle(0, 0, started, deadline, lifetime, started)

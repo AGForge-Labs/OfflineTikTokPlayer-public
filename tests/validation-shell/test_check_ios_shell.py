@@ -49,7 +49,7 @@ if [ "$1" = scripts/run-owned-xcodebuild.py ]; then
   shift 4
   case "$phase" in
     driver) phase_code=3; deadline=60 ;;
-    full-test) phase_code=4; deadline=3300 ;;
+    full-test) phase_code=4; deadline=4500 ;;
     *) exit 92 ;;
   esac
   "$@"
@@ -152,10 +152,10 @@ exit "$LAUNCHER_TEST_TEE_STATUS"
                 return actual
             self.assertEqual((root / "capture.args").read_text().splitlines(),
                 ["scripts/capture-simulator-test-frames.py", "--udid",
-                 "00000000-0000-0000-0000-000000000001", "--lifetime", "3600"])
+                 "00000000-0000-0000-0000-000000000001", "--lifetime", "4800"])
             self.assertEqual((root / "owned-full-test.args").read_text().splitlines(),
                 ["scripts/run-owned-xcodebuild.py", "--phase", "full-test", "--", "xcodebuild"] + actual)
-            self.assertIn('"phase":4,"deadlineSeconds":3300', evidence_log.read_text())
+            self.assertIn('"phase":4,"deadlineSeconds":4500', evidence_log.read_text())
             self.assertEqual((root / "verifier.args").exists(), status == 0 and tee_status == 0,
                              "The strict verifier runs only after both command and tee succeed")
             self.assertEqual(actual[-1], "test")

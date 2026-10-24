@@ -13,8 +13,9 @@ import time
 
 # The full native target compiles serially. Compilation has its own fixed budget;
 # playback cases and the owned-group cleanup policy keep their existing limits.
+# The prior 55-minute full run ended before its smaller source inventory completed.
 PHASES = {"build": (0, 1080), "case-01": (1, 300), "case-02": (2, 300), "driver": (3, 60),
-          "full-test": (4, 3300)}
+          "full-test": (4, 4500)}
 MAX_SESSION_SECONDS = max(seconds for _, seconds in PHASES.values())
 DRIVER_COMMAND = ("xcrun", "swiftc", "-driver-print-jobs", "-j1", "-j3", "-typecheck", "-")
 
