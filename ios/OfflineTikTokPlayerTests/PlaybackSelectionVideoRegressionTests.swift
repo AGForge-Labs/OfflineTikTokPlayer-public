@@ -14,7 +14,9 @@ import Synchronization
 @testable import OfflineTikTokPlayer
 
 #if DEBUG
-/// Test-only item configuration comparison. Muting is not a track-disable receipt.
+/// Production-default observation/idempotence. Both arms require audio already
+/// disabled before this hook; enabled requests only redundant extra suppression.
+/// Historical source03eb and earlier receipts remain the actual policy comparison.
 @MainActor
 private final class NativeItemAudioTrackControl {
     struct TrackRow {
@@ -89,7 +91,7 @@ private final class NativeItemAudioTrackControl {
             && Set(rows.map(\.trackID)).count == rows.count
             && rows.contains { $0.kind == 0 } && rows.contains { $0.kind == 1 }
             && rows.allSatisfy { row in
-                if row.kind == 0 { return row.after == !enabled }
+                if row.kind == 0 { return !row.before && !row.after && !row.wrote }
                 return row.before == row.after && !row.wrote && (row.kind != 1 || row.after)
             }
         if stage == 1 {
@@ -109,16 +111,16 @@ private final class NativeItemAudioTrackControl {
     }
     func stop() { stopped = true }
     func dumpAndAssert(cleanupAcknowledged: Bool) {
-        print("NativeItemAudioSummary schema=1 enabled=\(enabled) owners=\(owners.count) trackRows=\(tracks.count) ownerCapacity=6 trackCapacity=48 readyRequests=\(readyRequests.count) bytes=\(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6) stopped=\(stopped) failed=\(failed) cleanupAcknowledged=\(cleanupAcknowledged) configurationAt=existing-ready-callback originalAssetPreserved=true audioEngine=unchanged causalProof=false")
+        print("NativeItemAudioSummary schema=2 extraDisableRequested=\(enabled) productionDefaultAudioDisabled=true mode=observation-idempotence owners=\(owners.count) trackRows=\(tracks.count) ownerCapacity=6 trackCapacity=48 readyRequests=\(readyRequests.count) bytes=\(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6) stopped=\(stopped) failed=\(failed) cleanupAcknowledged=\(cleanupAcknowledged) configurationAt=production-before-existing-ready-hook originalAssetPreserved=true audioEngine=unchanged causalProof=false")
         XCTAssertTrue(stopped && cleanupAcknowledged); XCTAssertFalse(failed)
         XCTAssertEqual(owners.count, 6); XCTAssertEqual(readyRequests.count, 3)
         XCTAssertLessThan(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6, 65_536)
         for owner in owners {
-            print("NativeItemAudioOwner schema=1 enabled=\(enabled) phase=\(owner.phase) stage=\(owner.stage) request=\(owner.request) item=\(owner.item) entryNs=\(owner.entered) returnNs=\(owner.returned) tracks=\(owner.tracks) readyAfter=\(owner.readyAfter) qualified=\(owner.qualified)")
+            print("NativeItemAudioOwner schema=2 extraDisableRequested=\(enabled) mode=observation-idempotence phase=\(owner.phase) stage=\(owner.stage) request=\(owner.request) item=\(owner.item) entryNs=\(owner.entered) returnNs=\(owner.returned) tracks=\(owner.tracks) readyAfter=\(owner.readyAfter) qualified=\(owner.qualified)")
             XCTAssertTrue(owner.qualified && owner.readyAfter); XCTAssertGreaterThanOrEqual(owner.returned, owner.entered)
         }
         for row in tracks {
-            print("NativeItemAudioTrack schema=1 enabled=\(enabled) phase=\(row.phase) stage=\(row.stage) ordinal=\(row.ordinal) kind=\(row.kind) trackID=\(row.trackID) before=\(row.before) after=\(row.after) wrote=\(row.wrote) entryNs=\(row.entered) returnNs=\(row.returned)")
+            print("NativeItemAudioTrack schema=2 extraDisableRequested=\(enabled) mode=observation-idempotence phase=\(row.phase) stage=\(row.stage) ordinal=\(row.ordinal) kind=\(row.kind) trackID=\(row.trackID) before=\(row.before) after=\(row.after) wrote=\(row.wrote) entryNs=\(row.entered) returnNs=\(row.returned)")
         }
         for phase in 0..<3 {
             let ready = owners.filter { $0.phase == phase && $0.stage == 0 }
@@ -127,7 +129,7 @@ private final class NativeItemAudioTrackControl {
             XCTAssertEqual(ready.first?.item, after.first?.item)
             let startAudio = tracks.filter { $0.phase == phase && $0.stage == 0 && $0.kind == 0 }
             XCTAssertFalse(startAudio.isEmpty)
-            XCTAssertTrue(startAudio.allSatisfy { $0.before == !(enabled && phase == 2) })
+            XCTAssertTrue(startAudio.allSatisfy { !$0.before && !$0.after && !$0.wrote })
         }
         XCTAssertEqual(owners.first(where: { $0.phase == 0 && $0.stage == 0 })?.item,
                        owners.first(where: { $0.phase == 2 && $0.stage == 0 })?.item,
@@ -734,10 +736,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private func runNativeItemAudioTrackComparison(_ modes: [Bool], order: String) async throws {
         try recordRuntimeHost()
         for (ordinal, enabled) in modes.enumerated() {
-            print("NativeItemAudioArm schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) hook=existing-ready-callback zeroProbe=constant-on startupClock=constant-on originalGuards=unchanged")
+            print("NativeItemAudioArm schema=2 order=\(order) ordinal=\(ordinal) extraDisableRequested=\(enabled) productionDefaultAudioDisabled=true mode=observation-idempotence hook=existing-ready-callback zeroProbe=constant-on startupClock=constant-on originalGuards=unchanged")
             try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
                 traceClockHandoff: true, nativeAudioTrackDisabling: enabled)
-            print("NativeItemAudioArmEnd schema=1 order=\(order) ordinal=\(ordinal) enabled=\(enabled) helperReturned=true")
+            print("NativeItemAudioArmEnd schema=2 order=\(order) ordinal=\(ordinal) extraDisableRequested=\(enabled) mode=observation-idempotence helperReturned=true")
         }
     }
 
@@ -3640,6 +3642,131 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertLessThanOrEqual(abs(frame - state.requested), 0.080)
             XCTAssertLessThanOrEqual(abs(copied - frame), 0.080)
         } else { XCTFail("Playing A must retain coherent custom progress through helper work") }
+    }
+
+    func testProductionNativeAudioSuppressionPreservesRetainedVideoAndPCM() async throws {
+        #if DEBUG
+        try await withOwnedNaturalFixture { fixture, audio, service, screen in
+            service.isInteractingWithFeed = true
+            let tap = ProductionSelectionOutputTap()
+            audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
+                tap.append(buffer, time: time)
+            }
+            defer { tap.stop(); audio.graph.engine.mainMixerNode.removeTap(onBus: 0) }
+            @MainActor func verify(_ id: String, identity: SelectionVideoIdentity, frequency: Double) async throws -> AVPlayerItem {
+                try await self.requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: id)
+                let item = try XCTUnwrap(service.player.currentItem)
+                self.assertProductionNativeAudioTracks(item)
+                let source = audio.renderer.snapshot, submitted = service.submittedVideoFrameCount
+                let first = tap.begin()
+                try await Task.sleep(for: .milliseconds(240))
+                let last = tap.stop(), after = audio.renderer.snapshot
+                let recording = tap.samples(from: first, to: last)
+                let tone = ProductionSelectionOutputTap.toneBlocks(recording.values, rate: recording.rate, frequency: frequency)
+                XCTAssertGreaterThan(tone.total, 0); XCTAssertEqual(tone.correct, tone.total)
+                XCTAssertEqual(ProductionSelectionOutputTap.quietRun(recording.values, rate: recording.rate), 0)
+                XCTAssertEqual(after.token, source.token); XCTAssertEqual(after.visit, source.visit)
+                XCTAssertGreaterThan(after.frame, source.frame); XCTAssertEqual(after.underrunFrames, source.underrunFrames)
+                XCTAssertGreaterThan(service.submittedVideoFrameCount, submitted)
+                _ = await self.assertVisibleFrame(service, screen: screen, identity: identity, label: "native-audio-policy-" + identity.rawValue)
+                return item
+            }
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            let firstA = try await verify(fixture.aID, identity: .a, frequency: 440)
+            service.next()
+            _ = try await verify(fixture.bID, identity: .b, frequency: 880)
+            service.previous()
+            let returnedA = try await verify(fixture.aID, identity: .a, frequency: 440)
+            XCTAssertTrue(firstA === returnedA, "Previous must retain the actual configured native item")
+            XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, 6_912_000)
+        }
+        #else
+        XCTFail("Native audio ownership contracts require DEBUG")
+        #endif
+    }
+
+    func testNativeAudioSuppressionRejectsSupersessionAtEveryPrewriteRead() async throws {
+        #if DEBUG
+        try recordRuntimeHost()
+        let boundaries: [PlaybackService.DebugNativeAudioBoundary] = [.tracksRead, .assetTrackRead, .mediaTypeRead, .isEnabledRead]
+        for boundary in boundaries {
+            try await withOwnedNaturalFixture(recordHost: false) { fixture, audio, service, screen in
+                service.isInteractingWithFeed = true
+                var fired = false, superseded: AVPlayerItem?, beforeAudio: [Bool] = []
+                var originalAudioTracks: [AVPlayerItemTrack] = [], originalAudioIDs: [CMPersistentTrackID] = []
+                service.onDebugNativeAudioConfigurationBoundary = { stage, item in
+                    guard !fired, stage == boundary, service.queue.currentID == fixture.aID else { return }
+                    fired = true; superseded = item
+                    originalAudioTracks = item.tracks.filter { $0.assetTrack?.mediaType == .audio }
+                    originalAudioIDs = originalAudioTracks.compactMap { $0.assetTrack?.trackID }
+                    beforeAudio = originalAudioTracks.map(\.isEnabled)
+                    service.start(playlistIDs: [fixture.playlist], at: fixture.bID)
+                }
+                defer { service.onDebugNativeAudioConfigurationBoundary = nil }
+                service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+                try await self.requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
+                XCTAssertTrue(fired); XCTAssertFalse(beforeAudio.isEmpty); XCTAssertTrue(beforeAudio.allSatisfy { $0 })
+                let retired = try XCTUnwrap(superseded)
+                XCTAssertFalse(retired === service.player.currentItem)
+                XCTAssertFalse(originalAudioTracks.isEmpty)
+                XCTAssertEqual(originalAudioTracks.count, beforeAudio.count)
+                XCTAssertEqual(originalAudioIDs.count, originalAudioTracks.count)
+                XCTAssertEqual(Set(originalAudioIDs).count, originalAudioTracks.count)
+                XCTAssertEqual(originalAudioTracks.compactMap { $0.assetTrack?.trackID }, originalAudioIDs)
+                XCTAssertTrue(originalAudioTracks.allSatisfy(\.isEnabled),
+                    "A getter that changed the selected source must not authorize a later write to old A")
+                self.assertProductionNativeAudioTracks(try XCTUnwrap(service.player.currentItem))
+                _ = await self.assertVisibleFrame(service, screen: screen, identity: .b, label: "native-audio-superseded-" + String(describing: boundary))
+            }
+        }
+        #else
+        XCTFail("Native audio ownership boundaries require DEBUG")
+        #endif
+    }
+
+    func testNativeAudioSuppressionCannotUndoPauseOrDeniedInterruptionResume() async throws {
+        #if DEBUG
+        try recordRuntimeHost()
+        for explicitPause in [true, false] {
+            try await withOwnedNaturalFixture(recordHost: false) { fixture, audio, service, _ in
+                service.isInteractingWithFeed = true
+                var interrupted = false
+                service.onDebugNativeAudioConfigurationBoundary = { boundary, _ in
+                    guard !interrupted, boundary == .isEnabledRead else { return }
+                    interrupted = true
+                    service.handleInterruption(began: true)
+                    if explicitPause { service.pause() }
+                }
+                defer { service.onDebugNativeAudioConfigurationBoundary = nil }
+                service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+                try await self.require({ interrupted && service.player.currentItem?.status == .readyToPlay && !service.audioEngineRunning },
+                    "Interruption must stop the actual graph while native configuration is pending")
+                let paused = audio.renderer.snapshot
+                // Resume allowed after explicit Pause must stay paused. Without an
+                // explicit Pause this is the independent resume-denied case.
+                service.handleInterruption(began: false, shouldResume: explicitPause)
+                service.enteredForeground()
+                try await Task.sleep(for: .milliseconds(300))
+                XCTAssertFalse(service.audioEngineRunning); XCTAssertEqual(service.player.rate, 0)
+                XCTAssertEqual(audio.renderer.snapshot.token, paused.token)
+                XCTAssertEqual(audio.renderer.snapshot.frame, paused.frame)
+                if explicitPause { XCTAssertFalse(service.wantsToPlay) }
+                self.assertProductionNativeAudioTracks(try XCTUnwrap(service.player.currentItem))
+            }
+        }
+        #else
+        XCTFail("Native audio ownership boundaries require DEBUG")
+        #endif
+    }
+
+    private func assertProductionNativeAudioTracks(_ item: AVPlayerItem,
+        file: StaticString = #filePath, line: UInt = #line) {
+        let tracks = item.tracks
+        let audio = tracks.filter { $0.assetTrack?.mediaType == .audio }
+        let video = tracks.filter { $0.assetTrack?.mediaType == .video }
+        XCTAssertFalse(audio.isEmpty, file: file, line: line); XCTAssertFalse(video.isEmpty, file: file, line: line)
+        XCTAssertTrue(audio.allSatisfy { !$0.isEnabled }, "Only the independent PCM graph may present audio", file: file, line: line)
+        XCTAssertTrue(video.allSatisfy(\.isEnabled), "Native audio configuration must preserve actual video", file: file, line: line)
     }
 
     func testProductionDefaultReadinessRequiresTheSelectedCPPOutput() async throws {

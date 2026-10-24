@@ -345,6 +345,11 @@ final class PlaybackService: NSObject {
     }
     // Timing-only seam: nil preserves the original callback path without an await.
     @ObservationIgnored var onDebugInitialVideoReady: (@MainActor (Int) async -> Void)? = nil
+    enum DebugNativeAudioBoundary: Equatable {
+        case tracksRead, assetTrackRead, mediaTypeRead, isEnabledRead, audioTrackDisabled, statusRead
+    }
+    @ObservationIgnored var onDebugNativeAudioConfigurationBoundary:
+        (@MainActor (DebugNativeAudioBoundary, AVPlayerItem) -> Void)? = nil
     // Timing-only control of service adoption; the real renderer and ready callback continue.
     @ObservationIgnored var shouldDebugDeferAudioVisit: (@MainActor (Int) -> Bool)? = nil
     var debugInitialVideoReadyState: DebugInitialVideoReadyState {
@@ -1011,6 +1016,53 @@ final class PlaybackService: NSObject {
         }
     }
 
+    /// PCM owns audible content. Suppress unused native item audio while
+    /// preserving the native video and original source asset.
+    private func disableUnusedNativeAudio(on item: AVPlayerItem, request: Int) -> Bool {
+        @MainActor func owns() -> Bool {
+            guard generation == request, observedItem === item else { return false }
+            let current = player.currentItem
+            return generation == request && observedItem === item && current === item
+        }
+        guard owns() else { return false }
+        let tracks = item.tracks
+        #if DEBUG
+        onDebugNativeAudioConfigurationBoundary?(.tracksRead, item)
+        #endif
+        guard owns() else { return false }
+        for track in tracks {
+            let assetTrack = track.assetTrack
+            #if DEBUG
+            onDebugNativeAudioConfigurationBoundary?(.assetTrackRead, item)
+            #endif
+            guard owns() else { return false }
+            let type = assetTrack?.mediaType
+            #if DEBUG
+            onDebugNativeAudioConfigurationBoundary?(.mediaTypeRead, item)
+            #endif
+            guard owns() else { return false }
+            guard type == AVMediaType.audio else { continue }
+            let enabled = track.isEnabled
+            #if DEBUG
+            onDebugNativeAudioConfigurationBoundary?(.isEnabledRead, item)
+            #endif
+            guard owns() else { return false }
+            if enabled {
+                track.isEnabled = false
+                #if DEBUG
+                onDebugNativeAudioConfigurationBoundary?(.audioTrackDisabled, item)
+                #endif
+                guard owns() else { return false }
+            }
+        }
+        let ready = item.status == .readyToPlay
+        #if DEBUG
+        onDebugNativeAudioConfigurationBoundary?(.statusRead, item)
+        #endif
+        guard owns() else { return false }
+        return ready && generation == request && observedItem === item
+    }
+
     private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false,
                                 retainedPreviousStart: Bool = false) {
         continuousPiP.beginReadinessUpdates()
@@ -1087,6 +1139,7 @@ final class PlaybackService: NSObject {
                 guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
                 if playerItem.status == .readyToPlay {
                     guard self.statusHandledGeneration != request else { return }
+                    guard self.disableUnusedNativeAudio(on: playerItem, request: request) else { return }
                     self.statusHandledGeneration = request
                     #if DEBUG
                     if let gate = self.onDebugInitialVideoReady {
