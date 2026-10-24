@@ -1627,7 +1627,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 try XCTUnwrap(fixture.savedURLs[fixture.bID]), expectedHead: head)
             print("PreparedNextNativeReference schema=1 source=Saved-B frames=\(reference.frames) comparedHeadFrames=\(reference.comparedHeadFrames) headMismatchedSamples=\(reference.headMismatchedSamples) nativeStereoZeroFrames=\(reference.stereoZeroFrames) nativeSlidingQuietWindows=\(reference.quietWindows) headCapacityBytes=96000 engineStopped=true cleanupAcknowledged=true originalSourceUnchanged=true")
             if let frame = reference.firstHeadMismatchFrame {
-                print("PreparedNextNativeHeadMismatch schema=1 frame=\(frame) preparedLeft=\(reference.firstHeadPreparedLeft.map(String.init) ?? "unavailable") preparedRight=\(reference.firstHeadPreparedRight.map(String.init) ?? "unavailable") referenceLeft=\(reference.firstHeadReferenceLeft.map(String.init) ?? "unavailable") referenceRight=\(reference.firstHeadReferenceRight.map(String.init) ?? "unavailable")")
+                let preparedLeft = reference.firstHeadPreparedLeft.map { String($0) } ?? "unavailable"
+                let preparedRight = reference.firstHeadPreparedRight.map { String($0) } ?? "unavailable"
+                let referenceLeft = reference.firstHeadReferenceLeft.map { String($0) } ?? "unavailable"
+                let referenceRight = reference.firstHeadReferenceRight.map { String($0) } ?? "unavailable"
+                print("PreparedNextNativeHeadMismatch schema=1 frame=\(frame) preparedLeft=\(preparedLeft) preparedRight=\(preparedRight) referenceLeft=\(referenceLeft) referenceRight=\(referenceRight)")
             }
             XCTAssertEqual(reference.comparedHeadFrames, 12_000)
             XCTAssertEqual(reference.headMismatchedSamples, 0)

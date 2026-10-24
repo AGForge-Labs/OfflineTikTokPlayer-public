@@ -197,3 +197,11 @@ source samples. Native compilation/results remain pending. The absent new identi
 was rejected before implementation; local syntax/project/source-profile and launcher
 checks pass. Production Swift is unchanged; manual standard-public unsigned15min
 scope, Release qualification and phone acceptance remain separate.
+
+Run11 on ed04e64 stopped at native test compilation: the optional-Float logging
+expression used overloaded String.init references, which the Apple compiler could
+not diagnose. No native playback/UI cases ran;123 portable core tests passed.
+The exact expression independently fails local Swift type-checking as ambiguous.
+Four explicit Float-to-string closures and named strings now type-check and execute
+locally in Swift5 mode. This changes only failure logging, no player/source criteria.
+The native boundary diagnostic and full69-case profile still require SDK execution.
