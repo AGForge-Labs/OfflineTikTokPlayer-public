@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/native
-          swiftc -swift-version 5 scripts/probe-audio-file.swift -o artifacts/native/audio-file-probe
+          swiftc -parse-as-library -swift-version 5 scripts/probe-audio-file.swift -o artifacts/native/audio-file-probe
           artifacts/native/audio-file-probe 2>&1 | tee artifacts/native/audio-file-probe.log
       - name: Preserve synthetic native evidence briefly
         if: always()
