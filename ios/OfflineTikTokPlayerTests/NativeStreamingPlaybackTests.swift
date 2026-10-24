@@ -59,6 +59,7 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         try await until { service.player.rate > 0 }
         service.handleInterruption(began: true)
         service.pause()
+        let pausedPosition = service.player.currentTime().seconds
         service.handleInterruption(began: false, shouldResume: true)
         service.setAudioOnly(false)
         service.enteredForeground()
@@ -68,6 +69,8 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         XCTAssertTrue(service.player === player)
         XCTAssertTrue(service.player.currentItem === item)
         XCTAssertTrue(service.surface.playerLayer.player === player)
+        XCTAssertEqual(service.player.currentTime().seconds, pausedPosition, accuracy: 0.05,
+            "Restoring video must not consume audio after explicit Pause")
         XCTAssertFalse(service.audioEngineRunning)
         XCTAssertTrue(fixture.downloads.readyIDs.isEmpty)
     }

@@ -60,3 +60,27 @@ constructing another, stops the engine before cancelling its settling poll, canc
 the display monitor and awaits CPP video preparation as well as decoder closure.
 Fixture acknowledgement additionally requires the engine stopped; no assertion,
 case, close deadline or gap criterion is relaxed. Native execution is pending.
+
+Public run5 on0c355db passed119core/63native/1UI;2native cases failed. Cleanup
+acknowledgements now include stopped engine and joined video preparation; both PCM
+Audio only persistence/interruption cases and all visible A/B/A/natural/paused cases
+passed. The default returned-output audit captured384000frames/8seconds,400of400
+tones, zero actual stereo-zero frames, quiet windows, timestamp errors, drops and
+underruns. This is one simulator output window, not physical-phone/global acceptance.
+
+Remaining failures: prepared B became video-ready at330.931833ms against250ms, while
+its incoming tone started at26.990542ms without underruns. The new native streaming
+Pause case reported rate1 after video/foreground restoration while intent stayed paused.
+A local source candidate now enforces latest native playback permission on late rate
+changes, with an actual frozen-clock assertion added to the same regression. The rate
+observer exists only during native streaming. Syntax passes; native execution is pending.
+The prepared-B latency cause is still under investigation; no threshold was relaxed.
+
+
+The next67-case profile retains all66 prior identities and adds the existing traced
+production-selection benchmark. The normal default benchmark still requires the same
+250ms ready limit and exact audio/identity assertions. The existing bounded startup
+recorder is enabled only for the diagnostic case; normal/default tracing stays off.
+This reuses existing boundary evidence to locate prepared-B delay before proposing a
+start-policy change. No current-time shortcut, source trim or threshold change is made.
+The native Pause permission candidate and frozen-position regression require execution.

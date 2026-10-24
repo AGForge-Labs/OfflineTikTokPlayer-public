@@ -552,6 +552,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let seekVideo: SeekVideo
     @ObservationIgnored private var audioCheckTask: Task<Void, Never>?
     @ObservationIgnored private var timeControlObservation: NSKeyValueObservation?
+    @ObservationIgnored private var nativeRateObservation: NSKeyValueObservation?
     @ObservationIgnored private var stallTask: Task<Void, Never>?
     @ObservationIgnored private var timeObserver: Any?
     @ObservationIgnored private var notifications: [NSObjectProtocol] = []
@@ -753,7 +754,7 @@ final class PlaybackService: NSObject {
     func debugCloseOwnedPlayback(_ completion: @escaping @Sendable (Bool) -> Void) {
         pause()
         if let timeObserver { player.removeTimeObserver(timeObserver); self.timeObserver = nil }
-        timeControlObservation = nil
+        timeControlObservation = nil; nativeRateObservation = nil
         for token in notifications { NotificationCenter.default.removeObserver(token) }
         notifications.removeAll()
         frameMonitor.cancel(); frameMonitorOwner = nil
@@ -1082,6 +1083,11 @@ final class PlaybackService: NSObject {
     private func setNativeAudioOwner(_ enabled: Bool) {
         let request = generation
         usesNativeAudio = enabled
+        if enabled, nativeRateObservation == nil {
+            nativeRateObservation = player.observe(\.rate, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor in self?.enforceNativePlaybackPermission() }
+            }
+        } else if !enabled { nativeRateObservation = nil }
         buffer.usesExternalClock = !enabled
         guard generation == request, usesNativeAudio == enabled else { return }
         player.isMuted = !enabled
@@ -1989,6 +1995,7 @@ final class PlaybackService: NSObject {
     #endif
 
     private func sampleNativeVideoClock() {
+        enforceNativePlaybackPermission()
         guard !continuousAudio.isSelected else { return }
         guard let item = observedItem else { return }
         #if DEBUG
@@ -2677,10 +2684,20 @@ final class PlaybackService: NSObject {
             generation: generation, position: player.currentTime().seconds, retainedItems: buffer.retainedItemCount))
     }
 
+    /// Native readiness/seek/layer work can publish a late rate change. Audio
+    /// permission still belongs to the latest user intent and interruption state.
+    private func enforceNativePlaybackPermission() {
+        guard usesNativeAudio, !intent.canPlay, player.rate != 0 else { return }
+        player.pause()
+        continuousPiP.updatePlayback(positionSeconds: clock.position, durationSeconds: clock.duration, isPlaying: false)
+        recordPlaybackEvent("nativePauseEnforced")
+    }
+
     private func installObservers() {
         timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in
                 guard let self else { return }
+                self.enforceNativePlaybackPermission()
                 if self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
                 else if self.player.timeControlStatus == .playing { self.cancelStallRecovery() }
                 self.recordPlaybackEvent(self.player.timeControlStatus == .playing ? "playing" : "waitingOrPaused")
