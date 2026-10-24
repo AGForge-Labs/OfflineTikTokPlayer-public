@@ -396,3 +396,56 @@ Artifact12570326447/73581030bytes/SHA256
 downloaded/checksum verified (1744entries). Local syntax/project/70-case source
 checks pass for the corrected test source. Native17, full Release/HTTP and
 physical-phone acceptance remain pending. No new TestFlight or signing.
+
+
+### Native17: strict live-loop pass and first-copy boundary localized
+
+Run40118261949/job120944048832 on publica6a85c7 completes with job13m32s,
+owned716159ms/exit65/no timeout.123core/64native/1UI pass; all70selected
+identities return. Five native cases fail, so no complete-profile acceptance.
+
+The corrected live repeat-one case now passes14.121s, retaining its strict token
+equality. All633600frames match the complete57600frame AAC reference over at least
+ten whole loops/11visits (alignment0, one candidate). Zero stereo-zero/underrun/
+drop/timestamp faults, stable running engine and visible/advancing A. This is
+mono-projection/1e-6 and simulator evidence, with independent codec proof separate.
+
+Natural initial preparation fails the original3s guard before a source publishes.
+The29existing cached observations cover3.006339s with no drops; native lane0 moves
+from startReading to first copyEntered/sequence1. At the failed guard and around
+a responsive~12ms worker reply, the word remains20 (copyEntered,sequence1).
+One leased reader, no packets, one pending read/preparation, all source tokens0.
+Owned close succeeds. This localizes an unreturned native read wrapper; it does
+not yet establish internal SDK wait versus scheduling or an underlying cause.
+The natural transition and its new final-underrun assertion are not reached.
+
+Other real failures: default B progress has35.792709ms PCM/wall skew against
+26.333333ms while renderer underruns stay0; actual B full-window stereo silence
+is unmeasured. Prepared B first video is555.76275ms and traced B270.069542ms
+against250ms. A/B/A preparation also misses3s. Both actual returned-A8s audits
+stay clean384000frames/400tones/zero stereo-zero/quiet/drop/timestamp errors.
+No earlier intermittent audio failure is erased or causally repaired.
+
+Raw SHA25668c76c2d2c8053ea141489387d26f405115b5778573e10ff503e36d92297b691.
+Artifact12569434325/70778884bytes/SHA256
+79e7d8daa75fd7035540452c5f0598277e1cbe2a8f2589ec4606c465dcdfb835
+downloaded/checksum verified (1622entries). Its temporary file reference expired
+once before local download; refreshed through the same read-only artifact API.
+
+Next71-case source retains every70identity and adds the already-existing native
+own-thread calibration case. No new test method, profiler framework or app/core
+change. The natural case reuses NativeReaderWaitObservation and its existing
+before-copy own-thread context note. Only after the unchanged3s guard fails does
+it query up to three exact recorded threads, at most16frames each, with cached
+copy words before/after. Records label the real observation calibration=false,
+best-effort/noncoherent stack, possible brief kernel get_state stop and no proven
+SDK cause. No thread sampling during the measured preparation, no new sampler
+task, AVFoundation getter, cancellation/retry or relaxed budget. Native context
+publication itself is added instrumentation; no individual timing attribution.
+Closure acknowledgements control probe-right cleanup; uncertain closes retain
+their native owner rather than fabricating success.
+
+Local exact-helper Swift5 type check, syntax/project/source71/diff and3focused
+evidence tests (7.483s) pass. The broader release manifest still contains295native/
+UI identities and is unchanged. Native18/Release/streaming/phone acceptance and
+actual root-cause repair remain pending. No new TestFlight or signing.

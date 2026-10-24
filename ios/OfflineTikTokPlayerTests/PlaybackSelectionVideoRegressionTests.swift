@@ -9730,14 +9730,29 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 
     private func runNaturalBoundary(traceNativeLaneActivity: Bool) async throws {
+        let nativeCopyThreadNote: (@Sendable (Int, UInt64) -> Void)?
         #if DEBUG
+        let nativeThread = NativeReaderWaitObservation(enabled: true)
+        var nativeThreadCloseAcknowledged = false
+        nativeCopyThreadNote = { @Sendable lane, sequence in nativeThread.note(lane: lane, sequence: sequence) }
+        defer {
+            nativeThread.close()
+            nativeThread.dump(cleanupAcknowledged: nativeThreadCloseAcknowledged)
+        }
         var observations: [(probe: NaturalNativeRunwayProbe, reached: Bool)] = []
         if traceNativeLaneActivity { observations.reserveCapacity(2) }
         // Dump only after the existing owned cleanup has run. Stored endpoints,
         // not this later dump time, determine each phase's coverage.
         defer { for observation in observations { observation.probe.dumpAndAssert(reached: observation.reached) } }
+        #else
+        nativeCopyThreadNote = nil
         #endif
-        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceNativeLaneActivity, captureInitialNativeActivity: true) { fixture, audio, service, screen in
+        try await withOwnedNaturalFixture(traceNativeLaneActivity: traceNativeLaneActivity, captureInitialNativeActivity: true,
+            nativeCopyThreadNote: nativeCopyThreadNote, cleanupReceipt: { acknowledged in
+            #if DEBUG
+            nativeThreadCloseAcknowledged = acknowledged
+            #endif
+        }) { fixture, audio, service, screen in
         #if DEBUG
         service.debugInitialLoadPhaseEnabled = true
         // Initial preparation can fail before the later traced/rapid case runs.
@@ -9764,6 +9779,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         guard prepared else {
             XCTFail("Both complete Saved sources must be ready")
             #if DEBUG
+            recordNaturalPreparationThreadFailure(audio: audio, probe: nativeThread)
             await recordNaturalRunwayFailure(audio: audio,
                 expectedToken: audio.entry(for: fixture.aID)?.token ?? 0, stage: "initial-preparation", captureNativeLaneActivity: true)
             #endif
@@ -9836,6 +9852,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private func withOwnedNaturalFixture(traceNativeLaneActivity: Bool = false, captureInitialNativeActivity: Bool = false,
         buffer: PlaybackBuffer? = nil, recordHost: Bool = true,
         seekVideo: PlaybackService.SeekVideo? = nil,
+        nativeCopyThreadNote: (@Sendable (Int, UInt64) -> Void)? = nil,
         additionalCleanupAcknowledged: @MainActor () -> Bool = { @MainActor in true },
         cleanupReceipt: (@MainActor (Bool) -> Void)? = nil, _ body: @MainActor (SelectionVideoFixture, ContinuousAudioPlayer,
         PlaybackService, SelectionVideoScreen) async throws -> Void) async throws {
@@ -9847,7 +9864,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let fixture = try await SelectionVideoFixture(test: self)
         #if DEBUG
         let activity = traceNativeLaneActivity || captureInitialNativeActivity
-            ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder() : nil
+            ? ContinuousPCMDecoder.DebugNativeLaneActivityRecorder(beforeCopyThread: nativeCopyThreadNote) : nil
         let firstFailure = captureInitialNativeActivity
             ? ContinuousPCMRenderer.DebugFirstFailureRecorder() : nil
         let audio = ContinuousAudioPlayer(debugNativeLaneActivityRecorder: activity, debugFirstFailure: firstFailure)
@@ -9970,6 +9987,35 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     }
                 }
             }
+        }
+    }
+
+    private func recordNaturalPreparationThreadFailure(audio: ContinuousAudioPlayer,
+        probe: NativeReaderWaitObservation) {
+        // The unchanged three-second guard has ALREADY failed. Reuse the existing
+        // calibrated own-thread interface; no calibration hold is installed here.
+        print("NativePreparationThreadScope schema=1 originalGuardFailed=true trigger=initial-preparation maximumLanes=3 framesPerLane=16 newSampler=false explicitSuspend=false kernelGetStateMayBrieflyStopThread=true nativePolicy=unchanged sdkInternalCause=unestablished")
+        for lane in 0..<3 {
+            let before = audio.debugNativeLaneActivitySnapshot(at: lane)
+            guard let boundary = before, !boundary.sequenceOverflowed,
+                  boundary.stageCode == ContinuousPCMDecoder.DebugNativeLaneActivityStage.copyEntered.rawValue else {
+                print("NativePreparationThreadUnavailable schema=1 lane=\(lane) stage=\(before?.stageCode ?? 0) recordAvailable=\(before != nil) reason=no-copy-entered-boundary noEvent=inconclusive")
+                continue
+            }
+            let entryNs = DispatchTime.now().uptimeNanoseconds
+            var row = probe.calibrationSample(lane: lane, sequence: boundary.copySequence)
+            let returnNs = DispatchTime.now().uptimeNanoseconds
+            let after = audio.debugNativeLaneActivitySnapshot(at: lane)
+            row["calibration"] = false; row["trigger"] = "initial-preparation-guard-failed"
+            row["phase"] = "initial-preparation"; row["queryEntryNs"] = entryNs; row["queryReturnNs"] = returnNs
+            row["beforeWord"] = boundary.packedState; row["afterWord"] = after?.packedState ?? 0
+            row["boundaryQualified"] = after?.packedState == boundary.packedState && after?.sequenceOverflowed == false
+            row["stackCoherent"] = false; row["sdkInternalCause"] = "unestablished"
+            do {
+                let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+                XCTAssertLessThanOrEqual(data.count, 16_384)
+                print("NativePreparationThreadRow " + String(decoding: data, as: UTF8.self))
+            } catch { XCTFail("Bounded failed-preparation thread result could not be serialized") }
         }
     }
 
