@@ -1241,6 +1241,70 @@ final class ContinuousPCMDecoderTests: XCTestCase {
         print("PCM_PREWARM_ABA oldEpoch=\(oldEpoch) warmEpoch=\(warmRequest.epoch) returnedEpoch=\(returnedEpoch) readyFrames=\(readyFrames) renderedFrames=\(rendered) underrunDelta=\(underrunDelta) retainedBytes=\(retainedBytes)")
     }
 
+    func testDistantNative48kSeeksBoundDecodeWorkAndMatchFullSourceSamples() async throws {
+        #if DEBUG
+        guard !PCMWorkerBoundaryOwnership.blocksFixtures else {
+            XCTFail("An unresolved reader close blocks new decoder owners")
+            throw ContinuousPCMDecoder.Failure.cannotDecode
+        }
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let formats = try await track.load(.formatDescriptions)
+        let format = try XCTUnwrap(formats.first)
+        let asbd = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(format))
+        XCTAssertEqual(asbd.pointee.mSampleRate, 48_000)
+        // Independent full-source decode; do not compare the new range path to itself.
+        let expected = try await independentlyDecode(asset, diagnosticName: "48k-seek-full-source")
+        XCTAssertEqual(expected.count, 30 * 48_000 * 2)
+        let renderer = ContinuousPCMRenderer(prefixFrames: 96_000, ringFrames: 8_192)
+        let activity = ContinuousPCMDecoder.DebugNativeLaneActivityRecorder()
+        let decoder = ContinuousPCMDecoder(renderer: renderer, debugNativeLaneActivityRecorder: activity)
+        defer { decoder.shutdown() }
+        var bodyError: Error?
+        do {
+            let prepared = try await Self.mailboxPrepare(decoder, url: url, token: 1, slot: 0)
+            XCTAssertEqual(prepared.totalFrames, 30 * 48_000)
+            let source = renderer.source(at: 0), initial = source.streamRequest
+            _ = try await Self.mailboxStateUntil(decoder, timeout: 3) { state in
+                source.availableStreamFrames(for: initial.epoch) == 8_192
+                    && state.leases.allSatisfy { !$0.readPending && !$0.starting }
+            }
+            let memory = renderer.retainedPCMMemoryBytes
+            for target: Int64 in [28 * 48_000, 7 * 48_000] {
+                let beforeCopies = (0..<3).compactMap { activity.snapshot(at: $0)?.copySequence }.reduce(0, +)
+                Self.mailboxAcknowledge(renderer, token: 1, frame: target)
+                let request = source.streamRequest
+                XCTAssertEqual(request.startFrame, target)
+                _ = try await Self.mailboxStateUntil(decoder, timeout: 3) { state in
+                    source.availableStreamFrames(for: request.epoch) == 8_192
+                        && state.leases.allSatisfy { !$0.readPending && !$0.starting }
+                }
+                let afterCopies = (0..<3).compactMap { activity.snapshot(at: $0)?.copySequence }.reduce(0, +)
+                XCTAssertGreaterThan(afterCopies, beforeCopies)
+                XCTAssertLessThanOrEqual(afterCopies - beforeCopies, 192,
+                    "A distant seek must not demux the entire earlier presentation")
+                let beforeUnderruns = renderer.snapshot.underrunFrames
+                renderer.setPlaying(true)
+                var samples = [Float](repeating: .nan, count: 512 * 2)
+                samples.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 512) }
+                renderer.setPlaying(false)
+                assertSamples(samples, equal: Array(expected[Int(target) * 2..<Int(target + 512) * 2]))
+                XCTAssertEqual(renderer.snapshot.frame, target + 512)
+                XCTAssertEqual(renderer.snapshot.underrunFrames, beforeUnderruns)
+                XCTAssertEqual(source.totalFrames, prepared.totalFrames)
+                XCTAssertEqual(renderer.retainedPCMMemoryBytes, memory)
+                print("PCM_NATIVE48K_SEEK targetFrame=\(target) nativeCopies=\(afterCopies - beforeCopies) exactSamples=\(samples == Array(expected[Int(target) * 2..<Int(target + 512) * 2])) completeFrames=\(source.totalFrames) memoryBytes=\(memory)")
+            }
+        } catch { bodyError = error }
+        _ = try await Self.mailboxShutdown(decoder)
+        if let bodyError { throw bodyError }
+        #else
+        XCTFail("Seek work qualification requires the existing native copy recorder")
+        #endif
+    }
+
     func testLeavingAFarSeekYieldsToCurrentRefillAndPrewarmsTheRetainedHead() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

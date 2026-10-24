@@ -84,3 +84,34 @@ recorder is enabled only for the diagnostic case; normal/default tracing stays o
 This reuses existing boundary evidence to locate prepared-B delay before proposing a
 start-policy change. No current-time shortcut, source trim or threshold change is made.
 The native Pause permission candidate and frozen-position regression require execution.
+
+
+Public run6 on edc45d0 is terminal failure:119core/63native/1UI passed;
+three native cases failed (eight assertions). The streamed explicit Pause case now
+passes with frozen native position. The default uninstrumented benchmark passes
+26.538s with next-B165.230ms/returned-A124.695ms video readiness. Both default and
+traced8-second output audits contain384000frames,400of400tones and no stereo-zero,
+quiet windows, timestamp errors or dropped frames. The traced benchmark still
+fails B progress:50.267ms less PCM than wall time, maximum skew46.929ms against
+26.333ms. The prior330.932ms video delay did not recur; no cause/fix is claimed.
+
+Natural-boundary setup stalls on its explicit28-second seek. Worker evidence shows
+zero ready ring frames while reconstructing output from frame zero, only892928
+generated frames toward the requested1344000 after its unchanged10-second runway.
+Separately, two actual compositor captures take13.27s+21.65s, outlasting the30-second
+fixture and exposing end-of-source underruns. All failures and capture/window,
+progress, full-source, latency and zero-silence criteria remain unchanged.
+
+The next candidate bounds only distant native48kHz read work: begin two seconds
+before the requested seek, while retaining the complete precise endpoint. Initial
+playback, ordinary retained two-second heads and every sample-rate conversion
+retain their zero-based history. Apple documents configuring AVAssetReader.timeRange
+before reading: https://developer.apple.com/documentation/avfoundation/avassetreader/timerange
+This is a candidate, not native acceptance. Four new portable policy tests were
+observed RED while the policy was absent; all123core tests now pass. Native syntax
+and Xcode references pass. A new actual AAC regression compares sought samples
+bit-for-bit with an independent full-source decode, checks native copy work and
+unchanged endpoint/memory, then explicitly awaits reader closure. It requires SDK
+execution. The68-case profile retains all67 prior identities, including all three
+failed cases. No compositor fixture, threshold, test timeout or full-suite mode
+is changed. No new TestFlight delivery or phone acceptance is claimed.

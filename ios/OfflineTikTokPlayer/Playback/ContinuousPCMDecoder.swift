@@ -453,7 +453,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             #endif
             queue = DispatchQueue(label: "OfflineTikTokPlayer.NativeRead.\(index)", qos: .userInitiated)
         }
-        func start(_ description: Description,
+        func start(_ description: Description, readStartFrame: Int64,
                    completion: @escaping @Sendable (Result<Int64, Failure>) -> Void) {
             queue.async { [self] in
                 let result: Result<Int64, Failure> = autoreleasepool {
@@ -462,10 +462,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                         #if DEBUG
                         debugActivity = description.debugNativeLaneActivityRecorder?.record(at: index)
                         debugActivity?.publish(.construction)
-                        let created = try NativeReader(description: description, debugActivity: debugActivity)
+                        let created = try NativeReader(description: description, readStartFrame: readStartFrame, debugActivity: debugActivity)
                         debugActivity?.publish(.constructionReturned)
                         #else
-                        let created = try NativeReader(description: description)
+                        let created = try NativeReader(description: description, readStartFrame: readStartFrame)
                         #endif
                         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                             sampleRate: description.nativeRate, channels: description.nativeChannels,
@@ -884,7 +884,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
     }
     #endif
 
-    private func acquireReader(_ description: Description) throws -> ReaderLease {
+    private func acquireReader(_ description: Description, readStartFrame: Int64) throws -> ReaderLease {
         #if DEBUG
         var matchingMask = 0, retiredMask = 0, freeMask = 0
         if let recorder = debugReaderAdmission {
@@ -924,7 +924,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         peakLeasedReaders = max(peakLeasedReaders, leases.compactMap { $0 }.count)
         #endif
         readerClosures.enter()
-        lease.lane.start(description) { [weak self, weak lease] result in
+        lease.lane.start(description, readStartFrame: readStartFrame) { [weak self, weak lease] result in
             guard let self, let lease else { return }
             self.worker.async { [weak self, weak lease] in
                 guard let self, let lease, self.leases[index] === lease, !lease.retired else { return }
@@ -1013,12 +1013,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
 
     private func makeStream(description: Description, startFrame: Int64,
                             shouldCancel: @escaping () -> Bool) throws -> Stream {
+        let readStartFrame = PCMReadRange.startFrame(requestedFrame: startFrame,
+            nativeSampleRate: description.nativeRate)
         let lease: ReaderLease?
         if description.track == nil { lease = nil }
-        else { lease = try acquireReader(description) }
+        else { lease = try acquireReader(description, readStartFrame: readStartFrame) }
         do {
-            let stream = try Stream(description: description, startFrame: startFrame, native: lease,
-                                    shouldCancel: shouldCancel)
+            let stream = try Stream(description: description, startFrame: startFrame,
+                                    readStartFrame: readStartFrame, native: lease, shouldCancel: shouldCancel)
             #if DEBUG
             stream.injectNextPositiveHaveDataAsInputRanDry = positiveInputRanDryContractInjectionEnabled
             stream.onPositiveInputRanDry = { [weak self] frames, injected in
@@ -1333,9 +1335,10 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         var readerLease: ReaderLease? { native }
         var reachedEnd: Bool { eof }
 
-        init(description: Description, startFrame: Int64, native: ReaderLease?,
+        init(description: Description, startFrame: Int64, readStartFrame: Int64, native: ReaderLease?,
              shouldCancel: @escaping () -> Bool) throws {
             totalFrames = description.totalFrames; cursor = max(0, startFrame)
+            generatedFrames = readStartFrame; outputStart = readStartFrame
             nativeRate = description.nativeRate
             self.shouldCancel = shouldCancel
             analysisValid = startFrame == 0
@@ -1357,10 +1360,11 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
                   let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 4_096) else { throw Failure.unsupportedPCM }
             if description.nativeChannels == 1 { converter.channelMap = [0, 0] }
             self.native = native; self.converter = converter; self.input = input; self.output = output
-            // A reopen starts from the source's beginning and discards converted
-            // output up to the requested frame. This retains exactly the original
-            // SRC phase/history with bounded storage. Ordinary loop/reversal
-            // refills only need to rebuild the fixed two-second pinned prefix.
+            // SRC sources reopen from zero to preserve their original phase and
+            // filter history. A distant native-48k seek instead discards only its
+            // two-second decode preroll, retaining the exact requested output
+            // coordinates and complete endpoint. Ordinary loop/reversal heads
+            // keep their original zero-based path.
         }
 
         func read(into destination: UnsafeMutableBufferPointer<Float>, maximumFrames: Int) throws -> Int {
@@ -1540,7 +1544,7 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         var reachedEnd: Bool { eof && sampleCount == 0 && cursor >= totalFrames }
 
         #if DEBUG
-        init(description: Description, debugActivity: DebugNativeLaneActivityRecorder.Record?) throws {
+        init(description: Description, readStartFrame: Int64, debugActivity: DebugNativeLaneActivityRecorder.Record?) throws {
             guard let track = description.track else { throw Failure.cannotDecode }
             #if DEBUG
             self.debugActivity = debugActivity
@@ -1557,17 +1561,21 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { throw Failure.cannotDecode }
             reader.add(output)
-            // The default range extends to positive infinity and may expose
-            // decoder postroll outside a compressed asset's presentation.
-            // Request the complete declared asset/track interval explicitly.
-            reader.timeRange = CMTimeRange(start: .zero, duration: description.endTime)
+            // Configure before reading. Retain the complete declared endpoint;
+            // only a distant native-48k seek may begin at its decode preroll.
+            // No content boundary, ordinary loop or resampled history is trimmed.
+            guard readStartFrame >= 0, readStartFrame == 0 || rate == 48_000 else { throw Failure.invalidTimeline }
+            cursor = readStartFrame
+            let readStart = CMTime(value: readStartFrame, timescale: 48_000)
+            reader.timeRange = CMTimeRange(start: readStart,
+                duration: CMTimeSubtract(description.endTime, readStart))
             debugActivity?.publish(.startReading)
             let started = reader.startReading()
             debugActivity?.publish(.startReadingReturned)
             guard started else { throw Failure.cannotDecode }
         }
         #else
-        init(description: Description) throws {
+        init(description: Description, readStartFrame: Int64) throws {
             guard let track = description.track else { throw Failure.cannotDecode }
             #if DEBUG
             debugReadToken = description.debugReadToken
@@ -1583,10 +1591,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
             output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { throw Failure.cannotDecode }
             reader.add(output)
-            // The default range extends to positive infinity and may expose
-            // decoder postroll outside a compressed asset's presentation.
-            // Request the complete declared asset/track interval explicitly.
-            reader.timeRange = CMTimeRange(start: .zero, duration: description.endTime)
+            // Configure before reading. Retain the complete declared endpoint;
+            // only a distant native-48k seek may begin at its decode preroll.
+            // No content boundary, ordinary loop or resampled history is trimmed.
+            guard readStartFrame >= 0, readStartFrame == 0 || rate == 48_000 else { throw Failure.invalidTimeline }
+            cursor = readStartFrame
+            let readStart = CMTime(value: readStartFrame, timescale: 48_000)
+            reader.timeRange = CMTimeRange(start: readStart,
+                duration: CMTimeSubtract(description.endTime, readStart))
             guard reader.startReading() else { throw Failure.cannotDecode }
         }
         #endif
