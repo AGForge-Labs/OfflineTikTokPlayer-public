@@ -4,9 +4,9 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 # Require the reviewed final app/test commit and its exact ios tree.
-expected_code_source=8a09f1bc5e37bec219e1089fe3a8fb36320389a2
-expected_ios_tree=783601556d47e900109fd644bceeb81baf46a9f6
-expected_native=265
+expected_code_source=1dbaf5d446b6fe5cd09a5116af622f71a5c22844
+expected_ios_tree=10f43d3541dea3b5f8720a6e1835eb9656809fa3
+expected_native=283
 expected_ui=1
 expected_core=114
 verify_source() {

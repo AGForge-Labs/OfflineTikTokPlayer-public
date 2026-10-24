@@ -68,7 +68,7 @@ jobs:
           expected = evidence.source_manifest(Path('.'))
           native = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerTests.')}
           ui = {identity for identity in expected if identity.startswith('OfflineTikTokPlayerUITests.')}
-          expected_native, expected_ui = '265', '1'
+          expected_native, expected_ui = '283', '1'
           if not all(value.isdigit() and int(value) > 0 for value in (expected_native, expected_ui)):
               raise SystemExit('Final committed full-manifest counts are required.')
           if len(native) != int(expected_native) or len(ui) != int(expected_ui) or native | ui != expected:
