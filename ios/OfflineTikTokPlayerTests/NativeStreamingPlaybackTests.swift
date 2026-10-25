@@ -166,13 +166,31 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         service.cycleRepeat(); service.cycleRepeat()
         XCTAssertEqual(service.queue.repeatMode, .one)
         service.isInteractingWithFeed = false
+        let beforeSeek = service.audioSnapshot
+        let seekFrame = Int64(29.25 * 48_000)
         service.seek(29.25)
-        try await until { service.audioSnapshot.frame >= 29 * 48_000 && !service.audioSnapshot.ended }
-        let beforeLoop = service.audioSnapshot
+        // Bind the baseline to one consumed seek command and visit. Its
+        // published target alone does not establish that any PCM was copied.
+        var seekOwner: (version: Int, visit: Int64)?
+        var qualifiedLoopBaseline: ContinuousPCMRenderer.Snapshot?
+        try await until {
+            if qualifiedLoopBaseline != nil { return true }
+            let sample = service.audioSnapshot
+            guard sample.token == b.token, sample.selectionVersion > beforeSeek.selectionVersion,
+                  !sample.ended else { return false }
+            if seekOwner == nil { seekOwner = (sample.selectionVersion, sample.visit) }
+            guard let owner = seekOwner, sample.selectionVersion == owner.version,
+                  sample.visit == owner.visit, sample.frame > seekFrame, sample.frame < b.frames else { return false }
+            qualifiedLoopBaseline = sample
+            return true
+        }
+        let beforeLoop = try XCTUnwrap(qualifiedLoopBaseline)
         try await until { service.audioSnapshot.visit > beforeLoop.visit && service.audioSnapshot.frame < 2 * 48_000 }
         XCTAssertEqual(service.queue.currentID, fixture.bID)
         XCTAssertEqual(service.audioSnapshot.token, b.token)
-        XCTAssertEqual(service.audioSnapshot.underrunFrames, beforeLoop.underrunFrames)
+        let afterLoop = service.audioSnapshot
+        print("HTTPSeekLoopCounters schema=1 beforeSeekUnderruns=\(beforeSeek.underrunFrames) seekTargetFrame=\(seekFrame) baselineFrame=\(beforeLoop.frame) baselineUnderruns=\(beforeLoop.underrunFrames) afterLoopFrame=\(afterLoop.frame) afterLoopUnderruns=\(afterLoop.underrunFrames) baselineRequiresCopiedPCM=true naturalLoopAssertion=unchanged")
+        XCTAssertEqual(afterLoop.underrunFrames, beforeLoop.underrunFrames)
         XCTAssertEqual(ObjectIdentifier(audio.graph.engine), engine)
 
         service.previous()

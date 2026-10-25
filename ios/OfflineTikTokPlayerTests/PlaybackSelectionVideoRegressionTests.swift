@@ -1568,7 +1568,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let fixture = try await SelectionVideoFixture(test: self, shortLoopFixture: true)
         defer { fixture.remove() }
         let accounting = traceSource
-            ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(captureCallbackLedger: true) : nil
+            ? ContinuousPCMRenderer.DebugRenderAccountingRecorder(captureCallbackLedger: true,
+                captureCallbackExecutionTime: true) : nil
         let audio = ContinuousAudioPlayer(debugRenderAccounting: accounting)
         let service = fixture.service(continuousAudio: audio, actualSessionActivation: true)
         let screen = try SelectionVideoScreen(service: service)
@@ -1637,6 +1638,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         screen.close(); try await fixture.closePlayback(service); closed = true
         let recorded = tap.samples(from: first, to: last)
         let validity = tap.validity()
+        // Retain existing control-thread records after owned close. This adds
+        // no record calls, SDK sampling, render hooks or clock-join assumption.
+        let controlJournal = service.debugCachedPlaybackDiagnostics
+        let controlData = try JSONEncoder().encode(controlJournal.entries)
+        let controlAttachment = XCTAttachment(data: controlData, uniformTypeIdentifier: "public.json")
+        controlAttachment.name = traceSource ? "Loop-control-journal-accounting-on.json" : "Loop-control-journal-default.json"
+        controlAttachment.lifetime = .keepAlways
+        add(controlAttachment)
+        print("LiveLoopCachedJournal schema=1 traceSource=\(traceSource) capacity=\(controlJournal.capacity) retained=\(controlJournal.entries.count) dropped=\(controlJournal.droppedEvents) originUptime=\(controlJournal.originUptime ?? -1) cachedOnly=true newRecordCalls=0 newSDKReads=0")
         let match = LoopPCMComparison.compare(template: reference, recorded: recorded.values)
         if let ledger = accounting?.callbackLedger {
             let prefix = ledger.prefix()
@@ -1650,6 +1660,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 ["ordinal": value.ordinal, "host": value.stamp.host, "sample": finiteJSON(value.stamp.sample),
                  "stampValid": value.stamp.valid, "rate": finiteJSON(value.stamp.rate), "frames": value.frames,
                  "pairs": value.pairs, "zeros": value.zeros, "nonfinite": value.nonfinite,
+                 "executionEntryHost": value.executionEntryHost, "executionEndHost": value.executionEndHost,
+                 "result": value.result, "buffers": value.buffers, "channels0": value.channels0,
+                 "channels1": value.channels1, "bytes0": value.bytes0, "bytes1": value.bytes1,
+                 "entered": value.entered, "completed": value.completed,
+                 "requested": value.requested, "classified": value.classified,
                  "flags": value.flags, "token": value.token, "visit": value.visit,
                  "copied": value.copied, "inactive": value.inactive, "paused": value.paused,
                  "eof": value.eof, "underrun": value.underrun,
@@ -1671,11 +1686,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 "sourceFrames": reference.count, "recordedRate": finiteJSON(recorded.rate),
                 "recordedFirstHost": finiteJSON(recorded.hosts.first ?? -1), "recordedLastHost": finiteJSON(recorded.hosts.last ?? -1),
                 "stereoZeroFrames": channels.stereoZeroFrames, "matched": match.matched,
-                "comparedFrames": match.comparedFrames, "exactClockJoin": false, "formalRTJoin": false]
+                "comparedFrames": match.comparedFrames, "callbackExecutionTime": true,
+                "exactClockJoin": false, "formalRTJoin": false]
             let metadata = XCTAttachment(data: try JSONSerialization.data(withJSONObject: summary, options: [.sortedKeys]),
                 uniformTypeIdentifier: "public.json")
             metadata.name = "Synthetic-loop-source-mixer-ledger"; metadata.lifetime = .keepAlways; add(metadata)
-            print("LiveRepeatSourceMixerDiagnostic schema=1 sourceCallbacks=\(prefix.source.count) tapCallbacks=\(prefix.tap.count) sourceZeroPairs=\(prefix.source.reduce(UInt64(0)) { $0 + UInt64($1.zeros) }) mixerStereoZeroFrames=\(channels.stereoZeroFrames) stableObservedPrefix=\(prefix.stableObservedPrefix) ledgerFailed=\(prefix.failed) coverageClosed=\(prefix.coverageClosed) exactClockJoin=false formalRTJoin=false bytes=\(ledger.reservedPayloadBytes) sourceAccountingOnly=true defaultCaseAccounting=false runtimeUnchanged=true")
+            print("LiveRepeatSourceMixerDiagnostic schema=1 sourceCallbacks=\(prefix.source.count) tapCallbacks=\(prefix.tap.count) sourceZeroPairs=\(prefix.source.reduce(UInt64(0)) { $0 + UInt64($1.zeros) }) mixerStereoZeroFrames=\(channels.stereoZeroFrames) stableObservedPrefix=\(prefix.stableObservedPrefix) ledgerFailed=\(prefix.failed) coverageClosed=\(prefix.coverageClosed) exactClockJoin=false formalRTJoin=false bytes=\(ledger.reservedPayloadBytes) sourceAccountingAndExistingCallbackClocks=true defaultCaseAccounting=false runtimeUnchanged=true")
         }
         // Persist original default-case output too; all attachment work is after
         // playback cleanup and cannot change the measured render window.

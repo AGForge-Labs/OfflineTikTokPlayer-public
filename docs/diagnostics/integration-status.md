@@ -866,3 +866,56 @@ ATS exception or Saved download. It measures transport ownership, warmed Next/
 Previous and same-token repeat; native-to-PCM exact sample joining and physical
 output remain unmeasured. Profile75 retains every previous74case; native result
 is pending. Production app/core code, deadlines and buffers are unchanged.
+
+
+### Native32: actual HTTP path and retained intermittent failure
+
+Run40196497933/sourcea8c81e0 completes failed; buildjob121178345049 succeeds
+with125core tests and175compiled files, ownedbuild271968ms. Testjob121179711961
+owned686327ms/exit65/no timeout. All75case identities return:71pass,4fail;
+strict verifier rejects those same4, with no incomplete identity reconstruction.
+
+Actual HTTP case2.876s:6requests/4Range responses/1579694bytes, both temporary
+files checksum-verified, Saved empty, native playback advances through warming,
+Next/Previous use one PCM engine and same-token repeat occurs. It fails the
+post-seek counter comparison2048versus512. The initial baseline accepted the
+published seek target before cursor advancement, so it includes unqualified
+seek preparation; no attribution of1536frames to the natural boundary is proved.
+The next baseline requires actual copied-PCM progress beyond the exact target,
+retains the zero-added-underruns loop assertion, and reports both seek/loop counters.
+
+Original ten-loop case fails14.020s:633600frames, first mismatch58688,996actual
+stereo-zero frames, zero kernel underrun delta, same engine and visible video.
+Local verified attachment analysis finds a single996-frame/20.75ms zero insertion
+at source phase5888/48000,122.667ms after a loop. Every original sample before
+and after that inserted time matches exactly; the reference has no zero frames.
+This is diagnostic alignment only: original recording and failed oracle unchanged.
+The raw recording is retained now; Native30 had no raw failed recording.
+CoreAudio overload messages recur; source-versus-mixer causality remains unjoined.
+
+Other failed identities: compositor A/B/A readiness(18.450s), and traced production
+selection(32.490s):27.122667ms clock skew exceeds26.333333ms; returned-A8s
+stereo audit has964zero frames, a20.083ms run at84672..85636,399/400tone blocks.
+Default production selection's returned-A384000frames remain clean in this run.
+Existing traced cached journal retains6entries/dropped0, no interruption or route
+event; it does not identify the loop failure's control state. Historical failures
+remain open. No Release/TestFlight/phone acceptance.
+
+Artifact12600124464/73718501bytes/SHA256
+e7ab84b43be747931be8653b4b630d4164b7251c2eec886867259a37bb9dea03
+verified1670ZIPentries. Native logSHA47e3cdfb4bafe13ba3c5b3630178f681b0083af640e4e26adda8b1de9138756a.
+Failed recordingSHA1943f023a9871a0cc93547556d48878dcb48e9e3cbd43d154499b55665a3ec69.
+
+Next: retain the existing cached control journal in both existing live-loop arms
+after owned close, without new runtime probes/SDK reads. Select the already
+existing source/mixer diagnostic alongside every75prior identity(profile76),
+preserving full test context where the failure recurs. No new test method,
+production source, buffer, deadline, sample tolerance or acceptance waiver.
+Native result pending; source-only instrumentation is not a playback repair.
+
+The accounting-on arm also enables its existing callback-execution clock option
+and retains already-captured callback layout/result/classification fields. The
+default arm keeps all accounting/clocks off. Production hooks and fixed917504-byte
+ledger are unchanged; this observation setting is explicit, not a causal fix.
+Raw execution stamps remain separate from hardware stamps and no exact RT/source-
+mixer clock join or closure is inferred. No new SDK state getter is added.

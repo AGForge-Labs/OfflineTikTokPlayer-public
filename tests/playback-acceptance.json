@@ -75,6 +75,7 @@
     "OfflineTikTokPlayerTests.SpeakerAudioTests/testSlowPreparationFallsBackWithoutInstallingAMixAfterEnqueue",
     "OfflineTikTokPlayerTests.SpeakerAudioTests/testTimedOutOptionalPreparationRetriesWhenTheItemBecomesReady",
     "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable",
-    "OfflineTikTokPlayerTests.NativeStreamingPlaybackTests/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph"
+    "OfflineTikTokPlayerTests.NativeStreamingPlaybackTests/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRepeatOneSourceMixerDiagnostic"
   ]
 }
