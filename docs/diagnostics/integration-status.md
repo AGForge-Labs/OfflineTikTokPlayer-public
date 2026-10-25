@@ -848,3 +848,21 @@ Restore the unchanged74-case split workflow byte-for-byte from751464b after this
 diagnostic. App/core source remains identical to Native30. Full298source/Release,
 real HTTP/cache, historical failure resolution and physical-phone acceptance are
 still open. No new TestFlight and no complete-gaplessness claim.
+
+
+### Independent Native31 attachment analysis and real HTTP coverage
+
+Both retained633600-frame clean recordings were independently decoded locally
+from checksum-verified xcresult data and match the57600-frame source reference
+with maximumDifference0. The512 cumulative source-zero pairs all belong to the
+last deliberate paused callback; copied-source zero frames are0. This clarifies
+these clean windows only. Native30 causality and formalRTJoin=false/coverageClosed=false
+remain unchanged. No new hosted job or TestFlight from this local analysis.
+
+New HTTP regression is test-first investigation only, not a production repair.
+An ephemeral loopback range server supplies synthetic media to actual AVPlayer
+and URLSession/cache; no file URL substitutes, account/media access, production
+ATS exception or Saved download. It measures transport ownership, warmed Next/
+Previous and same-token repeat; native-to-PCM exact sample joining and physical
+output remain unmeasured. Profile75 retains every previous74case; native result
+is pending. Production app/core code, deadlines and buffers are unchanged.

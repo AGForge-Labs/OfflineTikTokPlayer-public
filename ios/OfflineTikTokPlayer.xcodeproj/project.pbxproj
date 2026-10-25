@@ -567,6 +567,16 @@
 			"path" = "Fixtures";
 			"sourceTree" = "<group>";
 		};
+		"5B1FC68E871DB2F89B757A5E" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "HTTPPlaybackFixtureServer.swift";
+			"sourceTree" = "<group>";
+		};
+		"6674851334528DB53C3F9050" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "5B1FC68E871DB2F89B757A5E";
+		};
 		"6C96D7A2B9170F5FC49BE09D" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -761,6 +771,7 @@
 				"B20DD8F524202FCC149D08C5",
 				"823D92756EFEACD3CFB746BD",
 				"49D98E474BBBDF405BABEA93",
+				"5B1FC68E871DB2F89B757A5E",
 				"6C96D7A2B9170F5FC49BE09D",
 				"53C1ED56AEF2C6C2F6604F5E",
 				"F96D9C0993C39ECEBC8BDDE7",
@@ -1074,6 +1085,7 @@
 				"A5C8D0438336CBC9AA4403E0",
 				"02B25AAD48D6EE8AC0B4FA2E",
 				"4B2F657C42D6DE6915A9FEC0",
+				"6674851334528DB53C3F9050",
 				"60D2911A177E91F7302481E0",
 				"54DB7842B82D98E59C46610A",
 				"DEFDD329E304B2DAAD77E172",
