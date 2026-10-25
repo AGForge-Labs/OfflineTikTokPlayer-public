@@ -1054,3 +1054,8 @@ Preparing one manual standard public macos-26/15minute compile of immutable cand
 - Restored the original D63842AF full80-case manual workflow after retaining the compile evidence. All app/core/native-test/profile bytes remain unchanged. Native35's80-case runtime gate and Native36's diagnostic remain failed; Release compilation cannot clear their silent-gap/readiness failures. No phone, physical output, OnTrac or TestFlight acceptance. Last delivered TestFlight remains1.0(19.1); no new build was sent.
 
 Restored the original D63842AF manual80-case workflow after retaining this compile-only result. Existing runtime failures remain open; no source change, signed build or TestFlight delivery follows from compile success.
+
+
+### Native38: in-process startup sampling, pending
+
+Native36 external attachment was too late and produced no stack. New opt-in test-only watcher registers a separate existing own-thread probe on MainActor, observes the existing100ms heartbeat, claims at most one16frame best-effort query after250ms absence and expires its trigger at4s. All phase/stack coherence claims stay explicitly unqualified; raw JSON is attached only after fixture cleanup. Locally executable gate/expiry/reentrant/drain checks,3Python opt-in checks, full Swift parse/project/80identity and two-case profile/shell/workflow checks pass. Source review has no Critical/Important findings. One standard public macos-26/manual/15minute diagnostic selects the original natural-boundary plus required UI case. App/core and80acceptance bytes unchanged; original failures and physical output acceptance remain unresolved.

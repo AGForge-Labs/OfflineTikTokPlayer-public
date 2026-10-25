@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "cases": [
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNaturalBoundaryAtPositiveIncomingOffsetRevealsB",
+    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable"
+  ]
+}

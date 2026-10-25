@@ -9825,7 +9825,27 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         let nativeThread = NativeReaderWaitObservation(enabled: true)
         var nativeThreadCloseAcknowledged = false
+        var initialMainThreadWatch: NativePreparationStallObservation?
         nativeCopyThreadNote = { @Sendable lane, sequence in nativeThread.note(lane: lane, sequence: sequence) }
+        defer {
+            if let watch = initialMainThreadWatch {
+                watch.stop()
+                let result = watch.result
+                XCTAssertTrue(result.closed); XCTAssertLessThanOrEqual(result.queries, 1)
+                XCTAssertLessThanOrEqual(result.rows.count, 1)
+                print("InitialPreparationMainThreadScope schema=1 enabled=true closed=\(result.closed) claimed=\(result.claimed) queries=\(result.queries) retainedRows=\(result.rows.count) heartbeatThresholdMs=250 lifetimeMs=4000 maximumQueries=1 framesPerQuery=16 mainThreadConfirmed=\(result.mainThreadConfirmed) phaseExecutionQualified=false stackCoherent=false originalAssertions=true runtimeChanged=false physicalOutputProof=false")
+                for row in result.rows {
+                    do {
+                        let data = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
+                        XCTAssertLessThanOrEqual(data.count, 16_384)
+                        print("InitialPreparationMainThreadRow " + String(decoding: data, as: UTF8.self))
+                        let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+                        attachment.name = "initial-main-thread-stack.json"; attachment.lifetime = .keepAlways
+                        add(attachment)
+                    } catch { XCTFail("The bounded initial MainActor stack row could not be serialized") }
+                }
+            }
+        }
         defer {
             nativeThread.close()
             nativeThread.dump(cleanupAcknowledged: nativeThreadCloseAcknowledged)
@@ -9848,8 +9868,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         service.debugInitialLoadPhaseEnabled = true
         // Initial preparation can fail before the later traced/rapid case runs.
         // Reuse cached stage records at100ms; the default stream probe stays off.
+        if ProcessInfo.processInfo.environment["OP_INITIAL_MAIN_THREAD_STACK"] == "1" {
+            initialMainThreadWatch = .usingOwnMainThread()
+        }
         let preparationProbe: NaturalNativeRunwayProbe? =
-            NaturalNativeRunwayProbe(phase: "initial-preparation", minimumFailureSeconds: nil)
+            NaturalNativeRunwayProbe(phase: "initial-preparation", minimumFailureSeconds: nil,
+                startupWatcher: initialMainThreadWatch)
         preparationProbe?.sample(audio: audio, service: service, renderer: service.audioSnapshot, force: true)
         #endif
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -9866,6 +9890,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #if DEBUG
         preparationProbe?.sample(audio: audio, service: service, renderer: service.audioSnapshot, force: true)
         if let preparationProbe { observations.append((preparationProbe, prepared)) }
+        if let watch = initialMainThreadWatch {
+            watch.stop()
+            let closed = await waitUntil(timeout: 1) { watch.result.closed }
+            XCTAssertTrue(closed, "The owned initial MainActor query must close before later boundary observations")
+        }
         #endif
         guard prepared else {
             XCTFail("Both complete Saved sources must be ready")
@@ -10041,10 +10070,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         private let origin = DispatchTime.now().uptimeNanoseconds
         private let phase: String
         private let minimumFailureSeconds: Double?
+        private let startupWatcher: NativePreparationStallObservation?
         private var samples: [Sample] = []
         private var dropped = 0
-        init(phase: String, minimumFailureSeconds: Double?) {
+        init(phase: String, minimumFailureSeconds: Double?, startupWatcher: NativePreparationStallObservation? = nil) {
             self.phase = phase; self.minimumFailureSeconds = minimumFailureSeconds
+            self.startupWatcher = startupWatcher
             samples.reserveCapacity(128)
         }
         func sample(audio: ContinuousAudioPlayer, service: PlaybackService, renderer: ContinuousPCMRenderer.Snapshot, force: Bool = false) {
@@ -10053,6 +10084,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             guard samples.count < 128 else { dropped += 1; return }
             let lanes = (0..<3).map { audio.debugNativeLaneActivitySnapshot(at: $0) }
             let load = service.debugInitialLoadPhaseState
+            startupWatcher?.heartbeat(now: begin, phase: load.phase.rawValue, request: load.request, generation: load.generation)
             let end = DispatchTime.now().uptimeNanoseconds
             samples.append(Sample(begin: begin, end: end, renderer: renderer, lanes: lanes, load: load))
         }
