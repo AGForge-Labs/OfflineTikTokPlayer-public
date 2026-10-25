@@ -1029,3 +1029,14 @@ full Release/TestFlight/phone acceptance remain open.
 - Artifact12603401892/72117083bytes/SHA2561e44aef393c247f6c72e3f6798e2780a044986a5616df18ead216ce95a9ed064; native-log SHA256f29bdc09a4849233a8fe96ae9ff584b6dd57ca5f594870b86afe23ef3ce0445c. Prior failures, full Release and phone acceptance remain open; no TestFlight.
 
 Next diagnostic reuses immutable Native35 artifact12602932379 and candidate9489d3b with unchanged app/core/test source and80-case acceptance profile. One existing playback case plus the required UI smoke receives a2s built-in stack sample. Phase and RuntimeHost freshness remain unqualified; only actual named stacks can support a call-path finding. Separate harness source is recorded; no new build, test method, signing or acceptance waiver. Bounded source review has no remaining Critical/Important findings.
+
+
+### Native36: no usable stack; original acceptance workflow restored
+
+- Run40207026014/harnessfe6f551 reuses exact candidate9489d3b/Native35 artifact12602932379; original175file checksums, source, Xcode26.6/17F113, SDK26.5 and arm64 identity verify before execution. No build or native method changes.
+- App and dSYM UUID70EB15C1-D46F-372F-AB5F-D751AAAC8755 match. Process/executable/Simulator ownership attests, but attestation takes5.455s after the observed RuntimeHost event; phase and event freshness remain unproved.
+- The requested2s sampler exceeds its20s process bound and is killed/reaped; captured=false, startupCaptureProved=false. No native-case.sample.txt exists in the artifact. There is no stack to interpret; do not raise the bound or retry unchanged to manufacture evidence.
+- Existing natural-boundary case fails26.653s on actual selected-AVPlayerItem clock advancement. UI smoke passes94.093s. Owned test417244ms/exit65/no timeout. Strict two-identity diagnostic verification fails; Native35's80-case acceptance also remains failed.
+- Artifact12603964852/61510908bytes/SHA25632bb906f467a913cb6add25ec67abaa22d38730ff53d03b191eee2c0ffcb7248 verifies1434entries. Exact native log25460bytes/SHA256aa08cde31b964468256f81fedd7c8f8979e66a08b181849859c3449fe45673d3, receipt9940229b0a590fda87cf73b65657a1e5778f9c31b38bb280fbc5624b375e5a07. Prior witnesses remain; no physical output or TestFlight acceptance.
+
+Restored the original D63842AF workflow after retaining the failed profiling attempt. All app/core/native-test sources and80-case acceptance identities remain unchanged. Release compilation is a separate open preparation check and cannot clear these runtime failures.

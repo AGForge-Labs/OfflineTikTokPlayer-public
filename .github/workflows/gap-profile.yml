@@ -9,51 +9,70 @@ on:
         type: boolean
 permissions:
   contents: read
-  actions: read
 concurrency:
   group: gap-profile-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  preparation-stacks:
+  build:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.ref == 'refs/heads/diagnostic/gapless-profile' && inputs.approve_runner }}
     runs-on: macos-26
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          path: harness
           persist-credentials: false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: 9489d3b3ae85cb41b5ef4f56633dcf41b36505af
-          path: candidate
-          persist-credentials: false
-      - name: Identify the unchanged candidate and exercise sampler rejection guards
+      - name: Source and Xcode identity
         run: |
-          git -C harness rev-parse HEAD
-          git -C candidate rev-parse HEAD
+          git rev-parse HEAD
           xcodebuild -version
-          python3 harness/tests/validation-shell/test_preparation_stack_sampler.py
-      - name: Reuse only Native35 compiled products
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+      - name: Build unsigned playback tests once
+        run: bash scripts/check-ios-profile.sh build
+      - name: Carry exact-source unsigned test products
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          artifact-ids: '12602932379'
-          merge-multiple: true
-          repository: AGForge-Labs/OfflineTikTokPlayer-public
-          run-id: 40204029345
-          github-token: ${{ github.token }}
-          path: candidate/artifacts/native
-          digest-mismatch: error
-      - name: Sample one existing unsigned native case near its observed start
-        run: bash harness/scripts/check-preparation-stacks.sh "$GITHUB_WORKSPACE/candidate"
-      - name: Retain only synthetic native and stack evidence briefly
+          name: gap-profile-products
+          path: artifacts/native/profile-products.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Preserve synthetic native evidence briefly
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: preparation-stack-evidence
+          name: gap-profile-build-evidence
           path: |
-            candidate/artifacts/native/xcodebuild-test.log
-            candidate/artifacts/native/preparation-stacks/
-            candidate/artifacts/native/*.xcresult
+            artifacts/native/xcodebuild-build.log
+            artifacts/native/swift-driver-plan.log
+          if-no-files-found: ignore
+          retention-days: 1
+  tests:
+    needs: build
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.ref == 'refs/heads/diagnostic/gapless-profile' && inputs.approve_runner }}
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Source and Xcode identity
+        run: |
+          git rev-parse HEAD
+          xcodebuild -version
+      - name: Download this run's compiled products
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: gap-profile-products
+          path: artifacts/native
+          digest-mismatch: error
+      - name: Verify products and run all unchanged playback cases
+        run: bash scripts/check-ios-profile.sh test
+      - name: Preserve synthetic native evidence briefly
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: gap-profile-evidence
+          path: |
+            artifacts/native/xcodebuild-test.log
+            artifacts/native/*.xcresult
           if-no-files-found: ignore
           retention-days: 1

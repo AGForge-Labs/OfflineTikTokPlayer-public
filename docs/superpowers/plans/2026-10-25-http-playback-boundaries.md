@@ -116,7 +116,22 @@
 **Attribution limit:** RuntimeHost output may be buffered and process attestation takes time. Case liveness does not prove initial preparation remains active. Export phaseQualified=false/startupCaptureProved=false, name the file native-case.sample.txt, and draw conclusions only from actual named stacks. Check original app/dSYM UUID agreement before profiling; inspect real symbolication afterward.
 
 - [x] Add a bounded host-event/process attestation watcher and local rejection tests. Sample only the matching app executable in the exact synthetic Simulator and only once; stop owned children and preserve explicit missed/failed outcomes. Four local rejection groups pass; phase/freshness remain explicitly unproved.
-- [ ] Prepare a manual-only standard public macos-26 job with15minute limit. Read only Native35's checksum/source/SDK-verified product artifact. Keep secrets/signing absent, main unchanged, all80acceptance identities intact and original deadlines/assertions unchanged.
+- [x] Prepare a manual-only standard public macos-26 job with15minute limit. Read only Native35's checksum/source/SDK-verified product artifact. Keep secrets/signing absent, main unchanged, all80acceptance identities intact and original deadlines/assertions unchanged. Native36 ran once without rebuilding.
 - [x] Run local syntax/profile/harness checks and bounded source review before one dispatch. Mark playback-plus-UI results as diagnostic-only; preserve native failures and profiler limitations. Source review's Important startup-attribution finding was corrected with explicit unqualified fields and neutral output names; re-review has no Critical/Important findings. Local175-product checksum and relocatable test paths verify; native app/dSYM UUID agreement will be checked before profiling.
-- [ ] Retain the symbolicated native stack output and act only on functions actually observed. An unsymbolicated, missed or clean trace does not explain the recorded gaps.
-- [ ] Restore the original80-case manual workflow byte-for-byte after retaining the trace; no diagnostic-only run becomes acceptance.
+- [x] Inspect and retain the stack attempt's actual output. Require named stacks before a call-path finding; an unsymbolicated, missed or clean trace does not explain the gaps. Native36 sampler times out and produces no stack file, so no SDK call is attributed.
+- [x] Restore the original80-case manual workflow byte-for-byte after retaining the trace; no diagnostic-only run becomes acceptance.
+
+## Native36 result: profiling unavailable on this attempt
+
+- Run40207026014/harnessfe6f551 reuses exact candidate9489d3b/Native35 artifact12602932379; original175file checksums, source, Xcode26.6/17F113, SDK26.5 and arm64 identity verify before execution. No build or native method changes.
+- App and dSYM UUID70EB15C1-D46F-372F-AB5F-D751AAAC8755 match. Process/executable/Simulator ownership attests, but attestation takes5.455s after the observed RuntimeHost event; phase and event freshness remain unproved.
+- The requested2s sampler exceeds its20s process bound and is killed/reaped; captured=false, startupCaptureProved=false. No native-case.sample.txt exists in the artifact. There is no stack to interpret; do not raise the bound or retry unchanged to manufacture evidence.
+- Existing natural-boundary case fails26.653s on actual selected-AVPlayerItem clock advancement. UI smoke passes94.093s. Owned test417244ms/exit65/no timeout. Strict two-identity diagnostic verification fails; Native35's80-case acceptance also remains failed.
+- Artifact12603964852/61510908bytes/SHA25632bb906f467a913cb6add25ec67abaa22d38730ff53d03b191eee2c0ffcb7248 verifies1434entries. Exact native log25460bytes/SHA256aa08cde31b964468256f81fedd7c8f8979e66a08b181849859c3449fe45673d3, receipt9940229b0a590fda87cf73b65657a1e5778f9c31b38bb280fbc5624b375e5a07. Prior witnesses remain; no physical output or TestFlight acceptance.
+
+### Task 6: Check the actual Release app without signing
+
+**Purpose:** Close the untested Release-configuration compilation path while preserving all failed runtime evidence. This is preparation for eventual device validation, not a waiver of the silent-gap or readiness failures.
+
+- [ ] Prepare a manual-only standard public macos-26/15minute compile of immutable candidate9489d3b with Release/iphoneos/CODE_SIGNING_ALLOWED=NO. Reuse the existing owned build launcher; no tests, secrets, archive, signing or upload to Apple.
+- [ ] Retain exact source/SDK/build outcome and restore the normal workflow afterward. A successful build proves compilation only, not gap-free playback, device behavior or release readiness.
