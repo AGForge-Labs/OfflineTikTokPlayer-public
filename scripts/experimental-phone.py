@@ -17,6 +17,9 @@ REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
            "APPLE_PROVISIONING_PROFILE_BASE64", "APP_STORE_CONNECT_KEY_BASE64")
 ROOT = Path(__file__).resolve().parents[1]
+PHASES = {"credential-inputs", "credential-validation", "project-validation", "archive", "export-upload", "complete"}
+REASONS = {"profile-not-found", "profile-entitlement-mismatch", "certificate-not-found", "keychain-signing-failed",
+           "swift-compilation", "xcodebuild-error", "tool-validation-failed"}
 
 
 def require(condition, message):
@@ -79,6 +82,67 @@ def load_module(name, path):
     return module
 
 
+def upload_with_receipt(helper, configuration, directory, build, receipt):
+    original = helper.run_tool
+    failed = False
+    def record(phase, reason=None, location=None):
+        nonlocal failed
+        if failed:
+            return
+        failed = reason is not None
+        status = {"phase": phase, "reason": reason}
+        if location is not None:
+            status.update(sourceFile=location[0], line=location[1])
+        receipt.write_text(json.dumps(status), encoding="utf-8")
+    def observed_tool(arguments, **kwargs):
+        tool = Path(arguments[0]).name
+        phase = ("export-upload" if "-exportArchive" in arguments else "archive") if tool == "xcodebuild" else (
+            "project-validation" if any("generate-ios-project.py" in str(value) for value in arguments) else "credential-validation")
+        record(phase)
+        try:
+            if tool != "xcodebuild":
+                return original(arguments, **kwargs)
+            environment = dict(kwargs.pop("env", os.environ))
+            for name in (*SECRETS, "APPLE_PRIVATE_DELIVERY"):
+                environment.pop(name, None)
+            kwargs.pop("visible", None)
+            kwargs.pop("combined_output", None)
+            with tempfile.TemporaryFile(dir=directory) as output:
+                result = subprocess.run(arguments, env=environment, stdout=output, stderr=subprocess.STDOUT, **kwargs)
+                if result.returncode:
+                    output.seek(0)
+                    raw = output.read(8 * 1024 * 1024)
+                    errors = [line for line in raw.splitlines() if b"error:" in line.lower()]
+                    text = b"\n".join(errors).lower()
+                    patterns = ((b"no profiles for", "profile-not-found"), (b"requires a provisioning profile", "profile-not-found"),
+                                (b"doesn't include", "profile-entitlement-mismatch"),
+                                (b"no signing certificate", "certificate-not-found"),
+                                (b"errsecinternalcomponent", "keychain-signing-failed"))
+                    reason = next((value for pattern, value in patterns if pattern in text), "xcodebuild-error")
+                    location = None
+                    known = {path.name for path in Path(getattr(helper, "ROOT", directory)).glob("ios/**/*.swift")}
+                    for line in errors:
+                        match = re.search(rb"(?:^|/)([A-Za-z0-9_]+\.swift):([0-9]+):(?:[0-9]+:)?\s*error:", line)
+                        if match and match[1].decode("ascii") in known:
+                            location = (match[1].decode("ascii"), int(match[2]))
+                            reason = "swift-compilation"
+                            break
+                    record(phase, reason, location)
+                    raise RuntimeError("Xcode failed; raw signing output is suppressed.")
+            return b""
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            record(phase, "tool-validation-failed")
+            raise
+    helper.run_tool = observed_tool
+    try:
+        record("credential-validation")
+        material = helper.materialize(configuration, directory)
+        helper.upload(configuration, directory, material, build)
+        record("complete")
+    finally:
+        helper.run_tool = original
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("check", "sign-upload", "child"))
@@ -100,8 +164,23 @@ def main():
     if args.command == "sign-upload":
         public = load_module("existing_public_release", ROOT / "scripts/public-release.py")
         # Reuse the existing redacted subprocess boundary; no raw Apple/Xcode output or artifact is published.
-        public.run_redacted([sys.executable, "-B", str(Path(__file__).resolve()), "child"],
-                            env=environment, cwd=ROOT, timeout=360)
+        with tempfile.TemporaryDirectory(prefix="phone-diagnostic-", dir=environment["RUNNER_TEMP"]) as temporary:
+            receipt = Path(temporary) / "phase.json"
+            receipt.write_text(json.dumps({"phase": "credential-inputs", "reason": None}))
+            environment["EXPERIMENTAL_RECEIPT_PATH"] = str(receipt)
+            try:
+                public.run_redacted([sys.executable, "-B", str(Path(__file__).resolve()), "child"],
+                                    env=environment, cwd=ROOT, timeout=360)
+            except RuntimeError:
+                status = json.loads(receipt.read_text()) if receipt.stat().st_size <= 2048 else {}
+                phase, reason = status.get("phase"), status.get("reason")
+                if isinstance(phase, str) and phase in PHASES:
+                    category = reason if isinstance(reason, str) and reason in REASONS else "unclassified"
+                    print("Experimental failure category: " + phase + "/" + category, flush=True)
+                    file, line = status.get("sourceFile"), status.get("line")
+                    if isinstance(file, str) and re.fullmatch(r"[A-Za-z0-9_]+\.swift", file) and type(line) is int and 0 < line < 1_000_000:
+                        print("Public compiler location: " + file + ":" + str(line), flush=True)
+                raise
         message = "Uploaded experimental internal-only phone build " + build + " from " + SOURCE + ". Native and phone acceptance remain unresolved."
         print(message)
         if environment.get("GITHUB_STEP_SUMMARY"):
@@ -112,11 +191,13 @@ def main():
     configuration = helper.public_configuration(environment)
     helper.validate_configuration(configuration)
     runner_temp = Path(environment["RUNNER_TEMP"]).resolve(strict=True)
+    receipt = Path(environment["EXPERIMENTAL_RECEIPT_PATH"]).resolve(strict=True)
+    require(receipt.name == "phase.json" and receipt.parent.name.startswith("phone-diagnostic-")
+            and receipt.parent.parent == runner_temp, "Only the owned diagnostic receipt is admitted.")
     with tempfile.TemporaryDirectory(prefix="experimental-player-signing-", dir=runner_temp) as temporary:
         directory = Path(temporary)
         directory.chmod(0o700)
-        material = helper.materialize(configuration, directory)
-        helper.upload(configuration, directory, material, build)
+        upload_with_receipt(helper, configuration, directory, build, receipt)
 
 
 if __name__ == "__main__":

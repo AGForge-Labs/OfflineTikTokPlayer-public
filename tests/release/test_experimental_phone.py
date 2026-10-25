@@ -4,6 +4,10 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+from types import SimpleNamespace
+import contextlib
+import io
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("experimental_phone", ROOT / "scripts/experimental-phone.py")
@@ -77,6 +81,57 @@ class ExperimentalPhoneTests(unittest.TestCase):
             (candidate / ".env").write_text("private fixture")
             with self.assertRaises(ValueError):
                 phone.verify_checkouts(control, candidate, self.sha, git=git, signer_sha=digest)
+
+    def test_failure_receipt_keeps_only_category_and_survives_cleanup(self):
+        test_root = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(dir=test_root, prefix="owned-phone-receipt-") as temporary:
+            directory = Path(temporary).resolve()
+            self.assertEqual(directory.parent, test_root)
+            receipt = directory / "phase.json"
+            helper = SimpleNamespace(run_tool=lambda *args, **kwargs: b"", materialize=lambda *args: ())
+            def upload(*args):
+                try:
+                    helper.run_tool(["xcodebuild", "archive"], visible=True,
+                                    env={name: "PRIVATE-MARKER" for name in phone.SECRETS})
+                finally:
+                    helper.run_tool(["security", "list-keychains"])
+            helper.upload = upload
+            def failure(command, **kwargs):
+                self.assertFalse(any(name in kwargs["env"] for name in phone.SECRETS))
+                kwargs["stdout"].write(b"error: No profiles for PRIVATE-MARKER were found")
+                return SimpleNamespace(returncode=65)
+            output = io.StringIO()
+            with mock.patch.object(phone.subprocess, "run", side_effect=failure), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                with self.assertRaises(RuntimeError):
+                    phone.upload_with_receipt(helper, {}, directory, "20.1", receipt)
+            import json
+            status = json.loads(receipt.read_text())
+            self.assertEqual(status, {"phase": "archive", "reason": "profile-not-found"})
+            self.assertNotIn("PRIVATE-MARKER", receipt.read_text() + output.getvalue())
+
+    def test_compiler_receipt_exposes_only_known_public_file_and_line(self):
+        test_root = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(dir=test_root, prefix="owned-compiler-receipt-") as temporary:
+            directory = Path(temporary).resolve()
+            self.assertEqual(directory.parent, test_root)
+            (directory / "ios").mkdir()
+            (directory / "ios/Example.swift").write_text("// synthetic public source")
+            receipt = directory / "phase.json"
+            helper = SimpleNamespace(ROOT=directory, run_tool=lambda *args, **kwargs: b"", materialize=lambda *args: ())
+            helper.upload = lambda *args: helper.run_tool(["xcodebuild", "archive"], visible=True)
+            def failure(command, **kwargs):
+                kwargs["stdout"].write(error_output)
+                return SimpleNamespace(returncode=65)
+            import json
+            cases = ((b"SwiftCompile succeeded\n/private/work/ios/Example.swift:17:4: error: PRIVATE-MARKER\n",
+                      {"phase": "archive", "reason": "swift-compilation", "sourceFile": "Example.swift", "line": 17}),
+                     (b"SwiftCompile succeeded\nld: error: PRIVATE-MARKER\n",
+                      {"phase": "archive", "reason": "xcodebuild-error"}))
+            for error_output, expected in cases:
+                with self.subTest(expected=expected), mock.patch.object(phone.subprocess, "run", side_effect=failure), self.assertRaises(RuntimeError):
+                    phone.upload_with_receipt(helper, {}, directory, "20.1", receipt)
+                self.assertEqual(json.loads(receipt.read_text()), expected)
+                self.assertNotIn("PRIVATE-MARKER", receipt.read_text())
 
 
 if __name__ == "__main__":
