@@ -133,5 +133,7 @@
 
 **Purpose:** Close the untested Release-configuration compilation path while preserving all failed runtime evidence. This is preparation for eventual device validation, not a waiver of the silent-gap or readiness failures.
 
-- [ ] Prepare a manual-only standard public macos-26/15minute compile of immutable candidate9489d3b with Release/iphoneos/CODE_SIGNING_ALLOWED=NO. Reuse the existing owned build launcher; no tests, secrets, archive, signing or upload to Apple.
+- [x] Prepare a manual-only standard public macos-26/15minute compile of immutable candidate9489d3b with Release/iphoneos/CODE_SIGNING_ALLOWED=NO. Reuse the existing owned build launcher; no tests, secrets, archive, signing or upload to Apple.
 - [ ] Retain exact source/SDK/build outcome and restore the normal workflow afterward. A successful build proves compilation only, not gap-free playback, device behavior or release readiness.
+
+- Local preparation found the original owned launcher's build phase admits only build-for-testing. Add a separate release-build action7 with a720s bound; retain every preceding phase/action/budget and the existing owned-group cleanup. The missing-phase regression fails before this addition, then all15owned-launcher tests pass on WSL. Bash syntax and manual-only standard macos-26/15minute/read-only workflow checks pass. This compiles only the frozen9489d3b Release app, without test launch, signing or Apple upload; full80-case runtime acceptance remains failed. Bounded source review has no remaining Critical/Important findings for the Release compile harness. Actual SDK compilation remains pending.

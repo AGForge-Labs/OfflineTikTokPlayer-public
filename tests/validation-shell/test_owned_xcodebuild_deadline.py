@@ -215,7 +215,7 @@ class OwnedXcodebuildDeadlineTests(unittest.TestCase):
     def test_full_test_cli_uses_only_the_fixed_combined_action_and_budget(self):
         expected = {"build": (0, 1080), "case-01": (1, 300), "case-02": (2, 300),
                     "driver": (3, 60), "full-test": (4, 4500),
-                    "profile-build": (5, 720), "profile-test": (6, 720)}
+                    "profile-build": (5, 720), "profile-test": (6, 720), "release-build": (7, 720)}
         self.assertEqual(self.module.PHASES, expected)
         self.assertEqual(self.module.MAX_SESSION_SECONDS, 4500)
         command = ["xcodebuild", "-project", "owned.xcodeproj", "-jobs", "1", "test"]
@@ -272,6 +272,27 @@ class OwnedXcodebuildDeadlineTests(unittest.TestCase):
                 if admitted: wait.assert_called_once_with([10], [], [], 4503)
                 else: wait.assert_not_called()
                 read.assert_not_called(); kill.assert_not_called(); child.assert_not_called()
+
+    def test_release_build_cli_admits_only_build_with_a_twelve_minute_budget(self):
+        command = ["xcodebuild", "-configuration", "Release", "-destination", "generic/platform=iOS",
+                   "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "build"]
+        with mock.patch.object(sys, "argv", [str(SCRIPT), "--phase", "release-build", "--"] + command), \
+             mock.patch.object(self.module.shutil, "which", return_value="/owned/xcodebuild"), \
+             mock.patch.object(self.module.signal, "signal"), \
+             mock.patch.object(self.module, "run_owned", return_value={"wrapperExit": 0}) as run:
+            self.assertEqual(self.module.main(), 0)
+            self.assertEqual(run.call_args.args[:3], (["/owned/xcodebuild"] + command[1:], 720, 7))
+            self.assertIsNone(run.call_args.kwargs["stdin"])
+        for actions in (("test",), ("archive",), ("clean",), ("build-for-testing",),
+                        ("test-without-building",), ("build", "test"), ("build", "archive"),
+                        ("build", "build"), ()):
+            with self.subTest(actions=actions), \
+                 mock.patch.object(sys, "argv", [str(SCRIPT), "--phase", "release-build", "--", "xcodebuild"] + list(actions)), \
+                 mock.patch.object(self.module.shutil, "which") as lookup, \
+                 mock.patch.object(self.module, "run_owned") as run:
+                with self.assertRaises(SystemExit) as failure: self.module.main()
+                self.assertEqual(failure.exception.code, 2)
+                lookup.assert_not_called(); run.assert_not_called()
 
     def test_full_phase_timeout_cleans_real_children_without_signaling_other_sessions(self):
         # Internal two-second control exercises phase4 cleanup; the public CLI

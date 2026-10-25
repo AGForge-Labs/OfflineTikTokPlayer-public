@@ -1040,3 +1040,8 @@ Next diagnostic reuses immutable Native35 artifact12602932379 and candidate9489d
 - Artifact12603964852/61510908bytes/SHA25632bb906f467a913cb6add25ec67abaa22d38730ff53d03b191eee2c0ffcb7248 verifies1434entries. Exact native log25460bytes/SHA256aa08cde31b964468256f81fedd7c8f8979e66a08b181849859c3449fe45673d3, receipt9940229b0a590fda87cf73b65657a1e5778f9c31b38bb280fbc5624b375e5a07. Prior witnesses remain; no physical output or TestFlight acceptance.
 
 Restored the original D63842AF workflow after retaining the failed profiling attempt. All app/core/native-test sources and80-case acceptance identities remain unchanged. Release compilation is a separate open preparation check and cannot clear these runtime failures.
+
+
+### Native37: unsigned Release compilation only, pending
+
+Preparing one manual standard public macos-26/15minute compile of immutable candidate9489d3b for Release/iphoneos, with signing disabled and no test launch/archive/Apple upload. Existing owned cleanup now has a separate fixed720s release-build action, preserving every earlier action/budget. Local RED and all15owned-process GREEN checks, shell syntax and workflow checks pass; bounded source review has no Critical/Important findings. App/core/native-test trees and80acceptance identities are unchanged. Native35/36 runtime failures and physical playback acceptance remain unresolved; compilation cannot waive them.
