@@ -919,3 +919,53 @@ default arm keeps all accounting/clocks off. Production hooks and fixed917504-by
 ledger are unchanged; this observation setting is explicit, not a causal fix.
 Raw execution stamps remain separate from hardware stamps and no exact RT/source-
 mixer clock join or closure is inferred. No new SDK state getter is added.
+
+
+### Native33: retained insertion witnesses and execution-order confound
+
+Run40199336854/sourced1fbcde fails without owned timeout. Build223333ms/core125/
+175compiled products pass; tests550994ms/exit65. Raw console has76completions,
+74pass/2fail. Strict identity verifier also rejects two passing lines prefixed
+by interleaved LoudnessManager output; no reconstruction or acceptance waiver.
+UI smoke passes36.389s. No Release/TestFlight/phone acceptance.
+
+Actual HTTP case passes1.657s with6requests/4Range responses/1579694bytes,
+two checksum-verified temporary files and zero Saved copies. Its qualified seek
+baseline is1404512 after target1404000;1024seek underruns remain1024after the
+natural loop. This corrects observation scope, not runtime. Native44100complete
+SRC/production-buffer test passes7.597s; cold native-to-PCM audio join unmeasured.
+
+Default loop fails15.003s with633600recordedframes, first mismatch142656,
+1616actual stereo-zero frames and no kernel underrun delta. Local verified raw
+PCM has1056zeros/22ms at142656..143712, then560zeros/11.667ms at244576..245136.
+All three original nonzero segments match exactly after accounting only for
+inserted time. Original PCM and strict oracle are untouched. Its cached journal
+has source-analysis, activation and final-owned-close pause records only, with
+no recorded pause/interruption/route event during either gap. It does not exclude
+unlogged internal control calls or source callback/layout failures.
+
+The later accounted loop passes14.452s/633600frames/maxdiff0. Its1252source/
+132tap records have2560source-zero pairs, all last5deliberate paused callbacks
+after the measured window. No copied-source zeros/underruns/sample-stamp gaps.
+Longest observed execution is0.3615median hardware quanta, only in this clean arm;
+not an RT deadline proof or explanation of the failed default arm. coverageClosed
+and formalRTJoin remainfalse. Overload-message spacing correlates with zero-run
+spacing within0.477ms, without a qualified absolute time mapping or causality.
+
+Default production selection passes25.854s. Traced selection fails25.724s,
+including1572actual stereo-zero frames/32.75ms at198016..199588 and timing guards.
+Prior failures remain open; a smaller raw failure count does not establish a fix.
+
+Artifact12601952554/73334192bytes/SHA256
+41437e9678e47c756c9d40a3723b4cd49b0fa46d7dfb9437e716fba04ee8b458
+verified1704ZIPentries. Native logSHA22cf1005850da1fd368fe6f90ac075fffc064ceee5d48fb1e9f54f64729d430d.
+Failed recordingSHAf3d4d512f2ca7d029bd33db197e6b53230e291262ba8dc5f535a0047274c263c.
+
+Next bounded order experiment adds one early wrapper calling the identical
+accounted helper before the original default's observed alphabetical position.
+All76prior identities, nil default accounting, assertions and production source
+remain. Both arms also retain two existing stored control-ticket values around
+capture; stable nonexhausted authority would exclude new audited play/suspend
+commands, not SDK/HAL behavior. Metadata names and post-close PCM hashes bind
+witnesses to their XCTest identity. One77case native check pending; a clean run
+would remain inconclusive because the early arm also warms the default's session.

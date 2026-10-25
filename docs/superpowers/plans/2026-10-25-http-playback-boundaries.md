@@ -39,8 +39,8 @@
 
 **Files:** Only the component shown to fail, its focused regression, and docs/diagnostics/integration-status.md.
 
-- [ ] If the network regression fails, classify whether HTTP/ATS, cache, transport ownership, preparation or repeat failed before modifying production code.
-- [ ] If it passes, record the network coverage gained without claiming native-to-PCM sample continuity or phone acceptance.
+- [x] If the network regression fails, classify whether HTTP/ATS, cache, transport ownership, preparation or repeat failed before modifying production code. Native32's counter baseline was unqualified; Native33's corrected observation passes without a runtime change.
+- [x] If it passes, record the network coverage gained without claiming native-to-PCM sample continuity or phone acceptance. Native33 passes actual HTTP/ranges, verified temporary cache, warmed navigation and natural repeat; cold native-to-PCM sample joining remains unmeasured.
 - [ ] Retain complete loop recordings on any recurrence. Resolve Native30 from failing-window evidence rather than a clean retry.
 - [ ] Keep full Release, TestFlight and phone acceptance open until actually run.
 
@@ -55,3 +55,21 @@
 - Compositor A/B/A and traced production selection also fail. The latter has964 actual stereo-zero frames and clock skew27.122667ms over its26.333333ms guard. Do not claim an otherwise-green suite.
 - Next diagnostic selects the existing accounting-on loop arm with all75 preceding identities, retains existing cached journals after owned close, and enables the already-implemented callback execution clocks only in that accounting-on arm. The default strict arm keeps accounting disabled. Raw execution stamps do not establish a source/mixer clock join. No new runtime probes, SDK reads, test methods, buffers or deadlines. Profile76/native result pending.
 - The HTTP seek baseline now requires the expected B token, a consumed selection version newer than the pre-seek snapshot, one retained command/visit identity and actual PCM cursor advancement beyond the exact target. The qualifying snapshot itself supplies beforeLoop; the natural-loop zero-added-underruns assertion is unchanged. Local full Swift parse, generated project and76-case identity checks pass after this correction; SDK execution remains pending.
+- Bounded source re-review accepts the command/visit correction and reports no remaining Critical/Important findings. Published private161850b/publicd1fbcde; app/core/workflow hashes unchanged. Native33/run40199336854 dispatched once on the approved manual free unsigned workflow. Buildjob121186961844 succeeds with125core tests and175compiled products; testjob121188153397 verifies those exact-source products and is in progress. No new TestFlight.
+- Native33 completes failed, with no owned timeout: build223333ms/test550994ms. Raw console has76 completions/74pass/2fail; strict verifier also rejects two passing lines prefixed by interleaved LoudnessManager text. It remains failed, with no reconstructed pass acceptance.
+- HTTP case passes1.657s. Seek baseline1404512 follows exact target1404000 with1024seek underruns; the natural loop adds0. Native44100 complete SRC/production-buffer case passes7.597s. Default selection passes25.854s; traced selection fails25.724s, including1572actual stereo-zero frames/32.75ms and timing guards.
+- Both loop PCM payloads and the common complete reference are checksum-verified. Default633600-frame recording has1056/22ms zeros at142656..143712 and560/11.667ms at244576..245136. Every original nonzero segment matches exactly after accounting only for inserted time. Original data/oracle are untouched. Its cached journal records no pause/interruption/route event during either gap.
+- Later accounting arm is clean633600/maxdiff0; all2560source zeros are its last5deliberate paused callbacks after the measured window.1252source/132tap callbacks, no copied-source zeros/underruns, no sample-stamp discontinuity. Callback timings describe only this clean arm; no causal transfer to the failing default case, RT join or closure is established.
+- Artifact12601952554/73334192bytes/SHA41437e9678e47c756c9d40a3723b4cd49b0fa46d7dfb9437e716fba04ee8b458 verified1704ZIPentries. Exact native-log SHA22cf1005850da1fd368fe6f90ac075fffc064ceee5d48fb1e9f54f64729d430d. All prior failures remain open.
+
+### Task 3: Test the execution-order confound with the same loop helper
+
+**Hypothesis:** The first live-loop position in the full profile differs from the late accounting arm. Moving an otherwise identical accounted observation to the first loop position may capture the failure with callback evidence. A clean observation alone does not prove or fix this hypothesis.
+
+**Bound:** One early wrapper identity calling the existing helper, all76prior identities retained, default accounting still nil, unchanged assertions/runtime/workflow/deadlines. Use existing stored control-ticket reads before and after capture to detect unlogged internal play/suspend commands without RT or SDK probes. Bind captured metadata to its XCTest identity.
+
+- [x] Review the order hypothesis and stored-ticket observation against current source. Bounded review recommends this single order experiment; stable authority narrows control calls but cannot identify SDK/HAL behavior.
+- [x] Add the early accounted wrapper and source identity metadata; retain the original default and late accounted identities. Raw PCM hashes are computed after owned close and retained with XCTest identity, enabling exact attachment binding.
+- [x] Verify local syntax, project references, exact77-case profile and unchanged production/workflow trees. Local syntax/project/profile checks pass; native SDK execution remains pending.
+- [ ] Run the changed-source order experiment once on the same approved free unsigned workflow. Require actual early/default/late test-start order from raw evidence before interpreting the experiment.
+- [ ] Act on failing-window evidence; no clean retry acceptance, tolerance changes or production patch without an identified mechanism.

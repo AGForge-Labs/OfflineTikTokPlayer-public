@@ -6,6 +6,7 @@ import AudioToolbox
 import CoreMedia
 import CoreFoundation
 import CoreVideo
+import CryptoKit
 import PlayerCore
 #if DEBUG
 import Darwin
@@ -1551,6 +1552,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runProductionSelectionBenchmark(traceVideoSeeks: true, traceClockHandoff: true)
     }
 
+    // XCTest's observed alphabetical order places this identical accounted
+    // helper before the original default arm. A clean result is inconclusive.
+    func testContinuousRepeatOneEarlySourceMixerDiagnostic() async throws {
+        try await runLiveRepeatOneSourceComparison(traceSource: true)
+    }
+
     func testContinuousRepeatOneTenFullSourceLoopsMatchLiveMixer() async throws {
         try await runLiveRepeatOneSourceComparison(traceSource: false)
     }
@@ -1623,11 +1630,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let firstState = audio.snapshot
         let engine = ObjectIdentifier(audio.graph.engine)
         let submitted = service.submittedVideoFrameCount
+        let firstControl = audio.debugPlaybackControlTicket
         let first = tap.begin(auditChannels: true)
         // Eleven source periods contain at least ten whole cycles at any start phase.
         let requestedFrames = Int(entry.frames) * 11
         let captured = await waitUntil(timeout: 15) { tap.count - first >= requestedFrames }
         let last = tap.stop(), finalState = audio.snapshot
+        let finalControl = audio.debugPlaybackControlTicket
         let channels = tap.channelAudit()
         let sameEngine = engine == ObjectIdentifier(audio.graph.engine)
         let engineRunning = audio.graph.engine.isRunning
@@ -1647,6 +1656,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         controlAttachment.lifetime = .keepAlways
         add(controlAttachment)
         print("LiveLoopCachedJournal schema=1 traceSource=\(traceSource) capacity=\(controlJournal.capacity) retained=\(controlJournal.entries.count) dropped=\(controlJournal.droppedEvents) originUptime=\(controlJournal.originUptime ?? -1) cachedOnly=true newRecordCalls=0 newSDKReads=0")
+        let stableControl = firstControl > 0 && firstControl < UInt64.max - 1 && firstControl == finalControl
+        print("LiveLoopControlAuthority schema=1 caseName=\(name) traceSource=\(traceSource) first=\(firstControl) final=\(finalControl) stableNonexhausted=\(stableControl) storedControlReadsOnly=true noRTOrSDKProbes=true")
+        let referencePayload = reference.withUnsafeBytes { Data($0) }
+        let recordedPayload = recorded.values.withUnsafeBytes { Data($0) }
+        let referenceSHA256 = SHA256.hash(data: referencePayload).map { String(format: "%02x", $0) }.joined()
+        let recordedSHA256 = SHA256.hash(data: recordedPayload).map { String(format: "%02x", $0) }.joined()
+        print("LiveLoopPCMIdentity schema=1 caseName=\(name) traceSource=\(traceSource) referenceSHA256=\(referenceSHA256) recordedSHA256=\(recordedSHA256) hashesAfterOwnedClose=true")
         let match = LoopPCMComparison.compare(template: reference, recorded: recorded.values)
         if let ledger = accounting?.callbackLedger {
             let prefix = ledger.prefix()
@@ -1677,7 +1693,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                  "end": value.end, "inputFrames": value.inputFrames, "channels": value.channels,
                  "flags": value.flags]
             }
-            let summary: [String: Any] = ["schema": 1, "source": sourceRows, "tap": tapRows,
+            let summary: [String: Any] = ["schema": 1, "caseName": name,
+                "referenceSHA256": referenceSHA256, "recordedSHA256": recordedSHA256,
+                "source": sourceRows, "tap": tapRows,
                 "enteredBefore": prefix.enteredBefore, "enteredAfter": prefix.enteredAfter,
                 "completedBefore": prefix.completedBefore, "completedAfter": prefix.completedAfter,
                 "tapsBefore": prefix.tapsBefore, "tapsAfter": prefix.tapsAfter,
@@ -1695,8 +1713,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         }
         // Persist original default-case output too; all attachment work is after
         // playback cleanup and cannot change the measured render window.
-        for (name, samples) in [("reference", reference), ("recorded", recorded.values)] {
-            let payload = samples.withUnsafeBytes { Data($0) }
+        for (name, payload) in [("reference", referencePayload), ("recorded", recordedPayload)] {
             let attachment = XCTAttachment(data: payload, uniformTypeIdentifier: "public.data")
             attachment.name = "Synthetic-loop-" + name + "-float32le"
             attachment.lifetime = .keepAlways; add(attachment)
