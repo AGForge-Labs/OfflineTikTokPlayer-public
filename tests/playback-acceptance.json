@@ -77,6 +77,9 @@
     "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable",
     "OfflineTikTokPlayerTests.NativeStreamingPlaybackTests/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph",
     "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testRepeatOneSourceMixerDiagnostic",
-    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testContinuousRepeatOneEarlySourceMixerDiagnostic"
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testContinuousRepeatOneEarlySourceMixerDiagnostic",
+    "OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testDefaultIdentityCompositionPreservesEveryDecodedVideoFrame",
+    "OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testPortraitAndMirrorCompositionProducesOrientedPixelsAndPreservesSourceTiming",
+    "OfflineTikTokPlayerTests.ContinuousPictureInPictureTests/testChangingItemCancelsOrientationPreparationAndCannotAttachOldOutput"
   ]
 }

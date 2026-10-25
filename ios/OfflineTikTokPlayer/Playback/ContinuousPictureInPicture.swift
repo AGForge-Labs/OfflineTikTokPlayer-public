@@ -854,7 +854,10 @@ final class ContinuousPictureInPicture: NSObject {
         }
         // Source timing drives media; empty edits use frameDuration. Override only a proved local
         // leading-empty mapping whose full boundaries lie exactly on the native minimum cadence.
-        let composition = AVMutableVideoComposition(propertiesOf: asset)
+        // The synchronous factory can load further asset properties on the UI
+        // actor. Suspend that work while preserving Apple's composition defaults.
+        let composition = try await AVMutableVideoComposition.videoComposition(withPropertiesOf: asset)
+        try Task.checkCancellation()
         if let leadingEmptyCadence { composition.frameDuration = leadingEmptyCadence }
         composition.sourceTrackIDForFrameTiming = track.trackID
         composition.renderSize = CGSize(width: ceil(bounds.width), height: ceil(bounds.height))

@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Keep production source unchanged until a failing behavior identifies a cause.
+- Require an observed failing path and a specific mechanism before a production change. Task4 permits one documented blocking-API removal in the measured initial-preparation path; it does not establish that API as the cause of prior mixer silence.
 - Preserve prefix96000/ring192000/3slots, renderer6912000bytes, cache256MiB, original timing guards and every existing acceptance identity.
 - No production ATS exception, private catalog/account/media, trimming, synthetic padding, weaker silence oracle, signing or paid checks.
 - Cold native-to-PCM ownership is not a measurement of the audio crossing that boundary. Report its limits explicitly.
@@ -71,5 +71,29 @@
 - [x] Review the order hypothesis and stored-ticket observation against current source. Bounded review recommends this single order experiment; stable authority narrows control calls but cannot identify SDK/HAL behavior.
 - [x] Add the early accounted wrapper and source identity metadata; retain the original default and late accounted identities. Raw PCM hashes are computed after owned close and retained with XCTest identity, enabling exact attachment binding.
 - [x] Verify local syntax, project references, exact77-case profile and unchanged production/workflow trees. Local syntax/project/profile checks pass; native SDK execution remains pending.
-- [ ] Run the changed-source order experiment once on the same approved free unsigned workflow. Require actual early/default/late test-start order from raw evidence before interpreting the experiment.
-- [ ] Act on failing-window evidence; no clean retry acceptance, tolerance changes or production patch without an identified mechanism.
+- [x] Run the changed-source order experiment once on the same approved free unsigned workflow. Require actual early/default/late test-start order from raw evidence before interpreting the experiment.
+- [x] Act on failing-window evidence; no clean retry acceptance, tolerance changes or production patch without an identified mechanism.
+
+## Native34 result
+
+- Run40201689817/sourcedd4abf6 completes failed without timeout. Build192161ms/core125/175products pass; tests494940ms return all77identities,75pass/2fail. Strict verifier rejects exactly the2failed cases; no torn-pass reconstruction issue. UI passes32.322s.
+- Raw start order confirms early-accounted, original-default, then late-accounted. All3record633600frames, exact complete-reference match/maxdiff0, zero actual mixer zeros/underruns, stable control ticket2to2. Both accounted prefixes contain only1024deliberate paused frames after capture. Hashes bind each case to exact PCM; two cases share identical bytes and deduplicate naturally. This is nonrecurrence, not an audio repair or proof of the order hypothesis.
+- Default navigation fails43.628s: prepared B video297.6155ms over250ms, two snapshot acquisition durations over5ms, PCM/wall skew, and actual returned-A zeros2008frames/41.833ms plus564frames/11.75ms. The8.2s393600-frame audit has2572stereo-zero frames and408/410correct tone blocks. No kernel underrun is counted.
+- Natural-boundary case fails22.894s because its initial-preparation main-actor sampler has a2.298253333s gap (250ms guard). This is NOT a2.3s natural handoff: the actual later boundary preserves its1024baseline underruns with0added and reveals correctly moving B. Cached phase advances audioPrepare4toobservedCurrent7 while PCM reaches109056frames; the precise blocking SDK call is unproved.
+- Local ffprobe verifies the default navigation fixture is stereo AAC48000, already eligible for the new reader. Do not attribute this failure to the mono fallback or expand reader admission without separate evidence.
+- Artifact12602641751/75055585bytes/SHA491bc58521c60d303073465851e3e2ed6fb07aef24357d780f8a2bca837af324 verified1716ZIPentries. Exact native-log SHA3bac0876f64e3284b53c0be62361f90a1afaf33333142ea3b4c448b1fd271d67. Prior failed loop recordings remain open. No Release/TestFlight/phone acceptance.
+
+### Task 4: Remove synchronous metadata loading from video composition creation
+
+**Observed RED:** Native34's original initial-preparation coverage guard fails with a2.298s main-actor sampling gap; prepared B readiness also exceeds250ms. The interval does not identify one SDK call.
+
+**Specific hazard and hypothesis:** makeVideoComposition is MainActor-isolated and invokes synchronous AVMutableVideoComposition(propertiesOf:). Apple documents that this constructor can synchronously load asset properties and provides an async equivalent to keep media apps responsive. Replace only that call, retaining all geometry, timing/color defaults and cancellation ownership. This is removal of a documented blocking hazard; a clean retry alone cannot establish it caused the mixer gaps.
+
+**Primary references:** https://developer.apple.com/videos/play/wwdc2022/110379/ and https://developer.apple.com/documentation/avfoundation/avmutablevideocomposition/videocomposition(withpropertiesof:completionhandler:)
+
+- [x] Replace the synchronous factory with try await AVMutableVideoComposition.videoComposition(withPropertiesOf: asset), then check cancellation before configuring instructions.
+- [x] Keep every77prior profile identity and add3existing full-frame identity, portrait/mirror timing and cancellation cases (80total); create no duplicate tests. Preserve the verifier's original80-case bound; the remaining cadence/retirement tests stay in the full native gate.
+- [x] Run local source/project/profile checks and bounded source review before publishing; leave audio renderer/core/buffers, workflow and timing/silence assertions unchanged. Full Swift parse, generated project and exact80-case profile pass; bounded review has no Critical/Important findings. Native SDK typechecking, cancellation latency and timing remain pending.
+- [ ] Run one changed-production-source native check, retain all failures, and distinguish blocking-API removal from actual recurrence/device acceptance.
+
+- Local profile validation caught an84-case selection exceeding the existing80-case bound. Narrowed only the added existing cases to identity, orientation/timing and cancellation (77+3); verifier bound and all preceding77cases remain unchanged. This was caught before any hosted run.

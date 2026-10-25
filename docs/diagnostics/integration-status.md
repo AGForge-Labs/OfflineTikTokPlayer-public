@@ -969,3 +969,51 @@ capture; stable nonexhausted authority would exclude new audited play/suspend
 commands, not SDK/HAL behavior. Metadata names and post-close PCM hashes bind
 witnesses to their XCTest identity. One77case native check pending; a clean run
 would remain inconclusive because the early arm also warms the default's session.
+
+
+### Native34: loop order stays inconclusive; navigation remains failed
+
+Run40201689817/sourcedd4abf6 fails without timeout: build192161ms/core125/
+175products pass, tests494940ms/exit65. All77identities return,75pass/2fail;
+strict verifier rejects those2real failures only. UI smoke passes32.322s.
+
+Raw order is early-accounted, original-default, late-accounted. All3loop cases
+capture633600frames with exact complete-reference match/maxdiff0, zero actual
+mixer zeros/underruns and stable stored control authority2to2. Both accounted
+arms have1024deliberate paused source frames after capture, no copied-source
+zeros or sample-stamp gaps. SHA bindings associate cases to raw PCM; the default
+and late arms share identical bytes. This is nonrecurrence, not a production fix.
+Prior failed recordings remain open; formalRTJoin/coverageClosed remainfalse.
+
+Default navigation fails43.628s: preparedB video297.6155ms>250ms, acquisition
+and PCM/wall timing guards, plus actual returned-A stereo-zero runs2008frames/
+41.833ms and564frames/11.75ms. Its8.2s393600-frame window has2572zero frames,
+408/410correct tone blocks and no counted kernel underrun. Traced navigation
+passes25.685s. These opposite outcomes do not identify a runtime cause.
+
+Natural-boundary case fails22.894s on its INITIAL-PREPARATION main-actor sampler:
+maxGap2.298253333s>250ms; cached phaseaudioPrepare4toobservedCurrent7 while PCM
+reaches109056frames. This is not a2.3s handoff delay: the later actual boundary
+reveals moving B and retains1024baseline underruns with0added. The specific
+blocking SDK call remains unproved. Local ffprobe confirms the defaultA fixture
+is AAC48000stereo, already eligible for the new reader; do not blame mono fallback.
+
+Artifact12602641751/75055585bytes/SHA256
+491bc58521c60d303073465851e3e2ed6fb07aef24357d780f8a2bca837af324
+verified1716ZIPentries. Native logSHA3bac0876f64e3284b53c0be62361f90a1afaf33333142ea3b4c448b1fd271d67.
+
+The measured startup path contains MainActor-isolated synchronous
+AVMutableVideoComposition(propertiesOf:). Apple's responsive-media guidance
+documents synchronous property loading here and its async counterpart:
+https://developer.apple.com/videos/play/wwdc2022/110379/
+https://developer.apple.com/documentation/avfoundation/avmutablevideocomposition/videocomposition(withpropertiesof:completionhandler:)
+
+Next candidate replaces only that factory with the async equivalent and checks
+cancellation before configuring instructions. All cadence/geometry/color defaults
+and renderer/core/buffers remain. This removes a documented blocking hazard, not
+an established cause of the recorded mixer gaps. Profile80 retains every77case
+and adds3existing full-frame identity, portrait/mirror timing and cancellation
+regressions, with no new test methods or relaxed guards. The profile's original
+80-case bound remains; the other cadence/retirement tests remain in the full gate.
+Native result pending;
+full Release/TestFlight/phone acceptance remain open.
