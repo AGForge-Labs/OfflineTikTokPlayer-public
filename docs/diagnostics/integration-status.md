@@ -1017,3 +1017,15 @@ regressions, with no new test methods or relaxed guards. The profile's original
 80-case bound remains; the other cadence/retirement tests remain in the full gate.
 Native result pending;
 full Release/TestFlight/phone acceptance remain open.
+
+
+### Native35: a failed loop binds skipped request time to mixer zeros
+
+- Run40204029345/source9489d3b completes failed without timeout. Build239148ms/core125/175products pass; tests505309ms return80cases/76pass/4fail; strict verifier rejects exactly those4. UI passes28.162s.
+- Early accounted loop retains1064inserted zero frames/22.166667ms at40256..41320; original default loop retains1044+1068zero frames; late accounted loop is exact633600/maxdiff0. Stable stored control authority2to2 in all3. This is no gap repair.
+- For the early failed prefix, source callbacks88to89 request timestamps advance1576samples instead of512. The unrequested1064-frame raw-HAL interval11485501299..11486033299 equals the recorded tap-zero interval exactly at500ticks/frame, with no latency shift. Both surrounding calls copied512finite nonzero pairs and returned0; observed executions12.125/11.792microseconds. All1536source zeros are3final paused callbacks after the recorded endpoint. Original coverageClosed/formalRTJoin remainfalse. This establishes one observed timestamp correspondence, not why requests skipped, driver culpability, absence of earlier app/observer load, or physical output.
+- Source phase45056precedes first57600-frame loop boundary. Re-extracted original ledger payload SHA256ccf62c204cd1fe4f7f2b77a6f4ab4bb4b7e52d3ae3f4198a7ae6917186b641f5 matches the verified artifact index and reformatted JSON; PCM/reference hashes match their case binding. Bounded independent review confirms interval arithmetic and scope; provenance was strengthened afterward by re-extracting this leaf.
+- Default navigation fails on386.35/357.75ms video readiness and7.55ms snapshot acquisition; returned-A actual stereo audit is retained. Natural-boundary case has791.915ms initial-preparation sampling gap (audioPrepare4toaudioPrepared5) and a31.635s screenshot window exceeding29s. PCM baseline2048underruns remains2048. Do not interpret screenshot time as an audio handoff.
+- Artifact12603401892/72117083bytes/SHA2561e44aef393c247f6c72e3f6798e2780a044986a5616df18ead216ce95a9ed064; native-log SHA256f29bdc09a4849233a8fe96ae9ff584b6dd57ca5f594870b86afe23ef3ce0445c. Prior failures, full Release and phone acceptance remain open; no TestFlight.
+
+Next diagnostic reuses immutable Native35 artifact12602932379 and candidate9489d3b with unchanged app/core/test source and80-case acceptance profile. One existing playback case plus the required UI smoke receives a2s built-in stack sample. Phase and RuntimeHost freshness remain unqualified; only actual named stacks can support a call-path finding. Separate harness source is recorded; no new build, test method, signing or acceptance waiver. Bounded source review has no remaining Critical/Important findings.
