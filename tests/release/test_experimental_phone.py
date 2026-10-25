@@ -8,6 +8,8 @@ from unittest import mock
 from types import SimpleNamespace
 import contextlib
 import io
+import base64
+import json
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("experimental_phone", ROOT / "scripts/experimental-phone.py")
@@ -16,6 +18,29 @@ spec.loader.exec_module(phone)
 
 
 class ExperimentalPhoneTests(unittest.TestCase):
+    def test_diagnostic_sealing_is_bounded_and_never_returns_plaintext_on_error(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent, prefix="owned-sealed-") as temporary:
+            directory = Path(temporary)
+            calls = []
+            def encrypt(command, **kwargs):
+                calls.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=b"\x30" + b"CIPHERTEXT" * 32)
+            with mock.patch.object(phone.subprocess, "run", side_effect=encrypt):
+                sealed = phone.seal_diagnostic(b"A" * 100000 + b"PRIVATE-MARKER", "archive", 65, directory)
+            command, kwargs = calls[0]
+            self.assertIn("cms", command)
+            self.assertIn("-aes-256-cbc", command)
+            self.assertEqual(kwargs["timeout"], 10)
+            self.assertEqual(set(kwargs["env"]) - {"PATH", "SYSTEMROOT", "TMPDIR"}, set())
+            payload = json.loads(kwargs["input"])
+            self.assertEqual(payload["source"], phone.SOURCE)
+            self.assertEqual(payload["exitCode"], 65)
+            self.assertEqual(len(base64.b64decode(payload["tail"])), 48 * 1024)
+            self.assertNotIn("PRIVATE-MARKER", sealed)
+            with mock.patch.object(phone.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout=b"PRIVATE-MARKER")):
+                with self.assertRaises(RuntimeError):
+                    phone.seal_diagnostic(b"PRIVATE-MARKER", "archive", 65, directory)
+
     def setUp(self):
         self.sha = "a" * 40
         self.env = dict(GITHUB_ACTIONS="true", RUNNER_OS="macOS", RUNNER_ENVIRONMENT="github-hosted",
@@ -97,6 +122,8 @@ class ExperimentalPhoneTests(unittest.TestCase):
                     helper.run_tool(["security", "list-keychains"])
             helper.upload = upload
             def failure(command, **kwargs):
+                if command[0] != "xcodebuild":
+                    return SimpleNamespace(returncode=1, stdout=b"")
                 self.assertFalse(any(name in kwargs["env"] for name in phone.SECRETS))
                 kwargs["stdout"].write(b"error: No profiles for PRIVATE-MARKER were found")
                 return SimpleNamespace(returncode=65)
@@ -120,6 +147,8 @@ class ExperimentalPhoneTests(unittest.TestCase):
             helper = SimpleNamespace(ROOT=directory, run_tool=lambda *args, **kwargs: b"", materialize=lambda *args: ())
             helper.upload = lambda *args: helper.run_tool(["xcodebuild", "archive"], visible=True)
             def failure(command, **kwargs):
+                if command[0] != "xcodebuild":
+                    return SimpleNamespace(returncode=1, stdout=b"")
                 kwargs["stdout"].write(error_output)
                 return SimpleNamespace(returncode=65)
             import json

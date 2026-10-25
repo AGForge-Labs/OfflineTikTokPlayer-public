@@ -1,5 +1,6 @@
 """Separate owner-only experimental phone build; never marks native acceptance passed."""
 import argparse
+import base64
 import hashlib
 import importlib.util
 import json
@@ -20,6 +21,47 @@ ROOT = Path(__file__).resolve().parents[1]
 PHASES = {"credential-inputs", "credential-validation", "project-validation", "archive", "export-upload", "complete"}
 REASONS = {"profile-not-found", "profile-entitlement-mismatch", "certificate-not-found", "keychain-signing-failed",
            "swift-compilation", "xcodebuild-error", "tool-validation-failed"}
+DIAGNOSTIC_CERTIFICATE = b"""-----BEGIN CERTIFICATE-----
+MIIECDCCAnCgAwIBAgIUZpv+W/YXo99JxSwDLtPIy9k2jWwwDQYJKoZIhvcNAQEL
+BQAwNDEyMDAGA1UEAwwpT2ZmbGluZSBQbGF5ZXIgZGlhZ25vc3RpYyBlbmNyeXB0
+aW9uIG9ubHkwHhcNMjYxMDI1MTk0MDA0WhcNMjYxMTAxMTk0NTA0WjA0MTIwMAYD
+VQQDDClPZmZsaW5lIFBsYXllciBkaWFnbm9zdGljIGVuY3J5cHRpb24gb25seTCC
+AaIwDQYJKoZIhvcNAQEBBQADggGPADCCAYoCggGBAKa26+Qt3NZ+W5Dv8mLN2t0Y
+G/tsO0kkrkCGAsD8COM+NbAKwpC8a/AcRBlK/6cE/mUJPrVbFIsdalXULE8FmzAW
+307jtdUC/AhAqcXrhG/9QQZ4lVzYK5RCz/stKDvGkJASPMPhtT4qsn8fiVoLPnjA
+EhvARN0LZ+EsLRj+uDQpJQBCm49dffQaqRJI3vWZnnxPuGPNHNSRIsmUSXsckEWE
+5C2oIDdjSzj+BJt0pDjvakpmocBM9mEqlTzSxhv9olkFOf50NpY/jN+HglZlFM5h
+ZRJxsCF8x9EpT3M908wKxMYXvd4YYy7M1DeracDe83/2Z1HyquTg6NZU5UC++Ou9
+WXRnfqp1CORKTLSVElW0OT8YQOUU2DOfUW9HpLjX6WDxF6LRERxUF5ItEuM0h8Q4
+aflRDwTE5KbF85JGrryATkEkMEeeKEhKXU3Gz9QV6P7eUIGftIHq1Kh696qCyU+4
+BcyCH8zYFfm+t5UpL40cYG6zCDkAk0HJ6sEmht7n6wIDAQABoxIwEDAOBgNVHQ8B
+Af8EBAMCBSAwDQYJKoZIhvcNAQELBQADggGBAIvzbiS1FX1LHYWOOovZA+uCgQKa
+Mep0IOZZ7zDu3WHy4Z1Uv2aZDYor0Hekf6syXVSqD+DFTqiGMChEtxwYiUaxBcai
+lE5pvcAbIMDLzpm7uE2lARmm4dKJHPtqHECd620Sd9k9Cj0yRiqny9/dQQa0EX40
+rxi61QwnGQ4xpEbfGp290MPFeEI1xwn1cAs6jDY/6IJx2MrymlHFnX/TEgtDv27p
+AfxAorHCiFF7SQmufMf+wtgf7/8W6hSC74VguFmsavu7nRfvMyt6c/4HB6iVfRve
+9dVwEx58mAiA16KycXLMAXxyZmSAJ/qWT4ADqk25QdCa34h9MIEju2f5g7YitD4d
+WE3+YQ/wF/mJcCYXEfllG9jpEcIJpMzqInQXG39srR5OW8nPr32NrtY6lixwVd9O
+C3Lr3MFLPp5nW+XyviyVOy/tHNgLo532m9SpUReen67BB72vz6UxmhqWRrCRK2MB
+IgtjJ/GZxotnmPYGh6qOJMm7orcTiSYsg2Rhyg==
+-----END CERTIFICATE-----
+"""
+
+
+def seal_diagnostic(raw, phase, exit_code, directory, *, openssl="openssl"):
+    """Only a public encryption certificate is present on the runner; no plaintext fallback."""
+    certificate = directory / "diagnostic-encryption.pem"
+    certificate.write_bytes(DIAGNOSTIC_CERTIFICATE)
+    payload = json.dumps(dict(source=SOURCE, control=os.environ.get("EXPECTED_CONTROL_COMMIT", ""),
+        build=os.environ.get("EXPERIMENTAL_BUILD_NUMBER", ""), phase=phase, exitCode=exit_code,
+        tail=base64.b64encode(raw[-48 * 1024:]).decode("ascii"))).encode()
+    environment = {name: os.environ[name] for name in ("PATH", "SYSTEMROOT", "TMPDIR") if name in os.environ}
+    result = subprocess.run([openssl, "cms", "-encrypt", "-aes-256-cbc", "-binary", "-outform", "DER",
+                             "-recip", str(certificate)], input=payload, capture_output=True,
+                            env=environment, timeout=10)
+    if result.returncode or not 128 <= len(result.stdout) <= 96 * 1024 or result.stdout[:1] != b"\x30":
+        raise RuntimeError("Diagnostic encryption failed; plaintext remains suppressed.")
+    return base64.b64encode(result.stdout).decode("ascii")
 
 
 def require(condition, message):
@@ -85,7 +127,7 @@ def load_module(name, path):
 def upload_with_receipt(helper, configuration, directory, build, receipt):
     original = helper.run_tool
     failed = False
-    def record(phase, reason=None, location=None):
+    def record(phase, reason=None, location=None, sealed=None, exit_code=None):
         nonlocal failed
         if failed:
             return
@@ -93,6 +135,8 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
         status = {"phase": phase, "reason": reason}
         if location is not None:
             status.update(sourceFile=location[0], line=location[1])
+        if sealed is not None:
+            status.update(sealedDiagnostic=sealed, exitCode=exit_code)
         receipt.write_text(json.dumps(status), encoding="utf-8")
     def observed_tool(arguments, **kwargs):
         tool = Path(arguments[0]).name
@@ -110,7 +154,9 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
             with tempfile.TemporaryFile(dir=directory) as output:
                 result = subprocess.run(arguments, env=environment, stdout=output, stderr=subprocess.STDOUT, **kwargs)
                 if result.returncode:
-                    output.seek(0)
+                    output.seek(0, os.SEEK_END)
+                    size = output.tell()
+                    output.seek(max(0, size - 8 * 1024 * 1024))
                     raw = output.read(8 * 1024 * 1024)
                     errors = [line for line in raw.splitlines() if b"error:" in line.lower()]
                     text = b"\n".join(errors).lower()
@@ -127,7 +173,12 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
                             location = (match[1].decode("ascii"), int(match[2]))
                             reason = "swift-compilation"
                             break
-                    record(phase, reason, location)
+                    sealed = None
+                    try:
+                        sealed = seal_diagnostic(raw, phase, result.returncode, directory)
+                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                        pass
+                    record(phase, reason, location, sealed, result.returncode)
                     raise RuntimeError("Xcode failed; raw signing output is suppressed.")
             return b""
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
@@ -172,7 +223,7 @@ def main():
                 public.run_redacted([sys.executable, "-B", str(Path(__file__).resolve()), "child"],
                                     env=environment, cwd=ROOT, timeout=360)
             except RuntimeError:
-                status = json.loads(receipt.read_text()) if receipt.stat().st_size <= 2048 else {}
+                status = json.loads(receipt.read_text()) if receipt.stat().st_size <= 128 * 1024 else {}
                 phase, reason = status.get("phase"), status.get("reason")
                 if isinstance(phase, str) and phase in PHASES:
                     category = reason if isinstance(reason, str) and reason in REASONS else "unclassified"
@@ -180,6 +231,10 @@ def main():
                     file, line = status.get("sourceFile"), status.get("line")
                     if isinstance(file, str) and re.fullmatch(r"[A-Za-z0-9_]+\.swift", file) and type(line) is int and 0 < line < 1_000_000:
                         print("Public compiler location: " + file + ":" + str(line), flush=True)
+                    sealed = status.get("sealedDiagnostic")
+                    if isinstance(sealed, str) and 128 <= len(sealed) <= 128 * 1024 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", sealed):
+                        for offset in range(0, len(sealed), 4096):
+                            print("Encrypted diagnostic " + str(offset // 4096 + 1) + ": " + sealed[offset:offset + 4096], flush=True)
                 raise
         message = "Uploaded experimental internal-only phone build " + build + " from " + SOURCE + ". Native and phone acceptance remain unresolved."
         print(message)
