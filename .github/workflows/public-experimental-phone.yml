@@ -1,0 +1,65 @@
+name: Experimental owner phone build
+run-name: Experimental phone candidate - native acceptance unresolved
+on:
+  workflow_dispatch:
+    inputs:
+      authorize_experimental_upload:
+        description: Build an experimental internal-only phone candidate with the retained native failures
+        required: true
+        default: false
+        type: boolean
+      expected_control_commit:
+        description: Exact reviewed main commit containing this experimental workflow
+        required: true
+        type: string
+      build_number:
+        description: Apple-checked increasing build number after 19.1
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: public-testflight-release
+  cancel-in-progress: false
+env:
+  EXPECTED_CONTROL_COMMIT: ${{ inputs.expected_control_commit }}
+  EXPERIMENTAL_BUILD_NUMBER: ${{ inputs.build_number }}
+  EXPERIMENTAL_PHONE_AUTHORIZED: ${{ inputs.authorize_experimental_upload }}
+  PYTHONDONTWRITEBYTECODE: '1'
+jobs:
+  experimental-phone:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.authorize_experimental_upload &&
+      github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private &&
+      github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' &&
+      github.ref == 'refs/heads/main' && github.run_attempt == 1
+    environment:
+      name: release
+    runs-on: macos-26
+    timeout-minutes: 8
+    steps:
+      - name: Read exact experimental workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Read frozen playback candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 9489d3b3ae85cb41b5ef4f56633dcf41b36505af
+          path: candidate
+          persist-credentials: false
+      - name: Verify experimental owner request and exact runtime source without credentials
+        run: python3 -B control/scripts/experimental-phone.py check
+      - name: Sign and upload experimental internal-only candidate with private output suppressed
+        env:
+          RELEASE_ENVIRONMENT: release
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          APP_STORE_CONNECT_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_KEY_BASE64 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ vars.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ vars.APP_STORE_CONNECT_ISSUER_ID }}
+          APPLE_CERTIFICATE_SHA256: ${{ vars.APPLE_CERTIFICATE_SHA256 }}
+        run: python3 -B control/scripts/experimental-phone.py sign-upload

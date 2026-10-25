@@ -1,0 +1,15 @@
+# Experimental owner phone candidate
+
+This separate manual workflow prepares an internal-only device experiment from frozen playback source `9489d3b3ae85cb41b5ef4f56633dcf41b36505af`. It does not claim verified silent-gap playback. Native37 compiled the exact runtime for unsigned Release/iphoneos; Native35's complete 80-case gate remains failed, and Native38's diagnostic also failed. Their assertions and evidence remain intact.
+
+The owner requested public builds for future work. One standard public `macos-26` job has an eight-minute limit and no automatic retry. Source/workflow inputs are validated as exact reviewed commits, owner/main/manual/first-attempt only. The two checkouts persist no token. Private media, catalogs, sessions and local overrides are refused.
+
+Signing reuses the existing protected `release` environment and its existing four separate credentials. Main-only branches, required owner review and disabled administrator bypass remain. No credential transfer, new certificate/profile/key, paid runner, subscription, tester or public link is required. Credentials exist only in the final signing step, with raw Xcode/Apple output redirected to a temporary file and never published. No archives, signed packages, caches or diagnostic artifacts are uploaded to GitHub.
+
+`public-testflight.yml`, its normal acceptance logic and `RELEASE_ACCEPTED_COMMIT` are unchanged. The experimental route has an explicitly separate purpose and never marks this known failed runtime candidate accepted. It calls the unchanged, hash-pinned existing delivery helper only after its own experimental admission checks, using the existing team/app/profile and internal-only export.
+
+Before each deliberate dispatch, read Apple's complete build list and select an unused increasing number. The local October25 readback contains12builds, no next page, maximum19.1; proposed next number20.1 must be rechecked immediately before dispatch. If a run times out or upload is uncertain, check Apple before another separately reviewed attempt. Do not use rerun.
+
+After processing, verify VALID/INTERNAL_ONLY and assign only the existing one-person Owner group. Phone acceptance must compare next/previous, repeat-one, selected-video synchronization, Library audio-only, explicit Pause, lock-screen playback and camera interruption recovery. The engine experiment is not complete until actual-device behavior is verified.
+
+Local control check: `python3 -B -m unittest discover -s tests/release -v`. These checks establish admission/redaction behavior only. No new Simulator run is required for unchanged runtime source; Native35 failures remain unresolved.
