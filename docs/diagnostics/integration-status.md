@@ -1045,3 +1045,12 @@ Restored the original D63842AF workflow after retaining the failed profiling att
 ### Native37: unsigned Release compilation only, pending
 
 Preparing one manual standard public macos-26/15minute compile of immutable candidate9489d3b for Release/iphoneos, with signing disabled and no test launch/archive/Apple upload. Existing owned cleanup now has a separate fixed720s release-build action, preserving every earlier action/budget. Local RED and all15owned-process GREEN checks, shell syntax and workflow checks pass; bounded source review has no Critical/Important findings. App/core/native-test trees and80acceptance identities are unchanged. Native35/36 runtime failures and physical playback acceptance remain unresolved; compilation cannot waive them.
+
+
+### Native37 result: Release compile evidence only
+
+- Run40208561208/harness25bb90a completes successfully. Frozen candidate9489d3b compiles for Release/iphoneos26.5 with Xcode26.6/17F113 and produces an unsigned arm64 executable. Owned build101857ms/exit0/no timeout/owned cleanup verified. Both app and core compile with-O and noDEBUG define; the core uses whole-module optimization while the app does not. No tests, signing, archive or Apple upload ran.
+- Artifact12604053126/51480bytes/SHA256c3acec8f78203714d971bf124ebcaa26ebf9c76c14b9f65cf4133932bddc4574 verifies10ZIPentries. Exact native log187800bytes/SHA256c7f636a631056b2572965c81fe5c1af719192eb38b0c2d3fae60a6401d80c9fa. There are32distinct warning lines, including existing strict-concurrency and SDK deprecation warnings; this is not a warning-free build. A local inspection initially assumed both modules used whole-module optimization; actual compiler commands show only the core does, so the receipt records the observed flags rather than that assumption.
+- Restored the original D63842AF full80-case manual workflow after retaining the compile evidence. All app/core/native-test/profile bytes remain unchanged. Native35's80-case runtime gate and Native36's diagnostic remain failed; Release compilation cannot clear their silent-gap/readiness failures. No phone, physical output, OnTrac or TestFlight acceptance. Last delivered TestFlight remains1.0(19.1); no new build was sent.
+
+Restored the original D63842AF manual80-case workflow after retaining this compile-only result. Existing runtime failures remain open; no source change, signed build or TestFlight delivery follows from compile success.
