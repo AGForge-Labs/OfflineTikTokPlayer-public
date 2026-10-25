@@ -9,6 +9,14 @@ import Foundation
 /// The caller must add displayLayer to its visible inline surface and keep its bounds current.
 @MainActor
 final class ContinuousPictureInPicture: NSObject {
+    struct PresentationTicket: Equatable, Sendable {
+        fileprivate let generation: Int
+        fileprivate let item: ObjectIdentifier
+    }
+    #if DEBUG
+    /// Observes the actual SDK request without replacing its result.
+    var onFrameAcquisition: ((AVPlayerItem, CMTime) -> Void)?
+    #endif
     enum Event: Int {
         case willStart = 0
         case didStart = 1
@@ -58,6 +66,9 @@ final class ContinuousPictureInPicture: NSObject {
     private var frameFeedEnabled = true
     private var preparationTask: Task<Void, Never>?
     private var itemGeneration = 0
+    private var presentationRevision = 0
+    private var installedTimeline: PresentationTicket?
+    private var presentationActive = false
     private var seekTicket: UInt64 = 0
     private var activeSeekTicket: UInt64?
     private var originalComposition: AVVideoComposition?
@@ -109,8 +120,21 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     /// Exactly one item output is attached at a time; this never prepares additional video items.
-    func setCurrentItem(_ item: AVPlayerItem?) {
-        guard !invalidated, currentItem !== item else { return }
+    @discardableResult
+    func setCurrentItem(_ item: AVPlayerItem?) -> PresentationTicket? {
+        guard !invalidated else { return nil }
+        presentationRevision &+= 1
+        installedTimeline = nil
+        presentationActive = false
+        activeSeekTicket = nil
+        stopFrameTimer()
+        let ticket = item.map { PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0)) }
+        if currentItem === item {
+            // A new service request for the same item needs its own timeline,
+            // while its output and in-flight geometry preparation stay reusable.
+            flushForSeek()
+            return ticket
+        }
         preparationTask?.cancel()
         preparationTask = nil
         stopFrameTimer()
@@ -128,7 +152,7 @@ final class ContinuousPictureInPicture: NSObject {
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
         lastCopiedFramePositionSeconds = nil
-        guard let item else { stopFrameTimer(); return }
+        guard let item else { stopFrameTimer(); return nil }
         originalComposition = item.videoComposition
         let existingComposition = item.videoComposition
         preparationTask = Task { [weak self, weak item] in
@@ -153,6 +177,37 @@ final class ContinuousPictureInPicture: NSObject {
                 self.onEvent?(.sourcePreparationFailed, (error as NSError).code)
             }
         }
+        return ticket
+    }
+
+    /// Bind the selected audio timeline before any output pull. Ordinary polling
+    /// can update this state, but cannot authorize a newly adopted presentation.
+    @discardableResult
+    func installTimeline(_ ticket: PresentationTicket, positionSeconds: Double,
+                         durationSeconds: Double, isPlaying: Bool) -> Bool {
+        guard owns(ticket) else { return false }
+        presentationActive = false
+        installedTimeline = nil
+        stopFrameTimer()
+        applyPlayback(positionSeconds: positionSeconds, durationSeconds: durationSeconds,
+                      isPlaying: isPlaying, forceAnchor: true)
+        guard owns(ticket) else { return false }
+        installedTimeline = ticket
+        return true
+    }
+
+    @discardableResult
+    func activate(_ ticket: PresentationTicket) -> Bool {
+        guard owns(ticket), installedTimeline == ticket, activeSeekTicket == nil else { return false }
+        presentationActive = true
+        renderFrame()
+        if frameFeedEnabled && playbackState.read().isPlaying { startFrameTimer() }
+        return true
+    }
+
+    private func owns(_ ticket: PresentationTicket) -> Bool {
+        !invalidated && ticket.generation == presentationRevision
+            && currentItem.map { ObjectIdentifier($0) == ticket.item } == true
     }
 
     private func attachOutput(to item: AVPlayerItem) {
@@ -208,6 +263,12 @@ final class ContinuousPictureInPicture: NSObject {
 
     /// Position must come from the audio renderer, not the independently muted video player.
     func updatePlayback(positionSeconds: Double, durationSeconds: Double, isPlaying: Bool) {
+        applyPlayback(positionSeconds: positionSeconds, durationSeconds: durationSeconds,
+                      isPlaying: isPlaying, forceAnchor: false)
+    }
+
+    private func applyPlayback(positionSeconds: Double, durationSeconds: Double, isPlaying: Bool,
+                               forceAnchor: Bool) {
         guard !invalidated else { return }
         let position = positionSeconds.isFinite ? max(0, positionSeconds) : 0
         let duration = durationSeconds.isFinite ? max(0, durationSeconds) : 0
@@ -215,7 +276,7 @@ final class ContinuousPictureInPicture: NSObject {
         playbackState.update(position: position, duration: duration, isPlaying: isPlaying)
         if let timebase {
             let current = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
-            if !current.isFinite || abs(current - position) > 0.08 {
+            if forceAnchor || !current.isFinite || abs(current - position) > 0.08 {
                 flushForSeek()
                 CMTimebaseSetTime(timebase, time: CMTime(seconds: position, preferredTimescale: 60_000))
             } else if previous.isPlaying != isPlaying || !isPlaying {
@@ -271,6 +332,11 @@ final class ContinuousPictureInPicture: NSObject {
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true
+        presentationActive = false
+        installedTimeline = nil
+        #if DEBUG
+        onFrameAcquisition = nil
+        #endif
         activeSeekTicket = nil
         preparationTask?.cancel()
         preparationTask = nil
@@ -295,7 +361,7 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     private func startFrameTimer() {
-        guard frameTimer == nil else { return }
+        guard presentationActive, activeSeekTicket == nil, frameTimer == nil else { return }
         let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             // This timer is installed only on RunLoop.main. No per-frame task or queue is created.
             MainActor.assumeIsolated { self?.renderFrame() }
@@ -316,6 +382,7 @@ final class ContinuousPictureInPicture: NSObject {
             blockedFrameAcquisitionCount &+= 1
             return
         }
+        guard presentationActive else { return }
         if displayLayer.status == .failed {
             if !hasReportedFrameFailure {
                 onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)
@@ -327,7 +394,11 @@ final class ContinuousPictureInPicture: NSObject {
         // Respect platform backpressure. No app-owned pixel-buffer queue or decoded-frame history.
         guard displayLayer.isReadyForMoreMediaData else { return }
         let requestedTime = CMTimebaseGetTime(timebase)
-        guard requestedTime.isNumeric, videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
+        guard requestedTime.isNumeric else { return }
+        #if DEBUG
+        if let item = currentItem { onFrameAcquisition?(item, requestedTime) }
+        #endif
+        guard videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
         var displayTime = CMTime.invalid
         guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
                                                       itemTimeForDisplay: &displayTime) else { return }
