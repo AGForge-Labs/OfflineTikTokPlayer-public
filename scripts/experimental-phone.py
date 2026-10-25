@@ -124,6 +124,14 @@ def load_module(name, path):
     return module
 
 
+def compatible_archive_arguments(arguments):
+    # Native37 emitted the per-file WMO objects Xcode expects using its default
+    # backend thread count. The old NO override instead leaves those files absent.
+    if Path(arguments[0]).name == "xcodebuild" and "archive" in arguments and "-exportArchive" not in arguments:
+        return [value for value in arguments if value != "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO"]
+    return list(arguments)
+
+
 def upload_with_receipt(helper, configuration, directory, build, receipt):
     original = helper.run_tool
     failed = False
@@ -139,6 +147,7 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
             status.update(sealedDiagnostic=sealed, exitCode=exit_code)
         receipt.write_text(json.dumps(status), encoding="utf-8")
     def observed_tool(arguments, **kwargs):
+        arguments = compatible_archive_arguments(arguments)
         tool = Path(arguments[0]).name
         phase = ("export-upload" if "-exportArchive" in arguments else "archive") if tool == "xcodebuild" else (
             "project-validation" if any("generate-ios-project.py" in str(value) for value in arguments) else "credential-validation")

@@ -18,6 +18,17 @@ spec.loader.exec_module(phone)
 
 
 class ExperimentalPhoneTests(unittest.TestCase):
+    def test_archive_preserves_default_whole_module_outputs_and_other_signing_arguments(self):
+        override = "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO"
+        command = ["xcodebuild", "-jobs", "1", "SWIFTC_MAXIMUM_DETERMINISM=1", override,
+                   "DEVELOPMENT_TEAM=approved", "CODE_SIGN_STYLE=Manual", "PROVISIONING_PROFILE_SPECIFIER=approved", "archive"]
+        original = list(command)
+        self.assertEqual(phone.compatible_archive_arguments(command), [value for value in command if value != override])
+        self.assertEqual(command, original)
+        export = ["xcodebuild", "-exportArchive", override]
+        self.assertEqual(phone.compatible_archive_arguments(export), export)
+        self.assertEqual(phone.compatible_archive_arguments(["other", "archive", override]), ["other", "archive", override])
+
     def test_diagnostic_sealing_is_bounded_and_never_returns_plaintext_on_error(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent, prefix="owned-sealed-") as temporary:
             directory = Path(temporary)
@@ -116,7 +127,7 @@ class ExperimentalPhoneTests(unittest.TestCase):
             helper = SimpleNamespace(run_tool=lambda *args, **kwargs: b"", materialize=lambda *args: ())
             def upload(*args):
                 try:
-                    helper.run_tool(["xcodebuild", "archive"], visible=True,
+                    helper.run_tool(["xcodebuild", "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO", "archive"], visible=True,
                                     env={name: "PRIVATE-MARKER" for name in phone.SECRETS})
                 finally:
                     helper.run_tool(["security", "list-keychains"])
@@ -124,6 +135,7 @@ class ExperimentalPhoneTests(unittest.TestCase):
             def failure(command, **kwargs):
                 if command[0] != "xcodebuild":
                     return SimpleNamespace(returncode=1, stdout=b"")
+                self.assertNotIn("SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO", command)
                 self.assertFalse(any(name in kwargs["env"] for name in phone.SECRETS))
                 kwargs["stdout"].write(b"error: No profiles for PRIVATE-MARKER were found")
                 return SimpleNamespace(returncode=65)
