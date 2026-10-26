@@ -175,6 +175,39 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         service.pause()
     }
 
+    func testStoppedEstablishedVideoRecoversWhilePCMContinues() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let service = fixture.service()
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until {
+            service.isVideoReady && service.submittedVideoFrameCount >= 3
+                && service.audioSnapshot.frame > 12_000
+        }
+        let before = service.audioSnapshot
+        // Reproduce a video-only stop after startup has already shown moving frames.
+        // Audio remains on the real production PCM engine throughout this test.
+        service.player.pause()
+        let stoppedPosition = service.player.currentTime().seconds
+        let stoppedFrames = service.submittedVideoFrameCount
+        try await until {
+            service.player.rate > 0 && service.submittedVideoFrameCount >= stoppedFrames + 4
+                && (service.videoFramePositionSeconds ?? 0) > stoppedPosition + 0.15
+        }
+        let after = service.audioSnapshot
+        XCTAssertEqual(service.queue.currentID, fixture.aID)
+        XCTAssertEqual(after.token, before.token)
+        XCTAssertEqual(after.visit, before.visit)
+        XCTAssertGreaterThan(after.frame, before.frame + 12_000)
+        XCTAssertTrue(service.wantsToPlay)
+        XCTAssertTrue(service.audioEngineRunning)
+        XCTAssertNil(service.message)
+        print("EstablishedVideoRecovery audioTokenUnchanged=\(after.token == before.token) audioFrames=\(after.frame - before.frame) videoFrames=\(service.submittedVideoFrameCount - stoppedFrames)")
+        service.pause()
+    }
+
+
     private func until(_ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(6))
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }

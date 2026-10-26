@@ -1,12 +1,12 @@
-name: Phone playback native regressions
+name: Video playback progress regressions
 on:
   push:
-    branches: [fix/phone-playback-reliability]
+    branches: [fix/video-playback22]
     paths: ['ios/OfflineTikTokPlayer/**', 'ios/OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests.swift', 'tests/phone-playback-reliability.json', 'scripts/run-phone-native.py', '.github/workflows/phone-native.yml']
 permissions:
   contents: read
 concurrency:
-  group: phone-playback-native
+  group: video-playback22-native
   cancel-in-progress: false
 jobs:
   ios:
