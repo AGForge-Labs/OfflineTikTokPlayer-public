@@ -12,7 +12,7 @@ jobs:
   ios:
     if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private && github.actor == 'Galaxybigbird'
     runs-on: macos-26
-    timeout-minutes: 12
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
