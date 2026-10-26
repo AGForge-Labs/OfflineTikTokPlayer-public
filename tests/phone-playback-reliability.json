@@ -2,6 +2,8 @@
   "version": 1,
   "cases": [
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testStoppedInitialVideoClockRecoversWithoutSkippingTheSelection",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testUnexpectedAudioEngineStopRecoversSameClipAndRespectsPause",
     "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable"
   ]
 }

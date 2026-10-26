@@ -208,6 +208,57 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
     }
 
 
+    func testStoppedInitialVideoClockRecoversWithoutSkippingTheSelection() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let service = fixture.service()
+        service.isInteractingWithFeed = true
+        var stoppedInitialStart = false
+        service.onDebugVideoRateHandoff = { [weak service] event in
+            if event.cause == .initialReady && !stoppedInitialStart {
+                stoppedInitialStart = true
+                service?.player.pause()
+            }
+        }
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until { stoppedInitialStart && service.audioSnapshot.frame > 12_000 }
+        try await until {
+            service.isVideoReady && service.player.rate > 0 && service.submittedVideoFrameCount >= 4
+                && (service.videoFramePositionSeconds ?? 0) > 0.25
+        }
+        XCTAssertEqual(service.queue.currentID, fixture.aID)
+        XCTAssertTrue(service.wantsToPlay)
+        XCTAssertTrue(service.audioEngineRunning)
+        XCTAssertNil(service.message)
+        service.onDebugVideoRateHandoff = nil
+        service.pause()
+    }
+
+    func testUnexpectedAudioEngineStopRecoversSameClipAndRespectsPause() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        let service = fixture.service(continuousAudio: audio)
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until { service.audioSnapshot.frame > 12_000 && service.isVideoReady }
+        let before = service.audioSnapshot
+        audio.graph.engine.stop()
+        XCTAssertFalse(service.audioEngineRunning)
+        try await until { service.audioEngineRunning && service.audioSnapshot.frame > before.frame + 12_000 }
+        XCTAssertEqual(service.audioSnapshot.token, before.token)
+        XCTAssertEqual(service.audioSnapshot.visit, before.visit)
+        XCTAssertEqual(service.queue.currentID, fixture.aID)
+        XCTAssertTrue(service.wantsToPlay)
+        XCTAssertNil(service.message)
+        audio.graph.engine.stop()
+        service.pause()
+        try await Task.sleep(for: .milliseconds(1_200))
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertFalse(service.audioEngineRunning, "Recovery must never override explicit Pause")
+    }
+
+
     private func until(_ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(6))
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
