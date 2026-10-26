@@ -10,6 +10,7 @@
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testFailedRemoteItemUsesFreshResolverOnceAndKeepsChosenVideo",
     "OfflineTikTokPlayerTests.PlaybackSelectionFailureTests/testFailedChosenSavedClipStopsOldAudioAndRetriesTheSameSelection",
     "OfflineTikTokPlayerTests.NativeStreamingPlaybackTests/testUncachedCloudSelectionPlaysAndNavigatesWithoutAnOfflineCopy",
-    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable"
+    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable",
+    "OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testDecodeFailureUsesPendingSelectionOrActualNaturalSuccessor"
   ]
 }

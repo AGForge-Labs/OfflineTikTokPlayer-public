@@ -490,26 +490,36 @@ final class ContinuousAudioPlayer {
     func onSourceSilence(_ handler: @escaping @Sendable (Int, ContinuousPCMDecoder.SourceSilence) -> Void) {
         decoder.setSourceSilenceHandler(handler)
     }
+    struct InvalidatedSource {
+        let entry: Entry
+        let sample: ContinuousPCMRenderer.Snapshot
+        let selectionPending: Bool
+        let selected: Bool
+    }
     @discardableResult
     func invalidateForRetry(token: Int) -> Bool {
-        let knownEntry = entries.values.contains { $0.token == token }
-        guard knownEntry || reservedTokens.contains(token) else { return false }
+        invalidateSourceForRetry(token: token)?.selected ?? false
+    }
+    func invalidateSourceForRetry(token: Int) -> InvalidatedSource? {
+        let knownEntry = entries.values.first { $0.token == token }
+        guard knownEntry != nil || reservedTokens.contains(token) else { return nil }
         failedTokens.insert(token)
         // Reservations must fail publication, but cannot own current playback.
-        guard knownEntry else { return false }
+        guard let failed = knownEntry else { return nil }
         for entry in entries.values { renderer.setSuccessor(token: 0, for: entry.token) }
         successors.removeAll()
         let sample = renderer.snapshot
         let requested = selectedID.flatMap { entries[$0]?.token }
         let relevant: Int?
-        if isSelectionPending(in: sample) { relevant = requested }
+        let selectionPending = isSelectionPending(in: sample)
+        if selectionPending { relevant = requested }
         else { relevant = sample.token > 0 ? sample.token : requested }
         let selected = relevant == token
         if selected {
             suspend(); pendingPosition = nil; renderer.select(token: 0); selectedID = nil
         }
         evictUnused()
-        return selected
+        return InvalidatedSource(entry: failed, sample: sample, selectionPending: selectionPending, selected: selected)
     }
     func suspend() {
         _ = issuePlaybackControl()

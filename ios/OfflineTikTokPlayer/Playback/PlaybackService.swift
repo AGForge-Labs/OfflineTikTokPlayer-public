@@ -1905,14 +1905,15 @@ final class PlaybackService: NSObject {
     // The renderer may already be on the successor while the service still
     // describes the preceding visit. Capture its source/clock before invalidation.
     func handleDecodeFailure(token: Int) {
-        let sample = continuousAudio.snapshot
-        let pendingSelection = continuousAudio.isSelectionPending(in: sample)
-        let failed = continuousAudio.entry(forToken: token)
-        let selected = continuousAudio.invalidateForRetry(token: token)
-        if let failed { nativeAudioFallbackIDs.insert(failed.id) }
+        guard let failure = continuousAudio.invalidateSourceForRetry(token: token) else {
+            recordDiagnostic(.sourcePreparationFailed)
+            return
+        }
+        let sample = failure.sample, pendingSelection = failure.selectionPending, failed = failure.entry
+        nativeAudioFallbackIDs.insert(failed.id)
         recordDiagnostic(.sourcePreparationFailed)
         updateAudioSuccessor()
-        guard selected, let failed else { return }
+        guard failure.selected else { return }
         if failed.id != queue.currentID {
             var following = queue
             guard !pendingSelection, sample.token == token,

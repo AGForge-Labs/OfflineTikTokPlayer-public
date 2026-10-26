@@ -20,5 +20,5 @@ jobs:
       - name: Focused native playback controls without signing inputs
         run: |
           mkdir -p artifacts
-          python3 -B scripts/run-phone-native.py 2>&1 | tee artifacts/phone-native.log
-          python3 -B scripts/verify-native-test-log.py --log artifacts/phone-native.log --profile tests/phone-playback-reliability.json
+          /usr/bin/python3 -B scripts/run-phone-native.py 2>&1 | tee artifacts/phone-native.log
+          /usr/bin/python3 -B scripts/verify-native-test-log.py --log artifacts/phone-native.log --profile tests/phone-playback-reliability.json
