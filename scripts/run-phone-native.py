@@ -19,5 +19,5 @@ def main():
         "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "60",
         "-maximum-test-execution-time-allowance", "60", *selectors,
         "SWIFTC_MAXIMUM_DETERMINISM=1", "CODE_SIGNING_ALLOWED=NO", "test"]
-    return owned.run_owned(command, 480, phase=4)["wrapperExit"]
+    return owned.run_owned(command, 600, phase=4)["wrapperExit"]
 if __name__ == "__main__": sys.exit(main())

@@ -12,13 +12,14 @@ jobs:
   ios:
     if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private && github.actor == 'Galaxybigbird'
     runs-on: macos-26
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Focused native playback controls without signing inputs
         run: |
+          set -euo pipefail
           mkdir -p artifacts
           /usr/bin/python3 -B scripts/run-phone-native.py 2>&1 | tee artifacts/phone-native.log
           /usr/bin/python3 -B scripts/verify-native-test-log.py --log artifacts/phone-native.log --profile tests/phone-playback-reliability.json
