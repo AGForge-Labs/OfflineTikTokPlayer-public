@@ -616,25 +616,7 @@ final class PlaybackService: NSObject {
             Task { @MainActor in self?.recordDiagnostic(.sourceTimelineAnalyzed, sourceSilence: analysis) }
         }
         self.continuousAudio.onDecodeFailure { [weak self] token, _ in
-            Task { @MainActor in
-                guard let self else { return }
-                let selected = self.continuousAudio.invalidateForRetry(token: token)
-                self.recordDiagnostic(.sourcePreparationFailed)
-                self.updateAudioSuccessor()
-                if selected {
-                    if let pending = self.pendingAudioSeek {
-                        _ = self.clock.completeSeek(pending.seek, actualPosition: self.clock.position)
-                        self.pendingAudioSeek = nil; self.completePiPSkip()
-                    }
-                    // A native-playable source can exceed the PCM reader's supported
-                    // timeline/format. Recover once on the same chosen source and bookmark.
-                    if let id = self.queue.currentID {
-                        self.nativeAudioFallbackIDs.insert(id)
-                        self.recordPlaybackEvent("decodeNativeRecovery")
-                        self.loadCurrent(position: self.clock.position)
-                    }
-                }
-            }
+            Task { @MainActor in self?.handleDecodeFailure(token: token) }
         }
         surface = PlayerSurface(player: player)
         player.isMuted = true
@@ -1755,7 +1737,7 @@ final class PlaybackService: NSObject {
         let successor = naturalID.flatMap { library.catalog.mediaByID[$0] }
         let explicitSuccessor = nextID.flatMap { library.catalog.mediaByID[$0] }
         let pcmIDs = Set([active?.id, previous?.id, nextID].compactMap { $0 })
-        continuousAudio.setWindow(pcmIDs)
+        continuousAudio.setWindow(pcmIDs.subtracting(nativeAudioFallbackIDs))
         updateAudioSuccessor()
         if buffer.nextMediaID != naturalID { buffer.discardNext() }
         guard generation == request, warmRevision == revision else { return }
@@ -1787,7 +1769,7 @@ final class PlaybackService: NSObject {
                self.continuousAudio.entry(for: explicitSuccessor.id) == nil {
                 let saved = await self.downloads.localURL(for: explicitSuccessor)
                 let cached = if let asset = explicitSuccessor.asset { await self.mediaCache?.file(for: asset) } else { nil as URL? }
-                if let local = saved ?? cached { _ = try? await self.continuousAudio.prepare(id: explicitSuccessor.id, url: local) }
+                if let local = saved ?? cached { await self.prepareWarmAudio(id: explicitSuccessor.id, url: local) }
                 guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
             }
             async let previousPreparation: Void = self.preparePrevious(previous, request: request, revision: revision)
@@ -1806,7 +1788,7 @@ final class PlaybackService: NSObject {
                     // Never infer a trim point from a silent tail or catalog duration.
                     let playerItem = AVPlayerItem(url: url)
                     playerItem.preferredForwardBufferDuration = 8
-                    if saved != nil || cached != nil { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
+                    if saved != nil || cached != nil { await self.prepareWarmAudio(id: next.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     #if DEBUG
                     let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: playerItem)
@@ -1833,7 +1815,7 @@ final class PlaybackService: NSObject {
                     if let url = await self.mediaCache?.prefetch(asset, revision: revision), pcmIDs.contains(item.id),
                        !self.nativeAudioFallbackIDs.contains(item.id) {
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
-                        _ = try? await self.continuousAudio.prepare(id: item.id, url: url)
+                        await self.prepareWarmAudio(id: item.id, url: url)
                         self.updateAudioSuccessor()
                         // Keep the prepared decoder. Promote the file now only for an offline handoff.
                         let requireLocal = !self.downloads.network.isConnected
@@ -1873,7 +1855,7 @@ final class PlaybackService: NSObject {
                 let item = AVPlayerItem(url: url)
                 item.preferredForwardBufferDuration = 8
                 _ = await PlaybackPreparation.value(within: .milliseconds(500)) { try? await item.asset.load(.isPlayable) }
-                if saved != nil || cached != nil { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
+                if saved != nil || cached != nil { await self.prepareWarmAudio(id: previous.id, url: url) }
                 guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                 #if DEBUG
                 let videoPreparation = try? await self.buffer.debugPrepareVideoResource(for: item)
@@ -1920,10 +1902,43 @@ final class PlaybackService: NSObject {
         }
     }
 
+    // The renderer may already be on the successor while the service still
+    // describes the preceding visit. Capture its source/clock before invalidation.
+    func handleDecodeFailure(token: Int) {
+        let sample = continuousAudio.snapshot
+        let pendingSelection = continuousAudio.isSelectionPending(in: sample)
+        let failed = continuousAudio.entry(forToken: token)
+        let selected = continuousAudio.invalidateForRetry(token: token)
+        if let failed { nativeAudioFallbackIDs.insert(failed.id) }
+        recordDiagnostic(.sourcePreparationFailed)
+        updateAudioSuccessor()
+        guard selected, let failed else { return }
+        if failed.id != queue.currentID {
+            var following = queue
+            guard !pendingSelection, sample.token == token,
+                  following.next(explicit: false) == failed.id else { return }
+            queue = following
+        }
+        let position = !pendingSelection && sample.token == token
+            ? Double(sample.frame) / 48_000 : clock.position
+        if let pending = pendingAudioSeek {
+            _ = clock.completeSeek(pending.seek, actualPosition: position)
+            pendingAudioSeek = nil; completePiPSkip()
+        }
+        recordPlaybackEvent("decodeNativeRecovery")
+        loadCurrent(position: position)
+    }
+
+    private func prepareWarmAudio(id: String, url: URL) async {
+        guard !nativeAudioFallbackIDs.contains(id) else { return }
+        _ = try? await continuousAudio.prepare(id: id, url: url)
+    }
+
     private func updateAudioSuccessor() {
         guard let id = queue.currentID else { return }
         var following = queue
-        let next = isInteractingWithFeed ? nil : following.next(explicit: false)
+        let next = isInteractingWithFeed || nativeAudioFallbackIDs.contains(id)
+            ? nil : following.next(explicit: false).flatMap { nativeAudioFallbackIDs.contains($0) ? nil : $0 }
         continuousAudio.follow(from: id, to: next)
         buffer.automaticAdvancementEnabled = false
     }

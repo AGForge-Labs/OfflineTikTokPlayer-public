@@ -24,6 +24,57 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         service.pause()
     }
 
+    func testNaturalSuccessorFailureBeforeAdoptionRecoversThatVideoAtItsOwnPosition() async throws {
+        let fixture = try await SelectionVideoFixture(test: self, shortLoopFixture: true)
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        let service = fixture.service(continuousAudio: audio)
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until { service.audioSnapshot.frame > 2400 && audio.entry(for: fixture.bID) != nil }
+        let a = try XCTUnwrap(audio.entry(for: fixture.aID))
+        let b = try XCTUnwrap(audio.entry(for: fixture.bID))
+        service.shouldDebugDeferAudioVisit = { _ in true }
+        audio.suspend(); audio.graph.engine.stop()
+        try audio.graph.engine.enableManualRenderingMode(.offline, format: audio.graph.format, maximumFrameCount: 32)
+        audio.follow(from: fixture.aID, to: fixture.bID)
+        XCTAssertTrue(audio.select(id: fixture.aID, position: Double(a.frames - 1) / 48_000))
+        try audio.setPlaying(true)
+        let output = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: audio.graph.format, frameCapacity: 32))
+        XCTAssertEqual(try audio.graph.engine.renderOffline(3, to: output), .success)
+        XCTAssertEqual(audio.snapshot.token, b.token)
+        XCTAssertEqual(service.queue.currentID, fixture.aID, "Hold the service before adoption")
+        service.handleDecodeFailure(token: b.token)
+        XCTAssertEqual(service.queue.currentID, fixture.bID, "Recover the failed rendered successor, never preceding A")
+        XCTAssertLessThan(service.clock.position, 0.1)
+        XCTAssertEqual(try audio.graph.engine.renderOffline(1, to: output), .success)
+        audio.graph.engine.stop(); audio.graph.engine.disableManualRenderingMode()
+        service.shouldDebugDeferAudioVisit = nil
+        try await until { service.player.currentItem?.status == .readyToPlay && service.player.rate > 0 }
+        XCTAssertFalse(service.player.isMuted)
+        XCTAssertEqual(service.previousID, fixture.aID)
+        XCTAssertNil(service.message)
+        service.pause()
+    }
+
+    func testKnownNativeSourceCannotBePreparedAgainByRepeatOneWarmup() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads,
+            cloud: fixture.cloud, bookmarkURL: fixture.bookmark, activateSession: {}, continuousAudio: audio,
+            preparePCM: { _, _, _, _ in throw ContinuousPCMDecoder.Failure.unsupportedPCM }))
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until { service.player.rate > 0 && service.clock.position > 0.1 }
+        service.cycleRepeat(); service.cycleRepeat()
+        try await until { audio.entry(for: fixture.bID) != nil }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(audio.entry(for: fixture.aID), "Repeat-one must not re-admit a rejected PCM source")
+        XCTAssertFalse(service.player.isMuted)
+        XCTAssertEqual(service.queue.repeatMode, .one)
+        service.pause()
+    }
+
     func testPauseDuringPCMRejectionSurvivesNativeRecovery() async throws {
         let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
