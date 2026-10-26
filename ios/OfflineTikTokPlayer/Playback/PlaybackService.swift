@@ -550,6 +550,19 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var statusHandledGeneration: Int?
     @ObservationIgnored private var explicitVideoSeekGeneration: Int?
     @ObservationIgnored private var readyGeneration: Int?
+    private struct StoppedVideoClock {
+        let request: Int, item: ObjectIdentifier
+        let token: Int, visit: Int64, selectionVersion: Int
+        let position: Double, since: Double
+        let audioFrame: Int64
+    }
+    @ObservationIgnored private var stoppedVideoClock: StoppedVideoClock?
+    private struct AudioProgress {
+        let request: Int, token: Int, selectionVersion: Int
+        let visit: Int64, frame: Int64
+        let since: Double
+    }
+    @ObservationIgnored private var audioProgress: AudioProgress?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var itemObservation: NSKeyValueObservation?
     @ObservationIgnored private let frameMonitor = PlaybackFrameMonitor()
@@ -1944,6 +1957,33 @@ final class PlaybackService: NSObject {
         buffer.automaticAdvancementEnabled = false
     }
 
+    /// Observe progress without an SDK getter on healthy render ticks. A full
+    /// second of stopped PCM lets interruption/configuration notifications settle.
+    private func recoverUnexpectedAudioStop(_ sample: ContinuousPCMRenderer.Snapshot) {
+        guard intent.canPlay, !usesNativeAudio, audioLoadingID == nil,
+              continuousAudio.isSelected, continuousAudio.selectedID == queue.currentID,
+              !sample.ended || continuousAudio.isSelectionPending(in: sample) else {
+            audioProgress = nil; return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let current = AudioProgress(request: generation, token: sample.token,
+            selectionVersion: sample.selectionVersion, visit: sample.visit, frame: sample.frame, since: now)
+        guard let previous = audioProgress,
+              previous.request == current.request, previous.token == current.token,
+              previous.selectionVersion == current.selectionVersion,
+              previous.visit == current.visit, previous.frame == current.frame else {
+            audioProgress = current; return
+        }
+        guard now - previous.since >= 1 else { return }
+        audioProgress = current
+        // Resume the same renderer/source; no queue movement, seek or re-selection.
+        // setPlaying rechecks intent and refreshes a stopped engine's clock interval.
+        if !continuousAudio.graph.engine.isRunning {
+            resumeContinuousAudio()
+            recordPlaybackEvent("audioEngineRecovery")
+        }
+    }
+
     private func sampleContinuousAudio(handleEnd: Bool = true) {
         defer { completePiPNavigationIfReady() }
         continuousPiP.beginReadinessUpdates()
@@ -1951,6 +1991,7 @@ final class PlaybackService: NSObject {
         continuousAudio.settlePausedState()
         guard !usesNativeAudio, audioLoadingID == nil else { return }
         let sample = continuousAudio.snapshot
+        recoverUnexpectedAudioStop(sample)
         // A natural boundary can publish an older visit after a selection is
         // requested. It must not replace the requested source/queue before that
         // exact command has been consumed by the audio thread.
@@ -2105,6 +2146,36 @@ final class PlaybackService: NSObject {
     }
     #endif
 
+    /// A stopped decoder gets a grace period rather than repeated startup seeks.
+    /// Only advancing PCM in this exact selection may authorize video-only recovery.
+    private func stoppedVideoClockNeedsRecovery(_ item: AVPlayerItem, position: Double) -> Bool {
+        let sample = continuousAudio.snapshot
+        guard intent.canPlay, videoAllowed, statusHandledGeneration == generation,
+              observedItem === item, videoPresentation?.request == generation,
+              audioLoadingID == nil, continuousAudio.selectedID == queue.currentID,
+              sample.token > 0, sample.token == audioToken, sample.visit == audioVisit,
+              !sample.ended, !continuousAudio.isSelectionPending(in: sample) else {
+            stoppedVideoClock = nil; return false
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let current = StoppedVideoClock(request: generation, item: ObjectIdentifier(item),
+            token: sample.token, visit: sample.visit, selectionVersion: sample.selectionVersion,
+            position: position, since: now, audioFrame: sample.frame)
+        guard let previous = stoppedVideoClock,
+              previous.request == current.request, previous.item == current.item,
+              previous.token == current.token, previous.visit == current.visit,
+              previous.selectionVersion == current.selectionVersion,
+              abs(previous.position - position) <= 1.0 / 48_000,
+              sample.frame >= previous.audioFrame else {
+            stoppedVideoClock = current; return false
+        }
+        guard now - previous.since >= 1, sample.frame - previous.audioFrame >= 24_000 else { return false }
+        // Restart the window before issuing the asynchronous correction: at most
+        // one recovery per second, and the existing native-seek barrier still wins.
+        stoppedVideoClock = current
+        return true
+    }
+
     private func readOrdinaryVideoPosition(_ item: AVPlayerItem) -> Double {
         #if DEBUG
         let kind: DebugVideoPositionReadKind = .itemTimebase
@@ -2133,8 +2204,14 @@ final class PlaybackService: NSObject {
             // an item exists. Keep finite zero-clock correction eligible until
             // that request becomes ready; ordinary owned starts still wait.
             let explicitStart = self.readyGeneration == nil && self.explicitVideoSeekGeneration == self.generation
+            let stoppedRecovery: Bool
+            if self.intent.canPlay && effectiveRate == 0 {
+                stoppedRecovery = self.stoppedVideoClockNeedsRecovery(item, position: seconds)
+            } else {
+                self.stoppedVideoClock = nil; stoppedRecovery = false
+            }
             guard !self.intent.canPlay || (effectiveRate.isFinite
-                && (effectiveRate > 0 || (effectiveRate == 0 && explicitStart))) else { return .nan }
+                && (effectiveRate > 0 || (effectiveRate == 0 && (explicitStart || stoppedRecovery)))) else { return .nan }
             return seconds.isFinite ? seconds : .nan
         }
         #if DEBUG
@@ -2625,6 +2702,7 @@ final class PlaybackService: NSObject {
         surface.isHidden = audioOnly
         pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
+        let restoringSuspendedVideo = videoAllowed && continuousPiP.isFrameFeedSuspended
         if !videoAllowed {
             initialPollWindow.withdraw(request: generation)
             transferInitialClockBinding(retainActivation: true)
@@ -2636,7 +2714,9 @@ final class PlaybackService: NSObject {
             surface.playerLayer.player = player
             continuousPiP.resumeFrameFeed()
         }
-        if actions.restoreInlineVideo {
+        // AVKit can restore a suspended PiP window while the app stays in the
+        // background. Restart its native video clock as well as the frame feed.
+        if actions.restoreInlineVideo || restoringSuspendedVideo {
             #if DEBUG
             synchronizeVideoToAudio(force: true, reason: .surfaceRestore)
             #else

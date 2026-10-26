@@ -18,6 +18,8 @@ def main():
         "-resultBundlePath", "artifacts/phone-native.xcresult", "-jobs", "1", "-parallel-testing-enabled", "NO",
         "-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "60",
         "-maximum-test-execution-time-allowance", "60", *selectors,
+        "SWIFT_OPTIMIZATION_LEVEL=-O", "PLAYBACK_TEST_SWIFT_FLAGS=-Onone",
+        "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO",
         "SWIFTC_MAXIMUM_DETERMINISM=1", "CODE_SIGNING_ALLOWED=NO", "test"]
     return owned.run_owned(command, 600, phase=4)["wrapperExit"]
 if __name__ == "__main__": sys.exit(main())

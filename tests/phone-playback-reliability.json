@@ -1,9 +1,21 @@
 {
   "version": 1,
   "cases": [
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testNativePlayableSavedVideoSurvivesPCMPreparationRejection",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPauseDuringPCMRejectionSurvivesNativeRecovery",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testNaturalSuccessorFailureBeforeAdoptionRecoversThatVideoAtItsOwnPosition",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testKnownNativeSourceCannotBePreparedAgainByRepeatOneWarmup",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPiPSkipNavigatesHistoryAndOverridesRepeatOneWithoutTenSecondSeek",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPiPSkipKeepsPausedStateAndAlwaysCompletesAtQueueEdges",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testFailedRemoteItemUsesFreshResolverOnceAndKeepsChosenVideo",
+    "OfflineTikTokPlayerTests.PlaybackSelectionFailureTests/testFailedChosenSavedClipStopsOldAudioAndRetriesTheSameSelection",
+    "OfflineTikTokPlayerTests.NativeStreamingPlaybackTests/testUncachedCloudSelectionPlaysAndNavigatesWithoutAnOfflineCopy",
+    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable",
+    "OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testDecodeFailureUsesPendingSelectionOrActualNaturalSuccessor",
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues",
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testStoppedInitialVideoClockRecoversWithoutSkippingTheSelection",
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testUnexpectedAudioEngineStopRecoversSameClipAndRespectsPause",
-    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable"
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testOrdinaryDriftRejectsStoppedNativeClockAndPreservesForcedRecovery",
+    "OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval"
   ]
 }
