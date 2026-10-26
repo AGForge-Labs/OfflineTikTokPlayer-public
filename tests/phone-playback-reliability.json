@@ -19,7 +19,8 @@
     "OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testRepeatedPlayingPreservesAnchorButEngineRestartRequiresFreshInterval",
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testColdRemoteResolutionFailureRefreshesOnceAndPlaysChosenVideo",
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testColdRemoteResolutionRetriesOnlyOnceForTransientErrorsAndNeverForPermanentErrors",
-    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPendingColdRemoteRefreshHonorsPauseAndSupersedingSelection",
-    "OfflineTikTokPlayerTests.PlaybackDiagnosticJournalTests/testNumericalSnapshotRejectsNonfiniteValuesAndExportHasNoFreeTextFields"
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPendingColdRemoteRefreshHonorsPause",
+    "OfflineTikTokPlayerTests.PlaybackDiagnosticJournalTests/testNumericalSnapshotRejectsNonfiniteValuesAndExportHasNoFreeTextFields",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPendingColdRemoteRefreshCannotReplaceSupersedingSelection"
   ]
 }
