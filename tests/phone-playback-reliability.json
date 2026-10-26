@@ -21,6 +21,9 @@
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testColdRemoteResolutionRetriesOnlyOnceForTransientErrorsAndNeverForPermanentErrors",
     "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPendingColdRemoteRefreshHonorsPause",
     "OfflineTikTokPlayerTests.PlaybackDiagnosticJournalTests/testNumericalSnapshotRejectsNonfiniteValuesAndExportHasNoFreeTextFields",
-    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPendingColdRemoteRefreshCannotReplaceSupersedingSelection"
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testPendingColdRemoteRefreshCannotReplaceSupersedingSelection",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixtureOwnerIsReleasedAfterRemoval",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixturesKeepIndependentSourceFilesAndRecords",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testDownloadFixtureLedgerReloadUsesOwnedVerifiedFilesWithoutTransferSession"
   ]
 }

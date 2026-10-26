@@ -13604,7 +13604,12 @@ final class SelectionVideoFixture {
     }
 
     private func removeImmediately() {
+        #if !DEBUG
         for id in ids { downloads.remove(id) }
+        #endif
+        // DEBUG storage is wholly confined to this fixture's UUID directory.
+        // Playback has joined before teardown; removing that directory also
+        // removes its ledger/files without redundant missing-resume deletions.
         Self.removeOwnedTemporary(temporary)
         restorePreferences()
     }

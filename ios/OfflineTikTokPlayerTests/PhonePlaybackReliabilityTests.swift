@@ -235,8 +235,13 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
     }
 
     private func assertPendingColdRemoteRefresh(supersedesSelection: Bool) async throws {
+        print("ColdSourceIntentControl schema=1 replacement=\(supersedesSelection) phase=1")
         let fixture = try await SelectionVideoFixture(test: self)
-        defer { fixture.remove() }
+        defer {
+            print("ColdSourceIntentControl schema=1 replacement=\(supersedesSelection) phase=6")
+            fixture.remove()
+        }
+        print("ColdSourceIntentControl schema=1 replacement=\(supersedesSelection) phase=2")
         let source = try XCTUnwrap(fixture.savedURLs[fixture.aID])
         let savedB = try XCTUnwrap(fixture.savedURLs[fixture.bID])
         let hash = try AppFiles.hash(source)
@@ -280,6 +285,7 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
             XCTFail("The transient failure must reach the held fresh resolution")
             throw CatalogError.invalid("Fresh source resolution was never requested")
         }
+        print("ColdSourceIntentControl schema=1 replacement=\(supersedesSelection) phase=3")
         XCTAssertNil(service.message)
         if supersedesSelection {
             service.start(playlistIDs: [replacementPlaylist], at: fixture.bID)
@@ -289,6 +295,7 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         let release = try XCTUnwrap(pending)
         pending = nil
         release.resume(returning: original)
+        print("ColdSourceIntentControl schema=1 replacement=\(supersedesSelection) phase=4")
         try await until {
             freshReturned && service.player.currentItem?.status == .readyToPlay
                 && (supersedesSelection ? service.audioSnapshot.frame > 2_400 : !service.isLoading)
@@ -308,6 +315,7 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
             XCTAssertFalse(service.audioEngineRunning)
             XCTAssertEqual(service.player.rate, 0)
         }
+        print("ColdSourceIntentControl schema=1 replacement=\(supersedesSelection) phase=5")
     }
 
     func testFailedRemoteItemUsesFreshResolverOnceAndKeepsChosenVideo() async throws {
