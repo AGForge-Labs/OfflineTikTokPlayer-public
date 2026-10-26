@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE = "1c29c2a5cd3922ec7b782cb3442118a9797fc38f"
+SOURCE = "0000000000000000000000000000000000000000"
 APP_TREE = "f5fdfeb7ec739c6a961ef13fd21df4b36c1ecedb"
 CORE_TREE = "64d337f129d7ee93a8b8f7361294e6b50cedfdd6"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
@@ -87,7 +87,7 @@ def validate_context(environment, event, *, signing=False):
     require(re.fullmatch(r"[1-9][0-9]{0,3}(?:\.(?:0|[1-9][0-9]?)){0,2}", build) is not None,
             "An Apple-checked increasing build number is required.")
     numbers = tuple(map(int, build.split("."))) + (0,) * (3 - len(build.split(".")))
-    require(numbers > (21, 1, 0), "The experimental build must follow existing build21.1.")
+    require(numbers > (22, 1, 0), "The experimental build must follow existing build22.1.")
     require(not environment.get("APPLE_PRIVATE_DELIVERY"), "The private aggregate secret is not used here.")
     if signing:
         require(environment.get("RELEASE_ENVIRONMENT") == "release", "The existing protected release environment is required.")
@@ -203,7 +203,7 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
         helper.run_tool = original
 
 
-NATIVE_RUN = 40284507148
+NATIVE_RUN = 0
 
 def require_native_result(read=None):
     if read is None:
@@ -220,7 +220,7 @@ def require_native_result(read=None):
     require(result.get("id") == NATIVE_RUN and result.get("head_sha") == SOURCE
         and result.get("status") == "completed" and result.get("conclusion") == "success"
         and result.get("path") == ".github/workflows/phone-native.yml" and result.get("event") == "push"
-        and result.get("head_branch") == "fix/video-playback22"
+        and result.get("head_branch") == "fix/source-preparation23"
         and result.get("repository", {}).get("full_name") == REPOSITORY
         and result.get("repository", {}).get("private") is False,
         "The exact focused public native run must pass before signing; full gapless acceptance remains unresolved.")
