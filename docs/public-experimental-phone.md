@@ -1,30 +1,27 @@
 # Experimental phone repair23.1
 
-Recover the same selected video after an interrupted initial OneDrive-link lookup.
-The initial resolver gets one failure-only fresh-link attempt for classified transient
-URL-loading errors. Permanent failures and cancellation do not retry. Pause and newer
-selections remain authoritative. The existing independently bounded AVPlayer-item
-recovery is unchanged. Error diagnostics store only numeric family/code and stage.
+Recover the selected video after an interrupted initial OneDrive-link lookup.
+One classified transient URL-loading failure receives one fresh-link attempt.
+Permanent errors and cancellation do not retry. Pause and newer selections remain
+authoritative. Diagnostics record only numeric error family/code and stage.
+The existing separately bounded AVPlayer-item recovery remains in place.
 
-Frozen source: `e9feab6815a7b5d90cfd3851c3a61d0608267cc7`.
+Frozen source: `2e43c1fc8c8be33e8677c73866246a328db3a892`.
 App tree: `79093f6ddf43272aff597bcc5a5749b6e8d001c4`.
-PlayerCore tree unchanged: `64d337f129d7ee93a8b8f7361294e6b50cedfdd6`.
-Required focused native run: `40416241013`, on `fix/source-preparation23`.
-The signing guard requires that exact source/run to complete successfully.
+PlayerCore tree: `64d337f129d7ee93a8b8f7361294e6b50cedfdd6`.
+Required native run: `40420488203`, branch `fix/source-preparation23`.
+This exact run completed SUCCESS with23native/UI-support cases plus1UI smoke case,
+24total, all individually verified. The signing guard requires that exact successful
+run and source. Physical-phone acceptance and the old full gapless gate remain open.
 
-Baseline run `40412922247` compiled the unchanged22.1 app. Its new cold-resolution
-regression reproduced the preparation alert with zero fresh lookups and no playback;
-the UI smoke case passed. The final profile retains all16existing controls, adds
-four cold-recovery cases and checks numeric diagnostic privacy:21cases total.
+Baseline `40412922247` reproduced the cold failure on unchanged22.1 runtime.
+Candidate workflows `40414570409`, `40416241013`, `40417588359`, and `40418821656`
+are FAILED and are not admitted to signing. Guard-fixture setup was corrected to
+supply a complete asset for a ready replacement clip. A narrowly validated adjacent
+Apple AQ log reconstruction repaired reporting without reducing case requirements.
+Original logs, failed histories and assertions are preserved.
 
-Reuse the existing protected release environment, unchanged signing/owner helpers,
-standard public macos-26 runner and owner-only internal TestFlight distribution.
-No normal acceptance-gate, key, permission, tester or public-link change.
-Focused native evidence does not establish the old full gapless acceptance gate
-or physical-phone acceptance. Keep archived media private.
-
-Candidate run `40414570409` passed19of20cases, including recovery and UI smoke, but
-failed the combined Pause/selection case on a missing temporary resume-file error
-in fixture cleanup. The next source separates both controls into independently
-owned XCTest cases without changing app/core runtime bytes or their assertions.
-The failed run remains in evidence and is not admitted to signing.
+Use only the existing protected release environment and unchanged signing/owner
+helpers on the standard public macos-26 runner. Distribution stays owner-only,
+internal TestFlight. No key, permission, tester, public-link, or normal gate change.
+Archived media and account credentials remain private.
