@@ -13,7 +13,7 @@ on:
         required: true
         type: string
       build_number:
-        description: Apple-checked increasing build number after 20.1
+        description: Apple-checked increasing build number after 21.1
         required: true
         type: string
 permissions:
@@ -47,7 +47,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: d66538f1f96722b8a8ab21e2e0b4928c58ee10d1
+          ref: 1c29c2a5cd3922ec7b782cb3442118a9797fc38f
           path: candidate
           persist-credentials: false
       - name: Verify experimental owner request and exact runtime source without credentials
