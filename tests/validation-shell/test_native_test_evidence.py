@@ -65,6 +65,13 @@ def aq_identity_case(identity, status="passed", timestamp=False):
             prefix + f"{owner} {method}]' {status} (0.250 seconds)."]
 
 
+def aq_process_case(identity, status="passed", timestamp=False):
+    prefix = "2026-10-26T23:27:48.4857290Z " if timestamp else ""
+    result = case_line(identity, status).replace("0.001 seconds", "0.932 seconds")
+    return [prefix + "2026-10-26 23:27:47.984434+0000 Offlin" + result,
+            prefix + "eTikTokPlayer[14111:44672] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false"]
+
+
 class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -93,6 +100,73 @@ class NativeTestEvidenceTests(unittest.TestCase):
         for identity in self.expected:
             lines.extend((case_line(identity, "started"), case_line(identity, timestamp=True)))
         return lines + ["** TEST SUCCEEDED **"]
+
+    def test_accepts_exact_adjacent_aq_process_interleave_from_native_run(self):
+        # Retained native run 40418821656: a complete result bisected the process
+        # name in one AQ diagnostic, preventing CASE's leading word boundary.
+        identity = ("OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/"
+                    "testNaturalSuccessorFailureBeforeAdoptionRecoversThatVideoAtItsOwnPosition")
+        self.assertIn(identity, self.expected)
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                lines = [case_line(identity, "started")] + aq_process_case(identity, timestamp=timestamp)
+                self.verifier.verify_log("\n".join(lines + ["** TEST SUCCEEDED **"]), {identity})
+
+    def test_aq_process_interleave_rejects_broken_prefix_tail_and_nonadjacency(self):
+        identity = self.expected[0]
+        first, last = aq_process_case(identity)
+        complete = [case_line(identity, "started"), case_line(identity)]
+        fragments = [
+            [first], [last], [first, "noise", last], [first, "", last],
+            [first.replace("2026-10-26 23:27:47.984434+0000", "unknown-time"), last],
+            [first.replace("OfflinTest Case", "OtherTest Case"), last],
+            [first.replace("0.932 seconds", "unknown seconds"), last],
+            [first, last.replace("eTikTokPlayer[", "OtherProcess[")],
+            [first, last.replace("[AQ]", "[Other]")],
+            [first, last.replace("1215", "1216")],
+            [first, last.replace("returning false", "arbitrary diagnostic")],
+            [first + " ** TEST FAILED **", last],
+            [first, "** TEST FAILED **", last],
+        ]
+        # Supply an ordinary passing result first: malformed fragments must be
+        # rejected even when the expected identity is already accounted for.
+        for fragment in fragments:
+            with self.subTest(fragment=fragment), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join(complete + fragment + ["** TEST SUCCEEDED **"]), {identity})
+
+    def test_aq_process_interleave_reports_failure_and_skip_even_with_retry_pass(self):
+        identity = self.expected[0]
+        for status in ("failed", "skipped"):
+            lines = [case_line(identity, "started")] + aq_process_case(identity, status)
+            lines += [case_line(identity), "** TEST SUCCEEDED **"]
+            with self.subTest(status=status), self.assertRaisesRegex(self.verifier.EvidenceError, status + " case"):
+                self.verifier.verify_log("\n".join(lines), {identity})
+
+    def test_aq_process_interleave_keeps_prior_start_result_and_success_guards(self):
+        identity = self.expected[0]
+        start = case_line(identity, "started")
+        split = aq_process_case(identity)
+        other = "OfflineTikTokPlayerTests.UnexpectedTests/testOther"
+        invalid = [
+            split, split + [start], [start, start] + split,
+            [case_line(other, "started")] + split,
+            [start] + aq_process_case(identity, "failed"),
+            [start] + aq_process_case(identity, "skipped"),
+            [start] + split + [case_line(identity)],
+            [start, case_line(identity)] + split,
+            [start] + split + split,
+            [start] + aq_process_case(other),
+            [start] + split + ["** TEST FAILED **"],
+        ]
+        for lines in invalid:
+            with self.subTest(lines=lines), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join(lines + ["** TEST SUCCEEDED **"]), {identity})
+        cases = [start] + split
+        for lines in (cases, ["** TEST SUCCEEDED **"] + cases,
+                      cases + ["** TEST SUCCEEDED **", "** TEST SUCCEEDED **"],
+                      cases + ["** TEST EXECUTE SUCCEEDED **"]):
+            with self.subTest(lines=lines), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join(lines), {identity})
 
     def test_accepts_exact_adjacent_fig_split_started_record(self):
         identity = self.expected[0]

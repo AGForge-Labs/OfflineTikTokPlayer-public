@@ -41,6 +41,14 @@ AQ_WORD_CASE = re.compile(
     r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessMan"
     r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
 AQ_WORD_TAIL = re.compile(r"ager\.mm:1215  IsHardwareSupported: no plist loaded, returning false")
+# A complete terminal record can also bisect this diagnostic's process name.
+# Recover only the observed Offlin/eTikTokPlayer split and its adjacent AQ tail.
+AQ_PROCESS_CASE = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} Offlin"
+    r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+AQ_PROCESS_TAIL = re.compile(
+    r"eTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215  "
+    r"IsHardwareSupported: no plist loaded, returning false")
 # The same exact AQ diagnostic can bisect an identity immediately after its
 # module. Join only that adjacent pair and still require one matching start.
 AQ_IDENTITY_CASE = re.compile(
@@ -240,6 +248,7 @@ def verify_log(text, expected, *, invocation="test"):
     observed, problems, successes, last_case = set(), [], [], 0
     pending = None
     pending_word = None
+    pending_process = None
     pending_identity = None
     pending_started = None
     for number, line in enumerate(text.splitlines(), 1):
@@ -251,6 +260,13 @@ def verify_log(text, expected, *, invocation="test"):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
+        if pending_process is not None:
+            raw, status, header_line = pending_process
+            pending_process = None
+            if AQ_PROCESS_TAIL.fullmatch(clean):
+                event, reconstructed = (raw, status), True
+            else:
+                problems.append(f"Unfinished AQ process interleave at line {header_line}: {raw}")
         if pending_started is not None:
             raw, header_line = pending_started
             pending_started = None
@@ -282,6 +298,16 @@ def verify_log(text, expected, *, invocation="test"):
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
+            process = AQ_PROCESS_CASE.fullmatch(clean)
+            if process:
+                pending_process = (*process.groups(), number)
+                continue
+            if "OfflinTest Case '" in clean:
+                problems.append(f"Malformed AQ process interleave at line {number}")
+                continue
+            if AQ_PROCESS_TAIL.fullmatch(clean):
+                problems.append(f"Orphan AQ process tail at line {number}")
+                continue
             started_split = FIG_STARTED_CASE.fullmatch(clean)
             if started_split:
                 pending_started = (started_split.group(1), number)
@@ -342,6 +368,9 @@ def verify_log(text, expected, *, invocation="test"):
     if pending is not None:
         raw, header_line = pending
         problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
+    if pending_process is not None:
+        raw, status, header_line = pending_process
+        problems.append(f"Unfinished AQ process interleave at line {header_line}: {raw}")
     if pending_identity is not None:
         _, header_line = pending_identity
         problems.append(f"Unfinished AQ identity interleave at line {header_line}")
