@@ -50,6 +50,12 @@ AQ_IDENTITY_CASE = re.compile(
     r"IsHardwareSupported: no plist loaded, returning false")
 AQ_IDENTITY_TAIL = re.compile(
     r"([A-Za-z_]\w* test[A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+# One observed Fig diagnostic bisected the word started. Reconstruct only the
+# exact adjacent pair; a terminal result is still required independently.
+FIG_STARTED_CASE = re.compile(
+    r"Test Case '([^']+)' sta\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[\] \(Fig\) signalled err=-12900 at <>:1242")
+FIG_STARTED_TAIL = re.compile(r"rted\.")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 EXECUTE_SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST EXECUTE SUCCEEDED \*\*\s*$")
 ANY_SUCCESS = re.compile(r"\*\* TEST(?: [A-Z]+)* SUCCEEDED \*\*")
@@ -235,6 +241,7 @@ def verify_log(text, expected, *, invocation="test"):
     pending = None
     pending_word = None
     pending_identity = None
+    pending_started = None
     for number, line in enumerate(text.splitlines(), 1):
         if success.fullmatch(line):
             successes.append(number)
@@ -244,6 +251,13 @@ def verify_log(text, expected, *, invocation="test"):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
+        if pending_started is not None:
+            raw, header_line = pending_started
+            pending_started = None
+            if FIG_STARTED_TAIL.fullmatch(clean):
+                event = (raw, "started")
+            else:
+                problems.append(f"Unfinished Fig start interleave at line {header_line}: {raw}")
         if pending_identity is not None:
             prefix, header_line = pending_identity
             pending_identity = None
@@ -268,6 +282,13 @@ def verify_log(text, expected, *, invocation="test"):
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
+            started_split = FIG_STARTED_CASE.fullmatch(clean)
+            if started_split:
+                pending_started = (started_split.group(1), number)
+                continue
+            if FIG_STARTED_TAIL.fullmatch(clean):
+                problems.append(f"Orphan Fig started tail at line {number}")
+                continue
             identity_split = AQ_IDENTITY_CASE.fullmatch(clean)
             if identity_split:
                 pending_identity = (identity_split.group(1), number)
@@ -327,6 +348,9 @@ def verify_log(text, expected, *, invocation="test"):
     if pending_word is not None:
         raw, status, header_line = pending_word
         problems.append(f"Unfinished AQ word interleave at line {header_line}: {raw}")
+    if pending_started is not None:
+        raw, header_line = pending_started
+        problems.append(f"Unfinished Fig start interleave at line {header_line}: {raw}")
     if len(successes) != 1:
         problems.append(f"Expected exactly one {success_label} marker; found {len(successes)}")
     elif successes[0] <= last_case:

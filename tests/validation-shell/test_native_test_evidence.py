@@ -94,6 +94,41 @@ class NativeTestEvidenceTests(unittest.TestCase):
             lines.extend((case_line(identity, "started"), case_line(identity, timestamp=True)))
         return lines + ["** TEST SUCCEEDED **"]
 
+    def test_accepts_exact_adjacent_fig_split_started_record(self):
+        identity = self.expected[0]
+        owner, method = identity.split("/")
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                prefix = "2026-10-26T07:06:48.0122050Z " if timestamp else ""
+                split = [prefix + f"Test Case '-[{owner} {method}]' sta"
+                         "2026-10-26 07:06:44.763267+0000 OfflineTikTokPlayer[14003:45619] [] (Fig) signalled err=-12900 at <>:1242",
+                         prefix + "rted."]
+                self.verifier.verify_log("\n".join(split + [case_line(identity), "** TEST SUCCEEDED **"]), {identity})
+
+    def test_fig_split_started_record_keeps_failure_duplicate_and_adjacency_guards(self):
+        identity = self.expected[0]
+        owner, method = identity.split("/")
+        head = f"Test Case '-[{owner} {method}]' sta" + (
+            "2026-10-26 07:06:44.763267+0000 OfflineTikTokPlayer[14003:45619] [] (Fig) signalled err=-12900 at <>:1242")
+        tail = "rted."
+        passed = case_line(identity)
+        wrong = "OfflineTikTokPlayerTests.UnexpectedTests/testOther"
+        invalid = [
+            [head], [tail, passed], [head, "noise", tail, passed], [head, "", tail, passed],
+            [head.replace("(Fig)", "unknown"), tail, passed],
+            [head.replace("OfflineTikTokPlayer[", "OtherProcess["), tail, passed],
+            [head, "rted!", passed], [head, tail, case_line(identity, "failed")],
+            [head, tail, case_line(identity, "skipped")],
+            [case_line(identity, "started"), head, tail, passed],
+            [head, tail, head, tail, passed], [head, tail, passed, passed],
+            [head, tail, case_line(wrong)],
+            [head, "** TEST FAILED **", tail, passed],
+            [head + " ** TEST FAILED **", tail, passed],
+        ]
+        for fragment in invalid:
+            with self.subTest(fragment=fragment), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join(fragment + ["** TEST SUCCEEDED **"]), {identity})
+
     def test_accepts_exact_adjacent_aq_identity_interleave_with_one_started_case(self):
         identity = self.expected[0]
         for timestamp in (False, True):
