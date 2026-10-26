@@ -2,7 +2,7 @@ name: Video playback progress regressions
 on:
   push:
     branches: [fix/video-playback22]
-    paths: ['ios/OfflineTikTokPlayer/**', 'ios/OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests.swift', 'tests/phone-playback-reliability.json', 'scripts/run-phone-native.py', '.github/workflows/phone-native.yml']
+    paths: ['ios/OfflineTikTokPlayer/**', 'ios/OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests.swift', 'tests/phone-playback-reliability.json', 'scripts/run-phone-native.py', 'scripts/verify-native-test-log.py', 'tests/validation-shell/test_native_test_evidence.py', '.github/workflows/phone-native.yml']
 permissions:
   contents: read
 concurrency:

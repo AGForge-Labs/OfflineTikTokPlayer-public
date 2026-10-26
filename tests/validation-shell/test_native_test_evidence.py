@@ -56,6 +56,15 @@ def aq_word_case(identity, status="passed", timestamp=False):
             prefix + "ager.mm:1215  IsHardwareSupported: no plist loaded, returning false"]
 
 
+def aq_identity_case(identity, status="passed", timestamp=False):
+    owner, method = identity.split("/")
+    target, owner = owner.split(".", 1)
+    prefix = "2026-10-26T06:29:54.8170410Z " if timestamp else ""
+    return [prefix + f"Test Case '-[{target}."
+            "2026-10-26 06:29:54.095922+0000 OfflineTikTokPlayer[13645:45302] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false",
+            prefix + f"{owner} {method}]' {status} (0.250 seconds)."]
+
+
 class NativeTestEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -84,6 +93,30 @@ class NativeTestEvidenceTests(unittest.TestCase):
         for identity in self.expected:
             lines.extend((case_line(identity, "started"), case_line(identity, timestamp=True)))
         return lines + ["** TEST SUCCEEDED **"]
+
+    def test_accepts_exact_adjacent_aq_identity_interleave_with_one_started_case(self):
+        identity = self.expected[0]
+        for timestamp in (False, True):
+            with self.subTest(timestamp=timestamp):
+                lines = [case_line(identity, "started")] + aq_identity_case(identity, timestamp=timestamp)
+                self.verifier.verify_log("\n".join(lines + ["** TEST SUCCEEDED **"]), {identity})
+
+    def test_aq_identity_interleave_preserves_failure_identity_and_adjacency_guards(self):
+        identity = self.expected[0]
+        first, last = aq_identity_case(identity)
+        start = case_line(identity, "started")
+        invalid = [
+            [first, last], [start, first], [start, last],
+            [start, first, "noise", last],
+            [start, first.replace("returning false", "arbitrary diagnostic"), last],
+            [start, first, last.replace("passed", "failed")],
+            [start, first, last.replace("passed", "skipped")],
+            [start, first, last, case_line(identity)],
+            [start, first, last.replace(identity.split("/")[1], "testWrongIdentity")],
+        ]
+        for lines in invalid:
+            with self.subTest(lines=lines), self.assertRaises(ValueError):
+                self.verifier.verify_log("\n".join(lines + ["** TEST SUCCEEDED **"]), {identity})
 
     def test_explicit_profile_requires_each_selected_case_and_does_not_claim_full_acceptance(self):
         native = next(x for x in self.expected if x.startswith(TARGETS[0] + "."))

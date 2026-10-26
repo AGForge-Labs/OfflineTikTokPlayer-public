@@ -41,6 +41,15 @@ AQ_WORD_CASE = re.compile(
     r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessMan"
     r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
 AQ_WORD_TAIL = re.compile(r"ager\.mm:1215  IsHardwareSupported: no plist loaded, returning false")
+# The same exact AQ diagnostic can bisect an identity immediately after its
+# module. Join only that adjacent pair and still require one matching start.
+AQ_IDENTITY_CASE = re.compile(
+    r"Test Case '(-\[OfflineTikTokPlayer(?:UI)?Tests\.)"
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215  "
+    r"IsHardwareSupported: no plist loaded, returning false")
+AQ_IDENTITY_TAIL = re.compile(
+    r"([A-Za-z_]\w* test[A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 EXECUTE_SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST EXECUTE SUCCEEDED \*\*\s*$")
 ANY_SUCCESS = re.compile(r"\*\* TEST(?: [A-Z]+)* SUCCEEDED \*\*")
@@ -225,6 +234,7 @@ def verify_log(text, expected, *, invocation="test"):
     observed, problems, successes, last_case = set(), [], [], 0
     pending = None
     pending_word = None
+    pending_identity = None
     for number, line in enumerate(text.splitlines(), 1):
         if success.fullmatch(line):
             successes.append(number)
@@ -234,6 +244,14 @@ def verify_log(text, expected, *, invocation="test"):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
+        if pending_identity is not None:
+            prefix, header_line = pending_identity
+            pending_identity = None
+            tail = AQ_IDENTITY_TAIL.fullmatch(clean)
+            if tail:
+                event, reconstructed = (prefix + tail.group(1), tail.group(2)), True
+            else:
+                problems.append(f"Unfinished AQ identity interleave at line {header_line}")
         if pending_word is not None:
             raw, status, header_line = pending_word
             pending_word = None
@@ -250,6 +268,13 @@ def verify_log(text, expected, *, invocation="test"):
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
+            identity_split = AQ_IDENTITY_CASE.fullmatch(clean)
+            if identity_split:
+                pending_identity = (identity_split.group(1), number)
+                continue
+            if AQ_IDENTITY_TAIL.fullmatch(clean):
+                problems.append(f"Orphan AQ identity result at line {number}")
+                continue
             word = AQ_WORD_CASE.fullmatch(clean)
             if word:
                 pending_word = (*word.groups(), number)
@@ -296,6 +321,9 @@ def verify_log(text, expected, *, invocation="test"):
     if pending is not None:
         raw, header_line = pending
         problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
+    if pending_identity is not None:
+        _, header_line = pending_identity
+        problems.append(f"Unfinished AQ identity interleave at line {header_line}")
     if pending_word is not None:
         raw, status, header_line = pending_word
         problems.append(f"Unfinished AQ word interleave at line {header_line}: {raw}")
