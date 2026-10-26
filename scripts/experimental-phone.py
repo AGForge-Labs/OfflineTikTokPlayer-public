@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE = "29f1aa2c36eaf2f25709277290212308b23d26c6"
+SOURCE = "d66538f1f96722b8a8ab21e2e0b4928c58ee10d1"
 APP_TREE = "4e208ea5440ccf37ede6241bd365f85a835f71ab"
 CORE_TREE = "64d337f129d7ee93a8b8f7361294e6b50cedfdd6"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
@@ -203,7 +203,7 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
         helper.run_tool = original
 
 
-NATIVE_RUN = 40262013290
+NATIVE_RUN = 40262863979
 
 def require_native_result(read=None):
     if read is None:
