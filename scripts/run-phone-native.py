@@ -10,6 +10,8 @@ def main():
     profile = "tests/phone-playback-reliability.json"
     selectors = subprocess.check_output([sys.executable, "-B", "scripts/verify-native-test-log.py",
         "--profile", profile, "--print-xcode-tests"], cwd=ROOT, timeout=30).decode().splitlines()
+    # Start the installed Simulator service before its first cold simctl query.
+    subprocess.run(["open", "-g", "-a", "Simulator"], cwd=ROOT, check=True, timeout=20)
     identifier = subprocess.check_output([sys.executable, "-B", "scripts/capture-simulator-test-frames.py",
         "--resolve-destination", "platform=iOS Simulator,name=iPhone 17 Pro Max"], cwd=ROOT, timeout=65).decode().strip()
     subprocess.run([sys.executable, "-B", "scripts/ensure-simulator-booted.py", "--udid", identifier], cwd=ROOT, check=True, timeout=245)
