@@ -1,21 +1,22 @@
-# Experimental owner phone candidate
+# Experimental phone repair 21.1
 
-This separate manual workflow prepares an internal-only device experiment from frozen playback source `9489d3b3ae85cb41b5ef4f56633dcf41b36505af`. It does not claim verified silent-gap playback. Native37 compiled the exact runtime for unsigned Release/iphoneos; Native35's complete 80-case gate remains failed, and Native38's diagnostic also failed. Their assertions and evidence remain intact.
+The frozen phone repair adds source-bound native audio recovery, next-first warming,
+fresh-link retry and PiP previous/next navigation. Its focused public native run must
+pass before signing. The retained 80-case gapless gate remains failed; no normal
+release acceptance variable or workflow is changed.
 
-The owner requested public builds for future work. One standard public `macos-26` job has an eight-minute limit and no automatic retry. Source/workflow inputs are validated as exact reviewed commits, owner/main/manual/first-attempt only. The two checkouts persist no token. Private media, catalogs, sessions and local overrides are refused.
+The existing protected public release environment, main-only manual/first-attempt
+admission, pinned signing helper, redacted output and archive adapter remain.
+The standard public macos-26 signing job is bounded to eleven minutes, with a
+600-second private child and no retry. No paid or private runner is used.
 
-Signing reuses the existing protected `release` environment and its existing four separate credentials. Main-only branches, required owner review and disabled administrator bypass remain. No credential transfer, new certificate/profile/key, paid runner, subscription, tester or public link is required. Credentials exist only in the final signing step, with raw Xcode/Apple output redirected to a temporary file and never published. No archives, signed packages, caches or diagnostic artifacts are uploaded to GitHub.
+The local encrypted Apple API recovery file is absent. Reuse the already approved
+existing GitHub-held key inside the existing redacted child: read the complete app
+build list and refuse a used/non-increasing build number before archive. After upload,
+wait at most180seconds for VALID/INTERNAL_ONLY and assign only the existing Owner
+group after checking the exact app, internal/private group and single owner member.
+Read the relationship back. Public output contains only build/state/assignment flags.
+No new key, permission, environment change, tester or public link is involved.
 
-`public-testflight.yml`, its normal acceptance logic and `RELEASE_ACCEPTED_COMMIT` are unchanged. The experimental route has an explicitly separate purpose and never marks this known failed runtime candidate accepted. It calls the unchanged, hash-pinned existing delivery helper only after its own experimental admission checks, using the existing team/app/profile and internal-only export.
-
-Before each deliberate dispatch, read Apple's complete build list and select an unused increasing number. The local October25 readback contains12builds, no next page, maximum19.1; proposed next number20.1 must be rechecked immediately before dispatch. If a run times out or upload is uncertain, check Apple before another separately reviewed attempt. Do not use rerun.
-
-After processing, verify VALID/INTERNAL_ONLY and assign only the existing one-person Owner group. Phone acceptance must compare next/previous, repeat-one, selected-video synchronization, Library audio-only, explicit Pause, lock-screen playback and camera interruption recovery. The engine experiment is not complete until actual-device behavior is verified.
-
-Local control check: `python3 -B -m unittest discover -s tests/release -v`. These checks establish admission/redaction behavior only. No new Simulator run is required for unchanged runtime source; Native35 failures remain unresolved.
-
-The first experimental run40225792319 passed admission and failed the redacted signing child after45seconds; Apple readback confirms20.1NOT_RECEIVED. A bounded diagnostic receipt now reports only a fixed phase/failure category and, for a compiler error, a known public source filename/line. Xcode output remains in a temporary file, is scanned for error lines with an8MiB read bound, and is never published. Successful compile headers cannot establish a compiler failure; cleanup cannot overwrite the first recorded failure. The runtime source and signing access remain unchanged; check Apple again before any new dispatch.
-
-The second changed run40226917435 reaches archive/xcodebuild-error without a compiler location. Apple again confirms20.1NOT_RECEIVED. To retain the useful error without publishing signing output, a separate diagnostic public certificate encrypts at most48KiB from the failed Xcode log tail with OpenSSL CMS and AES256CBC. The matching private key stays Windows-DPAPI protected on the owner's computer and is never uploaded. Only bounded base64 ciphertext appears in the public log, with source/control/build/phase/exit metadata inside the envelope; encryption failure has no plaintext fallback. A synthetic real OpenSSL/local decryption round-trip passes before use. This encryption certificate is unrelated to Apple signing, changes no account access, and grants no capability to decrypt on the runner. Cleanup still preserves the first failure. No encrypted artifact upload or new dependency installation is needed.
-
-Run40227823183 captures a real PlayerCore link failure: Xcode expects AssetURLCache.o, but the Swift whole-module build did not produce that per-file object. The failed archive omits `-num-threads`; Native37's successful unsigned Release includes `-num-threads 3`. The experimental archive adapter removes only the old `SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO` override to restore Xcode's default object-emission behavior. The one-job Xcode queue and Swift driver cap, optimization, frozen app/core/helper source, signing arguments and export settings stay unchanged. Local controls verify the actual intercepted archive command and unchanged other tools/export. The next hosted archive must validate the hypothesis; native and phone playback acceptance remain unresolved.
+Processing that exceeds the bound remains pending and cannot be called delivered.
+Physical iPhone playback and PiP acceptance remain required after installation.

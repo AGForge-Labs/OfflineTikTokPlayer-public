@@ -18,6 +18,16 @@ spec.loader.exec_module(phone)
 
 
 class ExperimentalPhoneTests(unittest.TestCase):
+    def test_exact_native_run_must_have_passed_before_signing(self):
+        result = dict(id=phone.NATIVE_RUN, head_sha=phone.SOURCE, status="completed", conclusion="success",
+            path=".github/workflows/phone-native.yml", event="push", head_branch="fix/phone-playback-reliability",
+            repository=dict(full_name=phone.REPOSITORY, private=False))
+        phone.require_native_result(lambda: result)
+        for key in result:
+            changed = copy.deepcopy(result); changed[key] = "wrong"
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                phone.require_native_result(lambda: changed)
+
     def test_archive_preserves_default_whole_module_outputs_and_other_signing_arguments(self):
         override = "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO"
         command = ["xcodebuild", "-jobs", "1", "SWIFTC_MAXIMUM_DETERMINISM=1", override,
@@ -60,11 +70,11 @@ class ExperimentalPhoneTests(unittest.TestCase):
                         GITHUB_TRIGGERING_ACTOR="Galaxybigbird", GITHUB_RUN_ATTEMPT="1",
                         GITHUB_WORKFLOW_REF=phone.REPOSITORY + "/.github/workflows/public-experimental-phone.yml@refs/heads/main",
                         GITHUB_SHA=self.sha, GITHUB_WORKFLOW_SHA=self.sha, EXPECTED_CONTROL_COMMIT=self.sha,
-                        EXPERIMENTAL_PHONE_AUTHORIZED="true", EXPERIMENTAL_BUILD_NUMBER="20.1")
+                        EXPERIMENTAL_PHONE_AUTHORIZED="true", EXPERIMENTAL_BUILD_NUMBER="21.1")
         self.event = {"repository": {"full_name": phone.REPOSITORY, "private": False}}
 
     def test_exact_public_owner_main_workflow_and_first_attempt_are_required(self):
-        self.assertEqual(phone.validate_context(self.env, self.event), "20.1")
+        self.assertEqual(phone.validate_context(self.env, self.event), "21.1")
         for key in self.env:
             env = dict(self.env, **{key: "wrong"})
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -79,8 +89,8 @@ class ExperimentalPhoneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             phone.validate_context(self.env, self.event, signing=True)
         signing = dict(self.env, RELEASE_ENVIRONMENT="release")
-        self.assertEqual(phone.validate_context(signing, self.event, signing=True), "20.1")
-        for value in ("", "19.1", "20.01", "$(command)", "10000.1"):
+        self.assertEqual(phone.validate_context(signing, self.event, signing=True), "21.1")
+        for value in ("", "20.1", "20.01", "$(command)", "10000.1"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 phone.validate_context(dict(signing, EXPERIMENTAL_BUILD_NUMBER=value), self.event, signing=True)
         with self.assertRaises(ValueError):
@@ -142,7 +152,7 @@ class ExperimentalPhoneTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.object(phone.subprocess, "run", side_effect=failure), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                 with self.assertRaises(RuntimeError):
-                    phone.upload_with_receipt(helper, {}, directory, "20.1", receipt)
+                    phone.upload_with_receipt(helper, {}, directory, "21.1", receipt)
             import json
             status = json.loads(receipt.read_text())
             self.assertEqual(status, {"phase": "archive", "reason": "profile-not-found"})
@@ -170,7 +180,7 @@ class ExperimentalPhoneTests(unittest.TestCase):
                       {"phase": "archive", "reason": "xcodebuild-error"}))
             for error_output, expected in cases:
                 with self.subTest(expected=expected), mock.patch.object(phone.subprocess, "run", side_effect=failure), self.assertRaises(RuntimeError):
-                    phone.upload_with_receipt(helper, {}, directory, "20.1", receipt)
+                    phone.upload_with_receipt(helper, {}, directory, "21.1", receipt)
                 self.assertEqual(json.loads(receipt.read_text()), expected)
                 self.assertNotIn("PRIVATE-MARKER", receipt.read_text())
 

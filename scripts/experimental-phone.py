@@ -10,15 +10,15 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE = "9489d3b3ae85cb41b5ef4f56633dcf41b36505af"
-APP_TREE = "afe3a687be3ed2d905c5841950ee7877f218e647"
-CORE_TREE = "859923fd7ca5fd3ea2689bf7b077e7f8af65fcb3"
+SOURCE = "29f1aa2c36eaf2f25709277290212308b23d26c6"
+APP_TREE = "4e208ea5440ccf37ede6241bd365f85a835f71ab"
+CORE_TREE = "64d337f129d7ee93a8b8f7361294e6b50cedfdd6"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
            "APPLE_PROVISIONING_PROFILE_BASE64", "APP_STORE_CONNECT_KEY_BASE64")
 ROOT = Path(__file__).resolve().parents[1]
-PHASES = {"credential-inputs", "credential-validation", "project-validation", "archive", "export-upload", "complete"}
+PHASES = {"credential-inputs", "credential-validation", "project-validation", "archive", "export-upload", "apple-processing", "complete"}
 REASONS = {"profile-not-found", "profile-entitlement-mismatch", "certificate-not-found", "keychain-signing-failed",
            "swift-compilation", "xcodebuild-error", "tool-validation-failed"}
 DIAGNOSTIC_CERTIFICATE = b"""-----BEGIN CERTIFICATE-----
@@ -87,7 +87,7 @@ def validate_context(environment, event, *, signing=False):
     require(re.fullmatch(r"[1-9][0-9]{0,3}(?:\.(?:0|[1-9][0-9]?)){0,2}", build) is not None,
             "An Apple-checked increasing build number is required.")
     numbers = tuple(map(int, build.split("."))) + (0,) * (3 - len(build.split(".")))
-    require(numbers > (19, 1, 0), "The experimental build must follow existing build19.1.")
+    require(numbers > (20, 1, 0), "The experimental build must follow existing build20.1.")
     require(not environment.get("APPLE_PRIVATE_DELIVERY"), "The private aggregate secret is not used here.")
     if signing:
         require(environment.get("RELEASE_ENVIRONMENT") == "release", "The existing protected release environment is required.")
@@ -203,6 +203,29 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
         helper.run_tool = original
 
 
+NATIVE_RUN = 40262013290
+
+def require_native_result(read=None):
+    if read is None:
+        import urllib.request
+        def read():
+            request = urllib.request.Request("https://api.github.com/repos/" + REPOSITORY + "/actions/runs/" + str(NATIVE_RUN),
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "OfflinePlayer-owner-delivery"})
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = response.read(128 * 1024 + 1)
+                require(len(data) <= 128 * 1024, "Native receipt exceeded its bound.")
+                return json.loads(data)
+    result = read()
+    require(isinstance(result, dict) and isinstance(result.get("repository"), dict), "Invalid native run receipt.")
+    require(result.get("id") == NATIVE_RUN and result.get("head_sha") == SOURCE
+        and result.get("status") == "completed" and result.get("conclusion") == "success"
+        and result.get("path") == ".github/workflows/phone-native.yml" and result.get("event") == "push"
+        and result.get("head_branch") == "fix/phone-playback-reliability"
+        and result.get("repository", {}).get("full_name") == REPOSITORY
+        and result.get("repository", {}).get("private") is False,
+        "The exact focused public native run must pass before signing; full gapless acceptance remains unresolved.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("check", "sign-upload", "child"))
@@ -230,7 +253,7 @@ def main():
             environment["EXPERIMENTAL_RECEIPT_PATH"] = str(receipt)
             try:
                 public.run_redacted([sys.executable, "-B", str(Path(__file__).resolve()), "child"],
-                                    env=environment, cwd=ROOT, timeout=360)
+                                    env=environment, cwd=ROOT, timeout=600)
             except RuntimeError:
                 status = json.loads(receipt.read_text()) if receipt.stat().st_size <= 128 * 1024 else {}
                 phase, reason = status.get("phase"), status.get("reason")
@@ -245,12 +268,16 @@ def main():
                         for offset in range(0, len(sealed), 4096):
                             print("Encrypted diagnostic " + str(offset // 4096 + 1) + ": " + sealed[offset:offset + 4096], flush=True)
                 raise
+            completed_status = json.loads(receipt.read_text())
+        delivery = completed_status.get("delivery", {})
+        print("Apple owner delivery: " + json.dumps(delivery, sort_keys=True))
         message = "Uploaded experimental internal-only phone build " + build + " from " + SOURCE + ". Native and phone acceptance remain unresolved."
         print(message)
         if environment.get("GITHUB_STEP_SUMMARY"):
             with Path(environment["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
                 stream.write(message + "\n")
         return
+    require_native_result()
     helper = load_module("existing_private_delivery", candidate / "scripts/private-delivery.py")
     configuration = helper.public_configuration(environment)
     helper.validate_configuration(configuration)
@@ -261,7 +288,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="experimental-player-signing-", dir=runner_temp) as temporary:
         directory = Path(temporary)
         directory.chmod(0o700)
+        apple_owner = load_module("apple_owner", ROOT / "scripts/apple-owner-runner.py")
+        apple = apple_owner.Apple(configuration, directory)
+        apple_owner.before_upload(apple, build)
         upload_with_receipt(helper, configuration, directory, build, receipt)
+        receipt.write_text(json.dumps({"phase": "apple-processing", "reason": None}))
+        delivery = apple_owner.finish(apple, build)
+        receipt.write_text(json.dumps({"phase": "complete", "reason": None, "delivery": delivery}))
 
 
 if __name__ == "__main__":
