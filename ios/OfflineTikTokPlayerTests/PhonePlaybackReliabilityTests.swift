@@ -140,6 +140,54 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         XCTAssertFalse(service.wantsToPlay)
     }
 
+    func testColdRemoteResolutionFailureRefreshesOnceAndPlaysChosenVideo() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let source = try XCTUnwrap(fixture.savedURLs[fixture.aID])
+        let hash = try AppFiles.hash(source)
+        let original = fixture.temporary.appendingPathComponent("cold-resolution-original.mp4")
+        try FileManager.default.copyItem(at: source, to: original)
+        fixture.downloads.remove(fixture.aID)
+        let asset = AssetReference(driveID: "synthetic", itemID: fixture.aID, fileName: "original.mp4",
+            byteSize: hash.size, sha256: hash.sha256, contentType: "video/mp4")
+        try fixture.library.install(LibraryCatalog(libraryID: "local:cold-resolution", media: [
+            MediaRecord(id: fixture.aID, title: "Synthetic cold resolution", duration: 30, status: .ready, asset: asset)
+        ], playlists: [PlaylistRecord(id: fixture.playlist, name: "Synthetic", itemIDs: [fixture.aID])]))
+        let cache = try PlaybackMediaCache(directory: fixture.temporary.appendingPathComponent("no-cold-cache"), byteLimit: 1) { _ in
+            throw CatalogError.invalid("Whole-file warming is optional")
+        }
+        var ordinary = 0, refreshed = 0
+        let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads,
+            cloud: fixture.cloud, bookmarkURL: fixture.bookmark, activateSession: {}, mediaCache: cache,
+            resolveRemote: { _ in
+                ordinary += 1
+                if ordinary == 1 { throw URLError(.networkConnectionLost) }
+                return original
+            },
+            refreshRemote: { _ in refreshed += 1; return original }))
+        service.setAudioOnly(false)
+        service.speakerSound = false
+        service.automaticPiP = false
+        try await until { fixture.downloads.network.isConnected }
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        // A returned bad URL already has coverage below. This error happens before
+        // an AVPlayerItem exists, so recovery must also cover cold source resolution.
+        try await until {
+            service.message != nil || (service.player.currentItem?.status == .readyToPlay
+                && service.player.rate > 0 && service.clock.position > 0.1)
+        }
+        XCTAssertEqual(service.queue.currentID, fixture.aID)
+        XCTAssertEqual(ordinary, 1)
+        XCTAssertEqual(refreshed, 1, "A cold transient failure must request one fresh source URL")
+        XCTAssertNil(service.message, "Recoverable source resolution must not raise a preparation alert")
+        XCTAssertEqual(service.player.currentItem?.status, .readyToPlay)
+        XCTAssertGreaterThan(service.player.rate, 0)
+        XCTAssertGreaterThan(service.clock.position, 0.1)
+        XCTAssertTrue(service.wantsToPlay)
+        service.pause()
+    }
+
     func testFailedRemoteItemUsesFreshResolverOnceAndKeepsChosenVideo() async throws {
         let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
