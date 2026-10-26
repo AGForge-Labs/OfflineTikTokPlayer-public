@@ -1,6 +1,7 @@
 {
   "version": 1,
   "cases": [
-    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues"
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues",
+    "OfflineTikTokPlayerUITests.PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable"
   ]
 }
