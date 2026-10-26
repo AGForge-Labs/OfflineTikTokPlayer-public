@@ -47,7 +47,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 0000000000000000000000000000000000000000
+          ref: ec59b1f8b2da334ad2c224821f9d2028fcb7742c
           path: candidate
           persist-credentials: false
       - name: Verify experimental owner request and exact runtime source without credentials

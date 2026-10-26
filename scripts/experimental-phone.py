@@ -10,8 +10,8 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE = "0000000000000000000000000000000000000000"
-APP_TREE = "f5fdfeb7ec739c6a961ef13fd21df4b36c1ecedb"
+SOURCE = "ec59b1f8b2da334ad2c224821f9d2028fcb7742c"
+APP_TREE = "79093f6ddf43272aff597bcc5a5749b6e8d001c4"
 CORE_TREE = "64d337f129d7ee93a8b8f7361294e6b50cedfdd6"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
@@ -203,7 +203,7 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
         helper.run_tool = original
 
 
-NATIVE_RUN = 0
+NATIVE_RUN = 40414570409
 
 def require_native_result(read=None):
     if read is None:
