@@ -26,13 +26,20 @@ final class PlaybackDiagnosticJournalTests: XCTestCase {
             retainedItems: -10, preparedPCMBytes: -20, outputRoute: .builtInSpeaker,
             sampleRate: .nan, ioBufferSeconds: -.infinity, outputLatencySeconds: -1,
             pipActive: true, pipPossible: false, pipSuspended: true)
-        journal.record(.pipStateChanged, snapshot: snapshot, uptime: 100)
+        let failure = NSError(domain: NSURLErrorDomain, code: URLError.networkConnectionLost.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: "private error description",
+                       NSURLErrorFailingURLErrorKey: URL(string: "https://private.invalid/secret-token")!])
+        journal.record(.sourceResolutionFailed, snapshot: snapshot,
+            error: PlaybackDiagnosticError(failure), uptime: 100)
         journal.record(.audioInterruptionBegan, snapshot: snapshot, uptime: 99)
         journal.record(.sampled, snapshot: snapshot, uptime: .nan)
         let data = try journal.exportJSON()
         let document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let entries = try XCTUnwrap(document["events"] as? [[String: Any]])
         let recorded = try XCTUnwrap(entries.first?["snapshot"] as? [String: Any])
+        let recordedError = try XCTUnwrap(entries.first?["error"] as? [String: Any])
+        XCTAssertEqual(recordedError["family"] as? Int, PlaybackDiagnosticError.Family.urlLoading.rawValue)
+        XCTAssertEqual(recordedError["code"] as? Int, URLError.networkConnectionLost.rawValue)
         XCTAssertNil(recorded["positionSeconds"])
         XCTAssertNil(recorded["durationSeconds"])
         XCTAssertNil(recorded["playbackRate"])

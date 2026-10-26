@@ -984,6 +984,7 @@ final class PlaybackService: NSObject {
             while let item = self.current, visited.insert(item.id).inserted {
                 let itemPosition = resume.seconds(for: item.id)
                 self.clock.reset(position: itemPosition, duration: item.duration)
+                var failurePhase: PlaybackDiagnosticPhase = .sourceResolutionFailed
                 do {
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.savedLookup, request: request)
@@ -992,9 +993,25 @@ final class PlaybackService: NSObject {
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.cachedLookupAndResolution, request: request)
                     #endif
-                    let source = try await PlaybackMediaSource.resolve(saved: saved, asset: item.asset,
-                        cache: self.mediaCache, allowRemote: self.downloads.network.isConnected,
-                        forceRemote: forceRemote, remoteURL: forceRemote ? self.refreshRemote : self.resolveRemote)
+                    let source: PlaybackMediaSource
+                    do {
+                        source = try await PlaybackMediaSource.resolve(saved: saved, asset: item.asset,
+                            cache: self.mediaCache, allowRemote: self.downloads.network.isConnected,
+                            forceRemote: forceRemote, remoteURL: forceRemote ? self.refreshRemote : self.resolveRemote)
+                    } catch {
+                        try Task.checkCancellation()
+                        guard self.generation == request, self.current?.id == item.id else { return }
+                        guard !forceRemote, Self.isTransientSourceResolutionError(error) else { throw error }
+                        self.recordDiagnostic(.sourceResolutionRetried, error: PlaybackDiagnosticError(error))
+                        // One failure-only retry refreshes the link without advancing the queue.
+                        try await Task.sleep(for: .milliseconds(200))
+                        try Task.checkCancellation()
+                        guard self.generation == request, self.current?.id == item.id else { return }
+                        source = try await PlaybackMediaSource.resolve(saved: saved, asset: item.asset,
+                            cache: self.mediaCache, allowRemote: self.downloads.network.isConnected,
+                            forceRemote: true, remoteURL: self.refreshRemote)
+                    }
+                    failurePhase = .sourcePreparationFailed
                     #if DEBUG
                     self.debugMarkInitialLoadPhase(.localResolved, request: request)
                     #endif
@@ -1005,6 +1022,7 @@ final class PlaybackService: NSObject {
                     playerItem.preferredForwardBufferDuration = 8
                     var usePCM = source.usesPCM && !self.nativeAudioFallbackIDs.contains(item.id)
                     if usePCM {
+                        failurePhase = .pcmPreparationFailed
                         #if DEBUG
                         self.debugMarkInitialLoadPhase(.audioPrepare, request: request)
                         #endif
@@ -1031,6 +1049,7 @@ final class PlaybackService: NSObject {
                         self.debugMarkInitialLoadPhase(.audioPrepared, request: request)
                         #endif
                     }
+                    failurePhase = .sourcePreparationFailed
                     try Task.checkCancellation()
                     guard self.generation == request else { return }
                     if usePCM {
@@ -1095,7 +1114,7 @@ final class PlaybackService: NSObject {
                     self.continuousAudio.clearSelection()
                     self.audioLoadingID = nil; self.isLoading = false
                     self.pause()
-                    self.recordDiagnostic(.sourcePreparationFailed)
+                    self.recordDiagnostic(failurePhase, error: PlaybackDiagnosticError(error))
                     self.message = "This video could not be prepared. Tap Play to retry or choose another video."
                     return
                 }
@@ -1106,6 +1125,19 @@ final class PlaybackService: NSObject {
             #endif
             self.isLoading = false; self.pause()
             self.message = "No available videos in this queue. Connect to your library or choose downloaded videos."
+        }
+    }
+
+    private static func isTransientSourceResolutionError(_ error: Error) -> Bool {
+        let failure = error as NSError
+        guard failure.domain == NSURLErrorDomain else { return false }
+        switch failure.code {
+        case URLError.timedOut.rawValue, URLError.cannotFindHost.rawValue,
+             URLError.cannotConnectToHost.rawValue, URLError.networkConnectionLost.rawValue,
+             URLError.dnsLookupFailed.rawValue, URLError.notConnectedToInternet.rawValue:
+            return true
+        default:
+            return false
         }
     }
 

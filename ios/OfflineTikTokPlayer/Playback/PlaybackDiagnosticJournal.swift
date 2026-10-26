@@ -36,6 +36,9 @@ enum PlaybackDiagnosticPhase: Int, Codable {
     case sourceTimelineAnalyzed = 48
     case videoRateChanged = 46
     case pipCommandsUnavailable = 47
+    case sourceResolutionRetried = 49
+    case sourceResolutionFailed = 50
+    case pcmPreparationFailed = 51
 }
 
 enum PlaybackDiagnosticPipeline: Int, Codable {
@@ -64,10 +67,28 @@ struct PlaybackDiagnosticError: Codable, Equatable {
         case avFoundation = 2
         case audioSession = 3
         case cocoa = 4
+        case urlLoading = 5
     }
 
     let family: Family
     let code: Int
+
+    init(family: Family, code: Int) {
+        self.family = family
+        self.code = code
+    }
+
+    init(_ error: Error) {
+        let failure = error as NSError
+        switch failure.domain {
+        case NSURLErrorDomain: family = .urlLoading
+        case NSCocoaErrorDomain: family = .cocoa
+        case "AVFoundationErrorDomain": family = .avFoundation
+        case "AVKitErrorDomain": family = .avKit
+        default: family = .unknown
+        }
+        code = failure.code
+    }
 }
 
 /// A deliberately closed schema: no filenames, URLs, titles, account/device IDs or error descriptions.

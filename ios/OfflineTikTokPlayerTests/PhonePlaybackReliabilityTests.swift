@@ -188,6 +188,123 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         service.pause()
     }
 
+    func testColdRemoteResolutionRetriesOnlyOnceForTransientErrorsAndNeverForPermanentErrors() async throws {
+        let cases: [(name: String, error: Error, expectedFresh: Int)] = [
+            ("transient exhausted", URLError(.networkConnectionLost), 1),
+            ("permanent", AppError.message("Synthetic permanent source failure"), 0)
+        ]
+        for control in cases {
+            let fixture = try await SelectionVideoFixture(test: self)
+            defer { fixture.remove() }
+            let source = try XCTUnwrap(fixture.savedURLs[fixture.aID])
+            let hash = try AppFiles.hash(source)
+            fixture.downloads.remove(fixture.aID)
+            let asset = AssetReference(driveID: "synthetic", itemID: fixture.aID, fileName: "original.mp4",
+                byteSize: hash.size, sha256: hash.sha256, contentType: "video/mp4")
+            try fixture.library.install(LibraryCatalog(libraryID: "local:cold-resolution-control", media: [
+                MediaRecord(id: fixture.aID, title: "Synthetic cold failure", duration: 30, status: .ready, asset: asset)
+            ], playlists: [PlaylistRecord(id: fixture.playlist, name: "Synthetic", itemIDs: [fixture.aID])]))
+            let cache = try PlaybackMediaCache(directory: fixture.temporary.appendingPathComponent("no-control-cache"), byteLimit: 1) { _ in
+                throw CatalogError.invalid("Whole-file warming is optional")
+            }
+            var ordinary = 0, refreshed = 0
+            let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads,
+                cloud: fixture.cloud, bookmarkURL: fixture.bookmark, activateSession: {}, mediaCache: cache,
+                resolveRemote: { _ in ordinary += 1; throw control.error },
+                refreshRemote: { _ in refreshed += 1; throw URLError(.networkConnectionLost) }))
+            try await until { fixture.downloads.network.isConnected }
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await until { !service.isLoading && service.message != nil }
+            XCTAssertEqual(service.queue.currentID, fixture.aID, control.name)
+            XCTAssertEqual(ordinary, 1, control.name)
+            XCTAssertEqual(refreshed, control.expectedFresh, control.name)
+            XCTAssertFalse(service.wantsToPlay, control.name)
+            XCTAssertFalse(service.audioEngineRunning, control.name)
+            XCTAssertNil(service.player.currentItem, control.name)
+            XCTAssertNotNil(service.message, control.name)
+            try await fixture.close()
+        }
+    }
+
+    func testPendingColdRemoteRefreshHonorsPauseAndSupersedingSelection() async throws {
+        for supersedesSelection in [false, true] {
+            let fixture = try await SelectionVideoFixture(test: self)
+            defer { fixture.remove() }
+            let source = try XCTUnwrap(fixture.savedURLs[fixture.aID])
+            let savedB = try XCTUnwrap(fixture.savedURLs[fixture.bID])
+            let hash = try AppFiles.hash(source)
+            let original = fixture.temporary.appendingPathComponent("pending-refresh-original.mp4")
+            try FileManager.default.copyItem(at: source, to: original)
+            fixture.downloads.remove(fixture.aID)
+            let asset = AssetReference(driveID: "synthetic", itemID: fixture.aID, fileName: "original.mp4",
+                byteSize: hash.size, sha256: hash.sha256, contentType: "video/mp4")
+            let replacementPlaylist = fixture.playlist + "-replacement"
+            try fixture.library.install(LibraryCatalog(libraryID: "local:pending-cold-resolution", media: [
+                MediaRecord(id: fixture.aID, title: "Synthetic pending refresh", duration: 30, status: .ready, asset: asset),
+                MediaRecord(id: fixture.bID, title: "Synthetic Saved replacement", duration: 30, status: .ready)
+            ], playlists: [
+                PlaylistRecord(id: fixture.playlist, name: "Pending", itemIDs: [fixture.aID]),
+                PlaylistRecord(id: replacementPlaylist, name: "Replacement", itemIDs: [fixture.bID])
+            ]))
+            let cache = try PlaybackMediaCache(directory: fixture.temporary.appendingPathComponent("no-pending-cache"), byteLimit: 1) { _ in
+                throw CatalogError.invalid("Whole-file warming is optional")
+            }
+            var ordinary = 0, refreshed = 0, freshReturned = false
+            var pending: CheckedContinuation<URL, Error>?
+            defer { pending?.resume(throwing: CancellationError()) }
+            let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads,
+                cloud: fixture.cloud, bookmarkURL: fixture.bookmark, activateSession: {}, mediaCache: cache,
+                resolveRemote: { _ in ordinary += 1; throw URLError(.networkConnectionLost) },
+                refreshRemote: { _ in
+                    refreshed += 1
+                    // Deliberately return late even if the requesting task is cancelled.
+                    let url: URL = try await withCheckedThrowingContinuation { pending = $0 }
+                    freshReturned = true
+                    return url
+                }))
+            service.setAudioOnly(false)
+            service.speakerSound = false
+            service.automaticPiP = false
+            service.isInteractingWithFeed = true
+            try await until { fixture.downloads.network.isConnected }
+            service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+            try await until { pending != nil || service.message != nil }
+            guard pending != nil else {
+                XCTFail("The transient failure must reach the held fresh resolution")
+                throw CatalogError.invalid("Fresh source resolution was never requested")
+            }
+            XCTAssertNil(service.message)
+            if supersedesSelection {
+                service.start(playlistIDs: [replacementPlaylist], at: fixture.bID)
+            } else {
+                service.pause()
+            }
+            let release = try XCTUnwrap(pending)
+            pending = nil
+            release.resume(returning: original)
+            try await until {
+                freshReturned && service.player.currentItem?.status == .readyToPlay
+                    && (supersedesSelection ? service.audioSnapshot.frame > 2_400 : !service.isLoading)
+            }
+            XCTAssertEqual(ordinary, 1)
+            XCTAssertEqual(refreshed, 1)
+            XCTAssertNil(service.message)
+            if supersedesSelection {
+                XCTAssertEqual(service.queue.currentID, fixture.bID)
+                XCTAssertEqual((service.player.currentItem?.asset as? AVURLAsset)?.url, savedB)
+                XCTAssertTrue(service.wantsToPlay)
+                XCTAssertTrue(service.audioEngineRunning)
+                XCTAssertGreaterThan(service.audioSnapshot.frame, 2_400)
+            } else {
+                XCTAssertEqual(service.queue.currentID, fixture.aID)
+                XCTAssertFalse(service.wantsToPlay)
+                XCTAssertFalse(service.audioEngineRunning)
+                XCTAssertEqual(service.player.rate, 0)
+            }
+            try await fixture.close()
+        }
+    }
+
     func testFailedRemoteItemUsesFreshResolverOnceAndKeepsChosenVideo() async throws {
         let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
