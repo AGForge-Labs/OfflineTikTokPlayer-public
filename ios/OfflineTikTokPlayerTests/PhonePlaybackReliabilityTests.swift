@@ -244,6 +244,7 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         print("ColdSourceIntentControl schema=1 replacement=\(supersedesSelection) phase=2")
         let source = try XCTUnwrap(fixture.savedURLs[fixture.aID])
         let savedB = try XCTUnwrap(fixture.savedURLs[fixture.bID])
+        let savedBAsset = try XCTUnwrap(fixture.downloads.records[fixture.bID]?.asset)
         let hash = try AppFiles.hash(source)
         let original = fixture.temporary.appendingPathComponent("pending-refresh-original.mp4")
         try FileManager.default.copyItem(at: source, to: original)
@@ -253,7 +254,8 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         let replacementPlaylist = fixture.playlist + "-replacement"
         try fixture.library.install(LibraryCatalog(libraryID: "local:pending-cold-resolution", media: [
             MediaRecord(id: fixture.aID, title: "Synthetic pending refresh", duration: 30, status: .ready, asset: asset),
-            MediaRecord(id: fixture.bID, title: "Synthetic Saved replacement", duration: 30, status: .ready)
+            MediaRecord(id: fixture.bID, title: "Synthetic Saved replacement", duration: 30,
+                status: .ready, asset: savedBAsset)
         ], playlists: [
             PlaylistRecord(id: fixture.playlist, name: "Pending", itemIDs: [fixture.aID]),
             PlaylistRecord(id: replacementPlaylist, name: "Replacement", itemIDs: [fixture.bID])
