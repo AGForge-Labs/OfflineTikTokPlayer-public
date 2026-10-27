@@ -315,6 +315,21 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     public func setPlaying(_ value: Bool) { playing.store(value, ordering: .releasing) }
     public func setSpeakerEnabled(_ value: Bool) { enhance.store(value, ordering: .releasing) }
 
+    /// Bounded observation for diagnostics outside the render callback. A busy
+    /// publication yields no sample rather than spinning on a preempted writer.
+    public var diagnosticSnapshot: Snapshot? {
+        for _ in 0..<4 {
+            let version = stateVersion.load(ordering: .sequentiallyConsistent)
+            if version & 1 != 0 { continue }
+            let value = Snapshot(token: stateToken.load(ordering: .sequentiallyConsistent), frame: stateFrame.load(ordering: .sequentiallyConsistent),
+                                 visit: stateVisit.load(ordering: .sequentiallyConsistent), ended: stateEnded.load(ordering: .sequentiallyConsistent),
+                                 underrunFrames: stateUnderrun.load(ordering: .sequentiallyConsistent),
+                                 selectionVersion: stateSelectionVersion.load(ordering: .sequentiallyConsistent))
+            if version == stateVersion.load(ordering: .sequentiallyConsistent) { return value }
+        }
+        return nil
+    }
+
     /// Coherent source-frame cursor. Read off the audio thread.
     public var snapshot: Snapshot {
         while true {

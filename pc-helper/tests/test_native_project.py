@@ -1,5 +1,11 @@
 import importlib.util
+import json
 from pathlib import Path
+import subprocess
+import threading
+import uuid
+
+import pytest
 
 
 def test_xcode_project_identities_match_across_windows_and_posix(monkeypatch):
@@ -31,3 +37,496 @@ def test_debug_app_and_test_targets_match_the_active_swift_package_architecture(
         release = captured[module.identity("config:" + name + "Release")]["buildSettings"]
         assert debug.get("ONLY_ACTIVE_ARCH") == "YES", "Debug must match the package's single active simulator architecture"
         assert release.get("ONLY_ACTIVE_ARCH") == "NO", "Release archives must retain their normal supported architectures"
+
+
+def test_generator_traversal_matches_case_sensitive_and_insensitive_path_order(tmp_path, monkeypatch):
+    path = Path(__file__).resolve().parents[2] / "scripts" / "generate-ios-project.py"
+    spec = importlib.util.spec_from_file_location("native_project_order", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class CaseSensitivePath(type(Path())):
+        def __lt__(self, other):
+            return self.as_posix() < other.as_posix()
+
+    class CaseInsensitivePath(type(Path())):
+        def __lt__(self, other):
+            return self.as_posix().casefold() < other.as_posix().casefold()
+
+    for target in (module.APP, module.APP + "Tests", module.APP + "UITests"):
+        directory = tmp_path / target
+        directory.mkdir()
+        for name in ("SpeakerTests.swift", "WorkerTests.swift", "test-video.mp4"):
+            (directory / name).write_text("")
+    monkeypatch.setattr(module, "ROOT", CaseSensitivePath(tmp_path))
+    sensitive = module.generate()
+    monkeypatch.setattr(module, "ROOT", CaseInsensitivePath(tmp_path))
+    assert module.generate() == sensitive, "Source ordering must not inherit the host Path comparison rules"
+
+
+def _capture_helper():
+    path = Path(__file__).resolve().parents[2] / "scripts" / "capture-simulator-test-frames.py"
+    spec = importlib.util.spec_from_file_location("native_worker_capture", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _worker_fixture(tmp_path, monkeypatch):
+    module = _capture_helper()
+    udid = "11111111-1111-4111-8111-111111111111"
+    device = tmp_path / "Devices" / udid
+    temporary = device / "data" / "Containers" / "Data" / "Application" / str(uuid.uuid4()) / "tmp"
+    temporary.mkdir(parents=True)
+    executable = (device / "data" / "Containers" / "Bundle" / "Application" / str(uuid.uuid4())
+                  / "OfflineTikTokPlayer.app" / "OfflineTikTokPlayer")
+    executable.parent.mkdir(parents=True)
+    executable.write_text("synthetic executable identity only", encoding="utf-8")
+    monkeypatch.setattr(module, "DEADLINE", module.time.monotonic() + 60)
+    watcher = module.WorkerTraceWatcher(udid, temporary.resolve(), threading.Event())
+    return module, watcher, temporary.resolve(), executable.resolve()
+
+
+WORKER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+OTHER_WORKER_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+
+def _worker_request(module, temporary, purpose=0, changes=None):
+    identifier = str(uuid.uuid4())
+    payload = {"schemaVersion": 2, "requestID": identifier, "processID": 4321,
+               "purposeCode": purpose, "workerID": WORKER_ID}
+    payload.update(changes or {})
+    request = temporary / f"{module.WORKER_PREFIX}{identifier}.request.json"
+    request.write_text(json.dumps(payload), encoding="utf-8")
+    return request, identifier
+
+
+WORKER_SAMPLE = f"""Sampling process 4321; PRIVATE_REPORT_HEADER
+Call graph:
+    100 Thread_123 DispatchQueue_1: com.apple.main-thread (serial)
+    + 100 PRIVATE_OTHER_THREAD
+    100 Thread_455 DispatchQueue_6: OfflineTikTokPlayer.PCMDecode.{OTHER_WORKER_ID} (serial)
+    + 100 PRIVATE_WRONG_DECODER
+    100 Thread_456 DispatchQueue_7: OfflineTikTokPlayer.PCMDecode.{WORKER_ID} (serial)
+    + 100 synthetic_worker_frame (in SyntheticFramework)
+    + ! 100 synthetic_reader_wait (in SyntheticFramework)
+    100 Thread_789 DispatchQueue_8: PRIVATE_ANOTHER_QUEUE (serial)
+    + 100 PRIVATE_OTHER_FRAME
+Binary Images:
+PRIVATE_BINARY_PATH
+"""
+
+
+def _mock_worker_commands(monkeypatch, watcher, executable, report=WORKER_SAMPLE, failure=None, application=None):
+    calls = []
+
+    def command(arguments, timeout):
+        calls.append((arguments, timeout))
+        if arguments[0] == "/bin/ps":
+            assert arguments == ["/bin/ps", "-ww", "-p", "4321", "-o", "comm="]
+            return subprocess.CompletedProcess(arguments, 0, str(executable) + "\n", "PRIVATE_STDERR")
+        if arguments[0] == "/usr/bin/xcrun":
+            assert arguments == ["/usr/bin/xcrun", "simctl", "get_app_container", watcher.udid,
+                                 "dev.galaxybigbird.OfflineTikTokPlayer", "app"]
+            assert timeout == 1
+            return subprocess.CompletedProcess(arguments, 0, str(application or executable.parent) + "\n", "PRIVATE_STDERR")
+        assert arguments[:5] == ["/usr/bin/sample", "4321", "1", "100", "-file"]
+        assert timeout <= 4
+        if failure is not None:
+            raise failure
+        Path(arguments[5]).write_text(report, encoding="utf-8")
+        return subprocess.CompletedProcess(arguments, 0, "PRIVATE_STDOUT", "PRIVATE_STDERR")
+
+    monkeypatch.setattr(watcher, "_command", command)
+    return calls
+
+
+def _worker_results(output):
+    return [dict(field.split("=", 1) for field in line.split()[1:])
+            for line in output.splitlines() if line.startswith("NativeWorkerTraceResult ")]
+
+
+def test_worker_trace_profiles_only_owned_pid_and_emits_only_worker_stack(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    request, identifier = _worker_request(module, temporary)
+    watcher.poll_once()
+    output = capsys.readouterr().out
+    assert len(calls) == 3
+    assert f"requestID={identifier} purposeCode=0 workerID={WORKER_ID} statusCode=0" in output
+    assert "decoderQueueCount=2" in output
+    assert "OfflineTikTokPlayer.PCMDecode" in output and "synthetic_reader_wait" in output
+    assert "PRIVATE_" not in output
+    assert "startUptime=" in output and "elapsedSeconds=" in output
+    fields = _worker_results(output)[0]
+    assert list(fields)[-7:] == ["stageCode", "ownershipCode", "psReturnCode", "bundleReturnCode",
+                                "psElapsedSeconds", "bundleElapsedSeconds", "bundleCacheHit"]
+    assert fields["stageCode"] == "8" and fields["ownershipCode"] == "1"
+    assert fields["psReturnCode"] == fields["bundleReturnCode"] == "0"
+    assert fields["bundleCacheHit"] == "0"
+    assert float(fields["psElapsedSeconds"]) >= 0 and float(fields["bundleElapsedSeconds"]) >= 0
+    assert not request.exists()
+    assert not list(temporary.glob(module.WORKER_PREFIX + "*.sample.txt"))
+
+
+@pytest.mark.parametrize("changes", [
+    {"extra": 1}, {"schemaVersion": True}, {"schemaVersion": 1},
+    {"requestID": "22222222-2222-4222-8222-222222222222"},
+    {"processID": True}, {"processID": 0}, {"processID": -1}, {"processID": "4321"},
+    {"purposeCode": True}, {"purposeCode": 3}, {"purposeCode": None},
+    {"workerID": True}, {"workerID": None}, {"workerID": "invalid"},
+    {"workerID": WORKER_ID.upper()}, {"workerID": WORKER_ID.replace("-", "")},
+])
+def test_worker_trace_rejects_invalid_schema_without_native_commands(tmp_path, monkeypatch, capsys, changes):
+    module, watcher, temporary, _ = _worker_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(watcher, "_command", lambda *args, **kwargs: pytest.fail("Invalid requests cannot inspect a PID"))
+    request, identifier = _worker_request(module, temporary, changes=changes)
+    watcher.process_request(request, identifier)
+    assert "statusCode=1" in capsys.readouterr().out
+    assert watcher.profile_count == 0 and not request.exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "duplicate", "oversized", "symlink"])
+def test_worker_trace_rejects_bad_request_files(tmp_path, monkeypatch, capsys, kind):
+    module, watcher, temporary, _ = _worker_fixture(tmp_path, monkeypatch)
+    request, identifier = _worker_request(module, temporary)
+    if kind == "missing":
+        payload = json.loads(request.read_text(encoding="utf-8"))
+        del payload["processID"]
+        request.write_text(json.dumps(payload), encoding="utf-8")
+    elif kind == "duplicate":
+        request.write_text('{"schemaVersion":2,"schemaVersion":2,"requestID":"' + identifier
+                           + '","processID":4321,"purposeCode":0,"workerID":"' + WORKER_ID + '"}', encoding="utf-8")
+    elif kind == "oversized":
+        request.write_text(" " * 4097, encoding="utf-8")
+    else:
+        original = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda path: path == request or original(path))
+    monkeypatch.setattr(watcher, "_command", lambda *args, **kwargs: pytest.fail("Invalid files cannot invoke native tools"))
+    watcher.process_request(request, identifier)
+    assert "statusCode=1" in capsys.readouterr().out
+    assert watcher.profile_count == 0
+    if kind == "symlink":
+        assert request.exists(), "Rejected symlinks are never removed as owned files"
+    else:
+        assert not request.exists()
+
+
+@pytest.mark.parametrize("kind", ["relative", "other_device", "other_app", "symlink", "ancestor_symlink"])
+def test_worker_trace_rejects_pid_with_wrong_executable_identity(tmp_path, monkeypatch, capsys, kind):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    reported = executable
+    if kind == "relative":
+        reported = Path("OfflineTikTokPlayer.app") / "OfflineTikTokPlayer"
+    elif kind == "other_device":
+        reported = Path(str(executable).replace(watcher.udid, "22222222-2222-4222-8222-222222222222"))
+    elif kind == "other_app":
+        reported = executable.parent.parent / "Another.app" / "OfflineTikTokPlayer"
+    elif kind == "symlink":
+        original = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink", lambda path: path == executable or original(path))
+    else:
+        original = Path.resolve
+        monkeypatch.setattr(Path, "resolve", lambda path, *args, **kwargs:
+                            path.parent / "redirected" if path == executable else original(path, *args, **kwargs))
+    calls = _mock_worker_commands(monkeypatch, watcher, reported)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    assert len(calls) == 1 and watcher.profile_count == 0
+    assert "statusCode=2" in capsys.readouterr().out
+
+
+def test_worker_trace_profiles_at_most_once_per_purpose_and_twice_total(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    for purpose in [0, 0, 1, 1]:
+        request, identifier = _worker_request(module, temporary, purpose=purpose)
+        watcher.process_request(request, identifier)
+    assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 2
+    assert len([call for call in calls if call[0][0] == "/usr/bin/xcrun"]) == 1
+    assert watcher.profile_count == 2 and watcher.purposes == {0, 1}
+    output = capsys.readouterr().out
+    assert output.count("statusCode=3") == 2
+    successes = [fields for fields in _worker_results(output) if fields["statusCode"] == "0"]
+    assert [fields["bundleCacheHit"] for fields in successes] == ["0", "1"]
+    assert successes[0]["bundleReturnCode"] == "0"
+    assert successes[1]["bundleReturnCode"] == "-1" and float(successes[1]["bundleElapsedSeconds"]) == 0
+    assert all(fields["stageCode"] == "8" and fields["ownershipCode"] == "1"
+               and fields["psReturnCode"] == "0" for fields in successes)
+
+
+def test_worker_trace_calibration_purpose_is_explicit_and_single_use(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    for _ in range(2):
+        request, identifier = _worker_request(module, temporary, purpose=2)
+        watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert watcher.profile_count == 1 and watcher.purposes == {2}
+    assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 1
+    assert f"purposeCode=2 workerID={WORKER_ID} statusCode=0" in output
+    assert f"purposeCode=2 workerID={WORKER_ID} statusCode=3" in output
+    assert "PRIVATE_" not in output
+
+
+@pytest.mark.parametrize("purposes", [(0, 2, 1), (2, 0, 1), (0, 1, 2)])
+def test_worker_trace_calibration_and_failures_share_the_two_profile_total_cap(tmp_path, monkeypatch, capsys, purposes):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    for purpose in purposes:
+        request, identifier = _worker_request(module, temporary, purpose=purpose)
+        watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert watcher.profile_count == 2 and watcher.purposes == set(purposes[:2])
+    assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 2
+    assert f"purposeCode={purposes[2]} workerID={WORKER_ID} statusCode=3" in output
+
+
+def test_worker_trace_rejects_same_app_name_in_another_bundle_container(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    imposter = (executable.parents[2] / str(uuid.uuid4())
+                / "OfflineTikTokPlayer.app" / "OfflineTikTokPlayer")
+    imposter.parent.mkdir(parents=True)
+    imposter.write_text("same name, different installed bundle identity", encoding="utf-8")
+    calls = _mock_worker_commands(monkeypatch, watcher, imposter, application=executable.parent)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    assert [call[0][0] for call in calls] == ["/bin/ps", "/usr/bin/xcrun"]
+    assert watcher.application == executable.parent
+    assert watcher.profile_count == 0 and not request.exists()
+    assert "statusCode=2" in capsys.readouterr().out
+
+
+def test_worker_trace_app_lookup_timeout_does_not_poison_later_calibration(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    successful_command = watcher._command
+    app_lookups = 0
+
+    def first_app_lookup_times_out(arguments, timeout):
+        nonlocal app_lookups
+        if arguments[0] == "/usr/bin/xcrun":
+            app_lookups += 1
+            if app_lookups == 1:
+                calls.append((arguments, timeout))
+                assert timeout == 1
+                raise subprocess.TimeoutExpired(arguments, timeout)
+        return successful_command(arguments, timeout)
+
+    monkeypatch.setattr(watcher, "_command", first_app_lookup_times_out)
+    request, identifier = _worker_request(module, temporary, purpose=0)
+    watcher.process_request(request, identifier)
+    first_output = capsys.readouterr().out
+    assert "statusCode=11" in first_output and "startUptime=-1.000000" in first_output
+    first_fields = _worker_results(first_output)[0]
+    assert first_fields["stageCode"] == "3" and first_fields["ownershipCode"] == "0"
+    assert first_fields["psReturnCode"] == "0" and first_fields["bundleReturnCode"] == "-1"
+    assert first_fields["bundleCacheHit"] == "0"
+    assert watcher.profile_count == 0 and watcher.purposes == set()
+    assert watcher.application is None
+    assert not any(call[0][0] == "/usr/bin/sample" for call in calls)
+
+    # A distinct later request must be able to validate the same exact app;
+    # timing out before profiling must not cache an unverified None forever.
+    request, identifier = _worker_request(module, temporary, purpose=2)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert app_lookups == 2, "Only successfully validated app paths may be cached"
+    assert f"purposeCode=2 workerID={WORKER_ID} statusCode=0" in output
+    fields = _worker_results(output)[0]
+    assert fields["stageCode"] == "8" and fields["ownershipCode"] == "1"
+    assert fields["bundleCacheHit"] == "0" and fields["bundleReturnCode"] == "0"
+    assert watcher.application == executable.parent
+    assert watcher.profile_count == 1 and watcher.purposes == {2}
+    assert len([call for call in calls if call[0][0] == "/usr/bin/sample"]) == 1
+
+
+@pytest.mark.parametrize("command_name,stage", [("/bin/ps", "1"), ("/usr/bin/xcrun", "3")])
+def test_worker_trace_preflight_timeout_reports_exact_stage_without_profiling(tmp_path, monkeypatch, capsys, command_name, stage):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    successful_command = watcher._command
+
+    def command(arguments, timeout):
+        if arguments[0] == command_name:
+            calls.append((arguments, timeout))
+            assert timeout == 1
+            raise subprocess.TimeoutExpired(arguments, timeout)
+        return successful_command(arguments, timeout)
+
+    monkeypatch.setattr(watcher, "_command", command)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    fields = _worker_results(output)[0]
+    assert fields["statusCode"] == "11" and fields["stageCode"] == stage
+    assert fields["ownershipCode"] == "0" and fields["startUptime"] == "-1.000000"
+    assert fields["psReturnCode"] == ("-1" if stage == "1" else "0")
+    assert fields["bundleReturnCode"] == "-1" and fields["bundleCacheHit"] == "0"
+    assert float(fields["psElapsedSeconds"]) >= 0 and float(fields["bundleElapsedSeconds"]) >= 0
+    assert watcher.profile_count == 0 and watcher.purposes == set()
+    assert not any(call[0][0] == "/usr/bin/sample" for call in calls)
+    assert "PRIVATE_" not in output
+
+
+@pytest.mark.parametrize("command_name,stage,ownership,status", [
+    ("/bin/ps", "1", "2", "5"), ("/usr/bin/xcrun", "3", "4", "2"),
+])
+def test_worker_trace_preflight_nonzero_reports_stage_and_returncode(tmp_path, monkeypatch, capsys, command_name, stage, ownership, status):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    calls = _mock_worker_commands(monkeypatch, watcher, executable)
+    successful_command = watcher._command
+
+    def command(arguments, timeout):
+        if arguments[0] == command_name:
+            calls.append((arguments, timeout))
+            assert timeout == 1
+            return subprocess.CompletedProcess(arguments, 19, "", "PRIVATE_ERROR")
+        return successful_command(arguments, timeout)
+
+    monkeypatch.setattr(watcher, "_command", command)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    fields = _worker_results(output)[0]
+    assert fields["statusCode"] == status and fields["stageCode"] == stage
+    assert fields["ownershipCode"] == ownership and fields["startUptime"] == "-1.000000"
+    assert fields["psReturnCode"] == ("19" if stage == "1" else "0")
+    assert fields["bundleReturnCode"] == ("19" if stage == "3" else "-1")
+    assert watcher.profile_count == 0 and not any(call[0][0] == "/usr/bin/sample" for call in calls)
+    assert "PRIVATE_" not in output
+
+
+def test_worker_trace_limits_request_processing_and_seen_ids_to_32(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, _ = _worker_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(watcher, "_command", lambda *args, **kwargs: pytest.fail("Invalid payloads must not invoke native tools"))
+    for _ in range(40):
+        request, identifier = _worker_request(module, temporary, changes={"extra": 1})
+        watcher.process_request(request, identifier)
+        watcher.process_request(request, identifier)
+    assert watcher.processed == len(watcher.seen) == 32
+    assert capsys.readouterr().out.count("NativeWorkerTraceResult") == 32
+
+
+@pytest.mark.parametrize("failure,status", [(FileNotFoundError(), 6), (PermissionError(), 7),
+                                           (subprocess.TimeoutExpired("sample", 4), 11)])
+def test_worker_trace_reports_unavailable_protected_and_timed_out_sampling(tmp_path, monkeypatch, capsys, failure, status):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    _mock_worker_commands(monkeypatch, watcher, executable, failure=failure)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert f"statusCode={status}" in output
+    fields = _worker_results(output)[0]
+    assert fields["stageCode"] == "6" and fields["ownershipCode"] == "1"
+    assert fields["psReturnCode"] == fields["bundleReturnCode"] == "0"
+    assert watcher.profile_count == 1 and watcher.purposes == {0}
+    assert not request.exists() and not list(temporary.glob("*.sample.txt"))
+
+
+def test_worker_trace_rejects_oversized_report_and_keeps_existing_files(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "WORKER_REPORT_LIMIT", 32)
+    _mock_worker_commands(monkeypatch, watcher, executable, report="x" * 33)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    assert "statusCode=9" in capsys.readouterr().out
+    assert not list(temporary.glob("*.sample.txt"))
+    request, identifier = _worker_request(module, temporary, purpose=1)
+    existing = temporary / f"{module.WORKER_PREFIX}{identifier}.sample.txt"
+    existing.write_text("preserve existing file", encoding="utf-8")
+    watcher.process_request(request, identifier)
+    assert "statusCode=9" in capsys.readouterr().out
+    assert existing.read_text(encoding="utf-8") == "preserve existing file"
+
+
+def test_worker_trace_filter_is_bounded_and_does_not_emit_other_sections():
+    module = _capture_helper()
+    section, truncated, queue_count = module.worker_section(WORKER_SAMPLE, WORKER_ID)
+    assert "synthetic_worker_frame" in section and "PRIVATE_" not in section
+    assert not truncated and queue_count == 2
+    report = f"Call graph:\n    1 Thread_1 DispatchQueue_1: OfflineTikTokPlayer.PCMDecode.{WORKER_ID} (serial)\n" + "    + 1 " + "x" * 70_000
+    section, truncated, _ = module.worker_section(report, WORKER_ID)
+    assert truncated and len(section.encode("utf-8")) <= 64 * 1024
+    section, _, queue_count = module.worker_section("PRIVATE_REPORT_HEADER\nCall graph:\n    1 Thread_1 DispatchQueue_1: other\n    + 1 PRIVATE_OTHER\n", WORKER_ID)
+    assert queue_count == 0
+    assert not section
+
+
+def test_worker_trace_rejects_missing_requested_decoder_without_emitting_another(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, executable = _worker_fixture(tmp_path, monkeypatch)
+    report = (f"Call graph:\n    1 Thread_1 DispatchQueue_1: OfflineTikTokPlayer.PCMDecode.{OTHER_WORKER_ID} (serial)\n"
+              "    + 1 PRIVATE_WRONG_DECODER\nBinary Images:\nPRIVATE_IMAGE\n")
+    _mock_worker_commands(monkeypatch, watcher, executable, report=report)
+    request, identifier = _worker_request(module, temporary)
+    watcher.process_request(request, identifier)
+    output = capsys.readouterr().out
+    assert "statusCode=10" in output and "decoderQueueCount=1" in output
+    assert "PRIVATE_" not in output and OTHER_WORKER_ID not in output
+    assert f"workerID={WORKER_ID}" in output
+
+
+@pytest.mark.parametrize("worker_id", ["", WORKER_ID.upper(), "OfflineTikTokPlayer.PCMDecode", True])
+def test_worker_trace_filter_requires_canonical_worker_uuid(worker_id):
+    module = _capture_helper()
+    with pytest.raises(ValueError):
+        module.worker_section(WORKER_SAMPLE, worker_id)
+
+
+def test_worker_trace_expired_deadline_never_invokes_native_tools(tmp_path, monkeypatch, capsys):
+    module, watcher, temporary, _ = _worker_fixture(tmp_path, monkeypatch)
+    request, identifier = _worker_request(module, temporary)
+    monkeypatch.setattr(module, "DEADLINE", module.time.monotonic() - 1)
+    monkeypatch.setattr(watcher, "_command", lambda *args, **kwargs: pytest.fail("Expired work must not invoke native tools"))
+    watcher.process_request(request, identifier)
+    assert "statusCode=4" in capsys.readouterr().out and watcher.profile_count == 0
+
+
+def test_worker_trace_native_wait_clamps_to_remaining_deadline(tmp_path, monkeypatch):
+    module, watcher, _, _ = _worker_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(module, "DEADLINE", 100.025)
+    waits = []
+
+    class Completed:
+        returncode = 0
+        def communicate(self, timeout):
+            waits.append(timeout)
+            return "synthetic output", None
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Completed())
+    result = watcher._command(["/bin/ps", "-ww", "-p", "4321", "-o", "comm="], timeout=4)
+    assert result.returncode == 0 and waits and max(waits) <= 0.025_001
+
+
+def test_worker_trace_stop_interrupts_and_kills_pending_command(tmp_path, monkeypatch):
+    module, watcher, _, _ = _worker_fixture(tmp_path, monkeypatch)
+    killed = []
+
+    class Pending:
+        returncode = None
+        def communicate(self, timeout):
+            if self.returncode is not None:
+                return "", None
+            watcher.stop.set()
+            raise subprocess.TimeoutExpired("synthetic command", timeout)
+        def poll(self):
+            return self.returncode
+        def kill(self):
+            killed.append(True)
+            self.returncode = -9
+
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Pending())
+    with pytest.raises(module.WorkerTraceStopped):
+        watcher._command(["/usr/bin/sample", "4321", "1", "100", "-file", "synthetic"], timeout=4)
+    assert killed == [True]
+
+
+def test_worker_trace_sigterm_requests_stop_and_unwinds_main_cleanup():
+    module = _capture_helper()
+    stop = threading.Event()
+    with pytest.raises(SystemExit) as error:
+        module.trace_termination_handler(stop)(module.signal.SIGTERM, None)
+    assert error.value.code == 0 and stop.is_set()
