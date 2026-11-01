@@ -15,6 +15,10 @@ class MediaTools:
     def __init__(self, ffmpeg="ffmpeg", ffprobe="ffprobe"):
         self.ffmpeg, self.ffprobe = ffmpeg, ffprobe
 
+    def loudness(self, path):
+        from .audio_analysis import analyze_loudness
+        return analyze_loudness(path, ffmpeg=self.ffmpeg)
+
     def _run(self, args):
         args = list(args)
         remote = any(str(value).startswith(("https://", "http://127.0.0.1:")) for value in args)

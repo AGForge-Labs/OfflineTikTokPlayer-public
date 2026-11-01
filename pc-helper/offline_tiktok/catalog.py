@@ -32,6 +32,37 @@ class AssetRef:
 
 
 @dataclass
+class AudioLoudness:
+    asset_sha256: str
+    integrated_lufs: float
+    true_peak_dbtp: float
+    version: int = 1
+
+    def validate(self):
+        if type(self.version) is not int or self.version != 1:
+            raise ValueError("Unsupported loudness measurement version")
+        if not isinstance(self.asset_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", self.asset_sha256):
+            raise ValueError("Loudness measurement needs its source checksum")
+        for value, lower, upper in ((self.integrated_lufs, -70, 10), (self.true_peak_dbtp, -100, 20)):
+            if type(value) not in (int, float) or not math.isfinite(value) or not lower <= value <= upper:
+                raise ValueError("Invalid loudness measurement")
+
+    def wire(self):
+        self.validate()
+        return dict(version=self.version, assetSHA256=self.asset_sha256,
+                    integratedLUFS=self.integrated_lufs, truePeakDBTP=self.true_peak_dbtp)
+
+    @classmethod
+    def decode(cls, data):
+        try:
+            result = cls(data["assetSHA256"], data["integratedLUFS"], data["truePeakDBTP"], data["version"])
+        except (KeyError, TypeError):
+            raise ValueError("Incomplete loudness measurement") from None
+        result.validate()
+        return result
+
+
+@dataclass
 class MediaItem:
     id: str
     title: str
@@ -43,19 +74,24 @@ class MediaItem:
     asset: AssetRef | None = None
     original: AssetRef | None = None
     artwork: AssetRef | None = None
+    audio_loudness: AudioLoudness | None = None
 
     def wire(self):
-        return dict(id=self.id, title=self.title, creator=self.creator, sourceURL=self.source_url,
+        result = dict(id=self.id, title=self.title, creator=self.creator, sourceURL=self.source_url,
                     duration=self.duration, kind=self.kind, status=self.status,
                     asset=self.asset.wire() if self.asset else None,
                     original=self.original.wire() if self.original else None,
                     artwork=self.artwork.wire() if self.artwork else None)
+        if self.audio_loudness is not None:
+            result["audioLoudness"] = self.audio_loudness.wire()
+        return result
 
     @classmethod
     def decode(cls, data):
         return cls(data["id"], data["title"], data.get("creator", ""), data.get("sourceURL", ""),
                    data.get("duration", 0), data.get("kind", "video"), data.get("status", "ready"),
-                   *[AssetRef.decode(data[key]) if data.get(key) else None for key in ("asset", "original", "artwork")])
+                   *[AssetRef.decode(data[key]) if data.get(key) else None for key in ("asset", "original", "artwork")],
+                   AudioLoudness.decode(data["audioLoudness"]) if data.get("audioLoudness") is not None else None)
 
 
 @dataclass
@@ -93,6 +129,8 @@ class Catalog:
             for ref in (item.asset, item.original, item.artwork):
                 if ref:
                     ref.validate()
+            if item.audio_loudness is not None:
+                item.audio_loudness.validate()
         for playlist in self.playlists:
             if not playlist.id or len(set(playlist.item_ids)) != len(playlist.item_ids):
                 raise ValueError("Invalid playlist identity or duplicate membership")

@@ -80,6 +80,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
         let rate = try await measuredRate(fixture, audioLag: 0.055)
+        XCTAssertGreaterThan(fixture.clockAlignments, 0, "An unrenderable clock must request owner-qualified alignment")
         XCTAssertGreaterThan(rate, 40, "An accepted native clock lead must not consume and discard every frame")
     }
 
@@ -207,6 +208,7 @@ private final class PresentedVideo {
     let player: AVPlayer
     let window: UIWindow
     private(set) var nativeGeometry = false
+    private(set) var clockAlignments = 0
     private var oldKey: UIWindow?
     private var resource: ContinuousPictureInPicture.PreparedVideoResource?
     var usedNativeGeometry: Bool { resource?.debugUsesNativeGeometry ?? false }
@@ -233,6 +235,14 @@ private final class PresentedVideo {
             .url(forResource: resourceName, withExtension: "mp4"))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let fixture = PresentedVideo(url: url, scene: scene)
+        fixture.bridge.onClockAlignmentRequired = { [weak fixture] ticket in
+            guard let fixture else { return }
+            fixture.clockAlignments += 1
+            let position = fixture.player.currentTime().seconds
+            if fixture.bridge.installTimeline(ticket, positionSeconds: position, durationSeconds: 6, isPlaying: true) {
+                _ = fixture.bridge.activate(ticket)
+            }
+        }
         fixture.nativeGeometry = nativeGeometry
         do {
             let plan = nativeGeometry

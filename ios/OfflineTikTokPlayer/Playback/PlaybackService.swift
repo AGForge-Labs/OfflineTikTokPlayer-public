@@ -194,7 +194,7 @@ final class PlaybackService: NSObject {
     enum DebugVideoSeekReason: Int, Sendable {
         case unattributed = 0, readyRestore = 1, readyRewind = 2, sourceVisit = 3, drift = 4
         case userPausedSeek = 5, latestPausedTarget = 6, foreground = 7
-        case pipRestore = 8, surfaceRestore = 9, preparedPausedSource = 10
+        case pipRestore = 8, surfaceRestore = 9, preparedPausedSource = 10, frameClockAlignment = 11
     }
     struct DebugVideoSeekStamp: Sendable {
         let reason: DebugVideoSeekReason
@@ -682,6 +682,7 @@ final class PlaybackService: NSObject {
         continuousPiP.onEvent = { [weak self] event, code in self?.handlePiPEvent(event, code: code) }
         continuousPiP.onCurrentFrameInvalidated = { [weak self] in self?.invalidateVideoReadiness() }
         continuousPiP.onCurrentFrameStateChanged = { [weak self] in self?.ensureCurrentFrameMonitor() }
+        continuousPiP.onClockAlignmentRequired = { [weak self] ticket in self?.alignVideoPresentationClock(ticket) }
         if audioOnly { applyPresentation(PlaybackPresentationPolicy.Actions()) }
         configureAudio(); installObservers(); installRemoteControls()
         audioPollTask = Task { [weak self] in
@@ -2204,6 +2205,48 @@ final class PlaybackService: NSObject {
                 && presentation?.ticket == returnedPresentation?.ticket))
     }
     #endif
+
+    /// A 55 ms native lead is below ordinary drift tolerance but outside the
+    /// output's displayable window. Align against the exact audible owner.
+    private func alignVideoPresentationClock(_ ticket: ContinuousPictureInPicture.PresentationTicket) {
+        guard intent.canPlay, videoAllowed, audioLoadingID == nil, syncingVideoGeneration != generation,
+              nativeSeekTicket == nil, statusHandledGeneration == generation,
+              let item = observedItem, let presentation = videoPresentation,
+              presentation.request == generation, presentation.ticket == ticket,
+              continuousPiP.activeTimelineReceipt(for: ticket) != nil else { return }
+        let request = generation, pcm = continuousAudio.isSelected
+        let before = continuousAudio.snapshot
+        if pcm {
+            guard before.token > 0, before.token == audioToken, before.visit == audioVisit,
+                  continuousAudio.selectedID == queue.currentID, !before.ended,
+                  !continuousAudio.isSelectionPending(in: before) else { return }
+        } else { guard usesNativeAudio else { return } }
+        let nativePosition = item.currentTime().seconds
+        let selected = player.currentItem === item
+        let position = pcm ? continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock())) : nativePosition
+        let fresh = continuousAudio.snapshot
+        guard selected, generation == request, observedItem === item, intent.canPlay, videoAllowed,
+              videoPresentation?.ticket == ticket, nativePosition.isFinite, position.isFinite,
+              continuousPiP.activeTimelineReceipt(for: ticket) != nil else { return }
+        if pcm {
+            guard continuousAudio.isSelected, fresh.token == before.token, fresh.visit == before.visit,
+                  fresh.selectionVersion == before.selectionVersion, !fresh.ended else { return }
+            if abs(nativePosition - position) > 1.0 / 30 {
+                #if DEBUG
+                synchronizeVideoToAudio(force: true, reason: .frameClockAlignment)
+                #else
+                synchronizeVideoToAudio(force: true)
+                #endif
+                return
+            }
+        } else { guard usesNativeAudio, !continuousAudio.isSelected else { return } }
+        // The native audio clock must never be sought for a layer-clock repair.
+        // Reanchor only the sample-buffer presentation clock, retaining its image.
+        guard continuousPiP.installTimeline(ticket, positionSeconds: position,
+            durationSeconds: clock.duration, isPlaying: true), generation == request,
+            intent.canPlay, videoAllowed, observedItem === item, videoPresentation?.ticket == ticket else { return }
+        _ = continuousPiP.activate(ticket)
+    }
 
     /// Repair a missing picture even if the muted native clock still advances.
     /// No audio selection, audio seek or queue mutation is authorized by this path.

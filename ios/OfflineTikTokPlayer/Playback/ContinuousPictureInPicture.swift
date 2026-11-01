@@ -5,6 +5,7 @@ import CoreVideo
 import Foundation
 import UIKit
 import CoreFoundation
+import IOSurface
 import PlayerCore
 
 /// A video-only PiP surface. Its supported sample-buffer delegate forwards user commands to
@@ -12,6 +13,36 @@ import PlayerCore
 /// The caller must add displayLayer to its visible inline surface and keep its bounds current.
 @MainActor
 final class ContinuousPictureInPicture: NSObject {
+    /// The renderer returns another CVPixelBuffer wrapper around the submitted
+    /// IOSurface and drops custom attachments. Keep only a bounded identity/PTS
+    /// table for this epoch, never a decoded-frame queue or pixel copies.
+    @MainActor fileprivate final class FrameSurfaces {
+        private struct Entry {
+            let buffer: ObjectIdentifier
+            let surface: UInt32?
+            let position: Double
+        }
+        private var entries: [Entry?] = Array(repeating: nil, count: 8)
+        private var next = 0
+        private func surfaceID(_ pixel: CVPixelBuffer) -> UInt32? {
+            CVPixelBufferGetIOSurface(pixel).map { IOSurfaceGetID($0.takeUnretainedValue()) }
+        }
+        func record(_ pixel: CVPixelBuffer, position: Double) {
+            let entry = Entry(buffer: ObjectIdentifier(pixel), surface: surfaceID(pixel), position: position)
+            if let index = entries.firstIndex(where: { old in
+                old.map { $0.buffer == entry.buffer || (entry.surface != nil && $0.surface == entry.surface) } ?? false
+            }) { entries[index] = entry }
+            else { entries[next] = entry; next = (next + 1) % entries.count }
+        }
+        func position(for pixel: CVPixelBuffer?) -> Double? {
+            guard let pixel else { return nil }
+            let buffer = ObjectIdentifier(pixel), surface = surfaceID(pixel)
+            for entry in entries {
+                if let entry, entry.buffer == buffer || (surface != nil && entry.surface == surface) { return entry.position }
+            }
+            return nil
+        }
+    }
     struct PresentationTicket: Equatable, Sendable {
         fileprivate let generation: Int
         fileprivate let item: ObjectIdentifier
@@ -27,15 +58,18 @@ final class ContinuousPictureInPicture: NSObject {
         let output: ObjectIdentifier
         let imageEpoch: UInt64
         let seekSerial: UInt64
-        let displayMarker: String
+        fileprivate let surfaces: FrameSurfaces
+
+        nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.ticket == rhs.ticket && lhs.output == rhs.output && lhs.imageEpoch == rhs.imageEpoch
+                && lhs.seekSerial == rhs.seekSerial && lhs.surfaces === rhs.surfaces
+        }
 
         @MainActor func matchesDisplayedImage(in layer: AVSampleBufferDisplayLayer) -> Bool {
             matchesDisplayedPixel(layer.sampleBufferRenderer.displayedPixelBuffer())
         }
         @MainActor fileprivate func matchesDisplayedPixel(_ pixel: CVPixelBuffer?) -> Bool {
-            guard let pixel,
-                  let value = CVBufferCopyAttachment(pixel, ContinuousPictureInPicture.displayedEpochKey, nil) as? String else { return false }
-            return value == displayMarker
+            surfaces.position(for: pixel) != nil
         }
     }
     /// Ownership of an installed, active timeline. This never credits an image.
@@ -46,9 +80,7 @@ final class ContinuousPictureInPicture: NSObject {
         let seekSerial: UInt64
     }
     private var imageEpoch: UInt64 = 0
-    private static let displayedEpochKey = "dev.galaxybigbird.OfflineTikTokPlayer.displayEpoch" as CFString
-    private static let displayedPositionKey = "dev.galaxybigbird.OfflineTikTokPlayer.displayPosition" as CFString
-    private var imageMarker = UUID().uuidString
+    private var surfaceProof = FrameSurfaces()
     private var imageEpochSaturated = false
     private var submittedReceipt: CurrentFrameReceipt?
     private var readinessMutationDepth = 0
@@ -57,6 +89,7 @@ final class ContinuousPictureInPicture: NSObject {
     /// and service mutations, so a callback cannot adopt a half-installed source.
     var onCurrentFrameInvalidated: (() -> Void)?
     var onCurrentFrameStateChanged: (() -> Void)?
+    var onClockAlignmentRequired: ((PresentationTicket) -> Void)?
 
     func beginReadinessUpdates() { readinessMutationDepth += 1 }
     func endReadinessUpdates() {
@@ -69,7 +102,7 @@ final class ContinuousPictureInPicture: NSObject {
     @discardableResult
     private func invalidateCurrentFrameProof() -> UInt64 {
         submittedReceipt = nil
-        imageMarker = UUID().uuidString
+        surfaceProof = FrameSurfaces()
         if imageEpoch == .max { imageEpochSaturated = true }
         else { imageEpoch += 1 }
         lastEnqueuedTime = .invalid
@@ -102,10 +135,9 @@ final class ContinuousPictureInPicture: NSObject {
     func displayedFramePosition(for ticket: PresentationTicket) -> Double? {
         guard let receipt = currentFrameReceipt(for: ticket),
               let pixel = displayLayer.sampleBufferRenderer.displayedPixelBuffer(),
-              receipt.matchesDisplayedPixel(pixel),
-              let value = CVBufferCopyAttachment(pixel, Self.displayedPositionKey, nil) as? NSNumber,
-              value.doubleValue.isFinite, currentFrameReceipt(for: ticket) == receipt else { return nil }
-        return value.doubleValue
+              let position = receipt.surfaces.position(for: pixel),
+              position.isFinite, currentFrameReceipt(for: ticket) == receipt else { return nil }
+        return position
     }
     /// Cached proof only. A completed paused seek may still await its first image.
     func activeTimelineReceipt(for ticket: PresentationTicket) -> ActiveTimelineReceipt? {
@@ -1169,6 +1201,7 @@ final class ContinuousPictureInPicture: NSObject {
         onEvent = nil
         onCurrentFrameInvalidated = nil
         onCurrentFrameStateChanged = nil
+        onClockAlignmentRequired = nil
     }
 
     private func startFrameTimer() {
@@ -1276,7 +1309,7 @@ final class ContinuousPictureInPicture: NSObject {
         let pullReceipt = CurrentFrameReceipt(
             ticket: PresentationTicket(generation: presentationRevision, item: ObjectIdentifier(item)),
             output: ObjectIdentifier(videoOutput), imageEpoch: imageEpoch, seekSerial: seekTicket,
-            displayMarker: imageMarker)
+            surfaces: surfaceProof)
         #if DEBUG
         debugWholeStage = .ownerGuard
         #endif
@@ -1352,9 +1385,26 @@ final class ContinuousPictureInPicture: NSObject {
             // decoder's frame boundary even with 60 display callbacks per second.
             let mapped = videoOutput.itemTime(forHostTime: targetHostTime)
             guard ownsFramePull(pullReceipt) else { return }
-            if mapped.isNumeric, presentationTime.isNumeric,
-               VideoFrameRequest.usesNativeDeadline(presentation: presentationTime.seconds, mapped: mapped.seconds) {
-                requestedTime = mapped
+            if mapped.isNumeric, presentationTime.isNumeric {
+                if VideoFrameRequest.usesNativeDeadline(presentation: presentationTime.seconds, mapped: mapped.seconds) {
+                    requestedTime = mapped
+                } else if mapped.seconds - presentationTime.seconds > 1.0 / 30 {
+                    let nativeNow = videoOutput.itemTime(forHostTime: CACurrentMediaTime())
+                    guard ownsFramePull(pullReceipt) else { return }
+                    if nativeNow.isNumeric,
+                       VideoFrameRequest.usesNativeDeadline(presentation: presentationTime.seconds, mapped: nativeNow.seconds) {
+                        // Vsync prediction can cross the lead budget even while
+                        // the native clock itself is valid. Clamp that prediction.
+                        requestedTime = CMTimeMinimum(mapped, CMTimeAdd(presentationTime, CMTime(value: 1, timescale: 30)))
+                    } else if nativeNow.isNumeric && nativeNow.seconds - presentationTime.seconds > 1.0 / 30 {
+                        // The output cannot supply indefinitely old images.
+                        // Align through the audible owner before consuming them.
+                        onClockAlignmentRequired?(pullReceipt.ticket)
+                        return
+                    }
+                }
+                // A stopped/starting native clock keeps the existing grace and
+                // recovery policy rather than starting repeated startup seeks.
             }
         }
         #if DEBUG
@@ -1485,10 +1535,6 @@ final class ContinuousPictureInPicture: NSObject {
         debugWholeStage = .sampleGuard
         #endif
         guard status == noErr, let sample else { reportFrameFailure(status); return }
-        // Carry ownership with the actual pixels. Layer readiness can remain true
-        // after a retaining flush; it is not incoming-image proof by itself.
-        CVBufferSetAttachment(pixel, Self.displayedEpochKey, pullReceipt.displayMarker as CFString, .shouldPropagate)
-        CVBufferSetAttachment(pixel, Self.displayedPositionKey, NSNumber(value: displayTime.seconds), .shouldPropagate)
         #if DEBUG
         let debugAlignedBeforeEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #endif
@@ -1515,6 +1561,7 @@ final class ContinuousPictureInPicture: NSObject {
         #if DEBUG
         debugWholeStage = .imageCredit
         #endif
+        pullReceipt.surfaces.record(pixel, position: displayTime.seconds)
         lastEnqueuedTime = displayTime
         lastFramePositionSeconds = CMTimeGetSeconds(displayTime)
         submittedFrameCount &+= 1

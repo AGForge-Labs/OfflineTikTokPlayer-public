@@ -22,6 +22,15 @@ def test_helper_catalog_matches_the_shared_wire_contract():
     contract().validate(wire_catalog())
 
 
+def test_optional_measured_loudness_matches_the_shared_contract():
+    data = wire_catalog()
+    data["media"][0]["audioLoudness"] = dict(version=1, assetSHA256="a" * 64,
+        integratedLUFS=-26.27, truePeakDBTP=-11.36)
+    contract().validate(data)
+    data["media"][0]["audioLoudness"]["version"] = 2
+    assert list(contract().iter_errors(data))
+
+
 @pytest.mark.parametrize("change", ["future-schema", "missing-ready-asset", "temporary-url", "fractional-size", "invalid-checksum", "duplicate-membership"])
 def test_shared_contract_rejects_unsafe_or_incompatible_catalogs(change):
     data = wire_catalog()

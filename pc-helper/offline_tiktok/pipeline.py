@@ -57,6 +57,16 @@ class ImportPipeline:
                 self.progress(f"{index}/{len(items)}: {'will retry' if retry_failures else 'unavailable'} {item.id}; {reason}")
             else:
                 item.duration = result.duration
+                analyzer = getattr(getattr(self.downloader, "tools", None), "loudness", None)
+                if analyzer is not None:
+                    try:
+                        item.audio_loudness = analyzer(result.playback)
+                    except Exception:
+                        # Analysis is optional metadata, never a reason to lose a
+                        # successfully archived video. A later audit can retry it.
+                        item.audio_loudness = None
+                        self.progress(f"Loudness analysis pending for {item.id}; original audio remains playable")
+                    self._check()
                 self.store.save_local(item, result.original, result.playback, result.artwork)
                 self.progress(f"{index}/{len(items)}: prepared {item.id}")
         if self.workers == 1:
