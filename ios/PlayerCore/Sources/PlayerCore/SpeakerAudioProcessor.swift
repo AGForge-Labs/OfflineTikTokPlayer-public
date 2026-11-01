@@ -51,6 +51,7 @@ public final class SpeakerAudioProcessor {
     private var wet = 0.0
     private var heldPeak = 0.0
     private var peakHoldRemaining = 0
+    private var normalizationGain: Double?
 
     public init(sampleRate: Double, channels: Int, enabled: Bool) {
         let valid = sampleRate.isFinite && sampleRate >= 16000 && sampleRate <= 192000 && (1...8).contains(channels)
@@ -69,15 +70,25 @@ public final class SpeakerAudioProcessor {
         signal = Array(repeating: 0, count: count)
     }
 
-    /// Render-thread configuration, called at a source span boundary.
-    public func setNormalizationGainDB(_ gain: Double?) {}
+    /// Configure before processing; the render path receives the precomputed scalar.
+    public func setNormalizationGainDB(_ gain: Double?) {
+        useNormalizationGain(Self.linearNormalizationGain(for: gain))
+    }
+
+    static func linearNormalizationGain(for gain: Double?) -> Double? {
+        guard let gain, gain.isFinite, (-12...24).contains(gain) else { return nil }
+        return pow(10, gain / 20)
+    }
+
+    /// No allocation or coefficient calculation when a renderer changes source spans.
+    func useNormalizationGain(_ gain: Double?) { normalizationGain = gain }
 
     public func process(_ frame: UnsafeMutableBufferPointer<Float>) {
         guard enabled, frame.count == bass.count else { return }
         wet = min(1, wet + rampStep)
         var peak = 0.0
         for channel in frame.indices {
-            let dry = frame[channel].isFinite ? Double(frame[channel]) : 0
+            let dry = frame[channel].isFinite ? Double(frame[channel]) * (normalizationGain ?? 1) : 0
             let shaped = presence[channel].sample(bass[channel].sample(dry))
             let value = dry + wet * (shaped - dry)
             signal[channel] = value
@@ -91,7 +102,10 @@ public final class SpeakerAudioProcessor {
         let targetCompression = level > 0.18 ? sqrt(0.18 / level) : 1
         let coefficient = targetCompression < compression ? compressionAttack : compressionRecovery
         compression = targetCompression + (compression - targetCompression) * coefficient
-        let gain = 1 + wet * (makeupGain * compression - 1)
+        // Measured input already has its track gain. Applying the old 9dB again
+        // would push matched songs into the limiter and flatten their bass.
+        let makeup = normalizationGain == nil ? makeupGain : 1
+        let gain = 1 + wet * (makeup * compression - 1)
         peak *= gain
         // Peak protection shares gain across channels and recovers quickly. No sample delay.
         // About 1dB of sample headroom. This is not a true-peak limiter.

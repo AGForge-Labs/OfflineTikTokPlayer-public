@@ -18,6 +18,7 @@ public final class ContinuousPCMSource: @unchecked Sendable {
     // This is never waited on by the audio thread. A failed retirement changes nothing.
     private let access = Atomic<Int>(0)
     fileprivate let successor = Atomic<Int>(0)
+    fileprivate let normalizationGainBits = Atomic<UInt64>(Double.nan.bitPattern)
     private let count = Atomic<Int64>(0)
     private let prefixCount = Atomic<Int>(0)
     private let requestEpoch = Atomic<Int>(0)
@@ -86,6 +87,7 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         guard access.compareExchange(expected: 0, desired: 2, ordering: .acquiringAndReleasing).exchanged else { return false }
         defer { access.store(0, ordering: .releasing) }
         let frames = samples.count / channels
+        normalizationGainBits.store(Double.nan.bitPattern, ordering: .releasing)
         warmNextVisitToken = 0
         if let base = samples.baseAddress { prefix.update(from: base, count: samples.count) }
         count.store(totalFrames, ordering: .releasing)
@@ -466,7 +468,13 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     public func setSpeakerEnabled(_ value: Bool) { enhance.store(value, ordering: .releasing) }
 
     /// Serial control owner; a token always names one retained preparation.
-    public func setNormalizationGainDB(_ gain: Double?, for token: Int) {}
+    public func setNormalizationGainDB(_ gain: Double?, for token: Int) {
+        guard token > 0, let source = find(token) else { return }
+        // The serial control owner also owns retirement/entry replacement, so
+        // this non-suspending token lookup cannot configure a reused slot.
+        let linear = SpeakerAudioProcessor.linearNormalizationGain(for: gain)
+        source.normalizationGainBits.store((linear ?? .nan).bitPattern, ordering: .releasing)
+    }
 
     /// Coherent source-frame cursor. Read off the audio thread.
     public var snapshot: Snapshot {
@@ -602,6 +610,10 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     continue
                 }
                 var starved = false
+                if shouldEnhance {
+                    let gain = Double(bitPattern: source.normalizationGainBits.load(ordering: .acquiring))
+                    speaker.useNormalizationGain(gain.isFinite ? gain : nil)
+                }
                 // Hold the single-reader claim for this source span. Decoder ring
                 // writes remain independent; retirement never races a live span.
                 while outputFrame < frameCount, cursor < total {
