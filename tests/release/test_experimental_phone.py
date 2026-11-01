@@ -111,6 +111,11 @@ class ExperimentalPhoneTests(unittest.TestCase):
             digest = hashlib.sha256(signer.read_bytes()).hexdigest()
             data = {(control, "rev-parse", "HEAD"): self.sha,
                     (candidate, "rev-parse", "HEAD"): phone.SOURCE,
+                    (candidate, "rev-parse", "HEAD^"): "6489eafb55ee67358e9aaf203368f27de8b5fc6b",
+                    (candidate, "diff", "--name-only", "6489eafb55ee67358e9aaf203368f27de8b5fc6b", phone.SOURCE):
+                        "ios/OfflineTikTokPlayer/Playback/PlaybackService.swift\n"
+                        "ios/OfflineTikTokPlayer/UI/SettingsView.swift\n"
+                        "ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift",
                     (candidate, "rev-parse", "HEAD:ios/OfflineTikTokPlayer"): phone.APP_TREE,
                     (candidate, "rev-parse", "HEAD:ios/PlayerCore"): phone.CORE_TREE,
                     (control, "status", "--porcelain", "--untracked-files=all"): "",

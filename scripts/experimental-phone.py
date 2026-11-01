@@ -10,10 +10,16 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE = "6489eafb55ee67358e9aaf203368f27de8b5fc6b"
-APP_TREE = "5111ed2e1d011c81c3b88b8a64e88564cad60caa"
+SOURCE_BASE = "6489eafb55ee67358e9aaf203368f27de8b5fc6b"
+SOURCE = "0c304fff59e385fb963a51d89eb61f6a6dbbe2d4"
+APP_TREE = "084542abd55e30e3fed832d9f1688cbd142e82a4"
 CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
+SOURCE_CHANGES = (
+    "ios/OfflineTikTokPlayer/Playback/PlaybackService.swift",
+    "ios/OfflineTikTokPlayer/UI/SettingsView.swift",
+    "ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift",
+)
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
            "APPLE_PROVISIONING_PROFILE_BASE64", "APP_STORE_CONNECT_KEY_BASE64")
@@ -103,6 +109,8 @@ def verify_checkouts(control, candidate, expected, *, git=None, signer_sha=SIGNE
                                            stdin=subprocess.DEVNULL, timeout=10).decode().strip()
     pins = {(control, "rev-parse", "HEAD"): expected,
             (candidate, "rev-parse", "HEAD"): SOURCE,
+            (candidate, "rev-parse", "HEAD^"): SOURCE_BASE,
+            (candidate, "diff", "--name-only", SOURCE_BASE, SOURCE): "\n".join(SOURCE_CHANGES),
             (candidate, "rev-parse", "HEAD:ios/OfflineTikTokPlayer"): APP_TREE,
             (candidate, "rev-parse", "HEAD:ios/PlayerCore"): CORE_TREE,
             (control, "status", "--porcelain", "--untracked-files=all"): "",
@@ -206,14 +214,15 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
 NATIVE_PROOFS = (
     (41327719585, "5fcd933c614d7473b3bc61cd3d5bd86e7ed7861c",
      ".github/workflows/media-presentation-repair.yml", "codex/media-presentation-repair"),
-    (41328715253, SOURCE, ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
+    (41328715253, SOURCE_BASE, ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
 )
 
 
 def require_native_result(read=None):
-    # The original image test was restored after the full focused run. The two
-    # immutable commits have the same app/core trees, enforced by verify_checkouts
-    # and by the original-image workflow's fixed runtime hashes.
+    # These receipts cover the delivered24.1 processing/video baseline. The new
+    # frozen child only removes the sound setting and its saved preference, with
+    # two PCM-fixture overrides; verify_checkouts pins that reviewed small delta.
+    # They do not claim exact-source native/UI acceptance for this candidate.
     if read is None:
         import urllib.request
         def read(run_id):
@@ -251,7 +260,7 @@ def main():
     verify_checkouts(ROOT, candidate, environment["EXPECTED_CONTROL_COMMIT"])
     if args.command == "check":
         require_native_result()
-        print("Exact source, owner request and focused media/image results verified. Full-suite and phone acceptance remain unresolved.")
+        print("Exact candidate, reviewed automatic-speaker delta and baseline focused media/image results verified. Full-suite and phone acceptance remain unresolved.")
         return
     require(sys.platform == "darwin", "Signing requires the existing standard macOS runner.")
     if args.command == "sign-upload":
