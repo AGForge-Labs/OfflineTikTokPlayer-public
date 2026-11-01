@@ -45,6 +45,81 @@ final class VideoPresentationContinuityTests: XCTestCase {
         XCTAssertGreaterThan(rate, 40, "The same source must remain smooth without an unnecessary composition")
     }
 
+    func testShortTrailingAudioKeepsNativeVideoAndAFreshLastFrameWhilePaused() async throws {
+        let fixture = try await PresentedVideo.make(resourceName: "test-motion-audio-tail", disableAudioTrack: true)
+        defer { fixture.close() }
+        XCTAssertTrue(fixture.usedNativeGeometry, "A 10 ms audio tail must preserve the native video path")
+        XCTAssertNil(fixture.item.videoComposition)
+        let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
+        let before = fixture.bridge.submittedFrameCount
+        let seek = fixture.bridge.beginSeek()
+        let sought = await fixture.seek(to: 6.005)
+        XCTAssertTrue(sought)
+        fixture.bridge.completeSeek(seek)
+        XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: 6.005, durationSeconds: 6.01, isPlaying: false))
+        XCTAssertTrue(fixture.bridge.activate(ticket))
+        let ready = await until {
+            fixture.bridge.updatePlayback(positionSeconds: 6.005, durationSeconds: 6.01, isPlaying: false)
+            return fixture.bridge.currentFrameReceipt(for: ticket) != nil
+                && fixture.bridge.submittedFrameCount > before
+        }
+        XCTAssertTrue(ready, "The held departing image cannot replace fresh video-end frame proof")
+        XCTAssertGreaterThan(fixture.bridge.lastFramePositionSeconds ?? -1, 5.95)
+        XCTAssertLessThanOrEqual(fixture.bridge.lastFramePositionSeconds ?? 10, 6.005)
+    }
+
+    func testRetainedOutgoingPixelsCannotCreditAnIncomingImageBeforeItDisplays() async throws {
+        let fixture = try await PresentedVideo.make()
+        defer { fixture.close() }
+        let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
+        let oldImage = try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer())
+        let timebase = try XCTUnwrap(fixture.bridge.displayLayer.controlTimebase)
+        let seek = fixture.bridge.beginSeek()
+        let sought = await fixture.seek(to: 1.5)
+        XCTAssertTrue(sought)
+        fixture.bridge.completeSeek(seek)
+        var frozen = false
+        fixture.bridge.onDebugCopiedPixel = { _, _ in
+            // Keep the genuine SDK image queued but not due, like a pause before
+            // a submitted future PTS. Do not manufacture an image or receipt.
+            if !frozen {
+                CMTimebaseSetRate(timebase, rate: 0)
+                CMTimebaseSetTime(timebase, time: .zero)
+                frozen = true
+            }
+        }
+        XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: 1.5, durationSeconds: 6, isPlaying: false))
+        XCTAssertTrue(fixture.bridge.activate(ticket))
+        let enqueued = await until {
+            if !frozen { fixture.bridge.updatePlayback(positionSeconds: 1.5, durationSeconds: 6, isPlaying: false) }
+            return fixture.bridge.currentFrameReceipt(for: ticket) != nil
+        }
+        fixture.bridge.onDebugCopiedPixel = nil
+        XCTAssertTrue(enqueued)
+        XCTAssertTrue(frozen)
+        XCTAssertEqual(try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer()), oldImage)
+        let monitor = PlaybackFrameMonitor()
+        monitor.debugAutomaticallyTicks = false
+        defer { monitor.cancel() }
+        let layer = AVPlayerLayer(player: fixture.player)
+        var completions = 0
+        monitor.start(item: fixture.item, layer: layer, displayLayer: fixture.bridge.displayLayer,
+            currentFrameReceipt: { fixture.bridge.currentFrameReceipt(for: ticket) },
+            onReady: { _ in completions += 1 })
+        monitor.debugTick(displayTime: 10)
+        monitor.debugTick(displayTime: 10 + 1.0 / 60)
+        XCTAssertEqual(completions, 0, "Sticky layer readiness plus an enqueue cannot prove incoming display")
+        CMTimebaseSetTime(timebase, time: CMTime(seconds: 1.5, preferredTimescale: 48_000))
+        let displayed = await until {
+            guard let image = try? self.fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer()) else { return false }
+            return image != oldImage
+        }
+        XCTAssertTrue(displayed)
+        monitor.debugTick(displayTime: 11)
+        monitor.debugTick(displayTime: 11 + 1.0 / 60)
+        XCTAssertEqual(completions, 1)
+    }
+
     private func measuredRate(_ fixture: PresentedVideo) async throws -> Double {
         let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
         let position = fixture.player.currentTime().seconds
@@ -52,11 +127,17 @@ final class VideoPresentationContinuityTests: XCTestCase {
         fixture.player.playImmediately(atRate: 1)
         XCTAssertTrue(fixture.bridge.activate(ticket))
         let first = fixture.bridge.submittedFrameCount
+        var stages: [String: Int] = [:]
+        fixture.bridge.onDebugWholeFrame = { event in
+            if case .returned(let span) = event { stages[String(describing: span.stage), default: 0] += 1 }
+        }
         let started = ProcessInfo.processInfo.systemUptime
         try await Task.sleep(for: .milliseconds(1200))
         let elapsed = ProcessInfo.processInfo.systemUptime - started
+        fixture.bridge.onDebugWholeFrame = nil
         let rate = Double(fixture.bridge.submittedFrameCount - first) / elapsed
         print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(fixture.player.currentTime().seconds) requestedEnd=\(fixture.bridge.requestedPositionSeconds) copiedEnd=\(fixture.bridge.lastCopiedFramePositionSeconds ?? -1)")
+        print("VIDEO_PRESENTATION_PULLS stages=\(stages) active=\(UIApplication.shared.applicationState.rawValue) maxScreenFPS=\(fixture.window.screen.maximumFramesPerSecond)")
         XCTAssertEqual(fixture.player.currentItem, fixture.item)
         return rate
     }
@@ -109,9 +190,9 @@ private final class PresentedVideo {
         host.view.layer.addSublayer(bridge.displayLayer)
     }
 
-    static func make(nativeGeometry: Bool = false) async throws -> PresentedVideo {
+    static func make(nativeGeometry: Bool = false, resourceName: String = "test-motion-60", disableAudioTrack: Bool = false) async throws -> PresentedVideo {
         let url = try XCTUnwrap(Bundle(for: VideoPresentationContinuityTests.self)
-            .url(forResource: "test-motion-60", withExtension: "mp4"))
+            .url(forResource: resourceName, withExtension: "mp4"))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let fixture = PresentedVideo(url: url, scene: scene)
         fixture.nativeGeometry = nativeGeometry
@@ -128,6 +209,9 @@ private final class PresentedVideo {
                 try await Task.sleep(for: .milliseconds(10))
             }
             fixture.player.pause()
+            if disableAudioTrack {
+                for track in fixture.item.tracks where track.assetTrack?.mediaType == .audio { track.isEnabled = false }
+            }
             let position = fixture.player.currentTime().seconds
             XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: position, durationSeconds: 6, isPlaying: false))
             XCTAssertTrue(fixture.bridge.activate(ticket))
@@ -140,6 +224,13 @@ private final class PresentedVideo {
         } catch {
             fixture.close()
             throw error
+        }
+    }
+
+    func seek(to seconds: Double) async -> Bool {
+        await withCheckedContinuation { continuation in
+            player.seek(to: CMTime(seconds: seconds, preferredTimescale: 48_000),
+                toleranceBefore: .zero, toleranceAfter: .zero) { finished in continuation.resume(returning: finished) }
         }
     }
 

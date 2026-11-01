@@ -5,6 +5,7 @@ import CoreVideo
 import Foundation
 import UIKit
 import CoreFoundation
+import PlayerCore
 
 /// A video-only PiP surface. Its supported sample-buffer delegate forwards user commands to
 /// the service that owns continuous audio; muted AVPlayer rate changes are never user commands.
@@ -351,10 +352,13 @@ final class ContinuousPictureInPicture: NSObject {
         let descriptions = try await track.load(.formatDescriptions)
         let duration = try await asset.load(.duration), range = try await track.load(.timeRange)
         let segments = try await track.load(.segments)
+        let minimumFrameDuration = try await track.load(.minFrameDuration)
         try Task.checkCancellation()
         guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0, range.start.isNumeric,
               range.duration.isNumeric, CMTimeCompare(range.start, .zero) == 0,
-              CMTimeCompare(CMTimeRangeGetEnd(range), duration) == 0,
+              NativeVideoCoverage.allowsNativePresentation(start: range.start.seconds,
+                end: CMTimeRangeGetEnd(range).seconds, assetDuration: duration.seconds,
+                frameDuration: minimumFrameDuration.seconds),
               segments.count == 1, let segment = segments.first, !segment.isEmpty else {
             return nil
         }
@@ -363,9 +367,9 @@ final class ContinuousPictureInPicture: NSObject {
               mapping.source.duration.isNumeric, mapping.target.duration.isNumeric,
               CMTimeCompare(mapping.source.start, .zero) >= 0,
               CMTimeCompare(mapping.target.start, .zero) == 0,
-              CMTimeCompare(mapping.source.duration, duration) == 0,
-              CMTimeCompare(mapping.target.duration, duration) == 0,
-              CMTimeCompare(CMTimeRangeGetEnd(mapping.target), duration) == 0,
+              CMTimeCompare(mapping.source.duration, range.duration) == 0,
+              CMTimeCompare(mapping.target.duration, range.duration) == 0,
+              CMTimeCompare(CMTimeRangeGetEnd(mapping.target), CMTimeRangeGetEnd(range)) == 0,
               item.asset === asset, item.videoComposition == nil,
               let geometry = VideoResourcePreparation.NativeVideoGeometry.validate(naturalSize: natural,
                 preferredTransform: transform, formatDescriptions: descriptions) else {
