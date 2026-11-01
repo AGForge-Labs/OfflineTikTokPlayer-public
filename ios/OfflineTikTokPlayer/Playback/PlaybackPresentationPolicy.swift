@@ -23,7 +23,11 @@ struct PlaybackPresentationPolicy {
     }
 
     var allowsPictureInPicture: Bool { !audioOnly }
-    var allowsVideoRendering: Bool { presentation != .audioOnly }
+    // A temporarily suspended active PiP needs new frames to become visible
+    // again. Stopping its producer here can leave it permanently black.
+    var allowsVideoRendering: Bool {
+        !audioOnly && (pictureInPictureIsActive || presentation != .audioOnly)
+    }
 
     var presentation: Presentation {
         if audioOnly { return .audioOnly }

@@ -6,6 +6,28 @@ import XCTest
 #endif
 
 final class PlaybackPresentationPolicyTests: XCTestCase {
+    func testActiveSuspendedPiPKeepsTheFrameProducerEligibleForRecovery() {
+        var policy = PlaybackPresentationPolicy()
+        _ = policy.applicationDidEnterBackground()
+        _ = policy.pictureInPictureChanged(active: true, possible: true, suspended: false)
+        _ = policy.pictureInPictureChanged(active: true, possible: false, suspended: true)
+        XCTAssertEqual(policy.presentation, .audioOnly)
+        XCTAssertTrue(policy.allowsVideoRendering,
+                      "AVKit cannot recover its active window if its frame producer is stopped")
+        _ = policy.setAudioOnly(true)
+        XCTAssertFalse(policy.allowsVideoRendering, "The user's explicit Audio only choice still wins")
+    }
+
+    func testClosedBackgroundPiPStopsVideoWorkAndForegroundRestoresIt() {
+        var policy = PlaybackPresentationPolicy()
+        _ = policy.applicationDidEnterBackground()
+        _ = policy.pictureInPictureChanged(active: true, possible: true, suspended: false)
+        _ = policy.pictureInPictureChanged(active: false, possible: false, suspended: false)
+        XCTAssertFalse(policy.allowsVideoRendering)
+        _ = policy.applicationDidBecomeActive()
+        XCTAssertTrue(policy.allowsVideoRendering)
+    }
+
     func testBackgroundTransitionKeepsVideoEligibleUntilPiPStartsOrFails() {
         var policy = PlaybackPresentationPolicy()
         _ = policy.applicationDidEnterBackground()

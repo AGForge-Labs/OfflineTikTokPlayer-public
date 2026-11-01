@@ -41,14 +41,19 @@ jobs:
           mkdir -p artifacts/presentation
           # Compile the complete app, with only these new independent test files.
           # The standard project/full test profile and its failures remain intact.
-          excluded="$(python3 -c 'from pathlib import Path; chosen={"VideoPresentationContinuityTests.swift", "MeasuredAudioIntegrationTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
-          printf '%s\n' 'Focused native sources: VideoPresentationContinuityTests.swift MeasuredAudioIntegrationTests.swift'
+          excluded="$(python3 -c 'from pathlib import Path; chosen={"VideoPresentationContinuityTests.swift", "MeasuredAudioIntegrationTests.swift", "PlaybackPresentationPolicyTests.swift", "ContinuousPictureInPictureTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
+          printf '%s\n' 'Focused native sources: VideoPresentationContinuityTests.swift MeasuredAudioIntegrationTests.swift PlaybackPresentationPolicyTests.swift ContinuousPictureInPictureTests.swift'
           xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
             -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
             -derivedDataPath artifacts/PresentationDerived -resultBundlePath artifacts/presentation/Pictures.xcresult \
             -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
             -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
-            -only-testing:OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests test 2>&1 | tee artifacts/presentation/xcodebuild.log
+            -only-testing:OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests \
+            -only-testing:OfflineTikTokPlayerTests/PlaybackPresentationPolicyTests \
+            -only-testing:OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testDefaultIdentityCompositionPreservesEveryDecodedVideoFrame \
+            -only-testing:OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testPortraitAndMirrorCompositionProducesOrientedPixelsAndPreservesSourceTiming \
+            -only-testing:OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback \
+            -only-testing:OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testPreparedExistingVideoCompositionSurvivesPreparationBorrowAndRetirement test 2>&1 | tee artifacts/presentation/xcodebuild.log
       - name: Preserve synthetic picture evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

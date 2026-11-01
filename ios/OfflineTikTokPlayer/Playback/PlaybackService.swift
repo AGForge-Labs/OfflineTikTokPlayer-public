@@ -421,7 +421,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var pipRequestToken = UUID()
     @ObservationIgnored private var pipSkipTimeoutTask: Task<Void, Never>?
     @ObservationIgnored private var lastUnderrun: Int64 = 0
-    private var videoAllowed: Bool { presentationPolicy.presentation != .audioOnly }
+    private var videoAllowed: Bool { presentationPolicy.allowsVideoRendering }
     @ObservationIgnored var requestPlayerUI: (() -> Void)?
     @ObservationIgnored private(set) var surface: PlayerSurface!
     @ObservationIgnored private var pip: AVPictureInPictureController?

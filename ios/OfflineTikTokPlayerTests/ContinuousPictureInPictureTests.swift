@@ -298,9 +298,9 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
         owned = plan.install()
         let resource = try XCTUnwrap(owned), output = try XCTUnwrap(resource.output)
-        let installedComposition = try XCTUnwrap(item.videoComposition,
-            "Default preparation must preserve its owned composition policy")
+        let installedComposition = item.videoComposition
         #if DEBUG
+        XCTAssertTrue(resource.debugUsesNativeGeometry, "The qualified identity fixture uses native presentation")
         XCTAssertTrue(resource.debugInstalledComposition === installedComposition)
         #endif
         XCTAssertTrue(resource.item === item); XCTAssertTrue(resource.output === output)
@@ -333,7 +333,9 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertEqual(CMTimeCompare(duration, CMTime(seconds: 30, preferredTimescale: 24)), 0)
         XCTAssertEqual(CMTimeCompare(range.start, .zero), 0)
         XCTAssertEqual(CMTimeCompare(CMTimeRangeGetEnd(range), duration), 0)
-        let baseline = installedComposition
+        // Keep the complete independent composed-vs-native pixel/timestamp
+        // comparison after promoting qualified production sources to native output.
+        let baseline = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
         XCTAssertEqual(baseline.sourceTrackIDForFrameTiming, track.trackID)
         XCTAssertEqual(baseline.renderSize, CGSize(width: 160, height: 96))
 

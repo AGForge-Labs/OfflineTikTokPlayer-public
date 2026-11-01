@@ -33,6 +33,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
     func testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo() async throws {
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
+        XCTAssertTrue(fixture.usedNativeGeometry, "The qualified production path must avoid an unnecessary compositor")
         let rate = try await measuredRate(fixture)
         XCTAssertGreaterThan(rate, 40, "A 60 fps source must not be limited by a 30 Hz app timer")
     }
@@ -89,6 +90,7 @@ private final class PresentedVideo {
     private(set) var nativeGeometry = false
     private var oldKey: UIWindow?
     private var resource: ContinuousPictureInPicture.PreparedVideoResource?
+    var usedNativeGeometry: Bool { resource?.debugUsesNativeGeometry ?? false }
 
     private init(url: URL, scene: UIWindowScene) {
         self.url = url
