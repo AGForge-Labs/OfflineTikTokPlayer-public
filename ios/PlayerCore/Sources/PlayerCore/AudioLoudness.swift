@@ -31,6 +31,8 @@ public struct AudioLoudness: Codable, Hashable, Sendable {
 
     public func normalizationGainDB(for asset: AssetReference?) -> Double? {
         guard asset?.sha256 == assetSHA256, integratedLUFS > -60 else { return nil }
-        return min(24, max(-12, -14 - integratedLUFS))
+        // Match the louder archived music, then retain EQ and linked peak
+        // protection. A -14 target would turn ordinary songs down on speakers.
+        return min(24, max(-12, -10 - integratedLUFS))
     }
 }
