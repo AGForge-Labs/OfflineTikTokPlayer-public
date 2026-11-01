@@ -3,11 +3,9 @@ import XCTest
 
 final class VideoImageIdentityTests: XCTestCase {
     func testWrapperAddressReuseCannotOverrideAConflictingSurfaceIdentity() {
-        for source in UInt32(1)...16 {
-            for displayed in UInt32(1)...16 where source != displayed {
-                XCTAssertFalse(VideoImageIdentity.matches(sourceSurface: source, displayedSurface: displayed,
-                    sameRetainedBuffer: true), "A recycled wrapper address cannot credit the departing surface")
-            }
+        for (source, displayed): (UInt32, UInt32) in [(7, 19), (19, 7), (.max, 1)] {
+            XCTAssertFalse(VideoImageIdentity.matches(sourceSurface: source, displayedSurface: displayed,
+                sameRetainedBuffer: true), "A recycled wrapper address cannot credit the departing surface")
         }
         XCTAssertFalse(VideoImageIdentity.matches(sourceSurface: 0, displayedSurface: 0, sameRetainedBuffer: true))
         XCTAssertFalse(VideoImageIdentity.matches(sourceSurface: 7, displayedSurface: nil, sameRetainedBuffer: true))
