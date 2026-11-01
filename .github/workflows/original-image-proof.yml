@@ -1,0 +1,44 @@
+name: Original image regression without retained diagnostic buffers
+on:
+  push:
+    branches: [codex/media-image-proof]
+    paths: ['ios/**', '.github/workflows/original-image-proof.yml']
+permissions:
+  contents: read
+concurrency:
+  group: original-image-proof-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  original-image:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Require the exact already-validated runtime trees
+        run: |
+          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = 5111ed2e1d011c81c3b88b8a64e88564cad60caa
+          test "$(git rev-parse HEAD:ios/PlayerCore)" = f9b20964220eb867c397e9fa8334c673263d92a5
+          python3 scripts/generate-ios-project.py --check
+          xcodebuild -version
+      - name: Original future-image regression with normal buffer lifetimes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/image-proof
+          excluded="$(python3 -c 'from pathlib import Path; chosen="VideoPresentationContinuityTests.swift"; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen in {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name != chosen)))')"
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
+            -derivedDataPath artifacts/ImageProofDerived -resultBundlePath artifacts/image-proof/Original.xcresult \
+            -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests/testRetainedOutgoingPixelsCannotCreditAnIncomingImageBeforeItDisplays \
+            test 2>&1 | tee artifacts/image-proof/xcodebuild.log
+      - name: Preserve only synthetic proof
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: original-image-proof
+          path: artifacts/image-proof
+          retention-days: 3
