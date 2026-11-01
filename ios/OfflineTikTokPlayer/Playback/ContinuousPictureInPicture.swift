@@ -1032,7 +1032,7 @@ final class ContinuousPictureInPicture: NSObject {
                     self.isolatedRequest = nil; self.isolatedPreparation = nil
                 }
             }
-            func eligible() -> Bool {
+            @MainActor func eligible() -> Bool {
                 !Task.isCancelled && self.isolatedRequest === request && self.owns(ticket)
                     && self.currentItem === item && self.currentResource === previous
                     && self.frameFeedEnabled && self.activeSeekTicket == nil
