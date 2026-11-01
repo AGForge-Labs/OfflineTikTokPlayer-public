@@ -10,9 +10,9 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE = "2e43c1fc8c8be33e8677c73866246a328db3a892"
-APP_TREE = "79093f6ddf43272aff597bcc5a5749b6e8d001c4"
-CORE_TREE = "64d337f129d7ee93a8b8f7361294e6b50cedfdd6"
+SOURCE = "6489eafb55ee67358e9aaf203368f27de8b5fc6b"
+APP_TREE = "5111ed2e1d011c81c3b88b8a64e88564cad60caa"
+CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -87,7 +87,7 @@ def validate_context(environment, event, *, signing=False):
     require(re.fullmatch(r"[1-9][0-9]{0,3}(?:\.(?:0|[1-9][0-9]?)){0,2}", build) is not None,
             "An Apple-checked increasing build number is required.")
     numbers = tuple(map(int, build.split("."))) + (0,) * (3 - len(build.split(".")))
-    require(numbers > (22, 1, 0), "The experimental build must follow existing build22.1.")
+    require(numbers > (23, 1, 0), "The experimental build must follow existing build23.1; Apple must still confirm the actual latest version.")
     require(not environment.get("APPLE_PRIVATE_DELIVERY"), "The private aggregate secret is not used here.")
     if signing:
         require(environment.get("RELEASE_ENVIRONMENT") == "release", "The existing protected release environment is required.")
@@ -203,27 +203,36 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
         helper.run_tool = original
 
 
-NATIVE_RUN = 40420488203
+NATIVE_PROOFS = (
+    (41327719585, "5fcd933c614d7473b3bc61cd3d5bd86e7ed7861c",
+     ".github/workflows/media-presentation-repair.yml", "codex/media-presentation-repair"),
+    (41328715253, SOURCE, ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
+)
+
 
 def require_native_result(read=None):
+    # The original image test was restored after the full focused run. The two
+    # immutable commits have the same app/core trees, enforced by verify_checkouts
+    # and by the original-image workflow's fixed runtime hashes.
     if read is None:
         import urllib.request
-        def read():
-            request = urllib.request.Request("https://api.github.com/repos/" + REPOSITORY + "/actions/runs/" + str(NATIVE_RUN),
+        def read(run_id):
+            request = urllib.request.Request("https://api.github.com/repos/" + REPOSITORY + "/actions/runs/" + str(run_id),
                 headers={"Accept": "application/vnd.github+json", "User-Agent": "OfflinePlayer-owner-delivery"})
             with urllib.request.urlopen(request, timeout=20) as response:
                 data = response.read(128 * 1024 + 1)
                 require(len(data) <= 128 * 1024, "Native receipt exceeded its bound.")
                 return json.loads(data)
-    result = read()
-    require(isinstance(result, dict) and isinstance(result.get("repository"), dict), "Invalid native run receipt.")
-    require(result.get("id") == NATIVE_RUN and result.get("head_sha") == SOURCE
-        and result.get("status") == "completed" and result.get("conclusion") == "success"
-        and result.get("path") == ".github/workflows/phone-native.yml" and result.get("event") == "push"
-        and result.get("head_branch") == "fix/source-preparation23"
-        and result.get("repository", {}).get("full_name") == REPOSITORY
-        and result.get("repository", {}).get("private") is False,
-        "The exact focused public native run must pass before signing; full gapless acceptance remains unresolved.")
+    for run_id, source, path, branch in NATIVE_PROOFS:
+        result = read(run_id)
+        require(isinstance(result, dict) and isinstance(result.get("repository"), dict), "Invalid native run receipt.")
+        require(result.get("id") == run_id and result.get("head_sha") == source
+            and result.get("status") == "completed" and result.get("conclusion") == "success"
+            and result.get("path") == path and result.get("event") == "push"
+            and result.get("head_branch") == branch and result.get("run_attempt") == 1
+            and result.get("repository", {}).get("full_name") == REPOSITORY
+            and result.get("repository", {}).get("private") is False,
+            "Both exact focused media/image results must pass before signing; full-suite and phone acceptance remain unresolved.")
 
 
 def main():
@@ -241,7 +250,8 @@ def main():
             "Only the two owned workspace checkouts are admitted.")
     verify_checkouts(ROOT, candidate, environment["EXPECTED_CONTROL_COMMIT"])
     if args.command == "check":
-        print("Exact experimental source and owner request verified. Native acceptance remains failed.")
+        require_native_result()
+        print("Exact source, owner request and focused media/image results verified. Full-suite and phone acceptance remain unresolved.")
         return
     require(sys.platform == "darwin", "Signing requires the existing standard macOS runner.")
     if args.command == "sign-upload":

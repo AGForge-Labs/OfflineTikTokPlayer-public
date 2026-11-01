@@ -1,0 +1,50 @@
+name: Owner read-only Apple build lookup
+run-name: Owner read-only Apple build lookup
+on:
+  workflow_dispatch:
+    inputs:
+      authorize_lookup:
+        description: Use the existing protected API key to read only this app's builds
+        required: true
+        default: false
+        type: boolean
+      expected_control_commit:
+        description: Exact reviewed main commit containing this workflow
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: owner-apple-build-lookup
+  cancel-in-progress: false
+env:
+  EXPECTED_CONTROL_COMMIT: ${{ inputs.expected_control_commit }}
+  LOOKUP_AUTHORIZED: ${{ inputs.authorize_lookup }}
+  PYTHONDONTWRITEBYTECODE: '1'
+jobs:
+  read-builds:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.authorize_lookup &&
+      github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private &&
+      github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' &&
+      github.ref == 'refs/heads/main' && github.run_attempt == 1
+    environment:
+      name: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Read the exact approved control revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Verify owner and clean source without Apple inputs
+        run: python3 -B control/scripts/apple-build-info.py check
+      - name: Read only this app's existing build numbers
+        env:
+          RELEASE_ENVIRONMENT: release
+          APP_STORE_CONNECT_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_KEY_BASE64 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ vars.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ vars.APP_STORE_CONNECT_ISSUER_ID }}
+        run: python3 -B control/scripts/apple-build-info.py lookup
