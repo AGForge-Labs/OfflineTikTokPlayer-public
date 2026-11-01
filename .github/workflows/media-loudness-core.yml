@@ -1,0 +1,17 @@
+name: Public measured audio core checks
+on:
+  push:
+    branches: [codex/media-loudness-core]
+permissions:
+  contents: read
+jobs:
+  core:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: swift --version
+      - run: bash scripts/test-core.sh

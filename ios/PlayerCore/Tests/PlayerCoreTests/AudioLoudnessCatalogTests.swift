@@ -22,6 +22,24 @@ final class AudioLoudnessCatalogTests: XCTestCase {
         }
     }
 
+    func testGainRequiresTheMeasuredAssetAndDoesNotAmplifySilence() throws {
+        let catalog = try LibraryCatalog.decode(measuredCatalog())
+        var item = catalog.media[0]
+        XCTAssertEqual(try XCTUnwrap(item.normalizationGainDB), 12.27, accuracy: 0.0001)
+        item.asset = catalog.media[1].asset
+        XCTAssertNil(item.normalizationGainDB, "Replacing media invalidates old loudness credit")
+        let silence = try AudioLoudness(assetSHA256: String(repeating: "a", count: 64), integratedLUFS: -65, truePeakDBTP: -65)
+        XCTAssertNil(silence.normalizationGainDB(for: catalog.media[0].asset))
+    }
+
+    func testExtremeButValidLevelsKeepGainWithinTheSpeakerBudget() throws {
+        let asset = try LibraryCatalog.decode(measuredCatalog()).media[0].asset
+        let quiet = try AudioLoudness(assetSHA256: String(repeating: "a", count: 64), integratedLUFS: -50, truePeakDBTP: -40)
+        let loud = try AudioLoudness(assetSHA256: String(repeating: "a", count: 64), integratedLUFS: 5, truePeakDBTP: 6)
+        XCTAssertEqual(quiet.normalizationGainDB(for: asset), 24)
+        XCTAssertEqual(loud.normalizationGainDB(for: asset), -12)
+    }
+
     private func measuredCatalog(replacing fields: [String: Any] = [:]) throws -> Data {
         var root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(CatalogTests.fixture.utf8)) as? [String: Any])
         var rows = try XCTUnwrap(root["media"] as? [[String: Any]])

@@ -465,6 +465,9 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     public func setPlaying(_ value: Bool) { playing.store(value, ordering: .releasing) }
     public func setSpeakerEnabled(_ value: Bool) { enhance.store(value, ordering: .releasing) }
 
+    /// Serial control owner; a token always names one retained preparation.
+    public func setNormalizationGainDB(_ gain: Double?, for token: Int) {}
+
     /// Coherent source-frame cursor. Read off the audio thread.
     public var snapshot: Snapshot {
         #if DEBUG

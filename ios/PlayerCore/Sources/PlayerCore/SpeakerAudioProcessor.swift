@@ -69,6 +69,9 @@ public final class SpeakerAudioProcessor {
         signal = Array(repeating: 0, count: count)
     }
 
+    /// Render-thread configuration, called at a source span boundary.
+    public func setNormalizationGainDB(_ gain: Double?) {}
+
     public func process(_ frame: UnsafeMutableBufferPointer<Float>) {
         guard enabled, frame.count == bass.count else { return }
         wet = min(1, wet + rampStep)

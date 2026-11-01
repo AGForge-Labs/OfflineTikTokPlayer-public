@@ -45,13 +45,16 @@ public struct MediaRecord: Codable, Hashable, Identifiable, Sendable {
     public var asset: AssetReference?
     public var original: AssetReference?
     public var artwork: AssetReference?
+    public var audioLoudness: AudioLoudness?
+    public var normalizationGainDB: Double? { audioLoudness?.normalizationGainDB(for: asset) }
 
     public init(id: String, title: String, creator: String = "", sourceURL: String = "", duration: Double = 0,
                 kind: Kind = .video, status: Status = .pending, asset: AssetReference? = nil,
-                original: AssetReference? = nil, artwork: AssetReference? = nil) {
+                original: AssetReference? = nil, artwork: AssetReference? = nil, audioLoudness: AudioLoudness? = nil) {
         self.id = id; self.title = title; self.creator = creator; self.sourceURL = sourceURL
         self.duration = duration; self.kind = kind; self.status = status
         self.asset = asset; self.original = original; self.artwork = artwork
+        self.audioLoudness = audioLoudness
     }
 }
 
