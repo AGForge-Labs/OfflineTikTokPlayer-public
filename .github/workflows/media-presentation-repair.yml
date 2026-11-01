@@ -1,0 +1,53 @@
+name: Public media presentation regressions
+on:
+  push:
+    branches: [codex/media-presentation-repair]
+    paths: ['ios/**', 'scripts/**', '.github/workflows/media-presentation-repair.yml']
+permissions:
+  contents: read
+concurrency:
+  group: media-presentation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  core:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: swift --version
+      - run: bash scripts/test-core.sh
+  pictures:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 12
+    env:
+      SWIFTC_MAXIMUM_DETERMINISM: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Exact source and SDK
+        run: |
+          git rev-parse HEAD
+          xcodebuild -version
+          python3 scripts/generate-ios-project.py --check
+      - name: Actual displayed pixels and sixty fps source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/presentation
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
+            -derivedDataPath artifacts/PresentationDerived -resultBundlePath artifacts/presentation/Pictures.xcresult \
+            -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests test 2>&1 | tee artifacts/presentation/xcodebuild.log
+      - name: Preserve synthetic picture evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: presentation-regressions
+          path: artifacts/presentation
+          retention-days: 3

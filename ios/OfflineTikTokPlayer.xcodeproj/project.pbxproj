@@ -526,6 +526,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "B0DBFA187C12371B0D325011";
 		};
+		"D4716ECBD891E4E0E63BFF79" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-motion-60.mp4";
+			"sourceTree" = "<group>";
+		};
+		"9938801A2A77ACF920A2F5DE" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "D4716ECBD891E4E0E63BFF79";
+		};
 		"A8F6764A13156B91EFA7EB79" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "file";
@@ -560,6 +570,7 @@
 			"isa" = "PBXGroup";
 			"children" = (
 				"B0DBFA187C12371B0D325011",
+				"D4716ECBD891E4E0E63BFF79",
 				"A8F6764A13156B91EFA7EB79",
 				"E9555D2EA4D7A1795504F02E",
 				"1F42C7A72E48159A7F757E9D",
@@ -769,6 +780,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "755E32E3A2AF2197C8E50246";
 		};
+		"375A2BEBF029E847C9CABDA3" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "VideoPresentationContinuityTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"112867BF5769A66E20E98457" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "375A2BEBF029E847C9CABDA3";
+		};
 		"843D8AE50F397108A8B1285E" = {
 			"isa" = "PBXGroup";
 			"children" = (
@@ -802,6 +823,7 @@
 				"0738E822CA97616F6E5DC8F9",
 				"5FC8AFE1EF84ED8F701F9F07",
 				"755E32E3A2AF2197C8E50246",
+				"375A2BEBF029E847C9CABDA3",
 			);
 			"path" = "OfflineTikTokPlayerTests";
 			"sourceTree" = "<group>";
@@ -1111,6 +1133,7 @@
 				"C661944F396B5236683903C4",
 				"A14E0397CE0BE76AB7D9965D",
 				"55ED0563DA5CDECEA34A3877",
+				"112867BF5769A66E20E98457",
 			);
 			"runOnlyForDeploymentPostprocessing" = 0;
 		};
@@ -1126,6 +1149,7 @@
 			"buildActionMask" = 2147483647;
 			"files" = (
 				"9FAA440B8218F93BDF1E002E",
+				"9938801A2A77ACF920A2F5DE",
 				"768C483BD57061BC08CB7E54",
 				"494447A8A2A13E1E9DC6CC13",
 				"2D6F617377A1E9DB15C50254",
