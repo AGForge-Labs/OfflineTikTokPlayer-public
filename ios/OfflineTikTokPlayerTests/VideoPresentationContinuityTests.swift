@@ -33,6 +33,18 @@ final class VideoPresentationContinuityTests: XCTestCase {
     func testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo() async throws {
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
+        let rate = try await measuredRate(fixture)
+        XCTAssertGreaterThan(rate, 40, "A 60 fps source must not be limited by a 30 Hz app timer")
+    }
+
+    func testNativeGeometryControlPreservesTheSixtyFPSFixtureCadence() async throws {
+        let fixture = try await PresentedVideo.make(nativeGeometry: true)
+        defer { fixture.close() }
+        let rate = try await measuredRate(fixture)
+        XCTAssertGreaterThan(rate, 40, "The same source must remain smooth without an unnecessary composition")
+    }
+
+    private func measuredRate(_ fixture: PresentedVideo) async throws -> Double {
         let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
         let position = fixture.player.currentTime().seconds
         XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: position, durationSeconds: 6, isPlaying: true))
@@ -43,9 +55,9 @@ final class VideoPresentationContinuityTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(1200))
         let elapsed = ProcessInfo.processInfo.systemUptime - started
         let rate = Double(fixture.bridge.submittedFrameCount - first) / elapsed
-        print("VIDEO_PRESENTATION nativeSourceFPS=60 submittedFPS=\(rate) elapsed=\(elapsed)")
-        XCTAssertGreaterThan(rate, 40, "A 60 fps source must not be limited by a 30 Hz app timer")
+        print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(fixture.player.currentTime().seconds) requestedEnd=\(fixture.bridge.requestedPositionSeconds) copiedEnd=\(fixture.bridge.lastCopiedFramePositionSeconds ?? -1)")
         XCTAssertEqual(fixture.player.currentItem, fixture.item)
+        return rate
     }
 
     private func fingerprint(_ value: CVPixelBuffer?) throws -> String {
@@ -74,6 +86,7 @@ private final class PresentedVideo {
     let item: AVPlayerItem
     let player: AVPlayer
     let window: UIWindow
+    private(set) var nativeGeometry = false
     private var oldKey: UIWindow?
     private var resource: ContinuousPictureInPicture.PreparedVideoResource?
 
@@ -94,13 +107,16 @@ private final class PresentedVideo {
         host.view.layer.addSublayer(bridge.displayLayer)
     }
 
-    static func make() async throws -> PresentedVideo {
+    static func make(nativeGeometry: Bool = false) async throws -> PresentedVideo {
         let url = try XCTUnwrap(Bundle(for: VideoPresentationContinuityTests.self)
             .url(forResource: "test-motion-60", withExtension: "mp4"))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let fixture = PresentedVideo(url: url, scene: scene)
+        fixture.nativeGeometry = nativeGeometry
         do {
-            let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: fixture.item)
+            let plan = nativeGeometry
+                ? try await ContinuousPictureInPicture.debugPrepareVideoResource(for: fixture.item, nativeGeometry: true)
+                : try await ContinuousPictureInPicture.prepareVideoResource(for: fixture.item)
             fixture.resource = try XCTUnwrap(plan.install())
             let ticket = try XCTUnwrap(fixture.bridge.setCurrentItem(fixture.item, preparedVideo: fixture.resource))
             fixture.player.playImmediately(atRate: 1)

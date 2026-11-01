@@ -140,6 +140,16 @@
         },
         "artwork": {
           "$ref": "#/$defs/optionalAsset"
+        },
+        "audioLoudness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/audioLoudness"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "allOf": [
@@ -182,6 +192,36 @@
           "items": {
             "$ref": "#/$defs/identity"
           }
+        }
+      }
+    },
+    "audioLoudness": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "version",
+        "assetSHA256",
+        "integratedLUFS",
+        "truePeakDBTP"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "assetSHA256": {
+          "pattern": "^[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "truePeakDBTP": {
+          "type": "number",
+          "minimum": -100,
+          "maximum": 20
+        },
+        "integratedLUFS": {
+          "type": "number",
+          "minimum": -70,
+          "maximum": 10
         }
       }
     }

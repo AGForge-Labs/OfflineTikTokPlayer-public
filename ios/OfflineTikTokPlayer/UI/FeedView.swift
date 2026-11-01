@@ -42,7 +42,8 @@ private struct FeedPage: View {
     var body: some View {
         ZStack {
             // Keep image state and UIKit host identity through forward/backward handoffs.
-            FeedVideoSurface(surface: app.playback.surface, isActive: isActive, isReady: app.playback.isVideoReady) {
+            FeedVideoSurface(surface: app.playback.surface, isActive: isActive,
+                isReady: app.playback.isVideoReady || app.playback.hasRetainedVideoFrame) {
                 MediaThumbnail(item: item, backdrop: .black)
             }
             Color.clear.contentShape(Rectangle()).onTapGesture { if isActive { app.playback.toggle() } }

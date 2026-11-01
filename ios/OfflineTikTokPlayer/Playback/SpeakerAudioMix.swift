@@ -4,10 +4,13 @@ import AudioToolbox
 import PlayerCore
 
 /// Each tap owns a render-thread state. No application locks, I/O or allocation in process().
-private final class SpeakerTapState {
+final class SpeakerTapState {
     var processor: SpeakerAudioProcessor?
     var scratch: [Float] = []
     var interleaved = false
+    private let normalizationGainDB: Double?
+
+    init(normalizationGainDB: Double? = nil) { self.normalizationGainDB = normalizationGainDB }
 
     func prepare(_ format: AudioStreamBasicDescription) {
         let count = Int(format.mChannelsPerFrame)
@@ -20,6 +23,7 @@ private final class SpeakerTapState {
         interleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
         scratch = Array(repeating: 0, count: count)
         processor = SpeakerAudioProcessor(sampleRate: format.mSampleRate, channels: count, enabled: true)
+        processor?.setNormalizationGainDB(normalizationGainDB)
     }
 
     func process(_ buffers: UnsafeMutablePointer<AudioBufferList>, frames: Int) {
@@ -52,11 +56,11 @@ enum SpeakerAudioMix {
         enabled && !routes.isEmpty && routes.allSatisfy { $0 == .builtInSpeaker }
     }
 
-    static func make(tracks: [AVAssetTrack]) -> AVAudioMix? {
+    static func make(tracks: [AVAssetTrack], normalizationGainDB: Double? = nil) -> AVAudioMix? {
         guard !tracks.isEmpty else { return nil }
         var parameters: [AVAudioMixInputParameters] = []
         for track in tracks {
-            let state = Unmanaged.passRetained(SpeakerTapState())
+            let state = Unmanaged.passRetained(SpeakerTapState(normalizationGainDB: normalizationGainDB))
             var callbacks = MTAudioProcessingTapCallbacks(
                 version: kMTAudioProcessingTapCallbacksVersion_0, clientInfo: state.toOpaque(),
                 init: { _, info, storage in storage.pointee = info },
@@ -98,11 +102,23 @@ final class SpeakerAudioController {
         let task: Task<Void, Never>?
         var awaitingEnqueue = false
         var retryWhenReady = false
+        var gainDB: Double? = nil
     }
+    private struct Loudness { weak var item: AVPlayerItem?; let gainDB: Double? }
+    private var loudness: [ObjectIdentifier: Loudness] = [:]
     private var entries: [ObjectIdentifier: Entry] = [:]
     private var enabled = false
     private let preparationBudget: Duration
     private let loadTracks: TrackLoader
+
+    /// Bound once to the item created from this exact asset URL, not its post ID.
+    func configureNormalization(_ gainDB: Double?, for item: AVPlayerItem) {
+        let id = ObjectIdentifier(item)
+        if loudness[id]?.item === item, loudness[id]?.gainDB == gainDB { return }
+        loudness[id] = Loudness(item: item, gainDB: gainDB)
+        entries[id]?.task?.cancel()
+        entries.removeValue(forKey: id)
+    }
 
     init(preparationBudget: Duration = .milliseconds(500),
          loadTracks: @escaping TrackLoader = { try? await $0.asset.loadTracks(withMediaType: .audio) }) {
@@ -122,27 +138,30 @@ final class SpeakerAudioController {
             return
         }
         // A route or Original-sound change can happen while metadata is loading.
-        item.audioMix = enabled ? tracks.flatMap { SpeakerAudioMix.make(tracks: $0) } : nil
+        let gain = loudness[id]?.item === item ? loudness[id]?.gainDB : nil
+        item.audioMix = enabled ? tracks.flatMap { SpeakerAudioMix.make(tracks: $0, normalizationGainDB: gain) } : nil
         entries[id] = Entry(item: item, enabled: enabled, token: token, task: nil, awaitingEnqueue: true,
-                            retryWhenReady: enabled && tracks == nil)
+                            retryWhenReady: enabled && tracks == nil, gainDB: gain)
     }
 
     func update(items: [AVPlayerItem], enabled: Bool) {
         self.enabled = enabled
+        loudness = loudness.filter { $0.value.item != nil }
         let ids = Set(items.map(ObjectIdentifier.init))
         for (id, entry) in entries where entry.item == nil || (!ids.contains(id) && !entry.awaitingEnqueue) {
             entry.task?.cancel(); entries.removeValue(forKey: id)
         }
         for item in items {
             let id = ObjectIdentifier(item)
+            let gain = loudness[id]?.item === item ? loudness[id]?.gainDB : nil
             entries[id]?.awaitingEnqueue = false
-            if let entry = entries[id], entry.item === item, entry.enabled == enabled,
+            if let entry = entries[id], entry.item === item, entry.enabled == enabled, entry.gainDB == gain,
                !(entry.retryWhenReady && item.status == .readyToPlay) { continue }
             entries[id]?.task?.cancel()
             let token = UUID()
             if !enabled {
                 item.audioMix = nil
-                entries[id] = Entry(item: item, enabled: false, token: token, task: nil)
+                entries[id] = Entry(item: item, enabled: false, token: token, task: nil, gainDB: gain)
                 continue
             }
             let loader = loadTracks, budget = preparationBudget
@@ -151,10 +170,10 @@ final class SpeakerAudioController {
                 let tracks = await PlaybackPreparation.value(within: budget) { await loader(item) }
                 guard let self, !Task.isCancelled,
                       self.entries[id]?.token == token else { return }
-                item.audioMix = tracks.flatMap { SpeakerAudioMix.make(tracks: $0) }
+                item.audioMix = tracks.flatMap { SpeakerAudioMix.make(tracks: $0, normalizationGainDB: gain) }
             }
             entries[id] = Entry(item: item, enabled: true, token: token, task: task,
-                                retryWhenReady: item.status != .readyToPlay)
+                                retryWhenReady: item.status != .readyToPlay, gainDB: gain)
         }
     }
 

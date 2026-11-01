@@ -3,6 +3,7 @@ import AVKit
 import CoreMedia
 import CoreVideo
 import Foundation
+import UIKit
 #if DEBUG
 import CoreFoundation
 #endif
@@ -79,6 +80,11 @@ final class ContinuousPictureInPicture: NSObject {
               ownsFramePull(receipt) else { return nil }
         return receipt
     }
+    private(set) var hasDisplayedImage = false
+    func acknowledgeDisplayedFrame(_ receipt: CurrentFrameReceipt) {
+        guard currentFrameReceipt(for: receipt.ticket) == receipt else { return }
+        hasDisplayedImage = true
+    }
     /// Cached proof only. A completed paused seek may still await its first image.
     func activeTimelineReceipt(for ticket: PresentationTicket) -> ActiveTimelineReceipt? {
         guard owns(ticket), presentationActive, frameFeedEnabled,
@@ -113,6 +119,7 @@ final class ContinuousPictureInPicture: NSObject {
         private(set) weak var item: AVPlayerItem?
         fileprivate(set) var output: AVPlayerItemVideoOutput?
         fileprivate(set) var isAttached = false
+        fileprivate var preferredFrameRate: Float = 60
         private(set) var isRetired = false
         private(set) var isBorrowed = false
         fileprivate var originalComposition: AVVideoComposition?
@@ -263,6 +270,11 @@ final class ContinuousPictureInPicture: NSObject {
             guard let item, let composition, ifEligible(),
                   item.videoComposition === original else { return nil }
             let resource = PreparedVideoResource(item: item)
+            let cadence = composition.frameDuration.seconds
+            guard ifEligible() else { resource.retire(); return nil }
+            if cadence.isFinite, cadence > 0 {
+                resource.preferredFrameRate = Float(min(120, max(30, 1 / cadence)))
+            }
             #if DEBUG
             resource.debugNativeGeometry = debugNativeGeometry
             #endif
@@ -611,6 +623,13 @@ final class ContinuousPictureInPicture: NSObject {
     private var videoOutput: AVPlayerItemVideoOutput?
     private var observations: [NSKeyValueObservation] = []
     private var frameTimer: Timer?
+    private var displayLink: CADisplayLink?
+    @MainActor private final class DisplayTarget: NSObject {
+        weak var owner: ContinuousPictureInPicture?
+        @objc func tick(_ link: CADisplayLink) { owner?.renderFrame() }
+    }
+    private let displayTarget = DisplayTarget()
+    private var lifecycleObservers: [NSObjectProtocol] = []
     private var timebase: CMTimebase?
     private var format: CMVideoFormatDescription?
     private var formatWidth = 0
@@ -632,7 +651,7 @@ final class ContinuousPictureInPicture: NSObject {
 
     var isReady: Bool { !invalidated && controller != nil && timebase != nil }
     var isFrameFeedSuspended: Bool { !frameFeedEnabled }
-    var isFrameFeedRunning: Bool { frameTimer != nil }
+    var isFrameFeedRunning: Bool { frameTimer != nil || displayLink != nil }
     var isVideoReadyForDisplay: Bool { displayLayer.isReadyForDisplay }
     var requestedPositionSeconds: Double { playbackState.read().position }
     var timebasePositionSeconds: Double? {
@@ -654,6 +673,16 @@ final class ContinuousPictureInPicture: NSObject {
                 CMTimebaseSetTime(createdTimebase, time: .zero)
                 CMTimebaseSetRate(createdTimebase, rate: 0)
             }
+        }
+        displayTarget.owner = self
+        for event in [UIApplication.didEnterBackgroundNotification, UIApplication.didBecomeActiveNotification] {
+            lifecycleObservers.append(NotificationCenter.default.addObserver(forName: event, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, !self.invalidated else { return }
+                    self.stopFrameTimer()
+                    if self.frameFeedEnabled && self.playbackState.read().isPlaying { self.startFrameTimer() }
+                }
+            })
         }
         guard timebase != nil, AVPictureInPictureController.isPictureInPictureSupported() else { return }
         let source = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: displayLayer,
@@ -694,7 +723,7 @@ final class ContinuousPictureInPicture: NSObject {
            preparedVideo == nil || preparedVideo === currentResource {
             // A new service request for the same item needs its own timeline,
             // while its output and in-flight geometry preparation stay reusable.
-            flushForSeek()
+            flushForSeek(removingImage: item == nil)
             return ticket
         }
         preparationTask?.cancel()
@@ -710,7 +739,7 @@ final class ContinuousPictureInPicture: NSObject {
         orientationPrepared = false
         format = nil
         hasReportedFrameFailure = false
-        flushForSeek()
+        flushForSeek(removingImage: item == nil)
         guard !invalidated, presentationRevision == adoptionRevision else { return nil }
         guard let item else { stopFrameTimer(); return nil }
         if let preparedVideo, preparedVideo.borrow(for: item), let output = preparedVideo.output {
@@ -916,13 +945,16 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     /// A seek starts a new frame epoch, including the image held by a paused timebase.
-    func flushForSeek() {
+    func flushForSeek(removingImage: Bool = false) {
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
         let revision = presentationRevision
         let epoch = invalidateCurrentFrameProof()
         guard !invalidated, imageEpoch == epoch, presentationRevision == revision else { return }
-        displayLayer.flushAndRemoveImage()
+        // Invalidate old readiness immediately, but retain the displayed picture
+        // until the replacement arrives. Clearing it here causes a black PiP/inline flash.
+        if removingImage { displayLayer.flushAndRemoveImage(); hasDisplayedImage = false }
+        else { displayLayer.flush() }
         guard !invalidated, imageEpoch == epoch, presentationRevision == revision else { return }
         hasReportedFrameFailure = false
     }
@@ -1017,6 +1049,8 @@ final class ContinuousPictureInPicture: NSObject {
         preparationTask = nil
         stopFrameTimer()
         observations.removeAll()
+        for observer in lifecycleObservers { NotificationCenter.default.removeObserver(observer) }
+        lifecycleObservers.removeAll()
         controller?.stopPictureInPicture()
         controller?.delegate = nil
         controller = nil
@@ -1024,6 +1058,7 @@ final class ContinuousPictureInPicture: NSObject {
         videoOutput = nil
         currentItem = nil
         displayLayer.flushAndRemoveImage()
+        hasDisplayedImage = false
         displayLayer.controlTimebase = nil
         timebase = nil
         format = nil
@@ -1037,17 +1072,28 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     private func startFrameTimer() {
-        guard presentationActive, activeSeekTicket == nil, frameTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
-            // This timer is installed only on RunLoop.main. No per-frame task or queue is created.
+        guard presentationActive, activeSeekTicket == nil, frameTimer == nil, displayLink == nil else { return }
+        let rate = currentResource?.preferredFrameRate ?? 60
+        if UIApplication.shared.applicationState != .background {
+            let link = CADisplayLink(target: displayTarget, selector: #selector(DisplayTarget.tick(_:)))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: min(30, rate), maximum: rate, preferred: rate)
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+            return
+        }
+        // Display links stop while background PiP is active. Keep its pulls at
+        // the same source cadence using a single main-runloop timer.
+        let timer = Timer(timeInterval: 1.0 / Double(rate), repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.renderFrame() }
         }
-        timer.tolerance = 1.0 / 120
+        timer.tolerance = 1.0 / (Double(rate) * 4)
         frameTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
 
     private func stopFrameTimer() {
+        displayLink?.invalidate()
+        displayLink = nil
         frameTimer?.invalidate()
         frameTimer = nil
     }
