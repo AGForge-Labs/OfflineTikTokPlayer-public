@@ -80,7 +80,7 @@ final class PlaybackFrameMonitor {
             currentReceipt = receipt
         }
         let sampledReadinessSerial = readinessSerial
-        let layerReady = displayLayer.isReadyForDisplay
+        let layerReady = displayLayer.isReadyForDisplay && receipt.matchesDisplayedImage(in: displayLayer)
         // The SDK getter may reenter a seek, source change or replacement start.
         let receiptAfterRead = receiptProvider()
         guard self.request === request, readinessSerial == sampledReadinessSerial,

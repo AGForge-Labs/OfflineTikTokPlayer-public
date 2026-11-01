@@ -27,6 +27,16 @@ final class ContinuousPictureInPicture: NSObject {
         let output: ObjectIdentifier
         let imageEpoch: UInt64
         let seekSerial: UInt64
+        let displayMarker: String
+
+        @MainActor func matchesDisplayedImage(in layer: AVSampleBufferDisplayLayer) -> Bool {
+            matchesDisplayedPixel(layer.sampleBufferRenderer.displayedPixelBuffer())
+        }
+        @MainActor fileprivate func matchesDisplayedPixel(_ pixel: CVPixelBuffer?) -> Bool {
+            guard let pixel,
+                  let value = CVBufferCopyAttachment(pixel, ContinuousPictureInPicture.displayedEpochKey, nil) as? String else { return false }
+            return value == displayMarker
+        }
     }
     /// Ownership of an installed, active timeline. This never credits an image.
     struct ActiveTimelineReceipt: Equatable, Sendable {
@@ -36,6 +46,9 @@ final class ContinuousPictureInPicture: NSObject {
         let seekSerial: UInt64
     }
     private var imageEpoch: UInt64 = 0
+    private static let displayedEpochKey = "dev.galaxybigbird.OfflineTikTokPlayer.displayEpoch" as CFString
+    private static let displayedPositionKey = "dev.galaxybigbird.OfflineTikTokPlayer.displayPosition" as CFString
+    private var imageMarker = UUID().uuidString
     private var imageEpochSaturated = false
     private var submittedReceipt: CurrentFrameReceipt?
     private var readinessMutationDepth = 0
@@ -56,6 +69,7 @@ final class ContinuousPictureInPicture: NSObject {
     @discardableResult
     private func invalidateCurrentFrameProof() -> UInt64 {
         submittedReceipt = nil
+        imageMarker = UUID().uuidString
         if imageEpoch == .max { imageEpochSaturated = true }
         else { imageEpoch += 1 }
         lastEnqueuedTime = .invalid
@@ -83,6 +97,15 @@ final class ContinuousPictureInPicture: NSObject {
     func acknowledgeDisplayedFrame(_ receipt: CurrentFrameReceipt) {
         guard currentFrameReceipt(for: receipt.ticket) == receipt else { return }
         hasDisplayedImage = true
+    }
+    /// Read actual renderer output, not enqueue activity or the muted player's clock.
+    func displayedFramePosition(for ticket: PresentationTicket) -> Double? {
+        guard let receipt = currentFrameReceipt(for: ticket),
+              let pixel = displayLayer.sampleBufferRenderer.displayedPixelBuffer(),
+              receipt.matchesDisplayedPixel(pixel),
+              let value = CVBufferCopyAttachment(pixel, Self.displayedPositionKey, nil) as? NSNumber,
+              value.doubleValue.isFinite, currentFrameReceipt(for: ticket) == receipt else { return nil }
+        return value.doubleValue
     }
     /// Cached proof only. A completed paused seek may still await its first image.
     func activeTimelineReceipt(for ticket: PresentationTicket) -> ActiveTimelineReceipt? {
@@ -653,7 +676,7 @@ final class ContinuousPictureInPicture: NSObject {
     private var displayLink: CADisplayLink?
     @MainActor private final class DisplayTarget: NSObject {
         weak var owner: ContinuousPictureInPicture?
-        @objc func tick(_ link: CADisplayLink) { owner?.renderFrame() }
+        @objc func tick(_ link: CADisplayLink) { owner?.renderFrame(targetHostTime: link.targetTimestamp) }
     }
     private let displayTarget = DisplayTarget()
     private var lifecycleObservers: [NSObjectProtocol] = []
@@ -1125,7 +1148,7 @@ final class ContinuousPictureInPicture: NSObject {
         frameTimer = nil
     }
 
-    private func renderFrame() {
+    private func renderFrame(targetHostTime: CFTimeInterval? = nil) {
         #if DEBUG
         let debugWholeObserver = onDebugWholeFrame
         var debugWholeEntry: DebugWholeFrameEntry?
@@ -1202,7 +1225,8 @@ final class ContinuousPictureInPicture: NSObject {
         guard let item = currentItem, !imageEpochSaturated else { return }
         let pullReceipt = CurrentFrameReceipt(
             ticket: PresentationTicket(generation: presentationRevision, item: ObjectIdentifier(item)),
-            output: ObjectIdentifier(videoOutput), imageEpoch: imageEpoch, seekSerial: seekTicket)
+            output: ObjectIdentifier(videoOutput), imageEpoch: imageEpoch, seekSerial: seekTicket,
+            displayMarker: imageMarker)
         #if DEBUG
         debugWholeStage = .ownerGuard
         #endif
@@ -1270,7 +1294,19 @@ final class ContinuousPictureInPicture: NSObject {
         debugWholeStage = .timebase
         debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         #endif
-        let requestedTime = CMTimebaseGetTime(timebase)
+        let presentationTime = CMTimebaseGetTime(timebase)
+        var requestedTime = presentationTime
+        if playbackState.read().isPlaying, let targetHostTime {
+            // Ask the native decoder for its next display deadline. Pulling from
+            // the independently anchored audio clock can repeatedly miss the
+            // decoder's frame boundary even with 60 display callbacks per second.
+            let mapped = videoOutput.itemTime(forHostTime: targetHostTime)
+            guard ownsFramePull(pullReceipt) else { return }
+            if mapped.isNumeric, presentationTime.isNumeric,
+               abs(CMTimeGetSeconds(CMTimeSubtract(mapped, presentationTime))) <= 0.080 {
+                requestedTime = mapped
+            }
+        }
         #if DEBUG
         if debugWholeEntry != nil {
             debugWholeTimebase = .init(entryNs: debugWholeReadEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
@@ -1356,7 +1392,7 @@ final class ContinuousPictureInPicture: NSObject {
         #endif
         guard !lastEnqueuedTime.isNumeric || CMTimeCompare(displayTime, lastEnqueuedTime) > 0 else { return }
         // Never build a future presentation backlog if the video decoder runs ahead of audio.
-        let lead = CMTimeGetSeconds(CMTimeSubtract(displayTime, requestedTime))
+        let lead = CMTimeGetSeconds(CMTimeSubtract(displayTime, presentationTime))
         #if DEBUG
         debugWholeStage = .leadGuard
         #endif
@@ -1399,6 +1435,10 @@ final class ContinuousPictureInPicture: NSObject {
         debugWholeStage = .sampleGuard
         #endif
         guard status == noErr, let sample else { reportFrameFailure(status); return }
+        // Carry ownership with the actual pixels. Layer readiness can remain true
+        // after a retaining flush; it is not incoming-image proof by itself.
+        CVBufferSetAttachment(pixel, Self.displayedEpochKey, pullReceipt.displayMarker as CFString, .shouldPropagate)
+        CVBufferSetAttachment(pixel, Self.displayedPositionKey, NSNumber(value: displayTime.seconds), .shouldPropagate)
         #if DEBUG
         let debugAlignedBeforeEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #endif

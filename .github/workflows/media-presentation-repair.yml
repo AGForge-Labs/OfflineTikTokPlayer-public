@@ -41,7 +41,7 @@ jobs:
           mkdir -p artifacts/presentation
           # Compile the complete app, with only these new independent test files.
           # The standard project/full test profile and its failures remain intact.
-          excluded="$(python3 -c 'from pathlib import Path; chosen={"VideoPresentationContinuityTests.swift", "MeasuredAudioIntegrationTests.swift", "PlaybackPresentationPolicyTests.swift", "ContinuousPictureInPictureTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
+          excluded="$(python3 -c 'from pathlib import Path; chosen={"VideoPresentationContinuityTests.swift", "MeasuredAudioIntegrationTests.swift", "PlaybackPresentationPolicyTests.swift", "ContinuousPictureInPictureTests.swift", "PictureRecoveryTests.swift", "PlaybackFrameMonitorTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
           printf '%s\n' 'Focused native sources: VideoPresentationContinuityTests.swift MeasuredAudioIntegrationTests.swift PlaybackPresentationPolicyTests.swift ContinuousPictureInPictureTests.swift'
           xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
             -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
@@ -50,6 +50,8 @@ jobs:
             -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
             -only-testing:OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests \
             -only-testing:OfflineTikTokPlayerTests/PlaybackPresentationPolicyTests \
+            -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests \
+            -only-testing:OfflineTikTokPlayerTests/PlaybackFrameMonitorTests \
             -only-testing:OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testDefaultIdentityCompositionPreservesEveryDecodedVideoFrame \
             -only-testing:OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testPortraitAndMirrorCompositionProducesOrientedPixelsAndPreservesSourceTiming \
             -only-testing:OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testImportedPositiveOffsetAndCompositionAssetsKeepConservativeFallback \

@@ -194,7 +194,7 @@ final class PlaybackService: NSObject {
     enum DebugVideoSeekReason: Int, Sendable {
         case unattributed = 0, readyRestore = 1, readyRewind = 2, sourceVisit = 3, drift = 4
         case userPausedSeek = 5, latestPausedTarget = 6, foreground = 7
-        case pipRestore = 8, surfaceRestore = 9, preparedPausedSource = 10
+        case pipRestore = 8, surfaceRestore = 9, preparedPausedSource = 10, frameProgressRecovery = 11
     }
     struct DebugVideoSeekStamp: Sendable {
         let reason: DebugVideoSeekReason
@@ -558,6 +558,12 @@ final class PlaybackService: NSObject {
         let audioFrame: Int64
     }
     @ObservationIgnored private var stoppedVideoClock: StoppedVideoClock?
+    private struct ImageProgressOwner: Equatable {
+        let request: Int, item: ObjectIdentifier, token: Int, visit: Int64, selectionVersion: Int
+    }
+    @ObservationIgnored private var imageProgressOwner: ImageProgressOwner?
+    @ObservationIgnored private var imageProgress = VideoImageProgress()
+    @ObservationIgnored private var lastImageProgressCheck = 0.0
     private struct AudioProgress {
         let request: Int, token: Int, selectionVersion: Int
         let visit: Int64, frame: Int64
@@ -841,6 +847,8 @@ final class PlaybackService: NSObject {
     func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
+        imageProgressOwner = nil
+        imageProgress = VideoImageProgress()
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         pausedExplicitVisitOwnership = nil
@@ -2129,6 +2137,7 @@ final class PlaybackService: NSObject {
             synchronizeVideoToAudio()
             #endif
         }
+        recoverMissingVideoImages()
         if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
     }
 
@@ -2193,6 +2202,46 @@ final class PlaybackService: NSObject {
                 && presentation?.ticket == returnedPresentation?.ticket))
     }
     #endif
+
+    /// Repair a missing picture even if the muted native clock still advances.
+    /// No audio selection, audio seek or queue mutation is authorized by this path.
+    private func recoverMissingVideoImages() {
+        guard intent.canPlay, videoAllowed, continuousAudio.isSelected, audioLoadingID == nil,
+              statusHandledGeneration == generation, let item = observedItem,
+              let presentation = videoPresentation, presentation.request == generation else {
+            imageProgressOwner = nil; imageProgress = VideoImageProgress(); return
+        }
+        let sample = continuousAudio.snapshot
+        guard sample.token > 0, sample.token == audioToken, sample.visit == audioVisit,
+              continuousAudio.selectedID == queue.currentID, !sample.ended,
+              !continuousAudio.isSelectionPending(in: sample) else { return }
+        let owner = ImageProgressOwner(request: generation, item: ObjectIdentifier(item), token: sample.token,
+            visit: sample.visit, selectionVersion: sample.selectionVersion)
+        if owner != imageProgressOwner { imageProgressOwner = owner; imageProgress = VideoImageProgress() }
+        // A matching in-flight correction retains the bounded-attempt latch.
+        guard syncingVideoGeneration != generation, nativeSeekTicket == nil,
+              continuousPiP.activeTimelineReceipt(for: presentation.ticket) != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastImageProgressCheck >= 0.25 else { return }
+        lastImageProgressCheck = now
+        guard player.currentItem === item, let timebase = item.timebase else { return }
+        let position = CMTimebaseGetTime(timebase)
+        let rate = CMTimebaseGetEffectiveRate(timebase)
+        guard position.isNumeric, rate.isFinite, rate > 0 else { return }
+        let displayed = continuousPiP.displayedFramePosition(for: presentation.ticket)
+        let fresh = continuousAudio.snapshot
+        guard generation == owner.request, observedItem === item, player.currentItem === item,
+              intent.canPlay, videoAllowed, videoPresentation?.ticket == presentation.ticket,
+              fresh.token == owner.token, fresh.visit == owner.visit,
+              fresh.selectionVersion == owner.selectionVersion, !fresh.ended,
+              continuousPiP.activeTimelineReceipt(for: presentation.ticket) != nil else { return }
+        guard imageProgress.shouldRecover(now: now, nativePosition: position.seconds, displayedPosition: displayed) else { return }
+        #if DEBUG
+        synchronizeVideoToAudio(force: true, reason: .frameProgressRecovery)
+        #else
+        synchronizeVideoToAudio(force: true)
+        #endif
+    }
 
     /// A stopped decoder gets a grace period rather than repeated startup seeks.
     /// Only advancing PCM in this exact selection may authorize video-only recovery.
