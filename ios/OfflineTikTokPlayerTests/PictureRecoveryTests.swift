@@ -82,8 +82,6 @@ final class PictureRecoveryTests: XCTestCase {
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until { service.isVideoReady && service.player.currentTime().seconds > 0.25 }
         let item = try XCTUnwrap(service.player.currentItem)
-        let audioProbe = try await NativeAudioContinuityProbe.attach(to: item)
-        try await until { audioProbe.totalFrames.load(ordering: .relaxed) >= 48_000 }
         let jumps = PictureTimeJumpCounter()
         var completedAudioSeeks = 0
         service.onPlaybackEvent = { if $0.name == "seekCompleted" { completedAudioSeeks += 1 } }
@@ -95,7 +93,28 @@ final class PictureRecoveryTests: XCTestCase {
             repairs += 1
             service.shouldDebugAcquireVideoFrame = nil
         }
-        for attempt in 1...2 {
+        // A tap changes AVFoundation's audio graph. Preserve an uninstrumented
+        // control so the observer cannot accidentally hide the original fault.
+        let controlFrames = service.submittedVideoFrameCount
+        var controlClock = NativeClockContinuityProbe()
+        service.shouldDebugAcquireVideoFrame = { _ in false }
+        try await until {
+            controlClock.sample(item)
+            return repairs == 1 && service.submittedVideoFrameCount >= controlFrames + 4 && service.isVideoReady
+        }
+        print("NATIVE_AUDIO_UNINSTRUMENTED timeJumpNotifications=\(jumps.value) completedAudioSeeks=\(completedAudioSeeks) clockSamples=\(controlClock.samples) definiteClockJumpSeconds=\(controlClock.maximumDefiniteJump) minimumEffectiveRate=\(controlClock.minimumRate)")
+        XCTAssertEqual(jumps.value, 0)
+        XCTAssertEqual(completedAudioSeeks, 0)
+        XCTAssertGreaterThan(controlClock.samples, 4)
+        XCTAssertLessThan(controlClock.maximumDefiniteJump, 0.002)
+        XCTAssertGreaterThan(controlClock.minimumRate, 0.99)
+        service.pause()
+        try await Task.sleep(for: .milliseconds(100))
+        service.play()
+        try await until { service.isVideoReady && service.player.rate > 0 }
+        let audioProbe = try await NativeAudioContinuityProbe.attach(to: item)
+        try await until { audioProbe.totalFrames.load(ordering: .relaxed) >= 48_000 }
+        for attempt in 2...3 {
             let output = try XCTUnwrap(item.outputs.first)
             let before = service.player.currentTime().seconds
             let frames = service.submittedVideoFrameCount
@@ -129,7 +148,7 @@ final class PictureRecoveryTests: XCTestCase {
             XCTAssertFalse(service.audioEngineRunning)
             XCTAssertTrue(service.wantsToPlay)
             XCTAssertNil(service.message)
-            if attempt == 1 {
+            if attempt == 2 {
                 let stoppedAt = service.player.currentTime().seconds
                 service.pause()
                 try await Task.sleep(for: .milliseconds(100))
