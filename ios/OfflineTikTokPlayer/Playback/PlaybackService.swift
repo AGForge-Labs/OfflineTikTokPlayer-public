@@ -492,6 +492,8 @@ final class PlaybackService: NSObject {
         }
     }
     @ObservationIgnored var onDebugVideoOutputRecovery: (() -> Void)?
+    var debugVideoPresentationItem: AVPlayerItem? { continuousPiP.debugPresentationItem }
+    var debugUsesIsolatedVideo: Bool { continuousPiP.debugUsesIsolatedVideo }
     #endif
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
     var videoFramePositionSeconds: Double? { continuousPiP.lastFramePositionSeconds }
@@ -2290,12 +2292,25 @@ final class PlaybackService: NSObject {
                   fresh.selectionVersion == owner.selectionVersion, !fresh.ended else { return }
         } else { guard usesNativeAudio, !continuousAudio.isSelected else { return } }
         guard imageProgress.shouldRecover(now: now, nativePosition: position.seconds, displayedPosition: displayed) else { return }
-        let repaired = continuousPiP.rebuildFrameOutput(for: presentation.ticket)
-        #if DEBUG
-        if repaired { onDebugVideoOutputRecovery?() }
-        #else
-        _ = repaired
-        #endif
+        if !pcm {
+            continuousPiP.recoverFrameFeedIsolatingNativeAudio(for: presentation.ticket, ifEligible: { [weak self, weak item] in
+                guard let self, let item else { return false }
+                return self.generation == owner.request && self.observedItem === item && self.player.currentItem === item
+                    && self.usesNativeAudio && !self.continuousAudio.isSelected && self.intent.canPlay && self.videoAllowed
+                    && self.videoPresentation?.ticket == presentation.ticket && self.nativeSeekTicket == nil
+            }, completion: { [weak self] repaired in
+                #if DEBUG
+                if repaired { self?.onDebugVideoOutputRecovery?() }
+                #endif
+            })
+        } else {
+            let repaired = continuousPiP.rebuildFrameOutput(for: presentation.ticket)
+            #if DEBUG
+            if repaired { onDebugVideoOutputRecovery?() }
+            #else
+            _ = repaired
+            #endif
+        }
     }
 
     /// A stopped decoder gets a grace period rather than repeated startup seeks.

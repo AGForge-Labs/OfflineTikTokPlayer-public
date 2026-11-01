@@ -37,12 +37,13 @@ final class ContinuousPictureInPicture: NSObject {
             }) { entries[index] = entry }
             else { entries[next] = entry; next = (next + 1) % entries.count }
         }
-        func position(for pixel: CVPixelBuffer?) -> Double? {
+        func position(for pixel: CVPixelBuffer?, presentationPosition: Double) -> Double? {
             guard let pixel else { return nil }
             let surface = surfaceID(pixel)
             for entry in entries {
-                if let entry, VideoImageIdentity.matches(sourceSurface: entry.surface, displayedSurface: surface,
-                    sameRetainedBuffer: entry.buffer === pixel) { return entry.position }
+                if let entry, VideoImageIdentity.isPresented(sourceSurface: entry.surface, displayedSurface: surface,
+                    sameRetainedBuffer: entry.buffer === pixel, framePosition: entry.position,
+                    presentationPosition: presentationPosition) { return entry.position }
             }
             return nil
         }
@@ -70,10 +71,12 @@ final class ContinuousPictureInPicture: NSObject {
         }
 
         @MainActor func matchesDisplayedImage(in layer: AVSampleBufferDisplayLayer) -> Bool {
-            matchesDisplayedPixel(layer.sampleBufferRenderer.displayedPixelBuffer())
+            displayedPosition(in: layer) != nil
         }
-        @MainActor fileprivate func matchesDisplayedPixel(_ pixel: CVPixelBuffer?) -> Bool {
-            surfaces.position(for: pixel) != nil
+        @MainActor fileprivate func displayedPosition(in layer: AVSampleBufferDisplayLayer) -> Double? {
+            guard let clock = layer.controlTimebase else { return nil }
+            let pixel = layer.sampleBufferRenderer.displayedPixelBuffer()
+            return surfaces.position(for: pixel, presentationPosition: CMTimebaseGetTime(clock).seconds)
         }
     }
     /// Ownership of an installed, active timeline. This never credits an image.
@@ -138,8 +141,7 @@ final class ContinuousPictureInPicture: NSObject {
     /// Read actual renderer output, not enqueue activity or the muted player's clock.
     func displayedFramePosition(for ticket: PresentationTicket) -> Double? {
         guard let receipt = currentFrameReceipt(for: ticket),
-              let pixel = displayLayer.sampleBufferRenderer.displayedPixelBuffer(),
-              let position = receipt.surfaces.position(for: pixel),
+              let position = receipt.displayedPosition(in: displayLayer),
               position.isFinite, currentFrameReceipt(for: ticket) == receipt else { return nil }
         return position
     }
@@ -218,7 +220,8 @@ final class ContinuousPictureInPicture: NSObject {
             }
             output = replacement
             publish(replacement)
-            item.remove(old)
+            let oldStillAttached = item.outputs.contains(where: { $0 === old })
+            if oldStillAttached { item.remove(old) }
             return ifEligible() && output === replacement && isAttached && isBorrowed
         }
         private func detach() {
@@ -759,6 +762,19 @@ final class ContinuousPictureInPicture: NSObject {
     private var activeSeekTicket: UInt64?
     private var currentResource: PreparedVideoResource?
     private var currentResourceOwned = false
+    // currentItem/ticket identify the audible selection. Only hard native-audio
+    // recovery gives its picture output a distinct, permanently muted decoder.
+    private var isolatedVideo: IsolatedVideoRecovery?
+    private final class IsolatedRequest {}
+    private var isolatedRequest: IsolatedRequest?
+    private var isolatedPreparation: Task<Void, Never>?
+    private var pendingIsolatedPreparations: [ObjectIdentifier: Task<Void, Never>] = [:]
+    private var pendingRecoveryDrains: [UUID: Task<Void, Never>] = [:]
+    private var dormantAudioResource: (resource: PreparedVideoResource, owned: Bool)?
+    #if DEBUG
+    var debugPresentationItem: AVPlayerItem? { currentResource?.item }
+    var debugUsesIsolatedVideo: Bool { isolatedVideo != nil }
+    #endif
 
     var isReady: Bool { !invalidated && controller != nil && timebase != nil }
     var isFrameFeedSuspended: Bool { !frameFeedEnabled }
@@ -831,11 +847,12 @@ final class ContinuousPictureInPicture: NSObject {
         activeSeekTicket = nil
         stopFrameTimer()
         let adoptionRevision = presentationRevision
+        cancelIsolatedPreparation()
         let ticket = item.map { PresentationTicket(generation: presentationRevision, item: ObjectIdentifier($0)) }
         invalidateCurrentFrameProof()
         guard !invalidated, presentationRevision == adoptionRevision else { return nil }
         if currentItem === item, currentResource?.isRetired != true,
-           preparedVideo == nil || preparedVideo === currentResource {
+           isolatedVideo != nil || preparedVideo == nil || preparedVideo === currentResource {
             // A new service request for the same item needs its own timeline,
             // while its output and in-flight geometry preparation stay reusable.
             flushForSeek(removingImage: item == nil)
@@ -947,10 +964,114 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     private func releaseCurrentResource() {
+        cancelIsolatedPreparation()
+        let isolated = isolatedVideo
         let resource = currentResource, owned = currentResourceOwned
+        let dormant = dormantAudioResource
+        isolatedVideo = nil
         currentResource = nil; currentResourceOwned = false; videoOutput = nil
+        dormantAudioResource = nil
+        retainRecoveryDrain(isolated?.close())
         if owned { resource?.retire() }
         resource?.releaseBorrow()
+        if let dormant {
+            if dormant.owned { dormant.resource.retire() }
+            dormant.resource.releaseBorrow()
+        }
+    }
+
+    private func cancelIsolatedPreparation() {
+        isolatedRequest = nil
+        isolatedPreparation?.cancel()
+        isolatedPreparation = nil
+    }
+
+    private func retainRecoveryDrain(_ pending: Task<Void, Never>?) {
+        guard let pending else { return }
+        let identity = UUID()
+        pendingRecoveryDrains[identity] = Task { [weak self] in
+            await pending.value
+            self?.pendingRecoveryDrains[identity] = nil
+        }
+    }
+
+    private func synchronizeIsolatedVideo(force: Bool = false) {
+        guard let isolated = isolatedVideo, let timebase, let item = currentItem else { return }
+        let ticket = PresentationTicket(generation: presentationRevision, item: ObjectIdentifier(item))
+        isolated.synchronize(to: timebase, playing: playbackState.read().isPlaying && frameFeedEnabled,
+            force: force, context: seekTicket) { [weak self, weak isolated] in
+                guard let self, let isolated, self.isolatedVideo === isolated, self.owns(ticket),
+                      self.frameFeedEnabled else { return }
+                self.renderFrame()
+            }
+    }
+
+    /// Creating a new video output on an audible item can stop AVFoundation's
+    /// audio clock. Keep its original tap attached, and recover on a muted item.
+    @discardableResult
+    func recoverFrameFeedIsolatingNativeAudio(for ticket: PresentationTicket,
+        ifEligible: @escaping @MainActor () -> Bool, completion: @escaping @MainActor (Bool) -> Void) -> Bool {
+        guard owns(ticket), frameFeedEnabled, activeSeekTicket == nil, playbackState.read().isPlaying,
+              let item = currentItem, let previous = currentResource, ifEligible() else { return false }
+        if isolatedVideo != nil {
+            let repaired = rebuildFrameOutput(for: ticket)
+            completion(repaired)
+            return repaired
+        }
+        guard isolatedPreparation == nil else { return false }
+        let request = IsolatedRequest()
+        isolatedRequest = request
+        isolatedPreparation = Task { [weak self, weak item] in
+            guard let self, let item else { return }
+            var prepared: IsolatedVideoRecovery?
+            var adopted = false
+            defer {
+                if !adopted { self.retainRecoveryDrain(prepared?.close()) }
+                self.pendingIsolatedPreparations[ObjectIdentifier(request)] = nil
+                if self.isolatedRequest === request {
+                    self.isolatedRequest = nil; self.isolatedPreparation = nil
+                }
+            }
+            func eligible() -> Bool {
+                !Task.isCancelled && self.isolatedRequest === request && self.owns(ticket)
+                    && self.currentItem === item && self.currentResource === previous
+                    && self.frameFeedEnabled && self.activeSeekTicket == nil
+                    && self.playbackState.read().isPlaying && ifEligible()
+            }
+            do {
+                let decoder = try await IsolatedVideoRecovery.prepare(from: item)
+                prepared = decoder
+                guard eligible(), decoder.resource.borrow(for: decoder.item) else { return }
+                guard eligible(), let output = decoder.resource.output else {
+                    decoder.resource.releaseBorrow(); return
+                }
+                let barrier = self.beginSeek()
+                guard !Task.isCancelled, self.isolatedRequest === request, self.owns(ticket),
+                      self.currentResource === previous, self.activeSeekTicket == barrier,
+                      self.frameFeedEnabled, self.playbackState.read().isPlaying, ifEligible() else {
+                    self.completeSeek(barrier); decoder.resource.releaseBorrow(); return
+                }
+                // Do not call releaseCurrentResource here: it could detach the
+                // still-audible item's output and reproduce the measured gap.
+                self.dormantAudioResource = (previous, self.currentResourceOwned)
+                self.currentResource = decoder.resource; self.currentResourceOwned = true
+                self.videoOutput = output; self.isolatedVideo = decoder
+                self.orientationPrepared = true
+                adopted = true
+                self.completeSeek(barrier)
+                guard self.owns(ticket), self.isolatedVideo === decoder, self.frameFeedEnabled,
+                      ifEligible() else { return }
+                self.synchronizeIsolatedVideo(force: true)
+                if self.playbackState.read().isPlaying { self.startFrameTimer() }
+                if self.owns(ticket), self.isolatedVideo === decoder, self.frameFeedEnabled, ifEligible() {
+                    completion(true)
+                }
+            } catch {
+                if eligible() { completion(false) }
+            }
+        }
+        pendingIsolatedPreparations[ObjectIdentifier(request)] = isolatedPreparation
+        return true
     }
 
     /// A narrow leading-empty cadence choice, never permission to bypass composition or source timing.
@@ -1054,6 +1175,8 @@ final class ContinuousPictureInPicture: NSObject {
         if previous.isPlaying != isPlaying || previous.duration != duration {
             controller?.invalidatePlaybackState()
         }
+        if !isPlaying { cancelIsolatedPreparation() }
+        synchronizeIsolatedVideo(force: forceAnchor)
         if frameFeedEnabled && isPlaying && currentItem != nil { startFrameTimer() }
         else { stopFrameTimer() }
         renderFrame()
@@ -1129,6 +1252,7 @@ final class ContinuousPictureInPicture: NSObject {
         guard rebuilt, eligible() else { return false }
         completeSeek(barrier)
         guard owns(ticket), currentResource === resource, activeSeekTicket == nil else { return false }
+        synchronizeIsolatedVideo(force: true)
         renderFrame()
         if playbackState.read().isPlaying { startFrameTimer() }
         return true
@@ -1140,6 +1264,8 @@ final class ContinuousPictureInPicture: NSObject {
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
         frameFeedEnabled = false
+        cancelIsolatedPreparation()
+        isolatedVideo?.suspend()
         stopFrameTimer()
         invalidateFrameEligibility()
     }
@@ -1151,6 +1277,7 @@ final class ContinuousPictureInPicture: NSObject {
         let wasSuspended = !frameFeedEnabled
         frameFeedEnabled = true
         if wasSuspended { readinessUpdatePending = true }
+        synchronizeIsolatedVideo(force: wasSuspended)
         renderFrame()
         if playbackState.read().isPlaying && currentItem != nil { startFrameTimer() }
     }
@@ -1160,7 +1287,15 @@ final class ContinuousPictureInPicture: NSObject {
     func debugInvalidateAndCapturePreparation() -> Task<Void, Never>? {
         let owned = preparationTask
         invalidate()
-        return owned
+        let preparations = Array(pendingIsolatedPreparations.values)
+        let drains = Array(pendingRecoveryDrains.values)
+        return Task { [self] in
+            await owned?.value
+            for task in preparations { await task.value }
+            for task in drains { await task.value }
+            // A cancelled preparation may have closed its decoder while being joined.
+            for task in Array(pendingRecoveryDrains.values) { await task.value }
+        }
     }
     #endif
 
@@ -1273,7 +1408,8 @@ final class ContinuousPictureInPicture: NSObject {
             }
         }
         #endif
-        guard !invalidated, frameFeedEnabled, let videoOutput, let timebase else { return }
+        guard !invalidated, frameFeedEnabled, isolatedVideo?.isAligning != true,
+              let videoOutput, let timebase else { return }
         beginReadinessUpdates()
         defer {
             #if DEBUG

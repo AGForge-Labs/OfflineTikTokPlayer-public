@@ -82,6 +82,7 @@ final class PictureRecoveryTests: XCTestCase {
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until { service.isVideoReady && service.player.currentTime().seconds > 0.25 }
         let item = try XCTUnwrap(service.player.currentItem)
+        let audibleOutput = try XCTUnwrap(item.outputs.first)
         let jumps = PictureTimeJumpCounter()
         var completedAudioSeeks = 0
         service.onPlaybackEvent = { if $0.name == "seekCompleted" { completedAudioSeeks += 1 } }
@@ -108,6 +109,9 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertGreaterThan(controlClock.samples, 4)
         XCTAssertLessThan(controlClock.maximumDefiniteJump, 0.002)
         XCTAssertGreaterThan(controlClock.minimumRate, 0.99)
+        XCTAssertTrue(service.debugUsesIsolatedVideo)
+        XCTAssertFalse(service.debugVideoPresentationItem === item)
+        XCTAssertTrue(item.outputs.first === audibleOutput, "Promoting picture recovery must leave the audible tap attached")
         service.pause()
         try await Task.sleep(for: .milliseconds(100))
         service.play()
@@ -115,21 +119,27 @@ final class PictureRecoveryTests: XCTestCase {
         let audioProbe = try await NativeAudioContinuityProbe.attach(to: item)
         try await until { audioProbe.totalFrames.load(ordering: .relaxed) >= 48_000 }
         for attempt in 2...3 {
-            let output = try XCTUnwrap(item.outputs.first)
+            let pictureItem = try XCTUnwrap(service.debugVideoPresentationItem)
+            XCTAssertFalse(pictureItem === item)
+            let output = try XCTUnwrap(pictureItem.outputs.first)
             let before = service.player.currentTime().seconds
             let frames = service.submittedVideoFrameCount
             jumps.value = 0
             let epoch = audioProbe.beginWindow()
             try await until { audioProbe.observedEpoch.load(ordering: .acquiring) == epoch }
             var nativeClock = NativeClockContinuityProbe()
-            service.shouldDebugAcquireVideoFrame = { _ in false }
+            // Detach the real SDK producer; do not release an application-side
+            // acquisition gate when the repair reports completion.
+            pictureItem.remove(output)
             try await until {
                 nativeClock.sample(item)
                 return repairs == attempt && service.submittedVideoFrameCount >= frames + 4 && service.isVideoReady
             }
             XCTAssertTrue(service.player.currentItem === item)
-            XCTAssertEqual(item.outputs.count, 1)
-            XCTAssertFalse(item.outputs.first === output)
+            XCTAssertTrue(item.outputs.first === audibleOutput)
+            XCTAssertTrue(service.debugVideoPresentationItem === pictureItem)
+            XCTAssertEqual(pictureItem.outputs.count, 1)
+            XCTAssertFalse(pictureItem.outputs.first === output)
             XCTAssertGreaterThan(service.player.currentTime().seconds, before + 1)
             XCTAssertEqual(jumps.value, 0, "Replacing a picture output must not seek the streamed/native audio clock")
             print("NATIVE_AUDIO_CONTINUITY attempt=\(attempt) timeJumpNotifications=\(jumps.value) completedAudioSeeks=\(completedAudioSeeks) windowFrames=\(audioProbe.windowFrames.load(ordering: .relaxed)) sourceGapFrames=\(audioProbe.gapFrames.load(ordering: .relaxed)) sourceOverlapFrames=\(audioProbe.overlapFrames.load(ordering: .relaxed)) zeroReturns=\(audioProbe.zeroReturns.load(ordering: .relaxed)) maximumSilentFrames=\(audioProbe.maximumSilentFrames.load(ordering: .relaxed)) readErrors=\(audioProbe.readErrors.load(ordering: .relaxed)) supportedPCM=\(audioProbe.supported.load(ordering: .relaxed)) clockSamples=\(nativeClock.samples) definiteClockJumpSeconds=\(nativeClock.maximumDefiniteJump) minimumEffectiveRate=\(nativeClock.minimumRate)")
@@ -179,6 +189,61 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertGreaterThan(service.audioSnapshot.frame, before.frame + 24_000)
         XCTAssertTrue(service.wantsToPlay)
         XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+    }
+
+    func testPausedIsolatedSeekSurvivesOrdinaryPausedClockUpdates() async throws {
+        let (decoder, clock) = try await isolatedDecoder(position: 1.5, rate: 0)
+        var completions = 0
+        decoder.synchronize(to: clock, playing: false, force: true) { completions += 1 }
+        for _ in 0..<6 {
+            decoder.synchronize(to: clock, playing: false) { completions += 1 }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await until { completions == 1 && !decoder.isAligning }
+        XCTAssertEqual(decoder.debugSeekCount, 1)
+        XCTAssertEqual(decoder.player.currentTime().seconds, 1.5, accuracy: 1.0 / 60)
+        XCTAssertEqual(decoder.player.rate, 0)
+    }
+
+    func testSlowIsolatedNativeStartDoesNotRepeatedlySeekItsStoppedClock() async throws {
+        let (decoder, clock) = try await isolatedDecoder(position: 0.2, rate: 1)
+        var pendingStart: (() -> Void)?
+        decoder.debugScheduleStart = { player, position, host in
+            pendingStart = { player.setRate(1, time: position, atHostTime: host) }
+        }
+        decoder.synchronize(to: clock, playing: true, force: true) {}
+        try await until { pendingStart != nil }
+        let seeks = decoder.debugSeekCount
+        for _ in 0..<35 {
+            decoder.synchronize(to: clock, playing: true) {}
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(decoder.debugSeekCount, seeks, "A stopped scheduled clock must get startup grace, not repeated seeks")
+        XCTAssertEqual(decoder.item.timebase.map { CMTimebaseGetEffectiveRate($0) }, 0)
+        let start = try XCTUnwrap(pendingStart)
+        decoder.debugScheduleStart = nil; pendingStart = nil
+        start()
+        try await until {
+            decoder.synchronize(to: clock, playing: true) {}
+            return decoder.player.currentTime().seconds > 0.45 && decoder.player.rate > 0
+        }
+        XCTAssertEqual(decoder.debugSeekCount, seeks)
+    }
+
+    private func isolatedDecoder(position: Double, rate: Double) async throws -> (IsolatedVideoRecovery, CMTimebase) {
+        let url = try XCTUnwrap(Bundle(for: PictureRecoveryTests.self).url(forResource: "test-motion-60", withExtension: "mp4"))
+        let decoder = try await IsolatedVideoRecovery.prepare(from: AVPlayerItem(url: url))
+        addTeardownBlock { @MainActor in
+            decoder.debugScheduleStart = nil
+            if let pending = decoder.close() { await pending.value }
+        }
+        var created: CMTimebase?
+        XCTAssertEqual(CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(), timebaseOut: &created), noErr)
+        let clock = try XCTUnwrap(created)
+        CMTimebaseSetTime(clock, time: CMTime(seconds: position, preferredTimescale: 48_000))
+        CMTimebaseSetRate(clock, rate: rate)
+        return (decoder, clock)
     }
 
     private func until(_ condition: () -> Bool) async throws {
