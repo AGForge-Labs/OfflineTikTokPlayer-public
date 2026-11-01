@@ -19,13 +19,18 @@ final class VideoImageProgressTests: XCTestCase {
         XCTAssertFalse(progress.shouldRecover(now: 1.7, nativePosition: 1.8, displayedPosition: 0))
         XCTAssertFalse(progress.shouldRecover(now: 4, nativePosition: 4.1, displayedPosition: 0))
     }
-    func testForwardImageProgressRearmsOnlyAfterAnotherFullGracePeriod() {
+    func testHealthySlowAndVFRHoldsCannotCauseRepeatedRepairsWithinOneOwner() {
         var progress = VideoImageProgress()
         XCTAssertFalse(progress.shouldRecover(now: 0, nativePosition: 0.2, displayedPosition: 0.2))
         XCTAssertTrue(progress.shouldRecover(now: 1.6, nativePosition: 1.8, displayedPosition: 0.2))
         XCTAssertFalse(progress.shouldRecover(now: 2, nativePosition: 2.2, displayedPosition: 2.1))
         XCTAssertFalse(progress.shouldRecover(now: 2.5, nativePosition: 2.7, displayedPosition: 2.1))
-        XCTAssertTrue(progress.shouldRecover(now: 3.6, nativePosition: 3.8, displayedPosition: 2.1))
+        XCTAssertFalse(progress.shouldRecover(now: 3.6, nativePosition: 3.8, displayedPosition: 2.1))
+        for tick in stride(from: 4, through: 20, by: 2) {
+            let position = Double(tick)
+            XCTAssertFalse(progress.shouldRecover(now: position, nativePosition: position + 0.2, displayedPosition: position))
+            XCTAssertFalse(progress.shouldRecover(now: position + 1.6, nativePosition: position + 1.8, displayedPosition: position))
+        }
     }
     func testNativeClockAndRepeatedDecodedFramesAreNotImageProgress() {
         var stopped = VideoImageProgress()
