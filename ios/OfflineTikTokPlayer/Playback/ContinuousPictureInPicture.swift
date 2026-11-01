@@ -142,6 +142,7 @@ final class ContinuousPictureInPicture: NSObject {
         fileprivate(set) var output: AVPlayerItemVideoOutput?
         fileprivate(set) var isAttached = false
         fileprivate var preferredFrameRate: Float = 60
+        fileprivate var sourceFrameRate: Float = 30
         private(set) var isRetired = false
         private(set) var isBorrowed = false
         fileprivate var originalComposition: AVVideoComposition?
@@ -163,6 +164,26 @@ final class ContinuousPictureInPicture: NSObject {
         func retire() {
             isRetired = true
             if !isBorrowed { detach() }
+        }
+        /// Replace only the picture tap. The item, native clock and audio tracks
+        /// remain installed. Publish the new owner before SDK removal can reenter.
+        fileprivate func rebuildOutput(ifEligible: () -> Bool,
+                                       publish: (AVPlayerItemVideoOutput) -> Void) -> Bool {
+            guard let item, let old = output, isAttached, isBorrowed, ifEligible() else { return false }
+            let replacement = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ])
+            replacement.suppressesPlayerRendering = old.suppressesPlayerRendering
+            guard ifEligible(), output === old, isAttached, isBorrowed else { return false }
+            item.add(replacement)
+            guard ifEligible(), output === old, isAttached, isBorrowed else {
+                item.remove(replacement); return false
+            }
+            output = replacement
+            publish(replacement)
+            item.remove(old)
+            return ifEligible() && output === replacement && isAttached && isBorrowed
         }
         private func detach() {
             let wasAttached = isAttached, output = self.output
@@ -245,12 +266,15 @@ final class ContinuousPictureInPicture: NSObject {
         fileprivate var nativeGeometry: NativeVideoGeometry?
         private var usesNativeGeometry = false
         private var nativeFrameRate: Float = 60
+        private var sourceFrameRate: Float = 30
         fileprivate init(item: AVPlayerItem, original: AVVideoComposition?, composition: AVVideoComposition) {
             self.item = item; self.original = original; self.composition = composition
         }
         fileprivate init(item: AVPlayerItem, asset: AVURLAsset, nativeGeometry: NativeVideoGeometry, frameRate: Float = 60) {
             self.item = item; nativeAsset = asset; self.nativeGeometry = nativeGeometry
-            usesNativeGeometry = true; nativeFrameRate = frameRate
+            usesNativeGeometry = true
+            sourceFrameRate = frameRate.isFinite && frameRate > 0 ? frameRate : 30
+            nativeFrameRate = min(120, max(60, sourceFrameRate))
         }
         private func installNative(ifEligible: () -> Bool) -> PreparedVideoResource? {
             guard !consumed else { return nil }
@@ -260,6 +284,7 @@ final class ContinuousPictureInPicture: NSObject {
                   ifEligible(), item.asset === asset, item.videoComposition == nil else { return nil }
             let resource = PreparedVideoResource(item: item)
             resource.preferredFrameRate = nativeFrameRate
+            resource.sourceFrameRate = sourceFrameRate
             #if DEBUG
             resource.debugNativeGeometry = nativeGeometry; resource.debugUsesNativeGeometry = true
             #endif
@@ -302,6 +327,7 @@ final class ContinuousPictureInPicture: NSObject {
             guard ifEligible() else { resource.retire(); return nil }
             if cadence.isFinite, cadence > 0 {
                 resource.preferredFrameRate = Float(min(120, max(60, 1 / cadence)))
+                resource.sourceFrameRate = Float(1 / cadence)
             }
             #if DEBUG
             resource.debugNativeGeometry = nativeGeometry
@@ -400,8 +426,7 @@ final class ContinuousPictureInPicture: NSObject {
         }
         let fps = try await track.load(.nominalFrameRate)
         try Task.checkCancellation()
-        let rate = fps.isFinite && fps > 0 ? min(120, max(60, fps)) : 60
-        return VideoResourcePreparation(item: item, asset: asset, nativeGeometry: geometry, frameRate: rate)
+        return VideoResourcePreparation(item: item, asset: asset, nativeGeometry: geometry, frameRate: fps)
     }
     #if DEBUG
     enum DebugNativeGeometryFailure: Error { case unqualified }
@@ -703,6 +728,10 @@ final class ContinuousPictureInPicture: NSObject {
     var isFrameFeedSuspended: Bool { !frameFeedEnabled }
     var isFrameFeedRunning: Bool { frameTimer != nil || displayLink != nil }
     var isVideoReadyForDisplay: Bool { displayLayer.isReadyForDisplay }
+    var imageRecoveryGraceSeconds: Double {
+        let rate = Double(currentResource?.sourceFrameRate ?? 30)
+        return rate.isFinite && rate > 0 ? min(30, max(1.5, 3 / rate)) : 3
+    }
     var requestedPositionSeconds: Double { playbackState.read().position }
     var timebasePositionSeconds: Double? {
         guard let timebase else { return nil }
@@ -1048,6 +1077,27 @@ final class ContinuousPictureInPicture: NSObject {
         readinessUpdatePending = true
     }
 
+    /// Restore a starved output in either audio mode without seeking AVPlayer.
+    @discardableResult
+    func rebuildFrameOutput(for ticket: PresentationTicket) -> Bool {
+        guard owns(ticket), presentationActive, frameFeedEnabled, activeSeekTicket == nil,
+              let resource = currentResource else { return false }
+        let barrier = beginSeek()
+        defer { completeSeek(barrier) }
+        func eligible() -> Bool {
+            owns(ticket) && frameFeedEnabled && currentResource === resource
+                && activeSeekTicket == barrier && seekTicket == barrier
+        }
+        guard eligible() else { return false }
+        let rebuilt = resource.rebuildOutput(ifEligible: eligible) { self.videoOutput = $0 }
+        guard rebuilt, eligible() else { return false }
+        completeSeek(barrier)
+        guard owns(ticket), currentResource === resource, activeSeekTicket == nil else { return false }
+        renderFrame()
+        if playbackState.read().isPlaying { startFrameTimer() }
+        return true
+    }
+
     /// Call when video is intentionally disabled, even if audio remains active.
     func suspendFrameFeed() {
         guard frameFeedEnabled else { return }
@@ -1303,7 +1353,7 @@ final class ContinuousPictureInPicture: NSObject {
             let mapped = videoOutput.itemTime(forHostTime: targetHostTime)
             guard ownsFramePull(pullReceipt) else { return }
             if mapped.isNumeric, presentationTime.isNumeric,
-               abs(CMTimeGetSeconds(CMTimeSubtract(mapped, presentationTime))) <= 0.080 {
+               VideoFrameRequest.usesNativeDeadline(presentation: presentationTime.seconds, mapped: mapped.seconds) {
                 requestedTime = mapped
             }
         }

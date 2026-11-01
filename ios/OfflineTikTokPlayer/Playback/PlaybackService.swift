@@ -194,7 +194,7 @@ final class PlaybackService: NSObject {
     enum DebugVideoSeekReason: Int, Sendable {
         case unattributed = 0, readyRestore = 1, readyRewind = 2, sourceVisit = 3, drift = 4
         case userPausedSeek = 5, latestPausedTarget = 6, foreground = 7
-        case pipRestore = 8, surfaceRestore = 9, preparedPausedSource = 10, frameProgressRecovery = 11
+        case pipRestore = 8, surfaceRestore = 9, preparedPausedSource = 10
     }
     struct DebugVideoSeekStamp: Sendable {
         let reason: DebugVideoSeekReason
@@ -491,6 +491,7 @@ final class PlaybackService: NSObject {
             }
         }
     }
+    @ObservationIgnored var onDebugVideoOutputRecovery: (() -> Void)?
     #endif
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
     var videoFramePositionSeconds: Double? { continuousPiP.lastFramePositionSeconds }
@@ -2166,6 +2167,7 @@ final class PlaybackService: NSObject {
         if usesNativeAudio, nativeSeekTicket == nil {
             continuousPiP.updatePlayback(positionSeconds: position, durationSeconds: clock.duration,
                 isPlaying: intent.canPlay && player.rate > 0)
+            recoverMissingVideoImages()
         }
         if firstProgressGeneration != generation, item.currentTime().seconds >= 0.05 {
             firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
@@ -2206,18 +2208,24 @@ final class PlaybackService: NSObject {
     /// Repair a missing picture even if the muted native clock still advances.
     /// No audio selection, audio seek or queue mutation is authorized by this path.
     private func recoverMissingVideoImages() {
-        guard intent.canPlay, videoAllowed, continuousAudio.isSelected, audioLoadingID == nil,
+        guard intent.canPlay, videoAllowed, (continuousAudio.isSelected || usesNativeAudio), audioLoadingID == nil,
               statusHandledGeneration == generation, let item = observedItem,
               let presentation = videoPresentation, presentation.request == generation else {
             imageProgressOwner = nil; imageProgress = VideoImageProgress(); return
         }
+        let pcm = continuousAudio.isSelected
         let sample = continuousAudio.snapshot
-        guard sample.token > 0, sample.token == audioToken, sample.visit == audioVisit,
-              continuousAudio.selectedID == queue.currentID, !sample.ended,
-              !continuousAudio.isSelectionPending(in: sample) else { return }
-        let owner = ImageProgressOwner(request: generation, item: ObjectIdentifier(item), token: sample.token,
-            visit: sample.visit, selectionVersion: sample.selectionVersion)
-        if owner != imageProgressOwner { imageProgressOwner = owner; imageProgress = VideoImageProgress() }
+        if pcm {
+            guard sample.token > 0, sample.token == audioToken, sample.visit == audioVisit,
+                  continuousAudio.selectedID == queue.currentID, !sample.ended,
+                  !continuousAudio.isSelectionPending(in: sample) else { return }
+        }
+        let owner = ImageProgressOwner(request: generation, item: ObjectIdentifier(item), token: pcm ? sample.token : -1,
+            visit: pcm ? sample.visit : 0, selectionVersion: pcm ? sample.selectionVersion : 0)
+        if owner != imageProgressOwner {
+            imageProgressOwner = owner
+            imageProgress = VideoImageProgress(graceSeconds: continuousPiP.imageRecoveryGraceSeconds)
+        }
         // A matching in-flight correction retains the bounded-attempt latch.
         guard syncingVideoGeneration != generation, nativeSeekTicket == nil,
               continuousPiP.activeTimelineReceipt(for: presentation.ticket) != nil else { return }
@@ -2232,14 +2240,17 @@ final class PlaybackService: NSObject {
         let fresh = continuousAudio.snapshot
         guard generation == owner.request, observedItem === item, player.currentItem === item,
               intent.canPlay, videoAllowed, videoPresentation?.ticket == presentation.ticket,
-              fresh.token == owner.token, fresh.visit == owner.visit,
-              fresh.selectionVersion == owner.selectionVersion, !fresh.ended,
               continuousPiP.activeTimelineReceipt(for: presentation.ticket) != nil else { return }
+        if pcm {
+            guard continuousAudio.isSelected, fresh.token == owner.token, fresh.visit == owner.visit,
+                  fresh.selectionVersion == owner.selectionVersion, !fresh.ended else { return }
+        } else { guard usesNativeAudio, !continuousAudio.isSelected else { return } }
         guard imageProgress.shouldRecover(now: now, nativePosition: position.seconds, displayedPosition: displayed) else { return }
+        let repaired = continuousPiP.rebuildFrameOutput(for: presentation.ticket)
         #if DEBUG
-        synchronizeVideoToAudio(force: true, reason: .frameProgressRecovery)
+        if repaired { onDebugVideoOutputRecovery?() }
         #else
-        synchronizeVideoToAudio(force: true)
+        _ = repaired
         #endif
     }
 
@@ -2814,6 +2825,7 @@ final class PlaybackService: NSObject {
         // AVKit can restore a suspended PiP window while the app stays in the
         // background. Restart its native video clock as well as the frame feed.
         if actions.restoreInlineVideo || restoringSuspendedVideo {
+            imageProgressOwner = nil
             #if DEBUG
             synchronizeVideoToAudio(force: true, reason: .surfaceRestore)
             #else

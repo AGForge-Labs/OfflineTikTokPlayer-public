@@ -3,10 +3,41 @@ import AVFoundation
 import CoreVideo
 import CryptoKit
 import UIKit
+import IOSurface
 @testable import OfflineTikTokPlayer
 
 @MainActor
 final class VideoPresentationContinuityTests: XCTestCase {
+    func testRendererPixelIdentityAndMetadataAfterActualIncomingDisplay() async throws {
+        let fixture = try await PresentedVideo.make()
+        defer { fixture.close() }
+        let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
+        let old = try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer())
+        let seek = fixture.bridge.beginSeek()
+        let sought = await fixture.seek(to: 1.5)
+        XCTAssertTrue(sought)
+        fixture.bridge.completeSeek(seek)
+        var acquired: CVPixelBuffer?
+        fixture.bridge.onDebugCopiedPixel = { pixel, _ in acquired = pixel }
+        XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: 1.5, durationSeconds: 6, isPlaying: false))
+        XCTAssertTrue(fixture.bridge.activate(ticket))
+        let changed = await until {
+            fixture.bridge.updatePlayback(positionSeconds: 1.5, durationSeconds: 6, isPlaying: false)
+            guard let actual = try? self.fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer()) else { return false }
+            return acquired != nil && actual != old
+        }
+        fixture.bridge.onDebugCopiedPixel = nil
+        XCTAssertTrue(changed)
+        let source = try XCTUnwrap(acquired)
+        let displayed = try XCTUnwrap(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer())
+        let sourceSurface = CVPixelBufferGetIOSurface(source).map { IOSurfaceGetID($0.takeUnretainedValue()) }
+        let displayedSurface = CVPixelBufferGetIOSurface(displayed).map { IOSurfaceGetID($0.takeUnretainedValue()) }
+        let sourceHash = try fingerprint(source), displayedHash = try fingerprint(displayed)
+        let key = "dev.galaxybigbird.OfflineTikTokPlayer.displayEpoch" as CFString
+        print("RENDERER_IDENTITY sameBuffer=\(source === displayed) sourceSurface=\(sourceSurface ?? 0) displayedSurface=\(displayedSurface ?? 0) samePixels=\(sourceHash == displayedHash) sourceFormat=\(CVPixelBufferGetPixelFormatType(source)) displayedFormat=\(CVPixelBufferGetPixelFormatType(displayed)) sourceRow=\(CVPixelBufferGetBytesPerRow(source)) displayedRow=\(CVPixelBufferGetBytesPerRow(displayed)) sourceHasEpoch=\(CVBufferCopyAttachment(source, key, nil) != nil) displayedHasEpoch=\(CVBufferCopyAttachment(displayed, key, nil) != nil)")
+        XCTAssertEqual(sourceHash, displayedHash, "Actual renderer/source bytes must be independently checked")
+    }
+
     func testSeekAndSourceAdoptionRetainTheDisplayedPictureWithoutOldFrameCredit() async throws {
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
@@ -43,6 +74,13 @@ final class VideoPresentationContinuityTests: XCTestCase {
         defer { fixture.close() }
         let rate = try await measuredRate(fixture)
         XCTAssertGreaterThan(rate, 40, "The same source must remain smooth without an unnecessary composition")
+    }
+
+    func testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames() async throws {
+        let fixture = try await PresentedVideo.make()
+        defer { fixture.close() }
+        let rate = try await measuredRate(fixture, audioLag: 0.055)
+        XCTAssertGreaterThan(rate, 40, "An accepted native clock lead must not consume and discard every frame")
     }
 
     func testShortTrailingAudioKeepsNativeVideoAndAFreshLastFrameWhilePaused() async throws {
@@ -120,9 +158,9 @@ final class VideoPresentationContinuityTests: XCTestCase {
         XCTAssertEqual(completions, 1)
     }
 
-    private func measuredRate(_ fixture: PresentedVideo) async throws -> Double {
+    private func measuredRate(_ fixture: PresentedVideo, audioLag: Double = 0) async throws -> Double {
         let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
-        let position = fixture.player.currentTime().seconds
+        let position = fixture.player.currentTime().seconds - audioLag
         XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: position, durationSeconds: 6, isPlaying: true))
         fixture.player.playImmediately(atRate: 1)
         XCTAssertTrue(fixture.bridge.activate(ticket))
