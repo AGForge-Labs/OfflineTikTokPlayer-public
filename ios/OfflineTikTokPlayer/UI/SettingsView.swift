@@ -52,9 +52,6 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Playback") {
-                    Toggle("Speaker sound", isOn: $playback.speakerSound)
-                    Text("Boosts quieter music and adds fuller bass through the iPhone speakers, with peak protection. Turn off for Original sound. Headphones and Bluetooth use the original audio. Your iPhone volume stays under your control.")
-                        .font(.caption).foregroundStyle(.secondary)
                     Toggle("Automatic Picture in Picture", isOn: $playback.automaticPiP)
                     Toggle("Audio only", isOn: $playback.audioOnly)
                     Text("Keeps the current audio position while video is hidden. Turn off to restore video. A camera or call can still interrupt audio when iOS requires it.")

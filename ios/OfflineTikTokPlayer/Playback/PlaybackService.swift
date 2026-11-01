@@ -390,8 +390,9 @@ final class PlaybackService: NSObject {
     var isInteractingWithFeed = false {
         didSet { updateAudioSuccessor() }
     }
-    var speakerSound: Bool {
-        didSet { preferences.set(speakerSound, forKey: "speakerSound"); refreshAudioProcessing() }
+    /// Automatic on built-in speakers; native PCM fixtures can bypass processing.
+    var speakerSound = true {
+        didSet { refreshAudioProcessing() }
     }
     var automaticPiP: Bool {
         didSet { pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture; preferences.set(automaticPiP, forKey: "automaticPiP") }
@@ -630,7 +631,6 @@ final class PlaybackService: NSObject {
         self.preparePCM = preparePCM ?? { try await $0.prepare(id: $1, url: $2, currentPriority: $3) }
         self.preferences = preferences
         automaticPiP = preferences.bool(forKey: "automaticPiP")
-        speakerSound = preferences.object(forKey: "speakerSound") as? Bool ?? true
         let restoredAudioOnly = preferences.bool(forKey: "audioOnly")
         audioOnly = restoredAudioOnly
         presentationPolicy = PlaybackPresentationPolicy(audioOnly: restoredAudioOnly)

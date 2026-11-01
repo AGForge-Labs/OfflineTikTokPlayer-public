@@ -115,7 +115,6 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         let suite = "HTTPPlayback-" + UUID().uuidString
         let preferences = try XCTUnwrap(UserDefaults(suiteName: suite))
         addTeardownBlock { preferences.removePersistentDomain(forName: suite) }
-        preferences.set(false, forKey: "speakerSound")
         preferences.set(false, forKey: "automaticPiP")
         preferences.set(false, forKey: "audioOnly")
         let audio = ContinuousAudioPlayer()
@@ -123,6 +122,7 @@ final class NativeStreamingPlaybackTests: XCTestCase {
             bookmarkURL: fixture.bookmark, activateSession: { try AVAudioSession.sharedInstance().setActive(true) },
             continuousAudio: audio, preferences: preferences, mediaCache: cache,
             resolveRemote: { base.appendingPathComponent($0.fileName) }))
+        service.speakerSound = false
         // Registered after fixture.own: XCTest runs this before its awaited
         // playback close, including failures before cache release.
         addTeardownBlock { await gate.cancel(); session.invalidateAndCancel() }
@@ -228,10 +228,10 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         let suite = "NativeStreaming-" + UUID().uuidString
         let preferences = try XCTUnwrap(UserDefaults(suiteName: suite))
         addTeardownBlock { preferences.removePersistentDomain(forName: suite) }
-        preferences.set(false, forKey: "speakerSound")
         let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
             bookmarkURL: fixture.bookmark, activateSession: {}, preferences: preferences,
             mediaCache: cache, resolveRemote: { try XCTUnwrap(sources[$0.itemID]) }))
+        service.speakerSound = false
         try await until { fixture.downloads.network.isConnected }
         return service
     }
