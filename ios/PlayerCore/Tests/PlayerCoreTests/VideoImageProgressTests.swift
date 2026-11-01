@@ -51,4 +51,12 @@ final class VideoImageProgressTests: XCTestCase {
         XCTAssertFalse(progress.shouldRecover(now: .nan, nativePosition: 3, displayedPosition: nil))
         XCTAssertFalse(progress.shouldRecover(now: 8, nativePosition: .infinity, displayedPosition: nil))
     }
+    func testKnownSlowSourceUsesItsCadenceBeforeRequestingAnyRepair() {
+        var progress = VideoImageProgress(graceSeconds: 6)
+        for tick in 0...12 {
+            let now = Double(tick) / 2
+            let image = floor(now / 2) * 2
+            XCTAssertFalse(progress.shouldRecover(now: now, nativePosition: now, displayedPosition: image))
+        }
+    }
 }
