@@ -23,6 +23,7 @@ struct PlaybackPresentationPolicy {
     }
 
     var allowsPictureInPicture: Bool { !audioOnly }
+    var allowsVideoRendering: Bool { presentation != .audioOnly }
 
     var presentation: Presentation {
         if audioOnly { return .audioOnly }

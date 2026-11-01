@@ -15,3 +15,7 @@ jobs:
           persist-credentials: false
       - run: swift --version
       - run: bash scripts/test-core.sh
+      - name: Active PiP suspension must retain its recovery frame feed
+        run: |
+          swiftc ios/OfflineTikTokPlayer/Playback/PlaybackPresentationPolicy.swift tests/validation-shell/pip_render_policy_check.swift -o artifacts/pip-render-policy
+          artifacts/pip-render-policy
