@@ -11,22 +11,22 @@ final class VideoPresentationContinuityTests: XCTestCase {
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
         let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
-        let original = try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.copyDisplayedPixelBuffer())
+        let original = try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer())
         XCTAssertNotNil(fixture.bridge.currentFrameReceipt(for: ticket))
         let seek = fixture.bridge.beginSeek()
         XCTAssertNil(fixture.bridge.currentFrameReceipt(for: ticket), "Held pixels cannot credit a new seek")
         try await Task.sleep(for: .milliseconds(80))
-        XCTAssertEqual(try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.copyDisplayedPixelBuffer()), original,
+        XCTAssertEqual(try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer()), original,
                        "A pending seek must not turn the visible video/PiP image black")
         fixture.bridge.completeSeek(seek)
         let next = AVPlayerItem(url: fixture.url)
         let nextTicket = try XCTUnwrap(fixture.bridge.setCurrentItem(next))
         XCTAssertNil(fixture.bridge.currentFrameReceipt(for: nextTicket))
         try await Task.sleep(for: .milliseconds(80))
-        XCTAssertEqual(try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.copyDisplayedPixelBuffer()), original,
+        XCTAssertEqual(try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer()), original,
                        "Keep the displayed picture while the next source prepares")
         fixture.bridge.setCurrentItem(nil)
-        let cleared = await until { fixture.bridge.displayLayer.sampleBufferRenderer.copyDisplayedPixelBuffer() == nil }
+        let cleared = await until { fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer() == nil }
         XCTAssertTrue(cleared, "Intentional stop clears the retained picture")
     }
 
