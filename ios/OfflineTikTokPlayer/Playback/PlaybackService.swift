@@ -752,6 +752,7 @@ final class PlaybackService: NSObject {
         persist(); updateNowPlaying()
     }
     func pause() {
+        imageProgressOwner = nil; imageProgress = VideoImageProgress(); lastImageProgressCheck = 0
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         transferInitialClockBinding(retainActivation: true)
@@ -2816,6 +2817,7 @@ final class PlaybackService: NSObject {
     func handleInterruption(began: Bool, shouldResume: Bool = false) {
         recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
+            imageProgressOwner = nil; imageProgress = VideoImageProgress(); lastImageProgressCheck = 0
             transferInitialClockBinding(retainActivation: true)
             intent.interruptionBegan(); initialPollWindow.withdraw(request: generation); cancelStallRecovery()
             continuousAudio.suspend()

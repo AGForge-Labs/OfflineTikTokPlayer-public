@@ -18,7 +18,8 @@ final class ContinuousPictureInPicture: NSObject {
     /// table for this epoch, never a decoded-frame queue or pixel copies.
     @MainActor fileprivate final class FrameSurfaces {
         private struct Entry {
-            let buffer: ObjectIdentifier
+            // Only a non-IOSurface fallback needs a retained wrapper identity.
+            let buffer: CVPixelBuffer?
             let surface: UInt32?
             let position: Double
         }
@@ -28,17 +29,20 @@ final class ContinuousPictureInPicture: NSObject {
             CVPixelBufferGetIOSurface(pixel).map { IOSurfaceGetID($0.takeUnretainedValue()) }
         }
         func record(_ pixel: CVPixelBuffer, position: Double) {
-            let entry = Entry(buffer: ObjectIdentifier(pixel), surface: surfaceID(pixel), position: position)
+            let surface = surfaceID(pixel)
+            let entry = Entry(buffer: surface == nil ? pixel : nil, surface: surface, position: position)
             if let index = entries.firstIndex(where: { old in
-                old.map { $0.buffer == entry.buffer || (entry.surface != nil && $0.surface == entry.surface) } ?? false
+                old.map { VideoImageIdentity.matches(sourceSurface: $0.surface, displayedSurface: surface,
+                    sameRetainedBuffer: $0.buffer === pixel) } ?? false
             }) { entries[index] = entry }
             else { entries[next] = entry; next = (next + 1) % entries.count }
         }
         func position(for pixel: CVPixelBuffer?) -> Double? {
             guard let pixel else { return nil }
-            let buffer = ObjectIdentifier(pixel), surface = surfaceID(pixel)
+            let surface = surfaceID(pixel)
             for entry in entries {
-                if let entry, entry.buffer == buffer || (surface != nil && entry.surface == surface) { return entry.position }
+                if let entry, VideoImageIdentity.matches(sourceSurface: entry.surface, displayedSurface: surface,
+                    sameRetainedBuffer: entry.buffer === pixel) { return entry.position }
             }
             return nil
         }

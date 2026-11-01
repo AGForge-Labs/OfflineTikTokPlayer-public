@@ -2,6 +2,9 @@ import XCTest
 import AVFoundation
 import UIKit
 import CoreVideo
+import AudioToolbox
+import MediaToolbox
+import Synchronization
 import PlayerCore
 @testable import OfflineTikTokPlayer
 
@@ -73,16 +76,17 @@ final class PictureRecoveryTests: XCTestCase {
         print("IMAGE_PROGRESS_RECOVERY repairs=\(repairs) sameToken=\(after.token == before.token) sameVisit=\(after.visit == before.visit) audioFrames=\(after.frame - before.frame) newVideoFrames=\(service.submittedVideoFrameCount - framesBefore)")
     }
 
-    func testNativeAudioOwnerRecoversItsPictureWithoutSeekingTheAudiblePlayer() async throws {
+    func testNativeAudioOwnerRecoversAgainAfterPauseWithoutSeekingTheAudiblePlayer() async throws {
         let fixture = try await PictureRecoveryFixture(test: self, nativeAudio: true)
         let service = fixture.service
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until { service.isVideoReady && service.player.currentTime().seconds > 0.25 }
         let item = try XCTUnwrap(service.player.currentItem)
-        let output = try XCTUnwrap(item.outputs.first)
-        let before = service.player.currentTime().seconds
-        let frames = service.submittedVideoFrameCount
+        let audioProbe = try await NativeAudioContinuityProbe.attach(to: item)
+        try await until { audioProbe.totalFrames.load(ordering: .relaxed) >= 48_000 }
         let jumps = PictureTimeJumpCounter()
+        var completedAudioSeeks = 0
+        service.onPlaybackEvent = { if $0.name == "seekCompleted" { completedAudioSeeks += 1 } }
         let observer = NotificationCenter.default.addObserver(forName: AVPlayerItem.timeJumpedNotification,
             object: item, queue: .main) { _ in MainActor.assumeIsolated { jumps.value += 1 } }
         defer { NotificationCenter.default.removeObserver(observer) }
@@ -91,17 +95,48 @@ final class PictureRecoveryTests: XCTestCase {
             repairs += 1
             service.shouldDebugAcquireVideoFrame = nil
         }
-        service.shouldDebugAcquireVideoFrame = { _ in false }
-        try await until { repairs == 1 && service.submittedVideoFrameCount >= frames + 4 && service.isVideoReady }
-        XCTAssertTrue(service.player.currentItem === item)
-        XCTAssertEqual(item.outputs.count, 1)
-        XCTAssertFalse(item.outputs.first === output)
-        XCTAssertGreaterThan(service.player.currentTime().seconds, before + 1)
-        XCTAssertEqual(jumps.value, 0, "Replacing a picture output must not seek the streamed/native audio clock")
-        XCTAssertFalse(service.player.isMuted)
-        XCTAssertFalse(service.audioEngineRunning)
-        XCTAssertTrue(service.wantsToPlay)
-        XCTAssertNil(service.message)
+        for attempt in 1...2 {
+            let output = try XCTUnwrap(item.outputs.first)
+            let before = service.player.currentTime().seconds
+            let frames = service.submittedVideoFrameCount
+            jumps.value = 0
+            let epoch = audioProbe.beginWindow()
+            try await until { audioProbe.observedEpoch.load(ordering: .acquiring) == epoch }
+            var nativeClock = NativeClockContinuityProbe()
+            service.shouldDebugAcquireVideoFrame = { _ in false }
+            try await until {
+                nativeClock.sample(item)
+                return repairs == attempt && service.submittedVideoFrameCount >= frames + 4 && service.isVideoReady
+            }
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertEqual(item.outputs.count, 1)
+            XCTAssertFalse(item.outputs.first === output)
+            XCTAssertGreaterThan(service.player.currentTime().seconds, before + 1)
+            XCTAssertEqual(jumps.value, 0, "Replacing a picture output must not seek the streamed/native audio clock")
+            print("NATIVE_AUDIO_CONTINUITY attempt=\(attempt) timeJumpNotifications=\(jumps.value) completedAudioSeeks=\(completedAudioSeeks) windowFrames=\(audioProbe.windowFrames.load(ordering: .relaxed)) sourceGapFrames=\(audioProbe.gapFrames.load(ordering: .relaxed)) sourceOverlapFrames=\(audioProbe.overlapFrames.load(ordering: .relaxed)) zeroReturns=\(audioProbe.zeroReturns.load(ordering: .relaxed)) maximumSilentFrames=\(audioProbe.maximumSilentFrames.load(ordering: .relaxed)) readErrors=\(audioProbe.readErrors.load(ordering: .relaxed)) supportedPCM=\(audioProbe.supported.load(ordering: .relaxed)) clockSamples=\(nativeClock.samples) definiteClockJumpSeconds=\(nativeClock.maximumDefiniteJump) minimumEffectiveRate=\(nativeClock.minimumRate)")
+            XCTAssertEqual(completedAudioSeeks, 0)
+            XCTAssertTrue(audioProbe.supported.load(ordering: .relaxed))
+            XCTAssertGreaterThan(audioProbe.windowFrames.load(ordering: .relaxed), 24_000)
+            XCTAssertEqual(audioProbe.gapFrames.load(ordering: .relaxed), 0)
+            XCTAssertEqual(audioProbe.overlapFrames.load(ordering: .relaxed), 0)
+            XCTAssertEqual(audioProbe.readErrors.load(ordering: .relaxed), 0)
+            XCTAssertEqual(audioProbe.zeroReturns.load(ordering: .relaxed), 0)
+            XCTAssertLessThanOrEqual(audioProbe.maximumSilentFrames.load(ordering: .relaxed), 2)
+            XCTAssertGreaterThan(nativeClock.samples, 4)
+            XCTAssertLessThan(nativeClock.maximumDefiniteJump, 0.002)
+            XCTAssertGreaterThan(nativeClock.minimumRate, 0.99)
+            XCTAssertFalse(service.player.isMuted)
+            XCTAssertFalse(service.audioEngineRunning)
+            XCTAssertTrue(service.wantsToPlay)
+            XCTAssertNil(service.message)
+            if attempt == 1 {
+                let stoppedAt = service.player.currentTime().seconds
+                service.pause()
+                try await Task.sleep(for: .milliseconds(100))
+                service.play()
+                try await until { service.isVideoReady && service.player.currentTime().seconds > stoppedAt + 0.25 }
+            }
+        }
     }
 
     func testPauseAndAudioOnlyPreventPictureRepair() async throws {
@@ -200,6 +235,7 @@ private final class PictureRecoveryFixture {
         test.addTeardownBlock { @MainActor [self] in
             service.onDebugVideoSeekStamp = nil
             service.onDebugVideoOutputRecovery = nil
+            service.onPlaybackEvent = nil
             service.shouldDebugAcquireVideoFrame = nil
             let closed = await withCheckedContinuation { continuation in
                 service.debugCloseOwnedPlayback { continuation.resume(returning: $0) }
@@ -220,3 +256,112 @@ private final class PictureRecoveryFixture {
 }
 
 @MainActor private final class PictureTimeJumpCounter { var value = 0 }
+
+/// Observe real native audio supply, leaving every sample unchanged. This is
+/// test-only and does not replace the physical-speaker acceptance check.
+private final class NativeAudioContinuityProbe: @unchecked Sendable {
+    let totalFrames = Atomic<Int64>(0), windowFrames = Atomic<Int64>(0)
+    let gapFrames = Atomic<Int64>(0), overlapFrames = Atomic<Int64>(0)
+    let zeroReturns = Atomic<Int64>(0), maximumSilentFrames = Atomic<Int64>(0), readErrors = Atomic<Int64>(0)
+    let supported = Atomic<Bool>(false)
+    private let requestedEpoch = Atomic<Int>(0)
+    let observedEpoch = Atomic<Int>(0)
+    // prepare/process are serialized by MTAudioProcessingTap; UI reads atomics only.
+    private var renderEpoch = 0, channels = 0
+    private var rate = 48_000.0, interleaved = false
+    private var previousEnd: Int64?, silentRun: Int64 = 0
+
+    func beginWindow() -> Int { requestedEpoch.wrappingAdd(1, ordering: .releasing).newValue }
+    private func prepare(_ format: AudioStreamBasicDescription) {
+        channels = Int(format.mChannelsPerFrame); rate = format.mSampleRate
+        interleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+        supported.store(format.mFormatID == kAudioFormatLinearPCM && format.mBitsPerChannel == 32
+            && format.mFormatFlags & kAudioFormatFlagIsFloat != 0 && channels > 0 && rate > 0, ordering: .relaxed)
+    }
+    private func record(_ buffers: UnsafeMutablePointer<AudioBufferList>, frames: Int, range: CMTimeRange, error: OSStatus) {
+        let epoch = requestedEpoch.load(ordering: .acquiring)
+        if epoch != renderEpoch {
+            renderEpoch = epoch; previousEnd = nil; silentRun = 0
+            windowFrames.store(0, ordering: .relaxed); gapFrames.store(0, ordering: .relaxed)
+            overlapFrames.store(0, ordering: .relaxed); zeroReturns.store(0, ordering: .relaxed)
+            maximumSilentFrames.store(0, ordering: .relaxed); readErrors.store(0, ordering: .relaxed)
+            observedEpoch.store(epoch, ordering: .releasing)
+        }
+        guard error == noErr else { _ = readErrors.wrappingAdd(1, ordering: .relaxed); return }
+        guard frames > 0 else { _ = zeroReturns.wrappingAdd(1, ordering: .relaxed); return }
+        _ = totalFrames.wrappingAdd(Int64(frames), ordering: .relaxed)
+        _ = windowFrames.wrappingAdd(Int64(frames), ordering: .relaxed)
+        if range.start.isNumeric, range.duration.isNumeric {
+            let start = Int64((range.start.seconds * rate).rounded())
+            if let previousEnd {
+                let delta = start - previousEnd
+                if delta > 1 { _ = gapFrames.wrappingAdd(delta, ordering: .relaxed) }
+                if delta < -1 { _ = overlapFrames.wrappingAdd(-delta, ordering: .relaxed) }
+            }
+            previousEnd = Int64((CMTimeRangeGetEnd(range).seconds * rate).rounded())
+        } else { _ = readErrors.wrappingAdd(1, ordering: .relaxed) }
+        guard supported.load(ordering: .relaxed) else { return }
+        let list = UnsafeMutableAudioBufferListPointer(buffers)
+        let stride = interleaved ? channels : 1
+        guard let first = list.first, let raw = first.mData, Int(first.mDataByteSize) >= frames * stride * 4 else {
+            _ = readErrors.wrappingAdd(1, ordering: .relaxed); return
+        }
+        let input = raw.assumingMemoryBound(to: Float.self)
+        for index in 0..<frames {
+            silentRun = abs(input[index * stride]) < 0.000001 ? silentRun + 1 : 0
+            if silentRun > maximumSilentFrames.load(ordering: .relaxed) {
+                maximumSilentFrames.store(silentRun, ordering: .relaxed)
+            }
+        }
+    }
+
+    @MainActor static func attach(to item: AVPlayerItem) async throws -> NativeAudioContinuityProbe {
+        let tracks = try await item.asset.loadTracks(withMediaType: .audio)
+        XCTAssertEqual(tracks.count, 1)
+        let track = try XCTUnwrap(tracks.first)
+        let probe = NativeAudioContinuityProbe()
+        let retained = Unmanaged.passRetained(probe)
+        var callbacks = MTAudioProcessingTapCallbacks(version: kMTAudioProcessingTapCallbacksVersion_0,
+            clientInfo: retained.toOpaque(), init: { _, info, storage in storage.pointee = info },
+            finalize: { tap in Unmanaged<NativeAudioContinuityProbe>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).release() },
+            prepare: { tap, _, format in
+                Unmanaged<NativeAudioContinuityProbe>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue().prepare(format.pointee)
+            }, unprepare: { _ in }, process: { tap, frames, _, buffers, framesOut, flagsOut in
+                var range = CMTimeRange.invalid
+                let status = MTAudioProcessingTapGetSourceAudio(tap, frames, buffers, flagsOut, &range, framesOut)
+                Unmanaged<NativeAudioContinuityProbe>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
+                    .record(buffers, frames: status == noErr ? framesOut.pointee : 0, range: range, error: status)
+                if status != noErr { framesOut.pointee = 0 }
+            })
+        var tap: MTAudioProcessingTap?
+        let status = MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks,
+            kMTAudioProcessingTapCreationFlag_PostEffects, &tap)
+        guard status == noErr, let tap else { retained.release(); throw CatalogError.invalid("Native audio probe unavailable") }
+        let input = AVMutableAudioMixInputParameters(track: track); input.audioTapProcessor = tap
+        let mix = AVMutableAudioMix(); mix.inputParameters = [input]; item.audioMix = mix
+        return probe
+    }
+}
+
+@MainActor private struct NativeClockContinuityProbe {
+    private var previous: (before: Double, after: Double, position: Double)?
+    private(set) var samples = 0
+    private(set) var maximumDefiniteJump = 0.0
+    private(set) var minimumRate = Double.infinity
+    mutating func sample(_ item: AVPlayerItem) {
+        guard let timebase = item.timebase else { return }
+        let host = CMClockGetHostTimeClock()
+        let before = CMClockGetTime(host).seconds
+        let position = CMTimebaseGetTime(timebase).seconds
+        let rate = CMTimebaseGetEffectiveRate(timebase)
+        let after = CMClockGetTime(host).seconds
+        guard position.isFinite, before.isFinite, after.isFinite, rate.isFinite else { return }
+        samples += 1; minimumRate = min(minimumRate, rate)
+        if let previous {
+            let progress = position - previous.position
+            let earliest = before - previous.after, latest = after - previous.before
+            maximumDefiniteJump = max(maximumDefiniteJump, max(earliest - progress, progress - latest))
+        }
+        previous = (before, after, position)
+    }
+}
