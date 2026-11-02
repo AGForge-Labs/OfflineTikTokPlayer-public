@@ -1,5 +1,6 @@
 import Foundation
 import Synchronization
+import PlayerCore
 @testable import OfflineTikTokPlayer
 
 #if DEBUG
