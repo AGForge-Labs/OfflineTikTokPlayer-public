@@ -28,6 +28,10 @@ AQ_TRAILING_HOST = re.compile(
     r'(NativeRuntimeHost \{.{1,3072}\})'
     r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} OfflineTikTokPlayer\[([1-9][0-9]*):[0-9]+\] '
     r'\[AQ\] {8}LoudnessManager\.mm:1215  IsHardwareSupported: no plist loaded, returning false')
+AQ_PID_HOST = re.compile(
+    r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} OfflineTikTokPlayer\[([1-9][0-9]{0,8})'
+    r'(NativeRuntimeHost \{.{1,3072}\})([0-9]{1,9}):[0-9]+\] '
+    r'\[AQ\] {8}LoudnessManager\.mm:1215  IsHardwareSupported: no plist loaded, returning false')
 
 
 def native_host_rows(lines):
@@ -35,6 +39,12 @@ def native_host_rows(lines):
     rows = []
     for index, line in enumerate(lines):
         if "NativeRuntimeHost " not in line:
+            continue
+        embedded = AQ_PID_HOST.fullmatch(line)
+        if embedded:
+            row = json.loads(embedded[2].removeprefix("NativeRuntimeHost "))
+            assert str(row["pid"]) == embedded[1] + embedded[3]
+            rows.append(row)
             continue
         assert line.startswith("NativeRuntimeHost ") and len(line) <= 4096
         try:
