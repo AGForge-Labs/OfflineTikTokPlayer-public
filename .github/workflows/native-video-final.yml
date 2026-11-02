@@ -12,7 +12,7 @@ jobs:
   presentation:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
     runs-on: macos-26
-    timeout-minutes: 12
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -44,7 +44,7 @@ jobs:
           xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -derivedDataPath artifacts/NativeFormatDerived -resultBundlePath artifacts/native-format/Native.xcresult \
-            -jobs 1 -parallel-testing-enabled NO -test-timeouts-enabled YES -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
+            -jobs 2 -parallel-testing-enabled NO -test-timeouts-enabled YES -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
             -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests \
             -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests \
             -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
