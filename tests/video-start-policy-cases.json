@@ -1,0 +1,14 @@
+{
+  "cases": [
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testFullResolutionVideoKeepsItsCadenceAfterStarting",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testHDNativeWaitingControlWithAudioTrack",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testHDNativeWaitingControlWithoutAudioTrack",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testNativeGeometryControlPreservesTheSixtyFPSFixtureCadence",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testRendererPixelIdentityAndMetadataAfterActualIncomingDisplay",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testRetainedOutgoingPixelsCannotCreditAnIncomingImageBeforeItDisplays",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testSeekAndSourceAdoptionRetainTheDisplayedPictureWithoutOldFrameCredit",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testShortTrailingAudioKeepsNativeVideoAndAFreshLastFrameWhilePaused"
+  ]
+}

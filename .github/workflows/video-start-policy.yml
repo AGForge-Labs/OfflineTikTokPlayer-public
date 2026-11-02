@@ -1,0 +1,67 @@
+name: Public video start policy comparison
+on:
+  push:
+    branches: [codex/video-start-policy]
+    paths: ['ios/**', 'tests/video-start-policy-cases.json', '.github/workflows/video-start-policy.yml']
+permissions:
+  contents: read
+concurrency:
+  group: video-start-policy-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  cadence:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Require unchanged runtime and current project
+        run: |
+          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = 988b7b6d7912dedf016969e76cc626edf1ed8ae8
+          test "$(git rev-parse HEAD:ios/PlayerCore)" = f9b20964220eb867c397e9fa8334c673263d92a5
+          python3 scripts/generate-ios-project.py --check
+      - name: Begin simulator boot before compilation
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          devices = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','available','--json']))['devices']
+          choices = [(runtime, d) for runtime, values in devices.items() for d in values if d['name'] == 'iPhone 17 Pro Max' and d['isAvailable']]
+          assert choices
+          _, device = sorted(choices, key=lambda p: p[0])[-1]
+          if device['state'] != 'Booted': subprocess.run(['xcrun','simctl','boot',device['udid']],check=True)
+          with open(os.environ['GITHUB_ENV'],'a') as f: f.write('SIMULATOR_UDID='+device['udid']+'\n')
+          PY
+      - name: Compare the production waiting policy with native controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/video-start-policy
+          excluded="$(python3 -c 'from pathlib import Path; print(" ".join(p.name for p in sorted(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")) if p.name != "VideoPresentationContinuityTests.swift"))')"
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath artifacts/PolicyDerived -resultBundlePath artifacts/video-start-policy/Policy.xcresult \
+            -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
+            test 2>&1 | tee artifacts/video-start-policy/native.log
+      - name: Require all ten exact cases and unchanged product budgets
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, runpy
+          from pathlib import Path
+          v=runpy.run_path('scripts/verify-native-test-log.py')
+          cases=set(json.loads(Path('tests/video-start-policy-cases.json').read_text())['cases'])
+          assert len(cases)==10 and cases<=v['source_manifest'](Path.cwd())
+          v['verify_log'](Path('artifacts/video-start-policy/native.log').read_text(),cases)
+          print('Exact10 native cases passed; native control observations are not production cadence acceptance.')
+          PY
+      - name: Preserve synthetic policy evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: video-start-policy
+          path: artifacts/video-start-policy
+          retention-days: 1

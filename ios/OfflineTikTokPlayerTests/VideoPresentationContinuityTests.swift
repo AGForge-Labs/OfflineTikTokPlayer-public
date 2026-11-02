@@ -1,6 +1,7 @@
 import XCTest
 import AVFoundation
 import CoreVideo
+import CoreImage
 import CryptoKit
 import UIKit
 import IOSurface
@@ -9,6 +10,7 @@ import Dispatch
 
 @MainActor
 final class VideoPresentationContinuityTests: XCTestCase {
+    private let imageReadback = CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false])
     func testRendererPixelIdentityAndMetadataAfterActualIncomingDisplay() async throws {
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
@@ -82,6 +84,20 @@ final class VideoPresentationContinuityTests: XCTestCase {
             let rate = try await measuredRate(fixture)
             XCTAssertGreaterThan(rate, 50, "1080p60 must exercise real frame throughput")
         }
+    }
+
+    func testHDNativeWaitingControlWithAudioTrack() async throws {
+        let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080", minimizesStalls: true)
+        defer { fixture.close() }
+        print("VIDEO_HD_CONTROL unusedNativeAudioDisabled=false waiting=true")
+        _ = try await measuredRate(fixture, enforceCadence: false)
+    }
+
+    func testHDNativeWaitingControlWithoutAudioTrack() async throws {
+        let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080", disableAudioTrack: true, minimizesStalls: true)
+        defer { fixture.close() }
+        print("VIDEO_HD_CONTROL unusedNativeAudioDisabled=true waiting=true")
+        _ = try await measuredRate(fixture, enforceCadence: false)
     }
 
     func testNativeGeometryControlPreservesTheSixtyFPSFixtureCadence() async throws {
@@ -175,7 +191,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
         XCTAssertEqual(completions, 1)
     }
 
-    private func measuredRate(_ fixture: PresentedVideo, audioLag: Double = 0) async throws -> Double {
+    private func measuredRate(_ fixture: PresentedVideo, audioLag: Double = 0, enforceCadence: Bool = true) async throws -> Double {
         let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
         let position = fixture.player.currentTime().seconds - audioLag
         XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: position, durationSeconds: 6, isPlaying: true))
@@ -233,35 +249,35 @@ final class VideoPresentationContinuityTests: XCTestCase {
         fixture.player.pause()
         fixture.bridge.updatePlayback(positionSeconds: nativeEnd, durationSeconds: 6, isPlaying: false)
         // All formatting occurs after measurement; callback work is fixed scalar counters.
-        let pixelFormat = fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer().map(CVPixelBufferGetPixelFormatType)
-        print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(nativeEnd) requestedEnd=\(requestedEnd) copiedEnd=\(copiedEnd)")
-        print("VIDEO_FORMAT displayedFourCC=\(pixelFormat ?? 0)")
+        let displayedPixel = fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer()
+        let pixelFormat = displayedPixel.map(CVPixelBufferGetPixelFormatType)
+        print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.usedNativeGeometry) explicitNativeControl=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(nativeEnd) requestedEnd=\(requestedEnd) copiedEnd=\(copiedEnd)")
+        print("VIDEO_FORMAT displayedFourCC=\(pixelFormat ?? 0) planes=\(displayedPixel.map(CVPixelBufferGetPlaneCount) ?? 0) shareableSurface=\(displayedPixel.flatMap(CVPixelBufferGetIOSurface) != nil) waiting=\(fixture.player.automaticallyWaitsToMinimizeStalling) cadenceRequired=\(enforceCadence)")
         print("VIDEO_CADENCE delivered=\(delivered) maximumGapMs=\(frameGap.milliseconds) stageCounts=\(stages)")
         print("VIDEO_STALL windowNs=[\(startNs),\(endNs)] frameGapNs=[\(frameGap.start),\(frameGap.end)] tickGapMs=\(tickGap.milliseconds) tickNs=[\(tickGap.start),\(tickGap.end)] outsideMs=\(outsideGap.milliseconds) outsideNs=[\(outsideGap.start),\(outsideGap.end)] backgroundTicks=\(background.ticks) backgroundMs=\(background.maximum.milliseconds) backgroundNs=[\(background.maximum.start),\(background.maximum.end)] observerMs=\(observer.milliseconds) sdkMs=\(sdk.map(\.milliseconds)) sdkStartsNs=\(sdk.map(\.start)) sdkEndsNs=\(sdk.map(\.end))")
         XCTAssertEqual(fixture.player.currentItem, fixture.item)
         XCTAssertEqual(depth, 0, "The measured render intervals must be complete at the window boundary")
         XCTAssertFalse(background.overflow, "The independent scheduling window must remain fully measured")
-        XCTAssertLessThan(frameGap.milliseconds, 100, "A short average-FPS check must not hide a visible video hitch")
+        if enforceCadence {
+            XCTAssertLessThan(frameGap.milliseconds, 100, "A short average-FPS check must not hide a visible video hitch")
+        }
         return rate
     }
 
     private func fingerprint(_ value: CVPixelBuffer?) throws -> String {
         let pixel = try XCTUnwrap(value, "An actual displayed pixel buffer is required")
-        CVPixelBufferLockBaseAddress(pixel, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
-        var digest = SHA256()
-        let planes = CVPixelBufferGetPlaneCount(pixel)
-        if planes == 0 {
-            let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixel))
-            digest.update(data: Data(bytes: base, count: CVPixelBufferGetBytesPerRow(pixel) * CVPixelBufferGetHeight(pixel)))
-        } else {
-            for plane in 0..<planes {
-                let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixel, plane))
-                digest.update(data: Data(bytes: base,
-                    count: CVPixelBufferGetBytesPerRowOfPlane(pixel, plane) * CVPixelBufferGetHeightOfPlane(pixel, plane)))
-            }
+        // Hash visible samples in a canonical format, never plane/row padding.
+        // Only tiny synthetic images use this CPU readback, outside cadence measurement.
+        let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+        guard width > 0, height > 0, width <= 4096, height <= 4096 else {
+            XCTFail("The synthetic image readback must remain bounded")
+            throw NSError(domain: "SyntheticImageReadback", code: 1)
         }
-        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        imageReadback.render(CIImage(cvPixelBuffer: pixel), toBitmap: &bytes, rowBytes: width * 4,
+            bounds: CGRect(x: 0, y: 0, width: width, height: height), format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB())
+        return SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
     }
 
     private func until(_ predicate: () -> Bool) async -> Bool {
@@ -346,11 +362,15 @@ private final class PresentedVideo {
         host.view.layer.addSublayer(bridge.displayLayer)
     }
 
-    static func make(nativeGeometry: Bool = false, resourceName: String = "test-motion-60", disableAudioTrack: Bool = false) async throws -> PresentedVideo {
+    static func make(nativeGeometry: Bool = false, resourceName: String = "test-motion-60", disableAudioTrack: Bool = false,
+                     minimizesStalls: Bool = false) async throws -> PresentedVideo {
         let url = try XCTUnwrap(Bundle(for: VideoPresentationContinuityTests.self)
             .url(forResource: resourceName, withExtension: "mp4"))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let fixture = PresentedVideo(url: url, scene: scene)
+        // Match PlaybackBuffer's external-clock/local-file policy. The default
+        // AVPlayer waiting policy remains an explicitly labelled control arm.
+        fixture.player.automaticallyWaitsToMinimizeStalling = minimizesStalls
         fixture.bridge.onClockAlignmentRequired = { [weak fixture] ticket in
             guard let fixture else { return }
             fixture.clockAlignments += 1
