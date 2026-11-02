@@ -10,6 +10,31 @@ import PlayerCore
 
 @MainActor
 final class PictureRecoveryTests: XCTestCase {
+    func testRapidFeedReversalCoversDepartingPixelsUntilReturnedMediaIsReady() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self)
+        let service = fixture.service
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && self.pictureIs(layer, red: true) }
+        service.feedDidSettle(direction: 1)
+        try await until { service.isVideoReady && self.pictureIs(layer, red: false) }
+        service.shouldDebugAcquireVideoFrame = { _ in false }
+        service.isInteractingWithFeed = true
+        service.feedDidSettle(direction: -1)
+        XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+        XCTAssertFalse(service.isVideoReady)
+        XCTAssertFalse(service.hasRetainedVideoFrame,
+            "Returned A must keep its poster over retained B pixels until an actual A frame is ready")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertTrue(pictureIs(layer, red: false), "Keep PiP's held picture without exposing it as the returned clip")
+        XCTAssertFalse(service.isVideoReady || service.hasRetainedVideoFrame)
+        service.shouldDebugAcquireVideoFrame = nil
+        try await until { service.isVideoReady && self.pictureIs(layer, red: true) }
+        XCTAssertNil(service.message)
+        XCTAssertTrue(service.wantsToPlay)
+    }
+
     func testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit() async throws {
         let fixture = try await PictureRecoveryFixture(test: self)
         let service = fixture.service

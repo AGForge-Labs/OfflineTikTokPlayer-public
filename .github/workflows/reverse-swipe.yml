@@ -1,0 +1,43 @@
+name: Public rapid reverse swipe regression
+on:
+  push:
+    branches: [codex/reverse-swipe]
+    paths: ['ios/**', '.github/workflows/reverse-swipe.yml']
+permissions:
+  contents: read
+concurrency:
+  group: reverse-swipe-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  reversals:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Exact source and project references
+        run: |
+          git rev-parse HEAD
+          python3 scripts/generate-ios-project.py --check
+      - name: Actual displayed-media ownership and immediate reverse settlement
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/reverse-swipe
+          excluded="$(python3 -c 'from pathlib import Path; chosen={"PictureRecoveryTests.swift", "FeedPresentationTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
+            -derivedDataPath artifacts/ReverseDerived -resultBundlePath artifacts/reverse-swipe/Reversal.xcresult \
+            -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
+            -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests/testRapidFeedReversalCoversDepartingPixelsUntilReturnedMediaIsReady \
+            -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether \
+            test 2>&1 | tee artifacts/reverse-swipe/xcodebuild.log
+      - name: Preserve synthetic reversal evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: reverse-swipe-evidence
+          path: artifacts/reverse-swipe
+          retention-days: 1

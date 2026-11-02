@@ -7,6 +7,41 @@ import PlayerCore
 
 @MainActor
 final class FeedPresentationTests: XCTestCase {
+    func testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        let model = FeedTestModel()
+        window.rootViewController = UIHostingController(rootView: FeedHarness(model: model))
+        window.frame = scene.coordinateSpace.bounds; window.isHidden = false
+        defer { window.isHidden = true; window.rootViewController = nil }
+        let root = try XCTUnwrap(window.rootViewController?.view)
+        try await waitUntil { root.layoutIfNeeded(); return model.markers["0:b"]?.window != nil }
+        let scroll = try XCTUnwrap(descendants(root).compactMap { $0 as? UIScrollView }.first)
+        try await waitUntil {
+            root.layoutIfNeeded()
+            guard let current = model.markers["0:b"] else { return false }
+            return abs(current.convert(current.bounds, to: scroll).midY - scroll.bounds.midY) < 1
+        }
+        let original = try XCTUnwrap(model.markers["0:b"])
+        for id in ["c", "b", "c", "b", "c", "b"] {
+            let pages = model.queue.feedWindow.pages
+            let index = try XCTUnwrap(pages.firstIndex { $0.mediaID == id })
+            scroll.delegate?.scrollViewWillBeginDragging?(scroll)
+            scroll.setContentOffset(CGPoint(x: 0, y: CGFloat(index) * scroll.bounds.height), animated: false)
+            scroll.delegate?.scrollViewDidEndDragging?(scroll, willDecelerate: false)
+            // A second gesture may begin immediately; no run-loop/layout await
+            // is allowed between committing the first and starting the reverse.
+            XCTAssertEqual(model.queue.currentID, id, "Gesture settlement must commit the landed visit synchronously")
+            root.layoutIfNeeded()
+            let current = try XCTUnwrap(model.queue.feedWindow.current)
+            let marker = try XCTUnwrap(model.markers[current.id])
+            XCTAssertEqual(marker.convert(marker.bounds, to: scroll).midY, scroll.bounds.midY, accuracy: 1,
+                "A reverse gesture must start from the committed page, without a delayed rebase")
+        }
+        XCTAssertTrue(model.markers["0:b"] === original)
+        XCTAssertLessThanOrEqual(descendants(scroll).filter { $0 is PageMarkerView }.count, 3)
+    }
+
     func testPosterAndVideoHostSurvivePreviewPlaybackAndHistory() async throws {
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
