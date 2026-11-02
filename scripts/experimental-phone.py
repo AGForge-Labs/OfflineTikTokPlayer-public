@@ -10,19 +10,14 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "4910ed6b69b0cdca3391810919b8e683851fae37"
-SOURCE = "8357efed671323bfbeea10b10f9fa2500f9022df"
+SOURCE_BASE = "583908a4c84b9af77af3e20e53f249d2d9dafa9c"
+SOURCE = "38ba9485b4491fed313fd5aaef3b04659000adb7"
 APP_TREE = "ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650"
-BASE_APP_TREE = "988b7b6d7912dedf016969e76cc626edf1ed8ae8"
+BASE_APP_TREE = "ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650"
 CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
-    '.github/workflows/native-video-final.yml',
-    'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
-    'ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift',
-    'ios/OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests.swift',
-    'ios/OfflineTikTokPlayerTests/VideoPresentationContinuityTests.swift',
-    'tests/native-video-format-cases.json',
+    'ios/OfflineTikTokPlayerTests/Support/PCMWorkerBoundaryOwnership.swift',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -221,7 +216,7 @@ NATIVE_PROOFS = (
      ".github/workflows/media-presentation-repair.yml", "codex/media-presentation-repair"),
     (41328715253, "6489eafb55ee67358e9aaf203368f27de8b5fc6b", ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
     (41388275137, "fe55925544585b85bb59b361eee450cc8cf60838", ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
-    (41396159005, SOURCE, ".github/workflows/native-video-final.yml", "codex/native-video-final"),
+    (41398139688, SOURCE, ".github/workflows/native-video-final.yml", "codex/native-video-final"),
 )
 
 

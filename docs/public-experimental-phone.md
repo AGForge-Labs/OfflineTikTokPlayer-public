@@ -1,15 +1,21 @@
 # Owner phone video timing repair
 
-Candidate: `8357efed671323bfbeea10b10f9fa2500f9022df`; parent `4910ed6b69b0cdca3391810919b8e683851fae37`.
+Candidate: `38ba9485b4491fed313fd5aaef3b04659000adb7`; parent `583908a4c84b9af77af3e20e53f249d2d9dafa9c`.
 App: `ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650`; unchanged Core: `f9b20964220eb867c397e9fa8334c673263d92a5`.
 
 Preserve the muted native timing track, native video pixel format and media-owned
 visibility during rapid reversals. PCM remains audible. The final exact31-case
-native run41396159005 must succeed before any signing input is mapped. It includes
+native run41398139688 must succeed before any signing input is mapped. It includes
 real-service1080p60, PCM progress/mute, supersession and pause/interruption checks.
 Earlier reversal19 and baseline/image receipts remain required. Failed pacing
 audits41390543020,41392840748 and41394165312 are retained as failure evidence;
-none of them authorizes this candidate. Full-suite and phone acceptance remain open.
+none of them authorizes this candidate. Run41396159005 failed test compilation
+because a shared ownership helper was excluded. Its three-file successor moves
+that unchanged helper into test support and regenerates project references; the
+app/core and all31 required cases are unchanged. Run41397564720 was canceled
+before validation when review found the extracted file needed PlayerCore. The
+current one-line successor restores that explicit import; the guard body, app,
+core and31-case requirements are unchanged. Full-suite and phone acceptance remain open.
 
 Use the existing protected release environment, unchanged signing helper and
 owner-only internal TestFlight group. No credential, role, tester or billing change.
