@@ -1,0 +1,80 @@
+name: Public same-runtime frame pacing audit
+on:
+  push:
+    branches: [codex/frame-pacing-audit]
+    paths: ['ios/**', 'tests/frame-pacing-cases.json', '.github/workflows/frame-pacing-audit.yml']
+permissions:
+  contents: read
+concurrency:
+  group: frame-pacing-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  cadence:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Require identical candidate runtime and current project
+        run: |
+          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = bf034b9a40169f80b71dbbd7e35cba47e591509b
+          test "$(git rev-parse HEAD:ios/PlayerCore)" = f9b20964220eb867c397e9fa8334c673263d92a5
+          python3 scripts/generate-ios-project.py --check
+      - name: Compare cadence after real recovery fixtures
+        id: full
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/frame-pacing
+          excluded="$(python3 -c 'from pathlib import Path; chosen={"PictureRecoveryTests.swift", "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
+            -derivedDataPath artifacts/CadenceDerived -resultBundlePath artifacts/frame-pacing/Full.xcresult \
+            -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
+            -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests \
+            -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
+            test 2>&1 | tee artifacts/frame-pacing/full.log
+      - name: Compare in a fresh test process without rebuilding
+        id: isolated
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
+            -derivedDataPath artifacts/CadenceDerived -resultBundlePath artifacts/frame-pacing/Isolated.xcresult \
+            -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests/testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests/testFullResolutionVideoKeepsItsCadenceAfterStarting \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests/testNativeGeometryControlPreservesTheSixtyFPSFixtureCadence \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames \
+            test-without-building 2>&1 | tee artifacts/frame-pacing/isolated.log
+      - name: Reject any failed skipped missing duplicate or unexpected case
+        if: always()
+        env:
+          FULL_OUTCOME: ${{ steps.full.outcome }}
+          ISOLATED_OUTCOME: ${{ steps.isolated.outcome }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, runpy, os
+          assert os.environ["FULL_OUTCOME"] == os.environ["ISOLATED_OUTCOME"] == "success"
+          from pathlib import Path
+          v = runpy.run_path('scripts/verify-native-test-log.py')
+          cases = json.loads(Path('tests/frame-pacing-cases.json').read_text())
+          assert len(cases['full']) == 20 and len(cases['isolated']) == 4
+          v['verify_log'](Path('artifacts/frame-pacing/full.log').read_text(), set(cases['full']))
+          v['verify_log'](Path('artifacts/frame-pacing/isolated.log').read_text(), set(cases['isolated']), invocation='test-without-building')
+          print('Exact20 full focused plus4 isolated cases passed; physical cadence acceptance remains separate.')
+          PY
+      - name: Preserve synthetic cadence evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: frame-pacing-audit
+          path: artifacts/frame-pacing
+          retention-days: 1

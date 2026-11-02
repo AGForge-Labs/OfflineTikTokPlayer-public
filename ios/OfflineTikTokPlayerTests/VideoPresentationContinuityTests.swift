@@ -4,6 +4,7 @@ import CoreVideo
 import CryptoKit
 import UIKit
 import IOSurface
+import Dispatch
 @testable import OfflineTikTokPlayer
 
 @MainActor
@@ -62,18 +63,32 @@ final class VideoPresentationContinuityTests: XCTestCase {
     }
 
     func testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo() async throws {
-        let fixture = try await PresentedVideo.make()
-        defer { fixture.close() }
-        XCTAssertTrue(fixture.usedNativeGeometry, "The qualified production path must avoid an unnecessary compositor")
-        let rate = try await measuredRate(fixture)
-        XCTAssertGreaterThan(rate, 40, "A 60 fps source must not be limited by a 30 Hz app timer")
+        for trial in 0..<6 {
+            let disabled = trial >= 3
+            let fixture = try await PresentedVideo.make(disableAudioTrack: disabled)
+            defer { fixture.close() }
+            XCTAssertTrue(fixture.usedNativeGeometry, "The qualified production path must avoid an unnecessary compositor")
+            print("VIDEO_TRIAL ordinal=\(trial) unusedNativeAudioDisabled=\(disabled)")
+            let rate = try await measuredRate(fixture)
+            XCTAssertGreaterThan(rate, 50, "A 60 fps source must not be limited by a 30 Hz app timer")
+        }
+    }
+
+    func testFullResolutionVideoKeepsItsCadenceAfterStarting() async throws {
+        for trial in 0..<3 {
+            let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080", disableAudioTrack: true)
+            defer { fixture.close() }
+            print("VIDEO_HD_TRIAL ordinal=\(trial)")
+            let rate = try await measuredRate(fixture)
+            XCTAssertGreaterThan(rate, 50, "1080p60 must exercise real frame throughput")
+        }
     }
 
     func testNativeGeometryControlPreservesTheSixtyFPSFixtureCadence() async throws {
         let fixture = try await PresentedVideo.make(nativeGeometry: true)
         defer { fixture.close() }
         let rate = try await measuredRate(fixture)
-        XCTAssertGreaterThan(rate, 40, "The same source must remain smooth without an unnecessary composition")
+        XCTAssertGreaterThan(rate, 50, "The same source must remain smooth without an unnecessary composition")
     }
 
     func testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames() async throws {
@@ -81,7 +96,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
         defer { fixture.close() }
         let rate = try await measuredRate(fixture, audioLag: 0.055)
         XCTAssertGreaterThan(fixture.clockAlignments, 0, "An unrenderable clock must request owner-qualified alignment")
-        XCTAssertGreaterThan(rate, 40, "An accepted native clock lead must not consume and discard every frame")
+        XCTAssertGreaterThan(rate, 50, "An accepted native clock lead must not consume and discard every frame")
     }
 
     func testShortTrailingAudioKeepsNativeVideoAndAFreshLastFrameWhilePaused() async throws {
@@ -167,27 +182,64 @@ final class VideoPresentationContinuityTests: XCTestCase {
         fixture.player.playImmediately(atRate: 1)
         XCTAssertTrue(fixture.bridge.activate(ticket))
         let first = fixture.bridge.submittedFrameCount
-        var stages: [String: Int] = [:]
-        var previousFrame: UInt64?, maximumFrameGap: UInt64 = 0, deliveredFrames = 0
-        fixture.bridge.onDebugWholeFrame = { event in
-            if case .returned(let span) = event {
-                stages[String(describing: span.stage), default: 0] += 1
-                if span.enqueueCalled {
-                    let now = span.returnNs
-                    if let previousFrame, now >= previousFrame { maximumFrameGap = max(maximumFrameGap, now - previousFrame) }
-                    previousFrame = now; deliveredFrames += 1
-                }
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        var stages = [Int](repeating: 0, count: ContinuousPictureInPicture.DebugWholeFrameStage.enqueued.rawValue + 1)
+        var sdk = [CadenceSpan](repeating: CadenceSpan(), count: 8)
+        var previousFrame = startNs, previousTick = startNs, previousReturn = startNs, depth = 0
+        var frameGap = CadenceSpan(), tickGap = CadenceSpan(), outsideGap = CadenceSpan(), observer = CadenceSpan()
+        var delivered = 0
+        let heartbeat = CadenceHeartbeat(start: startNs)
+        fixture.bridge.onDebugNativePullStamp = { stamp in
+            sdk[5 + stamp.stage.rawValue].record(start: stamp.entryNs, end: stamp.returnNs)
+            if stamp.stage == .enqueue {
+                frameGap.record(start: previousFrame, end: stamp.returnNs)
+                previousFrame = stamp.returnNs; delivered += 1
             }
+        }
+        fixture.bridge.onDebugWholeFrame = { event in
+            let callbackStart = DispatchTime.now().uptimeNanoseconds
+            switch event {
+            case .entered(let entry):
+                tickGap.record(start: previousTick, end: entry.entryNs)
+                if depth == 0 { outsideGap.record(start: previousReturn, end: entry.entryNs) }
+                previousTick = entry.entryNs; depth += 1
+            case .returned(let span):
+                stages[span.stage.rawValue] += 1
+                let entry = span.entry.entryNs
+                sdk[0].record(start: entry, end: span.returnNs)
+                if let v = span.layerStatus { sdk[1].record(start: v.entryNs, end: v.returnNs) }
+                if let v = span.backpressure { sdk[2].record(start: v.entryNs, end: v.returnNs) }
+                if let v = span.timebase { sdk[3].record(start: v.entryNs, end: v.returnNs) }
+                if let v = span.readinessCommit { sdk[4].record(start: v.entryNs, end: v.returnNs) }
+                depth = max(0, depth - 1)
+                if depth == 0 { previousReturn = span.returnNs }
+            }
+            observer.record(start: callbackStart, end: DispatchTime.now().uptimeNanoseconds)
         }
         let started = ProcessInfo.processInfo.systemUptime
         try await Task.sleep(for: .milliseconds(1200))
         let elapsed = ProcessInfo.processInfo.systemUptime - started
+        let endNs = DispatchTime.now().uptimeNanoseconds
+        frameGap.record(start: previousFrame, end: endNs)
+        tickGap.record(start: previousTick, end: endNs)
+        if depth == 0 { outsideGap.record(start: previousReturn, end: endNs) }
         fixture.bridge.onDebugWholeFrame = nil
+        fixture.bridge.onDebugNativePullStamp = nil
+        let background = heartbeat.stop(end: endNs)
         let rate = Double(fixture.bridge.submittedFrameCount - first) / elapsed
-        print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(fixture.player.currentTime().seconds) requestedEnd=\(fixture.bridge.requestedPositionSeconds) copiedEnd=\(fixture.bridge.lastCopiedFramePositionSeconds ?? -1)")
-        print("VIDEO_PRESENTATION_PULLS stages=\(stages) active=\(UIApplication.shared.applicationState.rawValue) maxScreenFPS=\(fixture.window.screen.maximumFramesPerSecond)")
-        print("VIDEO_CADENCE delivered=\(deliveredFrames) maximumGapMs=\(Double(maximumFrameGap) / 1_000_000)")
+        let nativeEnd = fixture.player.currentTime().seconds
+        let requestedEnd = fixture.bridge.requestedPositionSeconds
+        let copiedEnd = fixture.bridge.lastCopiedFramePositionSeconds ?? -1
+        fixture.player.pause()
+        fixture.bridge.updatePlayback(positionSeconds: nativeEnd, durationSeconds: 6, isPlaying: false)
+        // All formatting occurs after measurement; callback work is fixed scalar counters.
+        print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(nativeEnd) requestedEnd=\(requestedEnd) copiedEnd=\(copiedEnd)")
+        print("VIDEO_CADENCE delivered=\(delivered) maximumGapMs=\(frameGap.milliseconds) stageCounts=\(stages)")
+        print("VIDEO_STALL windowNs=[\(startNs),\(endNs)] frameGapNs=[\(frameGap.start),\(frameGap.end)] tickGapMs=\(tickGap.milliseconds) tickNs=[\(tickGap.start),\(tickGap.end)] outsideMs=\(outsideGap.milliseconds) outsideNs=[\(outsideGap.start),\(outsideGap.end)] backgroundTicks=\(background.ticks) backgroundMs=\(background.maximum.milliseconds) backgroundNs=[\(background.maximum.start),\(background.maximum.end)] observerMs=\(observer.milliseconds) sdkMs=\(sdk.map(\.milliseconds)) sdkStartsNs=\(sdk.map(\.start)) sdkEndsNs=\(sdk.map(\.end))")
         XCTAssertEqual(fixture.player.currentItem, fixture.item)
+        XCTAssertEqual(depth, 0, "The measured render intervals must be complete at the window boundary")
+        XCTAssertFalse(background.overflow, "The independent scheduling window must remain fully measured")
+        XCTAssertLessThan(frameGap.milliseconds, 100, "A short average-FPS check must not hide a visible video hitch")
         return rate
     }
 
@@ -208,6 +260,48 @@ final class VideoPresentationContinuityTests: XCTestCase {
         }
         return predicate()
     }
+}
+
+private struct CadenceSpan: Sendable {
+    var start: UInt64 = 0, end: UInt64 = 0
+    var milliseconds: Double { Double(end - start) / 1_000_000 }
+    mutating func record(start: UInt64, end: UInt64) {
+        guard end >= start, end - start > self.end - self.start else { return }
+        self.start = start; self.end = end
+    }
+}
+
+/// Independent scheduling probe; no UIKit, frame buffers, or main-actor work.
+private final class CadenceHeartbeat: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "synthetic.video-cadence", qos: .userInitiated)
+    private let timer: DispatchSourceTimer
+    private let start: UInt64
+    private var stamps = [UInt64](repeating: 0, count: 1024), count = 0
+    private var overflow = false
+    init(start: UInt64) {
+        self.start = start
+        timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            if self.count < self.stamps.count {
+                self.stamps[self.count] = DispatchTime.now().uptimeNanoseconds; self.count += 1
+            } else { self.overflow = true }
+        }
+        timer.resume()
+    }
+    func stop(end: UInt64) -> (ticks: Int, maximum: CadenceSpan, overflow: Bool) {
+        timer.cancel()
+        return queue.sync {
+            var previous = start, maximum = CadenceSpan(), ticks = 0
+            for index in 0..<count where stamps[index] <= end {
+                maximum.record(start: previous, end: stamps[index]); previous = stamps[index]; ticks += 1
+            }
+            maximum.record(start: previous, end: end)
+            return (ticks, maximum, overflow)
+        }
+    }
+    deinit { timer.cancel() }
 }
 
 @MainActor

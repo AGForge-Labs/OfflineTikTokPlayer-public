@@ -537,6 +537,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "B0DBFA187C12371B0D325011";
 		};
+		"0679C7A3D70C9FB95A0CAC28" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "file";
+			"path" = "test-motion-1080.mp4";
+			"sourceTree" = "<group>";
+		};
+		"A614AB2A2D86D85032D36AA9" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "0679C7A3D70C9FB95A0CAC28";
+		};
 		"D4716ECBD891E4E0E63BFF79" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "file";
@@ -591,6 +601,7 @@
 			"isa" = "PBXGroup";
 			"children" = (
 				"B0DBFA187C12371B0D325011",
+				"0679C7A3D70C9FB95A0CAC28",
 				"D4716ECBD891E4E0E63BFF79",
 				"BEF316A3E7370E70CA635667",
 				"A8F6764A13156B91EFA7EB79",
@@ -1196,6 +1207,7 @@
 			"buildActionMask" = 2147483647;
 			"files" = (
 				"9FAA440B8218F93BDF1E002E",
+				"A614AB2A2D86D85032D36AA9",
 				"9938801A2A77ACF920A2F5DE",
 				"5AA344776D853CFC947E9110",
 				"768C483BD57061BC08CB7E54",
