@@ -110,9 +110,15 @@ final class PictureRecoveryTests: XCTestCase {
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until { service.isVideoReady && service.audioSnapshot.frame > 2_400 }
+        let firstOwnerBefore = service.debugAlignedVideoPollState
+        let firstAudioBefore = service.audioSnapshot
         let imageReadStart = DispatchTime.now().uptimeNanoseconds
-        let oldPicture = try XCTUnwrap(smallPicture(layer))
+        var firstPixel: CVPixelBuffer? = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())
         let imageReadEnd = DispatchTime.now().uptimeNanoseconds
+        assertPictureOwner(firstOwnerBefore, service.debugAlignedVideoPollState)
+        XCTAssertEqual(service.audioSnapshot.token, firstAudioBefore.token)
+        XCTAssertEqual(service.audioSnapshot.visit, firstAudioBefore.visit)
+        XCTAssertEqual(service.queue.currentID, fixture.mediaID)
         let nativeReadStart = DispatchTime.now().uptimeNanoseconds
         let nativeStart = service.player.currentTime().seconds
         let nativeReadEnd = DispatchTime.now().uptimeNanoseconds
@@ -142,8 +148,22 @@ final class PictureRecoveryTests: XCTestCase {
         let nativeControl = service.player.timeControlStatus.rawValue
         XCTAssertTrue(service.player.isMuted)
         XCTAssertEqual(service.queue.currentID, fixture.mediaID)
-        let newPicture = try XCTUnwrap(smallPicture(layer))
+        let secondOwnerBefore = service.debugAlignedVideoPollState
+        let secondGetterStart = DispatchTime.now().uptimeNanoseconds
+        var secondPixel: CVPixelBuffer? = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())
+        let secondGetterEnd = DispatchTime.now().uptimeNanoseconds
+        assertPictureOwner(secondOwnerBefore, service.debugAlignedVideoPollState)
+        XCTAssertEqual(service.audioSnapshot.token, after.token)
+        XCTAssertEqual(service.audioSnapshot.visit, after.visit)
+        XCTAssertEqual(service.queue.currentID, fixture.mediaID)
         service.pause()
+        // Retain at most two actual display buffers. Cold image conversion must not
+        // block the playing graph, exhaust the six-second clip or starve its producer.
+        let conversionStart = DispatchTime.now().uptimeNanoseconds
+        let oldPicture = try XCTUnwrap(smallPicture(try XCTUnwrap(firstPixel)))
+        let newPicture = try XCTUnwrap(smallPicture(try XCTUnwrap(secondPixel)))
+        firstPixel = nil; secondPixel = nil
+        let conversionEnd = DispatchTime.now().uptimeNanoseconds
         let elapsed = Double(end - start) / 1_000_000_000
         let fps = Double(delivered) / elapsed, gapMs = Double(maximumGap) / 1_000_000
         print("PRODUCTION_HD deliveredFPS=\(fps) maximumGapMs=\(gapMs) maximumEnqueueMs=\(Double(maximumEnqueue) / 1_000_000) audioAdvanced=\(after.frame - before.frame) underrunsAdded=\(after.underrunFrames - before.underrunFrames) actualPictureChanged=\(oldPicture != newPicture)")
@@ -153,6 +173,7 @@ final class PictureRecoveryTests: XCTestCase {
             print("PRODUCTION_HD_SOURCE firstObservedEntryNs=\(v.0) returnNs=\(v.1) output=\(v.2) seek=\(v.3) revision=\(v.4)")
         }
         print("PRODUCTION_HD_HOST schema=1 processID=\(ProcessInfo.processInfo.processIdentifier) moduleNonce=\(Self.hostModuleNonce) explicitActivation=\(actualSessionActivation)")
+        print("PRODUCTION_HD_READBACK firstGetterNs=[\(imageReadStart),\(imageReadEnd)] secondGetterNs=[\(secondGetterStart),\(secondGetterEnd)] conversionNs=[\(conversionStart),\(conversionEnd)] pausedBeforeConversion=true maximumRetainedBuffers=2 buffersReleased=true")
         for v in positions {
             print("PRODUCTION_HD_POSITION entryNs=\(v.entryNs) returnNs=\(v.returnNs) position=\(v.position) raw=\(v.rawItemTimebasePosition ?? -1) effectiveRate=\(v.itemTimebaseEffectiveRate ?? -1) request=\(v.request) generation=\(v.returnGeneration) owned=\(v.observedItemMatches && v.presentationUnchanged)")
         }
@@ -178,8 +199,20 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertNil(service.message)
     }
 
-    private func smallPicture(_ layer: AVSampleBufferDisplayLayer) -> Data? {
-        guard let pixel = layer.sampleBufferRenderer.displayedPixelBuffer() else { return nil }
+    private func assertPictureOwner(_ before: PlaybackService.DebugAlignedVideoPollState,
+                                    _ after: PlaybackService.DebugAlignedVideoPollState) {
+        XCTAssertTrue(before.frame.coherent && after.frame.coherent)
+        XCTAssertTrue(before.presentationMatches && after.presentationMatches)
+        XCTAssertTrue(before.observedItemMatches && after.observedItemMatches)
+        XCTAssertEqual(before.generation, after.generation); XCTAssertEqual(before.request, after.request)
+        XCTAssertEqual(before.frame.ticket, after.frame.ticket); XCTAssertEqual(before.frame.output, after.frame.output)
+        XCTAssertEqual(before.frame.imageEpoch, after.frame.imageEpoch)
+        XCTAssertEqual(before.frame.seekSerial, after.frame.seekSerial)
+    }
+    private func smallPicture(_ pixel: CVPixelBuffer) -> Data? {
+        let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+        guard width > 0, height > 0, width <= 1920, height <= 1920,
+              width * height <= 1920 * 1080 else { return nil }
         let image = CIImage(cvPixelBuffer: pixel).transformed(by: CGAffineTransform(
             scaleX: 8 / CGFloat(CVPixelBufferGetWidth(pixel)), y: 8 / CGFloat(CVPixelBufferGetHeight(pixel))))
         var bytes = [UInt8](repeating: 0, count: 8 * 8 * 4)

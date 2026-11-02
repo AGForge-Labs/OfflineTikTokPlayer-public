@@ -95,7 +95,7 @@ jobs:
             -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testMutedNativeTimingPreservesRetainedVideoAndPCM \
-            -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeStartArgumentNumericThenCurrentItemTime \
+            -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeTimingConfigurationCannotUndoPauseOrDeniedInterruptionResume \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeTimingConfigurationRejectsSupersessionAtEveryPrewriteRead \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins \

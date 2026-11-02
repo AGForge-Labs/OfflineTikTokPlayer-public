@@ -44,6 +44,20 @@ final class VideoPresentationContinuityTests: XCTestCase {
     func testSeekAndSourceAdoptionRetainTheDisplayedPictureWithoutOldFrameCredit() async throws {
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
+        #if targetEnvironment(simulator)
+        let layer = fixture.bridge.displayLayer
+        fixture.window.rootViewController?.view.backgroundColor = .black
+        layer.backgroundColor = UIColor.black.cgColor
+        let displayed = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())
+        let size = CGSize(width: CGFloat(CVPixelBufferGetWidth(displayed)), height: CGFloat(CVPixelBufferGetHeight(displayed)))
+        let scale = min(layer.bounds.width / size.width, layer.bounds.height / size.height)
+        let video = CGRect(x: layer.bounds.midX - size.width * scale / 2,
+                           y: layer.bounds.midY - size.height * scale / 2,
+                           width: size.width * scale, height: size.height * scale)
+        let region = layer.convert(video.insetBy(dx: video.width * 0.1, dy: video.height * 0.1), to: fixture.window.layer)
+        let initialBlack = try await compositorBlackFraction(window: fixture.window, region: region, label: "initial-picture")
+        XCTAssertLessThan(initialBlack, 0.30, "The initial onscreen video must be visible before testing retention")
+        #endif
         let ticket = try XCTUnwrap(fixture.bridge.debugAlignedPollState.ticket)
         let original = try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer())
         XCTAssertNotNil(fixture.bridge.currentFrameReceipt(for: ticket))
@@ -59,17 +73,44 @@ final class VideoPresentationContinuityTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(80))
         XCTAssertEqual(try fingerprint(fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer()), original,
                        "Keep the displayed picture while the next source prepares")
+        #if targetEnvironment(simulator)
+        let beforeBlack = try await compositorBlackFraction(window: fixture.window, region: region, label: "before-stop")
+        XCTAssertLessThan(beforeBlack, 0.30, "The positive control must show the actual coloured test video")
+        let attached = layer.superlayer
+        let bounds = layer.bounds, frame = layer.frame
         var removed: (Int, UInt64)?
         fixture.bridge.onDebugImageRemovalCompleted = { revision, epoch in removed = (revision, epoch) }
         defer { fixture.bridge.onDebugImageRemovalCompleted = nil }
+        let stopStart = ProcessInfo.processInfo.systemUptime
+        let stopDeadline = stopStart + 5
         fixture.bridge.setCurrentItem(nil)
         let owner = fixture.bridge.debugImageRemovalOwner
-        let cleared = await until {
-            removed != nil && fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer() == nil
+        let count = fixture.bridge.submittedFrameCount
+        while removed == nil, ProcessInfo.processInfo.systemUptime < stopDeadline {
+            try await Task.sleep(for: .milliseconds(10))
         }
-        print("REMOVAL_COMPLETED received=\(removed != nil) revision=\(removed?.0 ?? -1) expectedRevision=\(owner.revision) epoch=\(removed?.1 ?? 0) expectedEpoch=\(owner.epoch) cleared=\(cleared)")
+        let removalCompleted = removed != nil && ProcessInfo.processInfo.systemUptime <= stopDeadline
+        XCTAssertTrue(removalCompleted, "The SDK must acknowledge the captured image removal")
         XCTAssertEqual(removed?.0, owner.revision); XCTAssertEqual(removed?.1, owner.epoch)
-        XCTAssertTrue(cleared, "Intentional stop clears the retained picture")
+        XCTAssertNil(fixture.bridge.currentFrameReceipt(for: nextTicket))
+        XCTAssertNil(fixture.bridge.debugAlignedPollState.ticket)
+        XCTAssertNil(fixture.bridge.debugAlignedPollState.output)
+        guard removalCompleted else { throw SelectionVideoTestFailure.timeout }
+        let afterBlack = try await compositorBlackFraction(window: fixture.window, region: region,
+            label: "after-stop", deadline: stopDeadline)
+        let witnessEnd = ProcessInfo.processInfo.systemUptime
+        XCTAssertLessThanOrEqual(witnessEnd, stopDeadline, "Removal and its compositor witness share the original five-second limit")
+        XCTAssertGreaterThan(afterBlack, 0.98, "Intentional stop must remove the actual onscreen picture")
+        XCTAssertEqual(fixture.bridge.submittedFrameCount, count, "No post-stop frame may refill the cleared layer")
+        XCTAssertTrue(layer.superlayer === attached)
+        XCTAssertEqual(layer.bounds, bounds); XCTAssertEqual(layer.frame, frame)
+        XCTAssertFalse(layer.isHidden); XCTAssertEqual(layer.opacity, 1)
+        XCTAssertFalse(fixture.window.isHidden); XCTAssertTrue(fixture.window.isKeyWindow)
+        let cachedBufferRemains = layer.sampleBufferRenderer.displayedPixelBuffer() != nil
+        print("REMOVAL_COMPOSITOR elapsedSeconds=\(witnessEnd - stopStart) completed=\(removed != nil) revision=\(owner.revision) epoch=\(owner.epoch) beforeBlack=\(beforeBlack) afterBlack=\(afterBlack) cachedBufferRemains=\(cachedBufferRemains) attached=true hidden=false postStopEnqueues=\(fixture.bridge.submittedFrameCount - count)")
+        #else
+        throw XCTSkip("The removal witness requires the Simulator host compositor bridge")
+        #endif
     }
 
     func testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo() async throws {
@@ -270,6 +311,42 @@ final class VideoPresentationContinuityTests: XCTestCase {
         }
         return rate
     }
+
+    #if targetEnvironment(simulator)
+    private func compositorBlackFraction(window: UIWindow, region: CGRect, label: String,
+                                         deadline: Double? = nil) async throws -> Double {
+        guard window.bounds.width > 0, window.bounds.height > 0,
+              region.width > 0, region.height > 0 else { throw SelectionVideoTestFailure.capture }
+        window.rootViewController?.view.layoutIfNeeded()
+        CATransaction.flush()
+        let image = try await HostCompositorCapture.image(in: window, deadline: deadline)
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "Retained-video-" + label; attachment.lifetime = .keepAlways
+        add(attachment)
+        let cg = try XCTUnwrap(image.cgImage)
+        let sx = CGFloat(cg.width) / window.bounds.width, sy = CGFloat(cg.height) / window.bounds.height
+        let pixels = CGRect(x: region.minX * sx, y: region.minY * sy,
+                            width: region.width * sx, height: region.height * sy).integral
+        guard CGRect(x: 0, y: 0, width: cg.width, height: cg.height).contains(pixels) else {
+            throw SelectionVideoTestFailure.capture
+        }
+        let crop = try XCTUnwrap(cg.cropping(to: pixels))
+        var bytes = [UInt8](repeating: 0, count: 64 * 96 * 4)
+        let drawn = bytes.withUnsafeMutableBytes { storage -> Bool in
+            guard let context = CGContext(data: storage.baseAddress, width: 64, height: 96,
+                bitsPerComponent: 8, bytesPerRow: 64 * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+            context.draw(crop, in: CGRect(x: 0, y: 0, width: 64, height: 96))
+            return true
+        }
+        guard drawn else { throw SelectionVideoTestFailure.capture }
+        var black = 0
+        for i in stride(from: 0, to: bytes.count, by: 4) {
+            if bytes[i] < 20 && bytes[i + 1] < 20 && bytes[i + 2] < 20 { black += 1 }
+        }
+        return Double(black) / (64 * 96)
+    }
+    #endif
 
     private func fingerprint(_ value: CVPixelBuffer?) throws -> String {
         let pixel = try XCTUnwrap(value, "An actual displayed pixel buffer is required")
