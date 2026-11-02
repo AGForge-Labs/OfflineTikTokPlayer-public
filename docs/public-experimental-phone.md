@@ -1,24 +1,43 @@
-# Owner phone video timing repair
+# Owner phone smooth switching repair
 
-Candidate: `e3b21a3f614e9414795cc99cf2ef875d1dcb0566`; parent `38ba9485b4491fed313fd5aaef3b04659000adb7`.
-App: `ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650`; unchanged Core: `f9b20964220eb867c397e9fa8334c673263d92a5`.
+Candidate: `30c1a5d36da393743cd3155ac991a2221eb7a7bc`; parent `c8d942c25b3b350d0fe4b40a45282a8f16e15ec7`.
+App: `3a7a7c5563bf51ff8c62e9b9db8dbaae3f8a7b66`; unchanged Core: `f9b20964220eb867c397e9fa8334c673263d92a5`.
 
-Preserve the muted native timing track, native video pixel format and media-owned
-visibility during rapid reversals. PCM remains audible. The final exact31-case
-native run41399945982 must succeed before any signing input is mapped. It includes
-real-service1080p60, PCM progress/mute, supersession and pause/interruption checks.
-Earlier reversal19 and baseline/image receipts remain required. Failed pacing
-audits41390543020,41392840748 and41394165312 are retained as failure evidence;
-none of them authorizes this candidate. Run41396159005 failed test compilation
-because a shared ownership helper was excluded. Its three-file successor moves
-that unchanged helper into test support and regenerates project references; the
-app/core and all31 required cases are unchanged. Run41397564720 was canceled
-before validation when review found the extracted file needed PlayerCore. The
-current one-line successor restores that explicit import; the guard body, app,
-core and31-case requirements are unchanged. Run41398139688 reached the end of
-Swift compilation without errors but hit its cap before test execution. The
-workflow-only successor permits two compilation tasks and18minutes overall;
-serial execution, per-case limits and all31 requirements remain unchanged. Full-suite and phone acceptance remain open.
+Require exact successful read-only revalidation run41438316239, proof source `f4dbfc8cff17f184d7f6a9c8e251f9b8d5bcaa09`,
+the original baseline/image receipts, and literal reversal19 before signing.
+The revalidation binds compiled native run41433680171/job125238206931 to the
+exact canonical log SHA256 bf1f24e3313d7e71f282acbe5d70584a30b11474bd413a105d5daa2ba287b547.
+That original job remains failed: its final reporter encountered host JSON
+interleaved inside an SDK diagnostic PID. All five runtime/build stages and
+32 native case executions succeeded. The corrected reporter changes no iOS
+source, Swift tests, case profile, native workflow or assertion threshold.
+Its Ubuntu proof requires that reporter to be the original job's sole failure.
+The isolated31 cases preserve production
+readiness, PCM/zero/tone/skew, ownership, visible picture and HD cadence gates.
+The main28, offset-native-clock check, production-default benchmark, HD baseline
+and supplementary explicit activation control run in five separate native
+processes after one compilation.
+All31 unique required cases and unchanged limits remain, with32 executions total.
+Exact simulator, unique process witnesses, and absence of host restarts are required.
+
+The5ms snapshot budget covers the complete existing product read with valid
+ordered receipts for every sample. Original outer test-bookkeeping spans remain
+reported; the earlier outer122ms failure is retained and is not called a pass.
+Witness-absent checks retain the earlier outer5ms criterion. All coverage, PCM,
+skew, stereo-zero, tone, underrun, owner and memory checks remain unchanged.
+
+The old numeric-start comparison remains failed experimental evidence. Its
+qualified Previous override differs from the production default; the revised
+profile uses the existing production-default execution-timing comparison instead.
+Image conversion follows pause so the witness cannot starve live playback. Stop
+requires actual compositor clearing on the same visible layer within five seconds,
+matching SDK completion and no refill; cached-buffer presence is diagnostic only.
+The unchanged confirmation follows c8with one274.901ms prepared return versus
+250ms. That failure remains recorded and a repeat does not establish its cause.
+Earlier mixed-process44fps and scheduled audio-gap failures remain recorded;
+isolated passes do not establish their cause. Earlier failed/canceled runs do
+not authorize this candidate.
+Full-suite and physical-phone acceptance remain separate and unresolved.
 
 Use the existing protected release environment, unchanged signing helper and
 owner-only internal TestFlight group. No credential, role, tester or billing change.

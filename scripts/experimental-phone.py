@@ -10,14 +10,17 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "38ba9485b4491fed313fd5aaef3b04659000adb7"
-SOURCE = "e3b21a3f614e9414795cc99cf2ef875d1dcb0566"
-APP_TREE = "ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650"
-BASE_APP_TREE = "ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650"
+SOURCE_BASE = "c8d942c25b3b350d0fe4b40a45282a8f16e15ec7"
+SOURCE = "30c1a5d36da393743cd3155ac991a2221eb7a7bc"
+APP_TREE = "3a7a7c5563bf51ff8c62e9b9db8dbaae3f8a7b66"
+BASE_APP_TREE = "3a7a7c5563bf51ff8c62e9b9db8dbaae3f8a7b66"
 CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
     '.github/workflows/native-video-final.yml',
+    'scripts/verify-native-test-log.py',
+    'scripts/verify-video-profile.py',
+    'tests/validation-shell/test_native_test_evidence.py',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -216,14 +219,14 @@ NATIVE_PROOFS = (
      ".github/workflows/media-presentation-repair.yml", "codex/media-presentation-repair"),
     (41328715253, "6489eafb55ee67358e9aaf203368f27de8b5fc6b", ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
     (41388275137, "fe55925544585b85bb59b361eee450cc8cf60838", ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
-    (41399945982, SOURCE, ".github/workflows/native-video-final.yml", "codex/native-video-final"),
+    (41438316239, "f4dbfc8cff17f184d7f6a9c8e251f9b8d5bcaa09", ".github/workflows/native-video-evidence.yml", "codex/native-video-evidence"),
 )
 
 
 def require_native_result(read=None):
     # The first two receipts preserve the accepted processing/video baseline.
     # Preserve the exact nineteen-case reversal/visibility baseline and require
-    # the final runtime's thirty-one-case presentation/PCM/HD/ownership run.
+    # the frozen execution's thirty-one-case profile plus an HD activation control.
     # Its workflow freezes app/core and rejects failed, skipped or missing cases.
     # Full-suite and physical-phone acceptance remain separate.
     if read is None:
