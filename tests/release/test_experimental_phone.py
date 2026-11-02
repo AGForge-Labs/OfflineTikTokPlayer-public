@@ -30,6 +30,18 @@ class ExperimentalPhoneTests(unittest.TestCase):
                 with self.subTest(run=run, key=key), self.assertRaises(ValueError):
                     phone.require_native_result(changed.__getitem__)
 
+    def test_reversal_candidate_requires_its_own_completed_native_result(self):
+        reversal = (41388275137, "fe55925544585b85bb59b361eee450cc8cf60838",
+            ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe")
+        proofs = (*phone.NATIVE_PROOFS, reversal)
+        results = {run: dict(id=run, head_sha=source, status="completed", conclusion="success",
+            path=path, event="push", head_branch=branch, run_attempt=1,
+            repository=dict(full_name=phone.REPOSITORY, private=False))
+            for run, source, path, branch in proofs}
+        results[reversal[0]].update(status="in_progress", conclusion=None)
+        with self.assertRaises(ValueError):
+            phone.require_native_result(results.__getitem__)
+
     def test_archive_preserves_default_whole_module_outputs_and_other_signing_arguments(self):
         override = "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO"
         command = ["xcodebuild", "-jobs", "1", "SWIFTC_MAXIMUM_DETERMINISM=1", override,
@@ -111,11 +123,9 @@ class ExperimentalPhoneTests(unittest.TestCase):
             digest = hashlib.sha256(signer.read_bytes()).hexdigest()
             data = {(control, "rev-parse", "HEAD"): self.sha,
                     (candidate, "rev-parse", "HEAD"): phone.SOURCE,
-                    (candidate, "rev-parse", "HEAD^"): "6489eafb55ee67358e9aaf203368f27de8b5fc6b",
-                    (candidate, "diff", "--name-only", "6489eafb55ee67358e9aaf203368f27de8b5fc6b", phone.SOURCE):
-                        "ios/OfflineTikTokPlayer/Playback/PlaybackService.swift\n"
-                        "ios/OfflineTikTokPlayer/UI/SettingsView.swift\n"
-                        "ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift",
+                    (candidate, "rev-parse", "HEAD^"): phone.SOURCE_BASE,
+                    (candidate, "rev-parse", phone.SOURCE_BASE + ":ios/OfflineTikTokPlayer"): phone.BASE_APP_TREE,
+                    (candidate, "diff", "--name-only", phone.SOURCE_BASE, phone.SOURCE): "\n".join(phone.SOURCE_CHANGES),
                     (candidate, "rev-parse", "HEAD:ios/OfflineTikTokPlayer"): phone.APP_TREE,
                     (candidate, "rev-parse", "HEAD:ios/PlayerCore"): phone.CORE_TREE,
                     (control, "status", "--porcelain", "--untracked-files=all"): "",

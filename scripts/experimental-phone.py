@@ -10,15 +10,22 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "6489eafb55ee67358e9aaf203368f27de8b5fc6b"
-SOURCE = "0c304fff59e385fb963a51d89eb61f6a6dbbe2d4"
-APP_TREE = "084542abd55e30e3fed832d9f1688cbd142e82a4"
+SOURCE_BASE = "129a0c7123532fcd380d83684ed7e1322b2b309e"
+SOURCE = "fe55925544585b85bb59b361eee450cc8cf60838"
+APP_TREE = "bf034b9a40169f80b71dbbd7e35cba47e591509b"
+BASE_APP_TREE = "084542abd55e30e3fed832d9f1688cbd142e82a4"
 CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
-    "ios/OfflineTikTokPlayer/Playback/PlaybackService.swift",
-    "ios/OfflineTikTokPlayer/UI/SettingsView.swift",
-    "ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift",
+    '.github/workflows/reverse-swipe.yml',
+    'ios/OfflineTikTokPlayer/Playback/ContinuousPictureInPicture.swift',
+    'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
+    'ios/OfflineTikTokPlayer/Support/Info.plist',
+    'ios/OfflineTikTokPlayer/UI/FeedPager.swift',
+    'ios/OfflineTikTokPlayer/UI/FeedView.swift',
+    'ios/OfflineTikTokPlayerTests/FeedPresentationTests.swift',
+    'ios/OfflineTikTokPlayerTests/VideoPresentationContinuityTests.swift',
+    'tests/reverse-swipe-cases.json',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -110,6 +117,7 @@ def verify_checkouts(control, candidate, expected, *, git=None, signer_sha=SIGNE
     pins = {(control, "rev-parse", "HEAD"): expected,
             (candidate, "rev-parse", "HEAD"): SOURCE,
             (candidate, "rev-parse", "HEAD^"): SOURCE_BASE,
+            (candidate, "rev-parse", SOURCE_BASE + ":ios/OfflineTikTokPlayer"): BASE_APP_TREE,
             (candidate, "diff", "--name-only", SOURCE_BASE, SOURCE): "\n".join(SOURCE_CHANGES),
             (candidate, "rev-parse", "HEAD:ios/OfflineTikTokPlayer"): APP_TREE,
             (candidate, "rev-parse", "HEAD:ios/PlayerCore"): CORE_TREE,
@@ -214,15 +222,16 @@ def upload_with_receipt(helper, configuration, directory, build, receipt):
 NATIVE_PROOFS = (
     (41327719585, "5fcd933c614d7473b3bc61cd3d5bd86e7ed7861c",
      ".github/workflows/media-presentation-repair.yml", "codex/media-presentation-repair"),
-    (41328715253, SOURCE_BASE, ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
+    (41328715253, "6489eafb55ee67358e9aaf203368f27de8b5fc6b", ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
+    (41388275137, SOURCE, ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
 )
 
 
 def require_native_result(read=None):
-    # These receipts cover the delivered24.1 processing/video baseline. The new
-    # frozen child only removes the sound setting and its saved preference, with
-    # two PCM-fixture overrides; verify_checkouts pins that reviewed small delta.
-    # They do not claim exact-source native/UI acceptance for this candidate.
+    # The first two receipts preserve the accepted processing/video baseline.
+    # This candidate additionally requires its own exact nineteen-case reversal,
+    # visibility, recovery and cadence run; its workflow rejects missing cases.
+    # Full-suite and physical-phone acceptance remain separate.
     if read is None:
         import urllib.request
         def read(run_id):
@@ -241,7 +250,7 @@ def require_native_result(read=None):
             and result.get("head_branch") == branch and result.get("run_attempt") == 1
             and result.get("repository", {}).get("full_name") == REPOSITORY
             and result.get("repository", {}).get("private") is False,
-            "Both exact focused media/image results must pass before signing; full-suite and phone acceptance remain unresolved.")
+            "Every fixed baseline/reversal native result must pass before signing; full-suite and phone acceptance remain unresolved.")
 
 
 def main():
@@ -260,7 +269,7 @@ def main():
     verify_checkouts(ROOT, candidate, environment["EXPECTED_CONTROL_COMMIT"])
     if args.command == "check":
         require_native_result()
-        print("Exact candidate, reviewed automatic-speaker delta and baseline focused media/image results verified. Full-suite and phone acceptance remain unresolved.")
+        print("Exact candidate, reviewed reversal delta and exact focused native results verified. Full-suite and phone acceptance remain unresolved.")
         return
     require(sys.platform == "darwin", "Signing requires the existing standard macOS runner.")
     if args.command == "sign-upload":
@@ -290,7 +299,7 @@ def main():
             completed_status = json.loads(receipt.read_text())
         delivery = completed_status.get("delivery", {})
         print("Apple owner delivery: " + json.dumps(delivery, sort_keys=True))
-        message = "Uploaded experimental internal-only phone build " + build + " from " + SOURCE + ". Native and phone acceptance remain unresolved."
+        message = "Uploaded experimental internal-only phone build " + build + " from " + SOURCE + ". Full-suite and phone acceptance remain unresolved."
         print(message)
         if environment.get("GITHUB_STEP_SUMMARY"):
             with Path(environment["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
