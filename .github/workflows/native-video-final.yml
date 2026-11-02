@@ -40,6 +40,30 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/native-format
+          # The capture bridge and xcodebuild share one exact booted Simulator.
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          capture_log=artifacts/native-format/capture-helper.log
+          capture_pid=''
+          cleanup_capture() {
+            local status=$?
+            trap - EXIT
+            if [ -n "$capture_pid" ]; then
+              kill "$capture_pid" 2>/dev/null || true
+              wait "$capture_pid" 2>/dev/null || true
+            fi
+            exit "$status"
+          }
+          trap cleanup_capture EXIT
+          python3 -u scripts/capture-simulator-test-frames.py \
+            --udid "$SIMULATOR_UDID" --lifetime 1200 >"$capture_log" 2>&1 &
+          capture_pid=$!
+          capture_ready=0
+          for ((attempt=0; attempt<100; attempt++)); do
+            kill -0 "$capture_pid" 2>/dev/null || { cat "$capture_log"; exit 1; }
+            if grep -Fq '"eventCode": 0' "$capture_log"; then capture_ready=1; break; fi
+            sleep 0.1
+          done
+          if [ "$capture_ready" -ne 1 ]; then cat "$capture_log"; exit 1; fi
           excluded="$(python3 -c 'from pathlib import Path; chosen={"PictureRecoveryTests.swift", "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift", "NativeReaderWaitObservation.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
           xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \

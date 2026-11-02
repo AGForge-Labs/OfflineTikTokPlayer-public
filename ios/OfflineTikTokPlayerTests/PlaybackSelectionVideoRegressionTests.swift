@@ -412,11 +412,25 @@ final class PresentationClockBoundaryTrace {
 /// both generated movies, so a decoded asset or advancing audio clock cannot satisfy visibility.
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
-    private static let fixtureImageReadback = CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false])
+    private static let fixtureImageReadback = CIContext(options: [.cacheIntermediates: false])
     /// Format-neutral readback for the bounded synthetic marker fixture only.
     private static func fixtureBGRA(_ pixel: CVPixelBuffer) -> [UInt8]? {
         guard CVPixelBufferGetWidth(pixel) == 160, CVPixelBufferGetHeight(pixel) == 96 else { return nil }
         var bytes = [UInt8](repeating: 0, count: 160 * 96 * 4)
+        if CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA {
+            guard CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
+            defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+            guard let base = CVPixelBufferGetBaseAddress(pixel),
+                  CVPixelBufferGetBytesPerRow(pixel) >= 160 * 4 else { return nil }
+            let sourceStride = CVPixelBufferGetBytesPerRow(pixel)
+            bytes.withUnsafeMutableBytes { destination in
+                for row in 0..<96 {
+                    destination.baseAddress!.advanced(by: row * 160 * 4).copyMemory(
+                        from: base.advanced(by: row * sourceStride), byteCount: 160 * 4)
+                }
+            }
+            return bytes
+        }
         fixtureImageReadback.render(CIImage(cvPixelBuffer: pixel), toBitmap: &bytes, rowBytes: 160 * 4,
             bounds: CGRect(x: 0, y: 0, width: 160, height: 96), format: .BGRA8,
             colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -2290,7 +2304,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             for (index, row) in pixels.enumerated() {
                 let colors = row.colors, raw = row.context.rawDisplayTime
                 let pixelMatches = row.bin >= 0 && row.bin < 8 && colors?.backgroundRed == true
-                    && colors?.blueCount == 384 && colors?.minX == row.bin * 10
+                    && colors?.blueInterior == true && colors?.redExterior == true && colors?.minX == row.bin * 10
                     && colors?.maxX == row.bin * 10 + 15 && colors?.minY == 0 && colors?.maxY == 23
                 let owner = row.ownerQualified && row.context.pull.ticket == attempt.ticket
                     && row.before.token == attempt.sample.token && row.after.token == attempt.sample.token
@@ -7733,38 +7747,56 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .video)
         let track = try XCTUnwrap(tracks.first)
-        let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track,
-            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-        guard reader.canAdd(output) else { throw SelectionVideoTestFailure.timeout }
-        reader.add(output)
-        guard reader.startReading() else { throw reader.error ?? SelectionVideoTestFailure.timeout }
-        defer { reader.cancelReading() }
-        var counts = [0, 0, 0]
-        for index in 0..<720 {
-            let (pts, colors) = try autoreleasepool { () throws -> (Double, PausedFirstFrameTrace.PixelColors) in
-                let sample = try XCTUnwrap(output.copyNextSampleBuffer())
-                let pixel = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
-                let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
-                XCTAssertTrue(timestamp.isNumeric); XCTAssertEqual(timestamp.epoch, 0)
-                return (timestamp.seconds,
-                    try XCTUnwrap(PausedFirstFrameTrace.pixelColors(pixel)))
+        for format in [kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange] {
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track,
+                outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: format])
+            guard reader.canAdd(output) else { throw SelectionVideoTestFailure.timeout }
+            reader.add(output)
+            guard reader.startReading() else { throw reader.error ?? SelectionVideoTestFailure.timeout }
+            defer { reader.cancelReading() }
+            var counts = [0, 0, 0], minimumBlue = Int.max, maximumBlue = 0
+            for index in 0..<720 {
+                let step = index / 3, x = (step * 10) % 144
+                let y = (step / 72) * 24
+                let (pts, colors) = try autoreleasepool { () throws -> (Double, PausedFirstFrameTrace.PixelColors) in
+                    let sample = try XCTUnwrap(output.copyNextSampleBuffer())
+                    let pixel = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+                    XCTAssertEqual(CVPixelBufferGetPixelFormatType(pixel), format)
+                    let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
+                    XCTAssertTrue(timestamp.isNumeric); XCTAssertEqual(timestamp.epoch, 0)
+                    let colors = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(pixel))
+                    if index == 0 || index == 9 {
+                        // Preserve every boundary pixel but corrupt a blue interior pixel.
+                        // Geometry alone must never prove the source image's marker bin.
+                        var corrupted = try XCTUnwrap(Self.fixtureBGRA(pixel))
+                        let offset = ((y + 1) * 160 + x + 1) * 4
+                        corrupted[offset] = 0; corrupted[offset + 1] = 0; corrupted[offset + 2] = 255
+                        let rejected = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(bgra: corrupted))
+                        XCTAssertEqual(rejected.minX, colors.minX); XCTAssertEqual(rejected.maxX, colors.maxX)
+                        XCTAssertEqual(rejected.minY, colors.minY); XCTAssertEqual(rejected.maxY, colors.maxY)
+                        XCTAssertFalse(rejected.blueInterior); XCTAssertEqual(rejected.classification, 0)
+                    }
+                    return (timestamp.seconds, colors)
+                }
+                XCTAssertEqual(pts, Double(index) / 24, accuracy: 0.5 / 48_000)
+                XCTAssertEqual(colors.minX, x); XCTAssertEqual(colors.maxX, x + 15)
+                XCTAssertEqual(colors.minY, y); XCTAssertEqual(colors.maxY, y + 23)
+                if format == kCVPixelFormatType_32BGRA { XCTAssertEqual(colors.blueCount, 384) }
+                XCTAssertTrue(colors.backgroundRed)
+                XCTAssertTrue(colors.blueInterior, "Every inset marker pixel must be blue: \(colors.witnessFailures)")
+                XCTAssertTrue(colors.redExterior, "Every pixel beyond the marker boundary must be red: \(colors.witnessFailures)")
+                let expected = index < 3 ? 1 : ((9...11).contains(index) ? 2 : 0)
+                XCTAssertEqual(colors.classification, expected,
+                    "Decoded format \(format) frame \(index) must separate the initial bin, target .4 bin and every other bin")
+                counts[colors.classification] += 1
+                minimumBlue = min(minimumBlue, colors.blueCount); maximumBlue = max(maximumBlue, colors.blueCount)
             }
-            XCTAssertEqual(pts, Double(index) / 24, accuracy: 0.5 / 48_000)
-            let step = index / 3, x = ((index / 3) * 10) % 144
-            let y = (step / 72) * 24
-            XCTAssertEqual(colors.minX, x); XCTAssertEqual(colors.maxX, x + 15)
-            XCTAssertEqual(colors.minY, y); XCTAssertEqual(colors.maxY, y + 23)
-            XCTAssertEqual(colors.blueCount, 384); XCTAssertTrue(colors.backgroundRed)
-            let expected = index < 3 ? 1 : ((9...11).contains(index) ? 2 : 0)
-            XCTAssertEqual(colors.classification, expected,
-                "Decoded fixture frame \(index) must separate the initial bin, target .4 bin and every other bin")
-            counts[colors.classification] += 1
+            XCTAssertNil(output.copyNextSampleBuffer(), "Calibration must cover the complete encoded fixture")
+            XCTAssertEqual(reader.status, .completed)
+            XCTAssertEqual(counts, [714, 3, 3])
+            print("PausedFirstPixelCalibration schema=3 pixelType=\(format) decodedFrames=720 width=160 height=96 initialBin=0 targetBin=3 initialFrames=\(counts[1]) targetFrames=\(counts[2]) otherFrames=\(counts[0]) minimumBlue=\(minimumBlue) maximumBlue=\(maximumBlue) classifier=exact-bounds-blue-interior-red-exterior boundaryExclusionPixels=1 corruptedInteriorControls=2 maximumInspectedPixelsPerFrame=15360 retainedPixelBuffers=0 exactFrameWithinThreeFrameBin=unavailable output=scalar-only")
         }
-        XCTAssertNil(output.copyNextSampleBuffer(), "Calibration must cover the complete encoded fixture")
-        XCTAssertEqual(reader.status, .completed)
-        XCTAssertEqual(counts, [714, 3, 3])
-        print("PausedFirstPixelCalibration schema=2 decodedFrames=720 width=160 height=96 initialBin=0 targetBin=3 initialFrames=\(counts[1]) targetFrames=\(counts[2]) otherFrames=\(counts[0]) classifier=blue-marker-full-bounds maximumInspectedPixelsPerFrame=15360 retainedPixelBuffers=0 exactFrameWithinThreeFrameBin=unavailable output=scalar-only")
         #else
         XCTFail("First copied-pixel calibration requires DEBUG audit helper")
         #endif
@@ -8166,9 +8198,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             try await require({ service.audioSnapshot.frame >= held.frame + 2_400 },
                 "Only explicit Play may resume actual selected PCM progress")
             diagnostic?.phase = 5; diagnostic?.record(service, kind: 3)
-            await assertMovingVisibleVideo(service, screen: screen, identity: .a,
-                label: pausedTarget == nil ? "initial-clock-pause-recovered-A" : "initial-clock-explicit-seek-recovered-A")
-            diagnostic?.phase = 6; diagnostic?.record(service, kind: 3)
+            // These belong to the original request. External compositor acquisition can
+            // outlive its 30-second fixture and legitimately select the next request.
             XCTAssertNil(service.debugInitialClockBindingState.request)
             XCTAssertEqual(service.debugInitialClockBindingState.statusHandledGeneration, request)
             XCTAssertEqual(starts, beforeInitialStart ? 0 : 1); XCTAssertFalse(overflow)
@@ -8176,6 +8207,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(audio.renderer.retainedPCMMemoryBytes, 6_912_000)
             XCTAssertLessThanOrEqual(service.preparedAudioCount, 3)
             XCTAssertLessThanOrEqual(buffer.retainedItemCount, 3)
+            await assertMovingVisibleVideo(service, screen: screen, identity: .a,
+                label: pausedTarget == nil ? "initial-clock-pause-recovered-A" : "initial-clock-explicit-seek-recovered-A")
+            diagnostic?.phase = 6; diagnostic?.record(service, kind: 3)
             receipt = "InitialClockBindingTransfer schema=2 beforeInitialStart=\(beforeInitialStart) explicitPausedSeek=\(pausedTarget != nil) request=\(request) actualReadyAccepts=\(readyAccepts) actualInitialStarts=\(starts) qualified=\(qualified) readyAtIntervention=\(readyAtReturn.map { String($0) } ?? "unavailable") loadingAtIntervention=\(loadingAtReturn.map { String($0) } ?? "unavailable") pendingAtIntervention=\(pendingAtReturn.map { String($0) } ?? "unavailable") statusTransferred=\(transferred) pausedHoldMs=200 realUserSeekIssued=\(userSeekIssued) overflow=\(overflow) movingRecoveryChecksReturned=true xctestOutcome=external output=after-owned-cleanup-attempt latencyAcceptance=false"
         }
     }
@@ -8186,11 +8220,13 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         struct PixelColors {
             let minX: Int, maxX: Int, minY: Int, maxY: Int
             let blueCount: Int, redCount: Int
+            let blueInterior: Bool, redExterior: Bool
+            let witnessFailures: [String]
             var backgroundRed: Bool { redCount > 14_000 }
             // These fixture bins each contain three identical consecutive frames.
             // Full bounds distinguish later positions that cover the same interior patch.
             var classification: Int {
-                guard backgroundRed, blueCount == 384, minY == 0, maxY == 23 else { return 0 }
+                guard backgroundRed, blueInterior, redExterior, minY == 0, maxY == 23 else { return 0 }
                 if minX == 0 && maxX == 15 { return 1 }
                 if minX == 30 && maxX == 45 { return 2 }
                 return 0
@@ -8227,18 +8263,49 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         // One bounded canonical fixture scan; no retained CV object or frame history.
         static func pixelColors(_ pixel: CVPixelBuffer) -> PixelColors? {
             guard let base = PlaybackSelectionVideoRegressionTests.fixtureBGRA(pixel) else { return nil }
+            return pixelColors(bgra: base)
+        }
+        static func pixelColors(bgra base: [UInt8]) -> PixelColors? {
+            guard base.count == 160 * 96 * 4 else { return nil }
             let stride = 160 * 4
+            var mask = [UInt8](repeating: 0, count: 160 * 96)
             var minX = 160, maxX = -1, minY = 96, maxY = -1, blueCount = 0, redCount = 0
             for y in 0..<96 { for x in 0..<160 {
                 let index = y * stride + x * 4
                 let b = base[index], g = base[index + 1], r = base[index + 2]
                 if b > 150 && g < 100 && r < 100 {
+                    mask[y * 160 + x] = 1
                     minX = min(minX, x); maxX = max(maxX, x)
                     minY = min(minY, y); maxY = max(maxY, y); blueCount += 1
-                } else if r > 150 && g < 100 && b < 100 { redCount += 1 }
+                } else if r > 150 && g < 100 && b < 100 {
+                    mask[y * 160 + x] = 2; redCount += 1
+                }
             } }
+            // Fixed one-pixel boundary exclusion is calibrated against every encoded
+            // frame in both BGRA and native YUV. Exact bounds and all interior/exterior
+            // pixels remain mandatory; a matching bounding box alone is insufficient.
+            let exactBounds = maxX - minX == 15 && maxY - minY == 23
+                && minX >= 0 && maxX < 160 && minY >= 0 && maxY < 96
+            var blueInterior = exactBounds, redExterior = exactBounds
+            var failures: [String] = []
+            if exactBounds {
+                for y in 0..<96 { for x in 0..<160 {
+                    let interior = x > minX && x < maxX && y > minY && y < maxY
+                    let exterior = x < minX - 1 || x > maxX + 1 || y < minY - 1 || y > maxY + 1
+                    let colour = mask[y * 160 + x]
+                    if (interior && colour != 1) || (exterior && colour != 2) {
+                        if interior { blueInterior = false }
+                        if exterior { redExterior = false }
+                        if failures.count < 8 {
+                            let i = y * stride + x * 4
+                            failures.append("x=\(x),y=\(y),r=\(base[i + 2]),g=\(base[i + 1]),b=\(base[i])")
+                        }
+                    }
+                } }
+            }
             return PixelColors(minX: minX, maxX: maxX, minY: minY, maxY: maxY,
-                blueCount: blueCount, redCount: redCount)
+                blueCount: blueCount, redCount: redCount, blueInterior: blueInterior,
+                redExterior: redExterior, witnessFailures: failures)
         }
         func recordCopiedPixel(_ pixel: CVPixelBuffer,
             context: ContinuousPictureInPicture.DebugCopiedPixelContext, service: PlaybackService) -> Bool {
@@ -8297,9 +8364,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     XCTAssertTrue(pixel.ownerQualified)
                     XCTAssertNotNil(pixel.colors)
                     XCTAssertTrue(pixel.colors?.classification == 1 || pixel.colors?.classification == 2,
-                        "Ambiguous pixels cannot establish either the initial or requested fixture bin")
+                        "Ambiguous pixels cannot establish either fixture bin: \(pixel.colors?.witnessFailures ?? [])")
                     let raw = pixel.context.rawDisplayTime
-                    print("PausedFirstCopiedPixel schema=2 request=\(request) seek=\(pixel.context.pull.seekSerial) epoch=\(pixel.context.pull.imageEpoch) beforeRenderStampOrdinal=\(pixel.beforeRenderStampOrdinal) ownerQualified=\(pixel.ownerQualified) width=\(pixel.width) height=\(pixel.height) pixelType=\(pixel.pixelType) requestedSeconds=\(pixel.context.requestedTime.seconds) rawDisplayValue=\(raw.value) rawDisplayTimescale=\(raw.timescale) rawDisplayFlags=\(raw.flags.rawValue) rawDisplayNumeric=\(raw.isNumeric) rawDisplaySeconds=\(show(raw.isNumeric ? raw.seconds : nil)) classification=\(show(pixel.colors?.classification)) minX=\(show(pixel.colors?.minX)) maxX=\(show(pixel.colors?.maxX)) minY=\(show(pixel.colors?.minY)) maxY=\(show(pixel.colors?.maxY)) blueCount=\(show(pixel.colors?.blueCount)) redCount=\(show(pixel.colors?.redCount)) auditDurationNs=\(pixel.auditDurationNs) classifier=blue-marker-full-bounds backgroundRed=\(show(pixel.colors?.backgroundRed)) markerVersion=\(show(pixel.markerVersion)) sourceBeforeToken=\(pixel.before.token) sourceBeforeVisit=\(pixel.before.visit) sourceBeforeVersion=\(pixel.before.selectionVersion) sourceBeforeFrame=\(pixel.before.frame) sourceAfterToken=\(pixel.after.token) sourceAfterVisit=\(pixel.after.visit) sourceAfterVersion=\(pixel.after.selectionVersion) sourceAfterFrame=\(pixel.after.frame) sourceObservations=separate-after-native-copy exactFrameWithinThreeFrameBin=unavailable bufferRetained=false extraConsumingCopies=0 output=after-owned-cleanup-attempt")
+                    print("PausedFirstCopiedPixel schema=2 request=\(request) seek=\(pixel.context.pull.seekSerial) epoch=\(pixel.context.pull.imageEpoch) beforeRenderStampOrdinal=\(pixel.beforeRenderStampOrdinal) ownerQualified=\(pixel.ownerQualified) width=\(pixel.width) height=\(pixel.height) pixelType=\(pixel.pixelType) requestedSeconds=\(pixel.context.requestedTime.seconds) rawDisplayValue=\(raw.value) rawDisplayTimescale=\(raw.timescale) rawDisplayFlags=\(raw.flags.rawValue) rawDisplayNumeric=\(raw.isNumeric) rawDisplaySeconds=\(show(raw.isNumeric ? raw.seconds : nil)) classification=\(show(pixel.colors?.classification)) minX=\(show(pixel.colors?.minX)) maxX=\(show(pixel.colors?.maxX)) minY=\(show(pixel.colors?.minY)) maxY=\(show(pixel.colors?.maxY)) blueCount=\(show(pixel.colors?.blueCount)) redCount=\(show(pixel.colors?.redCount)) auditDurationNs=\(pixel.auditDurationNs) classifier=exact-bounds-blue-interior-red-exterior blueInterior=\(show(pixel.colors?.blueInterior)) redExterior=\(show(pixel.colors?.redExterior)) backgroundRed=\(show(pixel.colors?.backgroundRed)) markerVersion=\(show(pixel.markerVersion)) sourceBeforeToken=\(pixel.before.token) sourceBeforeVisit=\(pixel.before.visit) sourceBeforeVersion=\(pixel.before.selectionVersion) sourceBeforeFrame=\(pixel.before.frame) sourceAfterToken=\(pixel.after.token) sourceAfterVisit=\(pixel.after.visit) sourceAfterVersion=\(pixel.after.selectionVersion) sourceAfterFrame=\(pixel.after.frame) sourceObservations=separate-after-native-copy exactFrameWithinThreeFrameBin=unavailable bufferRetained=false extraConsumingCopies=0 output=after-owned-cleanup-attempt")
                 }
             }
             let copies = events.filter {
