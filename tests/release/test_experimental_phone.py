@@ -31,16 +31,19 @@ class ExperimentalPhoneTests(unittest.TestCase):
                     phone.require_native_result(changed.__getitem__)
 
     def test_reversal_candidate_requires_its_own_completed_native_result(self):
-        reversal = (41388275137, "fe55925544585b85bb59b361eee450cc8cf60838",
-            ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe")
-        proofs = (*phone.NATIVE_PROOFS, reversal)
-        results = {run: dict(id=run, head_sha=source, status="completed", conclusion="success",
-            path=path, event="push", head_branch=branch, run_attempt=1,
-            repository=dict(full_name=phone.REPOSITORY, private=False))
-            for run, source, path, branch in proofs}
-        results[reversal[0]].update(status="in_progress", conclusion=None)
-        with self.assertRaises(ValueError):
-            phone.require_native_result(results.__getitem__)
+        checks = ((41388275137, "fe55925544585b85bb59b361eee450cc8cf60838",
+            ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
+            (41390543020, "4bc9dd2370ddf74411335ae34ed5196e3a3dac4f",
+            ".github/workflows/frame-pacing-audit.yml", "codex/frame-pacing-audit"))
+        for required in checks:
+            proofs = (*phone.NATIVE_PROOFS, required)
+            results = {run: dict(id=run, head_sha=source, status="completed", conclusion="success",
+                path=path, event="push", head_branch=branch, run_attempt=1,
+                repository=dict(full_name=phone.REPOSITORY, private=False))
+                for run, source, path, branch in proofs}
+            results[required[0]].update(status="in_progress", conclusion=None)
+            with self.subTest(run=required[0]), self.assertRaises(ValueError):
+                phone.require_native_result(results.__getitem__)
 
     def test_archive_preserves_default_whole_module_outputs_and_other_signing_arguments(self):
         override = "SWIFT_USE_PARALLEL_WHOLE_MODULE_OPTIMIZATION=NO"

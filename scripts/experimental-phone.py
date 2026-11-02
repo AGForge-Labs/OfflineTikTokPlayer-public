@@ -224,13 +224,16 @@ NATIVE_PROOFS = (
      ".github/workflows/media-presentation-repair.yml", "codex/media-presentation-repair"),
     (41328715253, "6489eafb55ee67358e9aaf203368f27de8b5fc6b", ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
     (41388275137, SOURCE, ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
+    (41390543020, "4bc9dd2370ddf74411335ae34ed5196e3a3dac4f",
+     ".github/workflows/frame-pacing-audit.yml", "codex/frame-pacing-audit"),
 )
 
 
 def require_native_result(read=None):
     # The first two receipts preserve the accepted processing/video baseline.
-    # This candidate additionally requires its own exact nineteen-case reversal,
-    # visibility, recovery and cadence run; its workflow rejects missing cases.
+    # Require the candidate's exact nineteen-case reversal/visibility run and
+    # the same-runtime twenty-case plus four-case isolated pacing audit. The
+    # audit freezes this app/core and requires both command outcomes and all cases.
     # Full-suite and physical-phone acceptance remain separate.
     if read is None:
         import urllib.request
@@ -250,7 +253,7 @@ def require_native_result(read=None):
             and result.get("head_branch") == branch and result.get("run_attempt") == 1
             and result.get("repository", {}).get("full_name") == REPOSITORY
             and result.get("repository", {}).get("private") is False,
-            "Every fixed baseline/reversal native result must pass before signing; full-suite and phone acceptance remain unresolved.")
+            "Every fixed baseline/reversal/pacing native result must pass before signing; full-suite and phone acceptance remain unresolved.")
 
 
 def main():
