@@ -12,14 +12,14 @@ jobs:
   presentation:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
     runs-on: macos-26
-    timeout-minutes: 18
+    timeout-minutes: 22
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Verify exact runtime and project
         run: |
-          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650
+          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = 3a7a7c5563bf51ff8c62e9b9db8dbaae3f8a7b66
           test "$(git rev-parse HEAD:ios/PlayerCore)" = f9b20964220eb867c397e9fa8334c673263d92a5
           python3 scripts/generate-ios-project.py --check
       - name: Begin simulator boot before compilation
@@ -33,6 +33,26 @@ jobs:
           _, device = sorted(choices, key=lambda p: p[0])[-1]
           if device['state'] != 'Booted': subprocess.run(['xcrun','simctl','boot',device['udid']],check=True)
           with open(os.environ['GITHUB_ENV'],'a') as f: f.write('SIMULATOR_UDID='+device['udid']+'\n')
+          PY
+      - name: Compile the focused test bundle once
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/native-format
+          excluded="$(python3 -c 'from pathlib import Path; chosen={"PictureRecoveryTests.swift", "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift", "NativeReaderWaitObservation.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
+          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath artifacts/NativeFormatDerived -resultBundlePath artifacts/native-format/Build.xcresult \
+            -jobs 2 CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
+            build-for-testing 2>&1 | tee artifacts/native-format/build.log
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          plans = list(Path('artifacts/NativeFormatDerived/Build/Products').glob('*.xctestrun'))
+          assert len(plans) == 1 and plans[0].is_file() and not plans[0].is_symlink()
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('NATIVE_XCTESTRUN=' + str(plans[0].resolve()) + '\n')
           PY
       - name: Real images rapid reversals and source frame pacing
         id: native
@@ -64,13 +84,14 @@ jobs:
             sleep 0.1
           done
           if [ "$capture_ready" -ne 1 ]; then cat "$capture_log"; exit 1; fi
-          excluded="$(python3 -c 'from pathlib import Path; chosen={"PictureRecoveryTests.swift", "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift", "NativeReaderWaitObservation.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
-          xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+          xcodebuild test-without-building -xctestrun "$NATIVE_XCTESTRUN" \
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
-            -derivedDataPath artifacts/NativeFormatDerived -resultBundlePath artifacts/native-format/Native.xcresult \
-            -jobs 2 -parallel-testing-enabled NO -test-timeouts-enabled YES -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
+            -resultBundlePath artifacts/native-format/Native.xcresult \
+            -parallel-testing-enabled NO -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 \
             -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests \
             -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests \
+            -skip-testing:OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackWithExplicitSessionActivation \
             -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testMutedNativeTimingPreservesRetainedVideoAndPCM \
@@ -80,18 +101,54 @@ jobs:
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoFirstFrameCapabilityBeforeSelection \
-            test 2>&1 | tee artifacts/native-format/native.log
+            2>&1 | tee artifacts/native-format/native.log
+      - name: Observe two fresh full-resolution service starts without recompiling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          result=0
+          for arm in 1 2; do
+            if [ "$arm" -eq 1 ]; then
+              method=testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving
+            else
+              method=testFullResolutionProductionPlaybackWithExplicitSessionActivation
+            fi
+            set +e
+            xcodebuild test-without-building -xctestrun "$NATIVE_XCTESTRUN" \
+              -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+              -resultBundlePath "artifacts/native-format/Fresh-$arm.xcresult" \
+              -parallel-testing-enabled NO -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 \
+              -only-testing:"OfflineTikTokPlayerTests/PictureRecoveryTests/$method" \
+              2>&1 | tee "artifacts/native-format/hd-fresh-$arm.log"
+            outcome=("${PIPESTATUS[@]}")
+            set -e
+            if [ "${outcome[0]}" -ne 0 ] || [ "${outcome[1]}" -ne 0 ]; then result=1; fi
+          done
+          exit "$result"
       - name: Require thirty one exact passing cases
+        if: ${{ always() }}
         shell: bash
         run: |
           python3 - <<'PY'
-          import json, runpy
+          import json, re, runpy
           from pathlib import Path
           v = runpy.run_path('scripts/verify-native-test-log.py')
           cases = set(json.loads(Path('tests/native-video-format-cases.json').read_text())['cases'])
           assert len(cases) == 31 and cases <= v['source_manifest'](Path.cwd())
-          v['verify_log'](Path('artifacts/native-format/native.log').read_text(), cases)
-          print('Exact31 focused presentation and ownership cases passed; phone cadence acceptance remains separate.')
+          v['verify_log'](Path('artifacts/native-format/native.log').read_text(), cases, invocation='test-without-building')
+          for arm, method in ((1, 'testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving'), (2, 'testFullResolutionProductionPlaybackWithExplicitSessionActivation')):
+              fresh = {'OfflineTikTokPlayerTests.PictureRecoveryTests/' + method}
+              v['verify_log'](Path(f'artifacts/native-format/hd-fresh-{arm}.log').read_text(), fresh, invocation='test-without-building')
+          hosts = []
+          for name in ('native.log', 'hd-fresh-1.log', 'hd-fresh-2.log'):
+              rows = re.findall(r'PRODUCTION_HD_HOST schema=1 processID=(\d+) moduleNonce=([0-9a-f-]{36}) explicitActivation=(true|false)', Path('artifacts/native-format', name).read_text())
+              assert len(rows) == 1, (name, rows)
+              hosts.append(rows[0])
+          assert len({pid for pid, _, _ in hosts}) == 3 and len({nonce for _, nonce, _ in hosts}) == 3
+          assert [mode for _, _, mode in hosts] == ['false', 'false', 'true']
+          print('Exact31 focused cases plus two fresh full-resolution service starts passed; phone cadence acceptance remains separate.')
           PY
       - name: Preserve synthetic video evidence
         if: always()

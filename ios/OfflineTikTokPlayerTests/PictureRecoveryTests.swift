@@ -11,17 +11,88 @@ import PlayerCore
 
 @MainActor
 final class PictureRecoveryTests: XCTestCase {
+    private static let hostModuleNonce = UUID().uuidString.lowercased()
     private let imageReadback = CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false])
     func testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving() async throws {
-        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-1080", firstDuration: 6)
+        try await measureProductionHD(actualSessionActivation: false)
+    }
+    func testFullResolutionProductionPlaybackWithExplicitSessionActivation() async throws {
+        try await measureProductionHD(actualSessionActivation: true)
+    }
+    private func measureProductionHD(actualSessionActivation: Bool) async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-1080", firstDuration: 6,
+            actualSessionActivation: actualSessionActivation)
+        defer { fixture.dumpSessionEvidence() }
         let service = fixture.service
         let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
-        var measuring = false, delivered = 0, invalidOwners = 0
+        var measuring = false, recording = true, delivered = 0, invalidOwners = 0
         var request = -1, token = 0, visit: Int64 = 0
         var selectedItem: ObjectIdentifier?
         var previous: UInt64 = 0, maximumGap: UInt64 = 0, maximumEnqueue: UInt64 = 0
+        var sdk = [CadenceSpan](repeating: CadenceSpan(), count: 8)
+        var stages = [Int](repeating: 0, count: ContinuousPictureInPicture.DebugWholeFrameStage.enqueued.rawValue + 1)
+        var previousTick: UInt64 = 0, previousReturn: UInt64 = 0, depth = 0
+        var tickGap = CadenceSpan(), outsideGap = CadenceSpan()
+        var positions: [PlaybackService.DebugVideoPositionRead] = []
+        var handoffs: [PlaybackService.DebugVideoRateHandoff] = []
+        var seeks: [(UInt64, PlaybackService.DebugVideoSeekStamp)] = []
+        var terminals: [(UInt64, PlaybackService.DebugVideoSeekCompletionTerminal)] = []
+        var outputChanges = 0, seekChanges = 0, revisionChanges = 0, overflow = false
+        var lastOutput: ObjectIdentifier?, lastSeek: UInt64?, lastRevision: Int?
+        var sourceChanges: [(UInt64, UInt64, ObjectIdentifier, UInt64, Int)] = []
+        sourceChanges.reserveCapacity(16)
+        positions.reserveCapacity(128); handoffs.reserveCapacity(16)
+        seeks.reserveCapacity(16); terminals.reserveCapacity(16)
+        service.onDebugCPPWholeFrame = { stamp in
+            guard measuring, stamp.request == request, stamp.generation == request,
+                  stamp.observedItem == selectedItem else { return }
+            switch stamp.event {
+            case .entered(let entry):
+                tickGap.record(start: previousTick, end: entry.entryNs)
+                if depth == 0 { outsideGap.record(start: previousReturn, end: entry.entryNs) }
+                previousTick = entry.entryNs; depth += 1
+            case .returned(let span):
+                stages[span.stage.rawValue] += 1
+                sdk[0].record(start: span.entry.entryNs, end: span.returnNs)
+                if let v = span.layerStatus { sdk[1].record(start: v.entryNs, end: v.returnNs) }
+                if let v = span.backpressure { sdk[2].record(start: v.entryNs, end: v.returnNs) }
+                if let v = span.timebase { sdk[3].record(start: v.entryNs, end: v.returnNs) }
+                if let v = span.readinessCommit { sdk[4].record(start: v.entryNs, end: v.returnNs) }
+                depth = max(0, depth - 1)
+                if depth == 0 { previousReturn = span.returnNs }
+            }
+        }
+        service.onDebugVideoPositionRead = { value in
+            guard recording else { return }
+            if positions.count < 128 { positions.append(value) } else { overflow = true }
+        }
+        service.onDebugVideoRateHandoff = { value in
+            guard recording else { return }
+            if handoffs.count < 16 { handoffs.append(value) } else { overflow = true }
+        }
+        service.onDebugVideoSeekStamp = { value in
+            guard recording else { return }
+            if seeks.count < 16 { seeks.append((DispatchTime.now().uptimeNanoseconds, value)) } else { overflow = true }
+        }
+        service.onDebugVideoSeekCompletionTerminal = { value in
+            guard recording else { return }
+            if terminals.count < 16 { terminals.append((DispatchTime.now().uptimeNanoseconds, value)) } else { overflow = true }
+        }
         service.onDebugCPPNativePullStamp = { stamp in
-            guard measuring, stamp.pull.stage == .enqueue else { return }
+            guard measuring else { return }
+            sdk[5 + stamp.pull.stage.rawValue].record(start: stamp.pull.entryNs, end: stamp.pull.returnNs)
+            if lastOutput != stamp.pull.output || lastSeek != stamp.pull.nativeSeekTicket
+                || lastRevision != stamp.pull.entryRevision {
+                if sourceChanges.count < 16 {
+                    sourceChanges.append((stamp.pull.entryNs, stamp.pull.returnNs, stamp.pull.output,
+                        stamp.pull.nativeSeekTicket, stamp.pull.entryRevision))
+                } else { overflow = true }
+            }
+            if let lastOutput, lastOutput != stamp.pull.output { outputChanges += 1 }
+            if let lastSeek, lastSeek != stamp.pull.nativeSeekTicket { seekChanges += 1 }
+            if let lastRevision, lastRevision != stamp.pull.entryRevision { revisionChanges += 1 }
+            lastOutput = stamp.pull.output; lastSeek = stamp.pull.nativeSeekTicket; lastRevision = stamp.pull.entryRevision
+            guard stamp.pull.stage == .enqueue else { return }
             guard stamp.request == request, stamp.generation == request,
                   stamp.sourceItem == selectedItem, stamp.sourceItemMatches, stamp.observedItemMatches,
                   stamp.presentationMatches, stamp.cachedAudioToken == token, stamp.cachedAudioVisit == visit,
@@ -31,24 +102,44 @@ final class PictureRecoveryTests: XCTestCase {
             maximumEnqueue = max(maximumEnqueue, stamp.pull.returnNs - stamp.pull.entryNs)
             previous = stamp.pull.returnNs; delivered += 1
         }
-        defer { service.onDebugCPPNativePullStamp = nil }
+        defer {
+            service.onDebugCPPNativePullStamp = nil; service.onDebugCPPWholeFrame = nil
+            service.onDebugVideoPositionRead = nil; service.onDebugVideoRateHandoff = nil
+            service.onDebugVideoSeekStamp = nil; service.onDebugVideoSeekCompletionTerminal = nil
+        }
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until { service.isVideoReady && service.audioSnapshot.frame > 2_400 }
+        let imageReadStart = DispatchTime.now().uptimeNanoseconds
         let oldPicture = try XCTUnwrap(smallPicture(layer))
+        let imageReadEnd = DispatchTime.now().uptimeNanoseconds
+        let nativeReadStart = DispatchTime.now().uptimeNanoseconds
+        let nativeStart = service.player.currentTime().seconds
+        let nativeReadEnd = DispatchTime.now().uptimeNanoseconds
         let before = service.audioSnapshot
         XCTAssertTrue(service.player.isMuted)
         XCTAssertEqual(service.queue.currentID, fixture.mediaID)
         request = service.debugAlignedVideoPollState.generation
         selectedItem = ObjectIdentifier(try XCTUnwrap(service.player.currentItem))
         token = before.token; visit = before.visit
+        let frameAtStart = service.debugAlignedVideoPollState.frame
+        XCTAssertNotNil(frameAtStart.output); XCTAssertNotNil(frameAtStart.ticket)
+        lastOutput = frameAtStart.output; lastSeek = frameAtStart.seekSerial
+        lastRevision = frameAtStart.ticket?.debugGeneration
         let start = DispatchTime.now().uptimeNanoseconds
-        previous = start; measuring = true
+        previous = start; previousTick = start; previousReturn = start
+        let heartbeat = CadenceHeartbeat(start: start)
+        measuring = true
         try await Task.sleep(for: .milliseconds(1200))
         let end = DispatchTime.now().uptimeNanoseconds
-        measuring = false
-        maximumGap = max(maximumGap, end - previous)
+        measuring = false; recording = false
         let after = service.audioSnapshot
+        maximumGap = max(maximumGap, end - previous)
+        tickGap.record(start: previousTick, end: end)
+        if depth == 0 { outsideGap.record(start: previousReturn, end: end) }
+        let background = heartbeat.stop(end: end)
+        let nativeEnd = service.player.currentTime().seconds
+        let nativeControl = service.player.timeControlStatus.rawValue
         XCTAssertTrue(service.player.isMuted)
         XCTAssertEqual(service.queue.currentID, fixture.mediaID)
         let newPicture = try XCTUnwrap(smallPicture(layer))
@@ -56,6 +147,25 @@ final class PictureRecoveryTests: XCTestCase {
         let elapsed = Double(end - start) / 1_000_000_000
         let fps = Double(delivered) / elapsed, gapMs = Double(maximumGap) / 1_000_000
         print("PRODUCTION_HD deliveredFPS=\(fps) maximumGapMs=\(gapMs) maximumEnqueueMs=\(Double(maximumEnqueue) / 1_000_000) audioAdvanced=\(after.frame - before.frame) underrunsAdded=\(after.underrunFrames - before.underrunFrames) actualPictureChanged=\(oldPicture != newPicture)")
+        print("PRODUCTION_HD_STALL windowNs=[\(start),\(end)] imageReadNs=[\(imageReadStart),\(imageReadEnd)] nativeStartReadNs=[\(nativeReadStart),\(nativeReadEnd)] nativeStart=\(nativeStart) nativeEnd=\(nativeEnd) nativeControl=\(nativeControl) tickMs=\(tickGap.milliseconds) tickNs=[\(tickGap.start),\(tickGap.end)] outsideMs=\(outsideGap.milliseconds) outsideNs=[\(outsideGap.start),\(outsideGap.end)] backgroundTicks=\(background.ticks) backgroundMs=\(background.maximum.milliseconds) backgroundNs=[\(background.maximum.start),\(background.maximum.end)] sdkMs=\(sdk.map(\.milliseconds)) sdkStartsNs=\(sdk.map(\.start)) sdkEndsNs=\(sdk.map(\.end)) stages=\(stages) outputChanges=\(outputChanges) seekChanges=\(seekChanges) revisionChanges=\(revisionChanges)")
+        print("PRODUCTION_HD_SOURCE_BASE output=\(String(describing: frameAtStart.output)) seek=\(frameAtStart.seekSerial) revision=\(frameAtStart.ticket?.debugGeneration ?? -1) windowStartNs=\(start) transitionTimes=first-observed-not-exact")
+        for v in sourceChanges {
+            print("PRODUCTION_HD_SOURCE firstObservedEntryNs=\(v.0) returnNs=\(v.1) output=\(v.2) seek=\(v.3) revision=\(v.4)")
+        }
+        print("PRODUCTION_HD_HOST schema=1 processID=\(ProcessInfo.processInfo.processIdentifier) moduleNonce=\(Self.hostModuleNonce) explicitActivation=\(actualSessionActivation)")
+        for v in positions {
+            print("PRODUCTION_HD_POSITION entryNs=\(v.entryNs) returnNs=\(v.returnNs) position=\(v.position) raw=\(v.rawItemTimebasePosition ?? -1) effectiveRate=\(v.itemTimebaseEffectiveRate ?? -1) request=\(v.request) generation=\(v.returnGeneration) owned=\(v.observedItemMatches && v.presentationUnchanged)")
+        }
+        for v in handoffs {
+            print("PRODUCTION_HD_RATE entryNs=\(v.entryNs) returnNs=\(v.returnNs) cause=\(v.cause.rawValue) rate=\(v.requestedRate) position=\(v.anchorTime.seconds) host=\(v.anchorHostTime.seconds) request=\(v.request) generation=\(v.returnGeneration) owned=\(v.presentationUnchanged)")
+        }
+        for (time, v) in seeks {
+            print("PRODUCTION_HD_SEEK observedNs=\(time) reason=\(v.reason.rawValue) ticket=\(v.nativeSeekTicket) target=\(v.requestedPosition) force=\(v.force) request=\(v.request) generation=\(v.generation) token=\(v.cachedAudioToken) visit=\(v.cachedAudioVisit)")
+        }
+        for (time, v) in terminals {
+            print("PRODUCTION_HD_SEEK_END observedNs=\(time) request=\(v.request) ticket=\(v.nativeSeekTicket)")
+        }
+        XCTAssertEqual(depth, 0); XCTAssertFalse(overflow); XCTAssertFalse(background.overflow)
         XCTAssertGreaterThan(fps, 50, "The actual service must deliver the full-resolution 60fps source")
         XCTAssertLessThan(gapMs, 100, "The actual audio clock must not hide a long video delivery gap")
         XCTAssertEqual(invalidOwners, 0)
@@ -370,11 +480,15 @@ private final class PictureRecoveryFixture {
     let service: PlaybackService
     private let directory: URL
     private let window: UIWindow
+    private let activationProbe: PictureActivationProbe
     private weak var previousWindow: UIWindow?
     private let preferences = ["speakerSound", "automaticPiP", "audioOnly"].map { ($0, UserDefaults.standard.object(forKey: $0)) }
 
     init(test: XCTestCase, nativeAudio: Bool = false,
-         firstResourceName: String = "test-selection-a", firstDuration: Double = 30) async throws {
+         firstResourceName: String = "test-selection-a", firstDuration: Double = 30,
+         actualSessionActivation: Bool = false) async throws {
+        let activation = PictureActivationProbe(actual: actualSessionActivation)
+        activationProbe = activation
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let cloud = OneDriveClient(account: MicrosoftAccount())
@@ -390,11 +504,11 @@ private final class PictureRecoveryFixture {
         ], playlists: [PlaylistRecord(id: playlist, name: "Synthetic", itemIDs: [mediaID, otherID])]))
         if nativeAudio {
             service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
-                bookmarkURL: directory.appendingPathComponent("playback.json"), activateSession: {},
+                bookmarkURL: directory.appendingPathComponent("playback.json"), activateSession: { try activation.activate() },
                 preparePCM: { _, _, _, _ in throw ContinuousPCMDecoder.Failure.unsupportedPCM })
         } else {
             service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
-                bookmarkURL: directory.appendingPathComponent("playback.json"), activateSession: {})
+                bookmarkURL: directory.appendingPathComponent("playback.json"), activateSession: { try activation.activate() })
         }
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         previousWindow = scene.windows.first(where: \.isKeyWindow)
@@ -427,6 +541,45 @@ private final class PictureRecoveryFixture {
             let owned = directory.standardizedFileURL.resolvingSymlinksInPath()
             if closed, UUID(uuidString: owned.lastPathComponent) != nil,
                owned.deletingLastPathComponent() == parent { try FileManager.default.removeItem(at: owned) }
+        }
+    }
+    func dumpSessionEvidence() {
+        activationProbe.dump()
+        // Post-window observation only: these SDK getters cannot move the cadence window.
+        let session = AVAudioSession.sharedInstance()
+        let start = DispatchTime.now().uptimeNanoseconds
+        let category = session.category.rawValue, mode = session.mode.rawValue
+        let rate = session.sampleRate, io = session.ioBufferDuration
+        let route = session.currentRoute.outputs.map { $0.portType.rawValue }
+        let end = DispatchTime.now().uptimeNanoseconds
+        print("PRODUCTION_HD_SESSION phase=after-measurement category=\(category) mode=\(mode) sampleRate=\(rate) ioDuration=\(io) route=\(route) readNs=[\(start),\(end)]")
+    }
+}
+
+@MainActor private final class PictureActivationProbe {
+    private let actual: Bool
+    private var entries: [(UInt64, UInt64, Bool, Int)] = []
+    private var overflow = false
+    init(actual: Bool) { self.actual = actual; entries.reserveCapacity(8) }
+    func activate() throws {
+        let start = DispatchTime.now().uptimeNanoseconds
+        do {
+            if actual { try AVAudioSession.sharedInstance().setActive(true) }
+            record(start: start, succeeded: true, code: 0)
+        } catch {
+            record(start: start, succeeded: false, code: (error as NSError).code)
+            throw error
+        }
+    }
+    private func record(start: UInt64, succeeded: Bool, code: Int) {
+        if entries.count < 8 { entries.append((start, DispatchTime.now().uptimeNanoseconds, succeeded, code)) }
+        else { overflow = true }
+    }
+    func dump() {
+        XCTAssertFalse(overflow)
+        XCTAssertFalse(entries.isEmpty); XCTAssertTrue(entries.allSatisfy { $0.2 })
+        for (ordinal, value) in entries.enumerated() {
+            print("PRODUCTION_HD_ACTIVATION ordinal=\(ordinal) explicit=\(actual) entryNs=\(value.0) returnNs=\(value.1) succeeded=\(value.2) errorCode=\(value.3)")
         }
     }
 }

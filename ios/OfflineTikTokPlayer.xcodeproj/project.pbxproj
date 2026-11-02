@@ -793,6 +793,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "9E6443E89957939B7475C36B";
 		};
+		"EAC80CE43F539B685426D33C" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "CadenceTimingObservation.swift";
+			"sourceTree" = "<group>";
+		};
+		"A6E9723AE3715CA4BC999A3C" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "EAC80CE43F539B685426D33C";
+		};
 		"2A9E9E78B7F616CA74635CF8" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -806,6 +816,7 @@
 		"902F209F10EC4D528CCD8BB0" = {
 			"isa" = "PBXGroup";
 			"children" = (
+				"EAC80CE43F539B685426D33C",
 				"2A9E9E78B7F616CA74635CF8",
 			);
 			"path" = "Support";
@@ -1210,6 +1221,7 @@
 				"C661944F396B5236683903C4",
 				"A14E0397CE0BE76AB7D9965D",
 				"55ED0563DA5CDECEA34A3877",
+				"A6E9723AE3715CA4BC999A3C",
 				"CAC5F3A70BD72AF385EFEED7",
 				"112867BF5769A66E20E98457",
 			);

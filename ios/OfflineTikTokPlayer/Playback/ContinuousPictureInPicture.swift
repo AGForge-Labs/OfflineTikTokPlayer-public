@@ -513,6 +513,8 @@ final class ContinuousPictureInPicture: NSObject {
     }
     // Separate from legacy point stamps and their capacity/masks.
     var onDebugNativePullStamp: (@MainActor (DebugNativePullStamp) -> Void)?
+    var onDebugImageRemovalCompleted: (@MainActor @Sendable (Int, UInt64) -> Void)?
+    var debugImageRemovalOwner: (revision: Int, epoch: UInt64) { (presentationRevision, imageEpoch) }
     enum DebugWholeFrameStage: Int, Sendable {
         case resourceGuard, seekGuard, activeGuard, itemGuard, ownerGuard, acquisitionGuard
         case layerStatus, ownerAfterStatus, failedLayerRecovery, backpressure, ownerAfterBackpressure
@@ -1190,10 +1192,24 @@ final class ContinuousPictureInPicture: NSObject {
         guard !invalidated, imageEpoch == epoch, presentationRevision == revision else { return }
         // Invalidate old readiness immediately, but retain the displayed picture
         // until the replacement arrives. Clearing it here causes a black PiP/inline flash.
-        if removingImage { displayLayer.flushAndRemoveImage(); hasDisplayedImage = false }
+        if removingImage { removeDisplayedImage() }
         else { displayLayer.flush() }
         guard !invalidated, imageEpoch == epoch, presentationRevision == revision else { return }
         hasReportedFrameFailure = false
+    }
+
+    private func removeDisplayedImage() {
+        #if DEBUG
+        if let observer = onDebugImageRemovalCompleted {
+            let revision = presentationRevision, epoch = imageEpoch
+            displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true) {
+                Task { @MainActor in observer(revision, epoch) }
+            }
+        } else { displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true) }
+        #else
+        displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true)
+        #endif
+        hasDisplayedImage = false
     }
 
     /// Stop pulls before native seeking can make its target available. Acquiring it
@@ -1327,8 +1343,7 @@ final class ContinuousPictureInPicture: NSObject {
         releaseCurrentResource()
         videoOutput = nil
         currentItem = nil
-        displayLayer.flushAndRemoveImage()
-        hasDisplayedImage = false
+        removeDisplayedImage()
         displayLayer.controlTimebase = nil
         timebase = nil
         format = nil

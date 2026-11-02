@@ -450,6 +450,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private var sourceCallbackLedgerBenchmarkMode: Bool?
     private var sourceCallbackExecutionTimingBenchmarkMode: Bool?
     private var sourceCallbackLedgerArmID: String?
+    private var sourceCallbackStartArgumentMode: Bool?
     private static var unresolvedFirstZeroCalibrationAudio: ContinuousAudioPlayer?
     #endif
 
@@ -2057,8 +2058,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     func testNativeStartArgumentNumericThenCurrentItemTime() async throws {
         try recordRuntimeHost()
         #if DEBUG
+        sourceCallbackLedgerBenchmarkMode = true
+        sourceCallbackExecutionTimingBenchmarkMode = true
+        defer {
+            sourceCallbackLedgerBenchmarkMode = nil
+            sourceCallbackExecutionTimingBenchmarkMode = nil
+            sourceCallbackLedgerArmID = nil; sourceCallbackStartArgumentMode = nil
+        }
         for (ordinal, currentItemTime) in [false, true].enumerated() {
-            print("NativeStartArgumentArm schema=1 order=numeric-then-current-item-time ordinal=\(ordinal) currentItemTime=\(currentItemTime) targetPhase=2 traceVideoSeeks=true traceClockHandoff=true tracingAcrossModes=constant qualification=history-near-zero nativeZeroAtIssue=unverified acceptance=unchanged")
+            sourceCallbackLedgerArmID = UUID().uuidString.lowercased()
+            sourceCallbackStartArgumentMode = currentItemTime
+            print("NativeStartArgumentArm schema=2 armID=\(sourceCallbackLedgerArmID ?? "missing") sourceAndTapExecutionLedger=true order=numeric-then-current-item-time ordinal=\(ordinal) currentItemTime=\(currentItemTime) targetPhase=2 traceVideoSeeks=true traceClockHandoff=true tracingAcrossModes=constant qualification=history-near-zero nativeZeroAtIssue=unverified acceptance=unchanged")
             try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
                 traceClockHandoff: true, initialNativeStartCurrentItemTime: currentItemTime)
         }
@@ -5256,7 +5266,12 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if sourceCallbackLedgerBenchmarkMode != nil {
             XCTAssertNotNil(sourceCallbackLedgerArmID)
             XCTAssertTrue(traceVideoSeeks); XCTAssertEqual(traceClockHandoff, true)
-            XCTAssertFalse(traceNativeRefill); XCTAssertNil(initialNativeStartCurrentItemTime)
+            XCTAssertFalse(traceNativeRefill)
+            XCTAssertEqual(initialNativeStartCurrentItemTime, sourceCallbackStartArgumentMode)
+            if sourceCallbackStartArgumentMode != nil {
+                XCTAssertEqual(sourceCallbackLedgerBenchmarkMode, true)
+                XCTAssertEqual(sourceCallbackExecutionTimingBenchmarkMode, true)
+            }
             XCTAssertNil(acceptedPCMOriginBenchmarkMode); XCTAssertNil(sourceOutputBenchmarkMode)
             XCTAssertNil(renderAccounting); XCTAssertNil(frameMonitorAlternative); XCTAssertNil(traceDefaultFrameMonitor)
             XCTAssertNil(suppressNativePlayerRendering); XCTAssertNil(freshPreviousBundle); XCTAssertNil(queuedPreviousLead)
