@@ -23,12 +23,14 @@ final class FeedPresentationTests: XCTestCase {
             return abs(current.convert(current.bounds, to: scroll).midY - scroll.bounds.midY) < 1
         }
         let original = try XCTUnwrap(model.markers["0:b"])
-        for id in ["c", "b", "c", "b", "c", "b"] {
+        for (ordinal, id) in ["c", "b", "c", "b", "c", "b"].enumerated() {
             let pages = model.queue.feedWindow.pages
             let index = try XCTUnwrap(pages.firstIndex { $0.mediaID == id })
             scroll.delegate?.scrollViewWillBeginDragging?(scroll)
             scroll.setContentOffset(CGPoint(x: 0, y: CGFloat(index) * scroll.bounds.height), animated: false)
-            scroll.delegate?.scrollViewDidEndDragging?(scroll, willDecelerate: false)
+            let decelerates = ordinal.isMultiple(of: 2)
+            scroll.delegate?.scrollViewDidEndDragging?(scroll, willDecelerate: decelerates)
+            if decelerates { scroll.delegate?.scrollViewDidEndDecelerating?(scroll) }
             // A second gesture may begin immediately; no run-loop/layout await
             // is allowed between committing the first and starting the reverse.
             XCTAssertEqual(model.queue.currentID, id, "Gesture settlement must commit the landed visit synchronously")
@@ -40,6 +42,36 @@ final class FeedPresentationTests: XCTestCase {
         }
         XCTAssertTrue(model.markers["0:b"] === original)
         XCTAssertLessThanOrEqual(descendants(scroll).filter { $0 is PageMarkerView }.count, 3)
+        scroll.delegate?.scrollViewWillBeginDragging?(scroll)
+        _ = model.queue.next() // A headphone command while the gesture still owns B's viewport.
+        try await Task.sleep(for: .milliseconds(30))
+        root.layoutIfNeeded()
+        scroll.setContentOffset(CGPoint(x: 0, y: 2 * scroll.bounds.height), animated: false)
+        scroll.delegate?.scrollViewDidEndDragging?(scroll, willDecelerate: false)
+        XCTAssertEqual(model.queue.currentID, "c", "The stale gesture cannot apply a second advance after a remote command")
+        root.layoutIfNeeded()
+        let remote = try XCTUnwrap(model.markers["1:c"])
+        XCTAssertEqual(remote.convert(remote.bounds, to: scroll).midY, scroll.bounds.midY, accuracy: 1)
+        let contact = try XCTUnwrap(scroll.gestureRecognizers?.compactMap { $0 as? FeedContactObserver }.first)
+        contact.contactChanged?(true) // Finger down, before UIKit's pan threshold.
+        XCTAssertTrue(model.interacting, "A held touch must already block natural advancement")
+        _ = model.queue.previous()
+        try await Task.sleep(for: .milliseconds(30)); root.layoutIfNeeded()
+        XCTAssertEqual(remote.convert(remote.bounds, to: scroll).midY, scroll.bounds.midY, accuracy: 1,
+            "A remote command cannot recenter the viewport beneath a held finger")
+        scroll.delegate?.scrollViewDidEndDecelerating?(scroll) // Canceled older deceleration.
+        XCTAssertTrue(model.interacting)
+        contact.contactChanged?(false)
+        try await waitUntil {
+            root.layoutIfNeeded()
+            return !model.interacting && abs(original.convert(original.bounds, to: scroll).midY - scroll.bounds.midY) < 1
+        }
+        window.frame.size.height -= 80
+        try await waitUntil {
+            root.layoutIfNeeded()
+            return abs(original.bounds.height - scroll.bounds.height) < 1
+                && abs(original.convert(original.bounds, to: scroll).midY - scroll.bounds.midY) < 1
+        }
     }
 
     func testPosterAndVideoHostSurvivePreviewPlaybackAndHistory() async throws {
@@ -177,6 +209,7 @@ final class FeedPresentationTests: XCTestCase {
 @MainActor @Observable
 private final class FeedTestModel {
     var queue = PlaybackQueue(ids: ["a", "b", "c", "d"], startAt: "b")
+    var interacting = false
     @ObservationIgnored var markers: [String: PageMarkerView] = [:]
 }
 
@@ -190,12 +223,18 @@ private struct FeedHarness: View {
                 if direction > 0 { _ = model.queue.next() }
                 else if direction < 0 { _ = model.queue.previous() }
                 return model.queue.feedWindow
-            }, interactionChanged: { _ in }) { page in
-                PageMarker(id: page.id, model: model)
+            }, interactionChanged: { model.interacting = $0 }) { page in
+                FeedEnvironmentMarker(id: page.id)
             }
             Color.black.frame(height: 70)
-        }.background(.black)
+        }.background(.black).environment(model)
     }
+}
+
+private struct FeedEnvironmentMarker: View {
+    let id: String
+    @Environment(FeedTestModel.self) private var model
+    var body: some View { PageMarker(id: id, model: model) }
 }
 
 private final class PageMarkerView: UIView {}

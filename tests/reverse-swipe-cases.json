@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "cases": [
+    "OfflineTikTokPlayerTests.FeedPresentationTests/testDismantlingThePreviousPageCannotRemoveTheVideoFromItsNewHost",
+    "OfflineTikTokPlayerTests.FeedPresentationTests/testFirstFrameMonitorHandlesPausedAndPreparedItemsAndDetachesItsOutput",
+    "OfflineTikTokPlayerTests.FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether",
+    "OfflineTikTokPlayerTests.FeedPresentationTests/testPagingUsesTheActualViewportAndPreservesTheArrivingView",
+    "OfflineTikTokPlayerTests.FeedPresentationTests/testPosterAndVideoHostSurvivePreviewPlaybackAndHistory",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testNativeAudioOwnerRecoversAgainAfterPauseWithoutSeekingTheAudiblePlayer",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testPauseAndAudioOnlyPreventPictureRepair",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testPausedIsolatedSeekSurvivesOrdinaryPausedClockUpdates",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testRapidFeedReversalCoversDepartingPixelsUntilReturnedMediaIsReady",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testSlowIsolatedNativeStartDoesNotRepeatedlySeekItsStoppedClock",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testNativeGeometryControlPreservesTheSixtyFPSFixtureCadence",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testRendererPixelIdentityAndMetadataAfterActualIncomingDisplay",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testRetainedOutgoingPixelsCannotCreditAnIncomingImageBeforeItDisplays",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testSeekAndSourceAdoptionRetainTheDisplayedPictureWithoutOldFrameCredit",
+    "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testShortTrailingAudioKeepsNativeVideoAndAFreshLastFrameWhilePaused"
+  ]
+}

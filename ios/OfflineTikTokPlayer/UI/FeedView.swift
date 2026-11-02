@@ -5,6 +5,9 @@ struct FeedView: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
+        let model = app
+        let playback = model.playback
+        let media = model.library.catalog.mediaByID
         Group {
             if app.playback.current == nil {
                 ContentUnavailableView {
@@ -15,15 +18,15 @@ struct FeedView: View {
                     Button("Open Library") { app.tab = .library }.buttonStyle(.borderedProminent)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                FeedPager(window: app.playback.queue.feedWindow,
+                FeedPager(window: playback.feedWindow,
                           didSettle: { window, landedID in
-                              let direction = window.settledDirection(at: landedID, currentWindow: app.playback.queue.feedWindow)
-                              app.playback.feedDidSettle(direction: direction)
-                              return app.playback.queue.feedWindow
+                              let direction = window.settledDirection(at: landedID, currentWindow: playback.feedWindow)
+                              playback.feedDidSettle(direction: direction)
+                              return playback.feedWindow
                           },
-                          interactionChanged: { app.playback.isInteractingWithFeed = $0 }) { page in
-                    if let item = app.library.catalog.mediaByID[page.mediaID] {
-                        FeedPage(item: item, isActive: page == app.playback.queue.feedWindow.current)
+                          interactionChanged: { playback.isInteractingWithFeed = $0 }) { page in
+                    if let item = media[page.mediaID] {
+                        FeedPage(item: item, isActive: page == playback.feedWindow.current)
                     }
                 }
             }

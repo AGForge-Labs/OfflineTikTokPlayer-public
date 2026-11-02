@@ -379,16 +379,23 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var firstProgressGeneration: Int?
     var player: AVQueuePlayer { buffer.player }
     let clock = PlaybackClock()
-    private(set) var queue = PlaybackQueue(ids: [])
+    private(set) var queue = PlaybackQueue(ids: []) {
+        didSet { feedWindow = queue.feedWindow }
+    }
+    private(set) var feedWindow = PlaybackPageWindow()
     private var intent = PlaybackIntent()
     var wantsToPlay: Bool { intent.canPlay }
     private(set) var isLoading = false
     private(set) var isVideoReady = false
-    var hasRetainedVideoFrame: Bool { continuousPiP.hasDisplayedImage }
+    private var displayedVideoMediaID: String?
+    var hasRetainedVideoFrame: Bool {
+        guard let id = queue.currentID else { return false }
+        return displayedVideoMediaID == id && continuousPiP.hasDisplayedImage
+    }
     private(set) var hasAudioTrack: Bool?
     var message: String?
     var isInteractingWithFeed = false {
-        didSet { updateAudioSuccessor() }
+        didSet { if oldValue != isInteractingWithFeed { updateAudioSuccessor() } }
     }
     /// Automatic on built-in speakers; native PCM fixtures can bypass processing.
     var speakerSound = true {
@@ -599,8 +606,8 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let activateSession: () throws -> Void
 
     var current: MediaRecord? { queue.currentID.flatMap { library.catalog.mediaByID[$0] } }
-    var previousID: String? { queue.previewPrevious() }
-    var nextID: String? { queue.previewNext() }
+    var previousID: String? { feedWindow.previous?.mediaID }
+    var nextID: String? { feedWindow.next?.mediaID }
 
     init(library: LibraryRepository, downloads: OfflineDownloads, cloud: OneDriveClient,
          bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
@@ -916,6 +923,9 @@ final class PlaybackService: NSObject {
 
     private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil,
                              audioAlreadySelected: Bool = false, preferRetainedPreviousStart: Bool = false) {
+        // A different clip must not uncover the preceding clip's held pixels.
+        // Same-media seeks and loops keep their already displayed picture.
+        if displayedVideoMediaID != queue.currentID { displayedVideoMediaID = nil }
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         pendingAudioSeek = nil; nativeSeekTicket = nil; completePiPSkip()
@@ -1544,6 +1554,7 @@ final class PlaybackService: NSObject {
     }
 
     private func monitorFirstFrame(_ playerItem: AVPlayerItem, request: Int) {
+        guard let mediaID = queue.currentID else { return }
         if usesCurrentCustomFrameForReadiness {
             guard generation == request, observedItem === playerItem,
                   let expected = videoPresentation, expected.request == request,
@@ -1562,7 +1573,7 @@ final class PlaybackService: NSObject {
                     guard selected, self.ownsFrameMonitor(owner, item: playerItem),
                           self.continuousPiP.currentFrameReceipt(for: owner.ticket) == receipt else { return }
                     self.continuousPiP.acknowledgeDisplayedFrame(receipt)
-                    self.completeVideoReadiness(request: request)
+                    self.completeVideoReadiness(request: request, mediaID: mediaID)
                 })
             guard ownsFrameMonitor(owner, item: playerItem) else { return }
             #if DEBUG
@@ -1573,7 +1584,7 @@ final class PlaybackService: NSObject {
         frameMonitorOwner = nil
         let completion: () -> Void = { [weak self, weak playerItem] in
             guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
-            self.completeVideoReadiness(request: request)
+            self.completeVideoReadiness(request: request, mediaID: mediaID)
         }
         #if DEBUG
         if let observer = onDebugFrameMonitorReadBatch {
@@ -1604,7 +1615,9 @@ final class PlaybackService: NSObject {
             && videoPresentation?.request == owner.request && videoPresentation?.ticket == owner.ticket
     }
 
-    private func completeVideoReadiness(request: Int) {
+    private func completeVideoReadiness(request: Int, mediaID: String) {
+        guard generation == request, queue.currentID == mediaID else { return }
+        displayedVideoMediaID = mediaID
         #if DEBUG
         debugTraceVideoStartup(.firstFrameEvent, request: request) {
             isVideoReady = true

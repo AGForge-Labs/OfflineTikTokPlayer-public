@@ -168,8 +168,16 @@ final class VideoPresentationContinuityTests: XCTestCase {
         XCTAssertTrue(fixture.bridge.activate(ticket))
         let first = fixture.bridge.submittedFrameCount
         var stages: [String: Int] = [:]
+        var previousFrame: UInt64?, maximumFrameGap: UInt64 = 0, deliveredFrames = 0
         fixture.bridge.onDebugWholeFrame = { event in
-            if case .returned(let span) = event { stages[String(describing: span.stage), default: 0] += 1 }
+            if case .returned(let span) = event {
+                stages[String(describing: span.stage), default: 0] += 1
+                if span.enqueueCalled {
+                    let now = span.returnNs
+                    if let previousFrame, now >= previousFrame { maximumFrameGap = max(maximumFrameGap, now - previousFrame) }
+                    previousFrame = now; deliveredFrames += 1
+                }
+            }
         }
         let started = ProcessInfo.processInfo.systemUptime
         try await Task.sleep(for: .milliseconds(1200))
@@ -178,6 +186,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
         let rate = Double(fixture.bridge.submittedFrameCount - first) / elapsed
         print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(fixture.player.currentTime().seconds) requestedEnd=\(fixture.bridge.requestedPositionSeconds) copiedEnd=\(fixture.bridge.lastCopiedFramePositionSeconds ?? -1)")
         print("VIDEO_PRESENTATION_PULLS stages=\(stages) active=\(UIApplication.shared.applicationState.rawValue) maxScreenFPS=\(fixture.window.screen.maximumFramesPerSecond)")
+        print("VIDEO_CADENCE delivered=\(deliveredFrames) maximumGapMs=\(Double(maximumFrameGap) / 1_000_000)")
         XCTAssertEqual(fixture.player.currentItem, fixture.item)
         return rate
     }

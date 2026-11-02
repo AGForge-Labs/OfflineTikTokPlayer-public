@@ -2,7 +2,7 @@ name: Public rapid reverse swipe regression
 on:
   push:
     branches: [codex/reverse-swipe]
-    paths: ['ios/**', '.github/workflows/reverse-swipe.yml']
+    paths: ['ios/**', 'tests/reverse-swipe-cases.json', '.github/workflows/reverse-swipe.yml']
 permissions:
   contents: read
 concurrency:
@@ -26,14 +26,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/reverse-swipe
-          excluded="$(python3 -c 'from pathlib import Path; chosen={"PictureRecoveryTests.swift", "FeedPresentationTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
+          excluded="$(python3 -c 'from pathlib import Path; chosen={"PictureRecoveryTests.swift", "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
           xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
             -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
             -derivedDataPath artifacts/ReverseDerived -resultBundlePath artifacts/reverse-swipe/Reversal.xcresult \
             -jobs 1 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO "EXCLUDED_SOURCE_FILE_NAMES=$excluded" \
-            -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests/testRapidFeedReversalCoversDepartingPixelsUntilReturnedMediaIsReady \
-            -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether \
+            -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests \
+            -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
             test 2>&1 | tee artifacts/reverse-swipe/xcodebuild.log
+      - name: Require all nineteen exact native cases
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, runpy
+          from pathlib import Path
+          verifier = runpy.run_path('scripts/verify-native-test-log.py')
+          expected = set(json.loads(Path('tests/reverse-swipe-cases.json').read_text())['cases'])
+          assert len(expected) == 19
+          assert expected <= verifier['source_manifest'](Path.cwd())
+          verifier['verify_log'](Path('artifacts/reverse-swipe/xcodebuild.log').read_text(), expected)
+          print('Exact19 focused native cases verified; full UI/device acceptance remains separate.')
+          PY
       - name: Preserve synthetic reversal evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

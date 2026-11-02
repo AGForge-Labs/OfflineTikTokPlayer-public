@@ -1348,7 +1348,10 @@ final class ContinuousPictureInPicture: NSObject {
         let rate = currentResource?.preferredFrameRate ?? 60
         if UIApplication.shared.applicationState != .background {
             let link = CADisplayLink(target: displayTarget, selector: #selector(DisplayTarget.tick(_:)))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: min(30, rate), maximum: rate, preferred: rate)
+            // Keep the lower hint at the source cadence: a 60 fps clip must not
+            // invite 30 Hz pulls. Lower-rate content can still adapt accordingly.
+            let sourceRate = currentResource?.sourceFrameRate ?? 30
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: min(rate, max(1, sourceRate)), maximum: rate, preferred: rate)
             link.add(to: .main, forMode: .common)
             displayLink = link
             return
