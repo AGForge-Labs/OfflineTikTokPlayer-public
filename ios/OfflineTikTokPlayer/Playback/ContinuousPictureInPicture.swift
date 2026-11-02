@@ -168,6 +168,8 @@ final class ContinuousPictureInPicture: NSObject {
             && videoOutput.map(ObjectIdentifier.init) == receipt.output
     }
     /// One output per retained item. Retirement is explicit; no SDK work runs in deinit.
+    /// Request shareable surfaces without forcing every decoded image through RGB.
+    /// The sample-buffer renderer accepts the decoder's native pixel format.
     @MainActor final class PreparedVideoResource {
         #if DEBUG
         fileprivate(set) var debugSuppressesPlayerRendering = false
@@ -209,7 +211,6 @@ final class ContinuousPictureInPicture: NSObject {
                                        publish: (AVPlayerItemVideoOutput) -> Void) -> Bool {
             guard let item, let old = output, isAttached, isBorrowed, ifEligible() else { return false }
             let replacement = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ])
             replacement.suppressesPlayerRendering = old.suppressesPlayerRendering
@@ -328,7 +329,6 @@ final class ContinuousPictureInPicture: NSObject {
             resource.debugNativeGeometry = nativeGeometry; resource.debugUsesNativeGeometry = true
             #endif
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ])
             #if DEBUG
@@ -390,7 +390,6 @@ final class ContinuousPictureInPicture: NSObject {
             }
             guard ifEligible() else { resource.retire(); return nil }
             let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ])
             #if DEBUG

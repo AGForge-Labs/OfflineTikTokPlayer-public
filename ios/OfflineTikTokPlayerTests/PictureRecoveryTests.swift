@@ -2,6 +2,7 @@ import XCTest
 import AVFoundation
 import UIKit
 import CoreVideo
+import CoreImage
 import AudioToolbox
 import MediaToolbox
 import Synchronization
@@ -279,18 +280,16 @@ final class PictureRecoveryTests: XCTestCase {
     }
 
     private func pictureIs(_ layer: AVSampleBufferDisplayLayer, red: Bool) -> Bool {
-        guard let pixel = layer.sampleBufferRenderer.displayedPixelBuffer(),
-              CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA else { return false }
-        CVPixelBufferLockBaseAddress(pixel, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pixel)?.assumingMemoryBound(to: UInt8.self) else { return false }
-        let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel), row = CVPixelBufferGetBytesPerRow(pixel)
-        var r = 0, g = 0
-        for y in stride(from: 0, to: height, by: max(1, height / 16)) {
-            for x in stride(from: 0, to: width, by: max(1, width / 16)) {
-                r += Int(base[y * row + x * 4 + 2]); g += Int(base[y * row + x * 4 + 1])
-            }
-        }
+        guard let pixel = layer.sampleBufferRenderer.displayedPixelBuffer() else { return false }
+        // Interpret the actual image independently of the decoder's storage format.
+        // The synthetic fixture is solid red or green; read its centre in RGB.
+        let image = CIImage(cvPixelBuffer: pixel)
+        var bytes = [UInt8](repeating: 0, count: 4)
+        CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false]).render(image,
+            toBitmap: &bytes, rowBytes: 4,
+            bounds: CGRect(x: image.extent.midX.rounded(.down), y: image.extent.midY.rounded(.down), width: 1, height: 1),
+            format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+        let r = Int(bytes[0]), g = Int(bytes[1])
         return red ? r > g * 2 : g > r * 2
     }
 }

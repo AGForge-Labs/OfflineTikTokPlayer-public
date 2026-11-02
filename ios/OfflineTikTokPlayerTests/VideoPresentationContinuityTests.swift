@@ -233,7 +233,9 @@ final class VideoPresentationContinuityTests: XCTestCase {
         fixture.player.pause()
         fixture.bridge.updatePlayback(positionSeconds: nativeEnd, durationSeconds: 6, isPlaying: false)
         // All formatting occurs after measurement; callback work is fixed scalar counters.
+        let pixelFormat = fixture.bridge.displayLayer.sampleBufferRenderer.displayedPixelBuffer().map(CVPixelBufferGetPixelFormatType)
         print("VIDEO_PRESENTATION nativeSourceFPS=60 nativeGeometry=\(fixture.nativeGeometry) submittedFPS=\(rate) elapsed=\(elapsed) nativeStart=\(position) nativeEnd=\(nativeEnd) requestedEnd=\(requestedEnd) copiedEnd=\(copiedEnd)")
+        print("VIDEO_FORMAT displayedFourCC=\(pixelFormat ?? 0)")
         print("VIDEO_CADENCE delivered=\(delivered) maximumGapMs=\(frameGap.milliseconds) stageCounts=\(stages)")
         print("VIDEO_STALL windowNs=[\(startNs),\(endNs)] frameGapNs=[\(frameGap.start),\(frameGap.end)] tickGapMs=\(tickGap.milliseconds) tickNs=[\(tickGap.start),\(tickGap.end)] outsideMs=\(outsideGap.milliseconds) outsideNs=[\(outsideGap.start),\(outsideGap.end)] backgroundTicks=\(background.ticks) backgroundMs=\(background.maximum.milliseconds) backgroundNs=[\(background.maximum.start),\(background.maximum.end)] observerMs=\(observer.milliseconds) sdkMs=\(sdk.map(\.milliseconds)) sdkStartsNs=\(sdk.map(\.start)) sdkEndsNs=\(sdk.map(\.end))")
         XCTAssertEqual(fixture.player.currentItem, fixture.item)
@@ -247,9 +249,19 @@ final class VideoPresentationContinuityTests: XCTestCase {
         let pixel = try XCTUnwrap(value, "An actual displayed pixel buffer is required")
         CVPixelBufferLockBaseAddress(pixel, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
-        let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixel))
-        let size = CVPixelBufferGetBytesPerRow(pixel) * CVPixelBufferGetHeight(pixel)
-        return SHA256.hash(data: Data(bytes: base, count: size)).map { String(format: "%02x", $0) }.joined()
+        var digest = SHA256()
+        let planes = CVPixelBufferGetPlaneCount(pixel)
+        if planes == 0 {
+            let base = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixel))
+            digest.update(data: Data(bytes: base, count: CVPixelBufferGetBytesPerRow(pixel) * CVPixelBufferGetHeight(pixel)))
+        } else {
+            for plane in 0..<planes {
+                let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixel, plane))
+                digest.update(data: Data(bytes: base,
+                    count: CVPixelBufferGetBytesPerRowOfPlane(pixel, plane) * CVPixelBufferGetHeightOfPlane(pixel, plane)))
+            }
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private func until(_ predicate: () -> Bool) async -> Bool {
