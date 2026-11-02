@@ -33,8 +33,8 @@ class ExperimentalPhoneTests(unittest.TestCase):
     def test_reversal_candidate_requires_its_own_completed_native_result(self):
         checks = ((41388275137, "fe55925544585b85bb59b361eee450cc8cf60838",
             ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
-            (41390543020, "4bc9dd2370ddf74411335ae34ed5196e3a3dac4f",
-            ".github/workflows/frame-pacing-audit.yml", "codex/frame-pacing-audit"))
+            (41396159005, "8357efed671323bfbeea10b10f9fa2500f9022df",
+            ".github/workflows/native-video-final.yml", "codex/native-video-final"))
         for required in checks:
             proofs = (*phone.NATIVE_PROOFS, required)
             results = {run: dict(id=run, head_sha=source, status="completed", conclusion="success",

@@ -1,4 +1,20 @@
-# Experimental phone repair23.1
+# Owner phone video timing repair
+
+Candidate: `8357efed671323bfbeea10b10f9fa2500f9022df`; parent `4910ed6b69b0cdca3391810919b8e683851fae37`.
+App: `ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650`; unchanged Core: `f9b20964220eb867c397e9fa8334c673263d92a5`.
+
+Preserve the muted native timing track, native video pixel format and media-owned
+visibility during rapid reversals. PCM remains audible. The final exact31-case
+native run41396159005 must succeed before any signing input is mapped. It includes
+real-service1080p60, PCM progress/mute, supersession and pause/interruption checks.
+Earlier reversal19 and baseline/image receipts remain required. Failed pacing
+audits41390543020,41392840748 and41394165312 are retained as failure evidence;
+none of them authorizes this candidate. Full-suite and phone acceptance remain open.
+
+Use the existing protected release environment, unchanged signing helper and
+owner-only internal TestFlight group. No credential, role, tester or billing change.
+
+# Historical phone repair23.1
 
 Recover the selected video after an interrupted initial OneDrive-link lookup.
 One classified transient URL-loading failure receives one fresh-link attempt.

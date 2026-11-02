@@ -10,22 +10,19 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "129a0c7123532fcd380d83684ed7e1322b2b309e"
-SOURCE = "fe55925544585b85bb59b361eee450cc8cf60838"
-APP_TREE = "bf034b9a40169f80b71dbbd7e35cba47e591509b"
-BASE_APP_TREE = "084542abd55e30e3fed832d9f1688cbd142e82a4"
+SOURCE_BASE = "4910ed6b69b0cdca3391810919b8e683851fae37"
+SOURCE = "8357efed671323bfbeea10b10f9fa2500f9022df"
+APP_TREE = "ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650"
+BASE_APP_TREE = "988b7b6d7912dedf016969e76cc626edf1ed8ae8"
 CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
-    '.github/workflows/reverse-swipe.yml',
-    'ios/OfflineTikTokPlayer/Playback/ContinuousPictureInPicture.swift',
+    '.github/workflows/native-video-final.yml',
     'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
-    'ios/OfflineTikTokPlayer/Support/Info.plist',
-    'ios/OfflineTikTokPlayer/UI/FeedPager.swift',
-    'ios/OfflineTikTokPlayer/UI/FeedView.swift',
-    'ios/OfflineTikTokPlayerTests/FeedPresentationTests.swift',
+    'ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift',
+    'ios/OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests.swift',
     'ios/OfflineTikTokPlayerTests/VideoPresentationContinuityTests.swift',
-    'tests/reverse-swipe-cases.json',
+    'tests/native-video-format-cases.json',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -223,17 +220,16 @@ NATIVE_PROOFS = (
     (41327719585, "5fcd933c614d7473b3bc61cd3d5bd86e7ed7861c",
      ".github/workflows/media-presentation-repair.yml", "codex/media-presentation-repair"),
     (41328715253, "6489eafb55ee67358e9aaf203368f27de8b5fc6b", ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
-    (41388275137, SOURCE, ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
-    (41390543020, "4bc9dd2370ddf74411335ae34ed5196e3a3dac4f",
-     ".github/workflows/frame-pacing-audit.yml", "codex/frame-pacing-audit"),
+    (41388275137, "fe55925544585b85bb59b361eee450cc8cf60838", ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
+    (41396159005, SOURCE, ".github/workflows/native-video-final.yml", "codex/native-video-final"),
 )
 
 
 def require_native_result(read=None):
     # The first two receipts preserve the accepted processing/video baseline.
-    # Require the candidate's exact nineteen-case reversal/visibility run and
-    # the same-runtime twenty-case plus four-case isolated pacing audit. The
-    # audit freezes this app/core and requires both command outcomes and all cases.
+    # Preserve the exact nineteen-case reversal/visibility baseline and require
+    # the final runtime's thirty-one-case presentation/PCM/HD/ownership run.
+    # Its workflow freezes app/core and rejects failed, skipped or missing cases.
     # Full-suite and physical-phone acceptance remain separate.
     if read is None:
         import urllib.request
