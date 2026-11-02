@@ -80,6 +80,39 @@ class NativeTestEvidenceTests(unittest.TestCase):
         cls.verifier = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.verifier)
 
+    def test_accepts_exact_adjacent_fig_thread_interleave(self):
+        identity = "OfflineTikTokPlayerTests.PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit"
+        self.assertIn(identity, self.expected)
+        for prefix in ("", "2026-11-02T10:38:30.7879930Z "):
+            head = "2026-11-02 10:38:30.340520+0000 OfflineTikTokPlayer[15130:4852" + case_line(identity)
+            tail = "5] [] (Fig) signalled err=-12900 at <>:1242"
+            text = "\n".join([case_line(identity, "started"), prefix + head, prefix + tail, "** TEST EXECUTE SUCCEEDED **"])
+            self.verifier.verify_log(text, {identity}, invocation="test-without-building")
+
+    def test_rejects_malformed_or_unmatched_fig_thread_interleave(self):
+        identity = "OfflineTikTokPlayerTests.PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit"
+        head = "2026-11-02 10:38:30.340520+0000 OfflineTikTokPlayer[15130:4852" + case_line(identity)
+        tail = "5] [] (Fig) signalled err=-12900 at <>:1242"
+        good = [case_line(identity, "started"), head, tail, "** TEST EXECUTE SUCCEEDED **"]
+        variants = [good[:2] + [tail.replace("-12900", "-12901")] + good[3:],
+                    [good[0], head.replace(":4852", ":thread"), tail, good[3]],
+                    good[:2] + [tail + " extra"] + good[3:],
+                    good[:2] + ["unrelated", tail] + good[3:],
+                    good[1:], good[:1] + [case_line(identity)] + good[1:],
+                    good[:2] + good[3:]]
+        for status in ("failed", "skipped"):
+            variants.append([good[0], head.replace(" passed ", " " + status + " "), tail, good[3]])
+        for lines in variants:
+            with self.subTest(lines=lines), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join(lines), {identity}, invocation="test-without-building")
+
+    def test_rejects_orphan_fig_thread_tail(self):
+        identity = "OfflineTikTokPlayerTests.PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit"
+        lines = [case_line(identity, "started"), case_line(identity),
+                 "5] [] (Fig) signalled err=-12900 at <>:1242", "** TEST EXECUTE SUCCEEDED **"]
+        with self.assertRaises(self.verifier.EvidenceError):
+            self.verifier.verify_log("\n".join(lines), {identity}, invocation="test-without-building")
+
     def check_log(self, lines, *, root=ROOT, selection_only=False, invocation=None, profile=None):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "xcodebuild.log"

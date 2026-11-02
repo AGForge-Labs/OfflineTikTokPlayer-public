@@ -24,6 +24,10 @@ AQ_SPLIT_HOST = re.compile(
     r'(NativeRuntimeHost \{.{0,2048}"testName":"-\[(?:PlaybackSelectionVideoRegressionTests|VideoPresentationContinuityTests) test[A-Za-z0-9_]*)'
     r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} OfflineTikTokPlayer\[([1-9][0-9]*):[0-9]+\] '
     r'\[AQ\] {8}LoudnessManager\.mm:1215  IsHardwareSupported: no plist loaded, returning false')
+AQ_TRAILING_HOST = re.compile(
+    r'(NativeRuntimeHost \{.{1,3072}\})'
+    r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} OfflineTikTokPlayer\[([1-9][0-9]*):[0-9]+\] '
+    r'\[AQ\] {8}LoudnessManager\.mm:1215  IsHardwareSupported: no plist loaded, returning false')
 
 
 def native_host_rows(lines):
@@ -36,6 +40,12 @@ def native_host_rows(lines):
         try:
             row = json.loads(line.removeprefix("NativeRuntimeHost "))
         except json.JSONDecodeError:
+            trailing = AQ_TRAILING_HOST.fullmatch(line)
+            if trailing:
+                row = json.loads(trailing[1].removeprefix("NativeRuntimeHost "))
+                assert str(row["pid"]) == trailing[2]
+                rows.append(row)
+                continue
             split = AQ_SPLIT_HOST.fullmatch(line)
             assert split and index + 1 < len(lines), line
             tail = lines[index + 1]

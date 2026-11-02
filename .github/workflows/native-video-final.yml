@@ -1,8 +1,9 @@
 name: Public final video presentation verification
+run-name: Unchanged playback confirmation after a 275 ms prepared return
 on:
   push:
     branches: [codex/native-video-final]
-    paths: ['ios/**', 'scripts/verify-video-profile.py', 'tests/native-video-format-cases.json', '.github/workflows/native-video-final.yml']
+    paths: ['ios/**', 'scripts/verify-video-profile.py', 'scripts/verify-native-test-log.py', 'tests/validation-shell/test_native_test_evidence.py', 'tests/native-video-format-cases.json', '.github/workflows/native-video-final.yml']
 permissions:
   contents: read
 concurrency:

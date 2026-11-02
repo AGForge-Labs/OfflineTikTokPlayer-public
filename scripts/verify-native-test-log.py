@@ -64,6 +64,13 @@ FIG_STARTED_CASE = re.compile(
     r"Test Case '([^']+)' sta\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[\] \(Fig\) signalled err=-12900 at <>:1242")
 FIG_STARTED_TAIL = re.compile(r"rted\.")
+# One complete terminal record bisected the decimal thread ID of this exact Fig
+# diagnostic. Require its adjacent numeric tail before crediting the result.
+FIG_THREAD_CASE = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[[1-9][0-9]*:[0-9]+"
+    r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+FIG_THREAD_TAIL = re.compile(r"[0-9]+\] \[\] \(Fig\) signalled err=-12900 at <>:1242")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 EXECUTE_SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST EXECUTE SUCCEEDED \*\*\s*$")
 ANY_SUCCESS = re.compile(r"\*\* TEST(?: [A-Z]+)* SUCCEEDED \*\*")
@@ -251,6 +258,7 @@ def verify_log(text, expected, *, invocation="test"):
     pending_process = None
     pending_identity = None
     pending_started = None
+    pending_thread = None
     for number, line in enumerate(text.splitlines(), 1):
         if success.fullmatch(line):
             successes.append(number)
@@ -260,6 +268,13 @@ def verify_log(text, expected, *, invocation="test"):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
+        if pending_thread is not None:
+            raw, status, header_line = pending_thread
+            pending_thread = None
+            if FIG_THREAD_TAIL.fullmatch(clean):
+                event, reconstructed = (raw, status), True
+            else:
+                problems.append(f"Unfinished Fig thread interleave at line {header_line}: {raw}")
         if pending_process is not None:
             raw, status, header_line = pending_process
             pending_process = None
@@ -298,6 +313,13 @@ def verify_log(text, expected, *, invocation="test"):
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
+            thread = FIG_THREAD_CASE.fullmatch(clean)
+            if thread:
+                pending_thread = (*thread.groups(), number)
+                continue
+            if FIG_THREAD_TAIL.fullmatch(clean):
+                problems.append(f"Orphan Fig thread tail at line {number}")
+                continue
             process = AQ_PROCESS_CASE.fullmatch(clean)
             if process:
                 pending_process = (*process.groups(), number)
@@ -380,6 +402,9 @@ def verify_log(text, expected, *, invocation="test"):
     if pending_started is not None:
         raw, header_line = pending_started
         problems.append(f"Unfinished Fig start interleave at line {header_line}: {raw}")
+    if pending_thread is not None:
+        raw, status, header_line = pending_thread
+        problems.append(f"Unfinished Fig thread interleave at line {header_line}: {raw}")
     if len(successes) != 1:
         problems.append(f"Expected exactly one {success_label} marker; found {len(successes)}")
     elif successes[0] <= last_case:
