@@ -1,11 +1,11 @@
 # Owner phone video timing repair
 
-Candidate: `38ba9485b4491fed313fd5aaef3b04659000adb7`; parent `583908a4c84b9af77af3e20e53f249d2d9dafa9c`.
+Candidate: `e3b21a3f614e9414795cc99cf2ef875d1dcb0566`; parent `38ba9485b4491fed313fd5aaef3b04659000adb7`.
 App: `ce76fdd2a2665b0e4ca131dcaca3a8f1906ff650`; unchanged Core: `f9b20964220eb867c397e9fa8334c673263d92a5`.
 
 Preserve the muted native timing track, native video pixel format and media-owned
 visibility during rapid reversals. PCM remains audible. The final exact31-case
-native run41398139688 must succeed before any signing input is mapped. It includes
+native run41399945982 must succeed before any signing input is mapped. It includes
 real-service1080p60, PCM progress/mute, supersession and pause/interruption checks.
 Earlier reversal19 and baseline/image receipts remain required. Failed pacing
 audits41390543020,41392840748 and41394165312 are retained as failure evidence;
@@ -15,7 +15,10 @@ that unchanged helper into test support and regenerates project references; the
 app/core and all31 required cases are unchanged. Run41397564720 was canceled
 before validation when review found the extracted file needed PlayerCore. The
 current one-line successor restores that explicit import; the guard body, app,
-core and31-case requirements are unchanged. Full-suite and phone acceptance remain open.
+core and31-case requirements are unchanged. Run41398139688 reached the end of
+Swift compilation without errors but hit its cap before test execution. The
+workflow-only successor permits two compilation tasks and18minutes overall;
+serial execution, per-case limits and all31 requirements remain unchanged. Full-suite and phone acceptance remain open.
 
 Use the existing protected release environment, unchanged signing helper and
 owner-only internal TestFlight group. No credential, role, tester or billing change.

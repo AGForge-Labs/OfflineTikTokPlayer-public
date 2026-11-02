@@ -33,7 +33,7 @@ class ExperimentalPhoneTests(unittest.TestCase):
     def test_reversal_candidate_requires_its_own_completed_native_result(self):
         checks = ((41388275137, "fe55925544585b85bb59b361eee450cc8cf60838",
             ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
-            (41398139688, "38ba9485b4491fed313fd5aaef3b04659000adb7",
+            (41399945982, "e3b21a3f614e9414795cc99cf2ef875d1dcb0566",
             ".github/workflows/native-video-final.yml", "codex/native-video-final"))
         for required in checks:
             proofs = (*phone.NATIVE_PROOFS, required)
