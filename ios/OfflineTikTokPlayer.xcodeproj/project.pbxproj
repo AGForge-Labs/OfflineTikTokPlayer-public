@@ -793,6 +793,24 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "9E6443E89957939B7475C36B";
 		};
+		"2A9E9E78B7F616CA74635CF8" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "PCMWorkerBoundaryOwnership.swift";
+			"sourceTree" = "<group>";
+		};
+		"CAC5F3A70BD72AF385EFEED7" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "2A9E9E78B7F616CA74635CF8";
+		};
+		"902F209F10EC4D528CCD8BB0" = {
+			"isa" = "PBXGroup";
+			"children" = (
+				"2A9E9E78B7F616CA74635CF8",
+			);
+			"path" = "Support";
+			"sourceTree" = "<group>";
+		};
 		"375A2BEBF029E847C9CABDA3" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -874,6 +892,7 @@
 				"B9B9989FECAD3A33E62678AC",
 				"8BA57CB4081B6214133F6A95",
 				"9E6443E89957939B7475C36B",
+				"902F209F10EC4D528CCD8BB0",
 				"375A2BEBF029E847C9CABDA3",
 				"752FC7F8D7C0757784F13C76",
 				"0738E822CA97616F6E5DC8F9",
@@ -1191,6 +1210,7 @@
 				"C661944F396B5236683903C4",
 				"A14E0397CE0BE76AB7D9965D",
 				"55ED0563DA5CDECEA34A3877",
+				"CAC5F3A70BD72AF385EFEED7",
 				"112867BF5769A66E20E98457",
 			);
 			"runOnlyForDeploymentPostprocessing" = 0;
