@@ -94,6 +94,7 @@ jobs:
             -skip-testing:OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackWithExplicitSessionActivation \
             -skip-testing:OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving \
             -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
+            -skip-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testMutedNativeTimingPreservesRetainedVideoAndPCM \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeTimingConfigurationCannotUndoPauseOrDeniedInterruptionResume \
@@ -102,6 +103,18 @@ jobs:
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoFirstFrameCapabilityBeforeSelection \
             2>&1 | tee artifacts/native-format/native.log
+      - name: Measure the offset native clock in a fresh process
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild test-without-building -xctestrun "$NATIVE_XCTESTRUN" \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -resultBundlePath artifacts/native-format/Lead.xcresult \
+            -parallel-testing-enabled NO -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 \
+            -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames \
+            2>&1 | tee artifacts/native-format/native-lead.log
       - name: Measure the production startup policy in a fresh process
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash

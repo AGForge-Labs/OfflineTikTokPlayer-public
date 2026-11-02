@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the complete native case profile and four distinct process witnesses."""
+"""Verify the complete native case profile and five distinct process witnesses."""
 import argparse
 import json
 from pathlib import Path
@@ -10,6 +10,7 @@ import uuid
 HD = "OfflineTikTokPlayerTests.PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
 ACTIVATED = "OfflineTikTokPlayerTests.PictureRecoveryTests/testFullResolutionProductionPlaybackWithExplicitSessionActivation"
 BENCHMARK = "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn"
+LEAD = "OfflineTikTokPlayerTests.VideoPresentationContinuityTests/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames"
 MAIN_HOST_METHODS = frozenset({
     "testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace",
     "testMutedNativeTimingPreservesRetainedVideoAndPCM",
@@ -17,10 +18,10 @@ MAIN_HOST_METHODS = frozenset({
     "testNativeTimingConfigurationRejectsSupersessionAtEveryPrewriteRead",
     "testPreparedNextVideoFirstFrameCapabilityBeforeSelection",
 })
-PHASE_FILES = {"main29": "native.log", "benchmark": "benchmark.log",
+PHASE_FILES = {"main28": "native.log", "native-lead": "native-lead.log", "benchmark": "benchmark.log",
                "hd-fresh-1": "hd-fresh-1.log", "hd-fresh-2": "hd-fresh-2.log"}
 AQ_SPLIT_HOST = re.compile(
-    r'(NativeRuntimeHost \{.{0,2048}"testName":"-\[PlaybackSelectionVideoRegressionTests test[A-Za-z0-9_]*)'
+    r'(NativeRuntimeHost \{.{0,2048}"testName":"-\[(?:PlaybackSelectionVideoRegressionTests|VideoPresentationContinuityTests) test[A-Za-z0-9_]*)'
     r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} OfflineTikTokPlayer\[([1-9][0-9]*):[0-9]+\] '
     r'\[AQ\] {8}LoudnessManager\.mm:1215  IsHardwareSupported: no plist loaded, returning false')
 
@@ -56,10 +57,10 @@ def phase_cases(root):
     profile = json.loads((root / "tests/native-video-format-cases.json").read_text())["cases"]
     cases = set(profile)
     assert len(profile) == len(cases) == 31 and cases <= verifier["source_manifest"](root)
-    assert {HD, BENCHMARK} <= cases and ACTIVATED not in cases
-    groups = {"main29": cases - {HD, BENCHMARK}, "benchmark": {BENCHMARK},
+    assert {HD, BENCHMARK, LEAD} <= cases and ACTIVATED not in cases
+    groups = {"main28": cases - {HD, BENCHMARK, LEAD}, "native-lead": {LEAD}, "benchmark": {BENCHMARK},
               "hd-fresh-1": {HD}, "hd-fresh-2": {ACTIVATED}}
-    assert [len(group) for group in groups.values()] == [29, 1, 1, 1]
+    assert [len(group) for group in groups.values()] == [28, 1, 1, 1, 1]
     assert set.union(*groups.values()) == cases | {ACTIVATED}
     return verifier, groups
 
@@ -80,9 +81,10 @@ def inspect_profile(root, texts, simulator, *, diagnose=False):
         clean = [re.sub(r"^\d{4}-\d\d-\d\dT\S+Z ", "", line) for line in text.splitlines()]
         native = native_host_rows(clean)
         hd = [line for line in clean if "PRODUCTION_HD_HOST " in line]
-        if name in ("main29", "benchmark"):
+        if name in ("main28", "native-lead", "benchmark"):
             assert not hd, (name, hd)
-            methods = MAIN_HOST_METHODS if name == "main29" else {BENCHMARK.split("/")[1]}
+            methods = MAIN_HOST_METHODS if name == "main28" else {(LEAD if name == "native-lead" else BENCHMARK).split("/")[1]}
+            host_class = "VideoPresentationContinuityTests" if name == "native-lead" else "PlaybackSelectionVideoRegressionTests"
             assert len(native) == len(methods), (name, native)
             witnesses, observed = set(), set()
             for row in native:
@@ -90,7 +92,7 @@ def inspect_profile(root, texts, simulator, *, diagnose=False):
                 assert row["schema"] == 1 and row["bundleIdentifier"] == "dev.galaxybigbird.OfflineTikTokPlayer"
                 assert type(row["pid"]) is int and row["pid"] > 0
                 assert canonical_uuid(row["simulatorUDID"]) == simulator
-                method = re.fullmatch(r"-\[PlaybackSelectionVideoRegressionTests (test[A-Za-z0-9_]+)\]", row["testName"])
+                method = re.fullmatch(r"-\[" + host_class + r" (test[A-Za-z0-9_]+)\]", row["testName"])
                 assert method and method[1] in methods and method[1] not in observed
                 observed.add(method[1])
                 witnesses.add((row["pid"], canonical_uuid(row["moduleNonce"])))
@@ -101,8 +103,8 @@ def inspect_profile(root, texts, simulator, *, diagnose=False):
             row = re.fullmatch(r"PRODUCTION_HD_HOST schema=1 processID=([1-9][0-9]*) moduleNonce=([0-9a-f-]{36}) explicitActivation=(true|false)", hd[0])
             assert row and row[3] == ("true" if name == "hd-fresh-2" else "false"), (name, hd)
             hosts.append((int(row[1]), canonical_uuid(row[2])))
-    assert len({pid for pid, _ in hosts}) == len({nonce for _, nonce in hosts}) == 4, hosts
-    report = {"phases": results, "distinctHosts": 4, "requiredUniqueCases": 31,
+    assert len({pid for pid, _ in hosts}) == len({nonce for _, nonce in hosts}) == 5, hosts
+    report = {"phases": results, "distinctHosts": 5, "requiredUniqueCases": 31,
               "executions": 32, "activationModes": [False, True],
               "allPassed": all(row["passed"] for row in results.values())}
     if not diagnose:

@@ -10,6 +10,7 @@ import Dispatch
 
 @MainActor
 final class VideoPresentationContinuityTests: XCTestCase {
+    private static let runtimeHostModuleNonce = UUID().uuidString.lowercased()
     private let imageReadback = CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false])
     func testRendererPixelIdentityAndMetadataAfterActualIncomingDisplay() async throws {
         let fixture = try await PresentedVideo.make()
@@ -156,6 +157,14 @@ final class VideoPresentationContinuityTests: XCTestCase {
     }
 
     func testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames() async throws {
+        let process = ProcessInfo.processInfo
+        let receipt: [String: Any] = ["schema": 1,
+            "simulatorUDID": process.environment["SIMULATOR_UDID"] ?? "unknown",
+            "pid": Int(process.processIdentifier),
+            "bundleIdentifier": Bundle.main.bundleIdentifier ?? "unknown",
+            "moduleNonce": Self.runtimeHostModuleNonce, "testName": self.name]
+        let data = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+        print("NativeRuntimeHost " + String(decoding: data, as: UTF8.self))
         let fixture = try await PresentedVideo.make()
         defer { fixture.close() }
         let rate = try await measuredRate(fixture, audioLag: 0.055)
