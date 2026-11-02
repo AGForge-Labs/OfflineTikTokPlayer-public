@@ -19,6 +19,30 @@ MAIN_HOST_METHODS = frozenset({
 })
 PHASE_FILES = {"main29": "native.log", "benchmark": "benchmark.log",
                "hd-fresh-1": "hd-fresh-1.log", "hd-fresh-2": "hd-fresh-2.log"}
+AQ_SPLIT_HOST = re.compile(
+    r'(NativeRuntimeHost \{.{0,2048}"testName":"-\[PlaybackSelectionVideoRegressionTests test[A-Za-z0-9_]*)'
+    r'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} OfflineTikTokPlayer\[([1-9][0-9]*):[0-9]+\] '
+    r'\[AQ\] {8}LoudnessManager\.mm:1215  IsHardwareSupported: no plist loaded, returning false')
+
+
+def native_host_rows(lines):
+    """Join only the observed adjacent AQ diagnostic split inside a test name."""
+    rows = []
+    for index, line in enumerate(lines):
+        if "NativeRuntimeHost " not in line:
+            continue
+        assert line.startswith("NativeRuntimeHost ") and len(line) <= 4096
+        try:
+            row = json.loads(line.removeprefix("NativeRuntimeHost "))
+        except json.JSONDecodeError:
+            split = AQ_SPLIT_HOST.fullmatch(line)
+            assert split and index + 1 < len(lines), line
+            tail = lines[index + 1]
+            assert re.fullmatch(r'[A-Za-z0-9_]{1,200}\]"\}', tail), tail
+            row = json.loads((split[1] + tail).removeprefix("NativeRuntimeHost "))
+            assert str(row["pid"]) == split[2]
+        rows.append(row)
+    return rows
 
 
 def canonical_uuid(value):
@@ -54,16 +78,15 @@ def inspect_profile(root, texts, simulator, *, diagnose=False):
         except verifier["EvidenceError"] as error:
             results[name] = {"passed": False, "cases": len(cases), "reason": str(error)[:3000]}
         clean = [re.sub(r"^\d{4}-\d\d-\d\dT\S+Z ", "", line) for line in text.splitlines()]
-        native = [line for line in clean if "NativeRuntimeHost " in line]
+        native = native_host_rows(clean)
         hd = [line for line in clean if "PRODUCTION_HD_HOST " in line]
         if name in ("main29", "benchmark"):
             assert not hd, (name, hd)
             methods = MAIN_HOST_METHODS if name == "main29" else {BENCHMARK.split("/")[1]}
             assert len(native) == len(methods), (name, native)
             witnesses, observed = set(), set()
-            for line in native:
-                assert line.startswith("NativeRuntimeHost ")
-                row = json.loads(line.removeprefix("NativeRuntimeHost "))
+            for row in native:
+                assert set(row) == {"schema", "bundleIdentifier", "pid", "simulatorUDID", "moduleNonce", "testName"}
                 assert row["schema"] == 1 and row["bundleIdentifier"] == "dev.galaxybigbird.OfflineTikTokPlayer"
                 assert type(row["pid"]) is int and row["pid"] > 0
                 assert canonical_uuid(row["simulatorUDID"]) == simulator

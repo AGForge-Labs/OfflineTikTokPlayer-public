@@ -414,10 +414,15 @@ final class PresentationClockBoundaryTrace {
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private static let fixtureImageReadback = CIContext(options: [.cacheIntermediates: false])
+    // Matrix conversion must compare values in the same RGB domain. Device RGB
+    // color matching is checked separately against the calibrated marker mask.
+    private static let fixtureMatrixReadback = CIContext(options: [.cacheIntermediates: false,
+        .workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
     private static var fixtureNV12FastReads = 0, fixtureCIFallbackReads = 0, fixtureCIOracleReads = 0
     private static var fixtureMatrixCounts = [Int](repeating: 0, count: 4) // missing/601/709/other
     /// Format-neutral readback for the bounded synthetic marker fixture only.
-    private static func fixtureBGRA(_ pixel: CVPixelBuffer, forceCoreImage: Bool = false) -> [UInt8]? {
+    private static func fixtureBGRA(_ pixel: CVPixelBuffer, forceCoreImage: Bool = false,
+                                    matrixOnly: Bool = false) -> [UInt8]? {
         guard CVPixelBufferGetWidth(pixel) == 160, CVPixelBufferGetHeight(pixel) == 96 else { return nil }
         var bytes = [UInt8](repeating: 0, count: 160 * 96 * 4)
         if !forceCoreImage, CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA {
@@ -470,9 +475,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
         }
         if forceCoreImage { fixtureCIOracleReads += 1 } else { fixtureCIFallbackReads += 1 }
-        fixtureImageReadback.render(CIImage(cvPixelBuffer: pixel), toBitmap: &bytes, rowBytes: 160 * 4,
-            bounds: CGRect(x: 0, y: 0, width: 160, height: 96), format: .BGRA8,
-            colorSpace: CGColorSpaceCreateDeviceRGB())
+        if forceCoreImage && matrixOnly {
+            fixtureMatrixReadback.render(CIImage(cvPixelBuffer: pixel, options: [.colorSpace: NSNull()]),
+                toBitmap: &bytes, rowBytes: 160 * 4,
+                bounds: CGRect(x: 0, y: 0, width: 160, height: 96), format: .BGRA8, colorSpace: nil)
+        } else {
+            fixtureImageReadback.render(CIImage(cvPixelBuffer: pixel), toBitmap: &bytes, rowBytes: 160 * 4,
+                bounds: CGRect(x: 0, y: 0, width: 160, height: 96), format: .BGRA8,
+                colorSpace: CGColorSpaceCreateDeviceRGB())
+        }
         return bytes
     }
     // Stop targeted arms from creating more owners after an unacknowledged close.
@@ -7888,7 +7899,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             try requireBudget()
         }
-        print("FIXTURE_READBACK fastNV12=\(Self.fixtureNV12FastReads) fallbackCI=\(Self.fixtureCIFallbackReads) oracleCI=\(Self.fixtureCIOracleReads) matricesMissing601709Other=\(Self.fixtureMatrixCounts) elapsedSeconds=\(ProcessInfo.processInfo.systemUptime - calibrationStart) maximumSeconds=45 oracleSamplesA=7 oracleSamplesB=4")
+        print("FIXTURE_READBACK fastNV12=\(Self.fixtureNV12FastReads) fallbackCI=\(Self.fixtureCIFallbackReads) oracleCI=\(Self.fixtureCIOracleReads) matricesMissing601709Other=\(Self.fixtureMatrixCounts) elapsedSeconds=\(ProcessInfo.processInfo.systemUptime - calibrationStart) maximumSeconds=45 oracleSamplesA=7 oracleSamplesB=4 rawMatrixOracles=11 managedMaskOracles=11")
         #else
         XCTFail("First copied-pixel calibration requires DEBUG audit helper")
         #endif
@@ -7897,14 +7908,18 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     #if DEBUG
     private func assertFixtureColourOracle(_ pixel: CVPixelBuffer, greenBackground: Bool) throws {
         let actual = try XCTUnwrap(Self.fixtureBGRA(pixel))
-        let reference = try XCTUnwrap(Self.fixtureBGRA(pixel, forceCoreImage: true))
+        let reference = try XCTUnwrap(Self.fixtureBGRA(pixel, forceCoreImage: true, matrixOnly: true))
+        let managed = try XCTUnwrap(Self.fixtureBGRA(pixel, forceCoreImage: true))
         let a = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(bgra: actual))
         let b = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(bgra: reference))
-        XCTAssertEqual(a.minX, b.minX); XCTAssertEqual(a.maxX, b.maxX)
-        XCTAssertEqual(a.minY, b.minY); XCTAssertEqual(a.maxY, b.maxY)
-        XCTAssertEqual(a.classification, b.classification)
-        XCTAssertEqual(a.blueInterior, b.blueInterior); XCTAssertEqual(a.redExterior, b.redExterior)
-        XCTAssertTrue(a.blueInterior && b.blueInterior)
+        let c = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(bgra: managed))
+        for oracle in [b, c] {
+            XCTAssertEqual(a.minX, oracle.minX); XCTAssertEqual(a.maxX, oracle.maxX)
+            XCTAssertEqual(a.minY, oracle.minY); XCTAssertEqual(a.maxY, oracle.maxY)
+            XCTAssertEqual(a.classification, oracle.classification)
+            XCTAssertEqual(a.blueInterior, oracle.blueInterior); XCTAssertEqual(a.redExterior, oracle.redExterior)
+            XCTAssertTrue(a.blueInterior && oracle.blueInterior)
+        }
         guard b.minX >= 0, b.maxX < 160, b.minY >= 0, b.maxY < 96 else {
             throw SelectionVideoTestFailure.sample
         }
@@ -7915,7 +7930,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let offset = (row * 160 + column) * 4
             for channel in 0..<3 {
                 XCTAssertLessThanOrEqual(abs(Int(actual[offset + channel]) - Int(reference[offset + channel])), 8,
-                    "Independent Core Image and vImage must agree on interior primary colours")
+                    "Independent raw Core Image and vImage must agree on interior primary colours")
             }
             XCTAssertEqual(actual[offset + 3], 255)
         }
