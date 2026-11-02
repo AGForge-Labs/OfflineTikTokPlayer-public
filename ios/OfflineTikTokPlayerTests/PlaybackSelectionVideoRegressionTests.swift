@@ -6,6 +6,7 @@ import AudioToolbox
 import CoreMedia
 import CoreFoundation
 import CoreVideo
+import CoreImage
 import CryptoKit
 import PlayerCore
 #if DEBUG
@@ -15,9 +16,9 @@ import Synchronization
 @testable import OfflineTikTokPlayer
 
 #if DEBUG
-/// Production-default observation/idempotence. Both arms require audio already
-/// disabled before this hook; enabled requests only redundant extra suppression.
-/// Historical source03eb and earlier receipts remain the actual policy comparison.
+/// Single-audio-track fixture observation/idempotence. Both arms preserve the
+/// selected native timing track; the enabled arm requests redundant enabling.
+/// Historical disabling receipts remain observations of the earlier policy.
 @MainActor
 private final class NativeItemAudioTrackControl {
     struct TrackRow {
@@ -78,8 +79,8 @@ private final class NativeItemAudioTrackControl {
                 let kind = type == .audio ? 0 : (type == .video ? 1 : 2)
                 let before = track.isEnabled
                 guard owns() else { qualified = false; break }
-                let wrote = stage == 0 && enabled && kind == 0 && before
-                if wrote { track.isEnabled = false }
+                let wrote = stage == 0 && enabled && kind == 0 && !before
+                if wrote { track.isEnabled = true }
                 let after = track.isEnabled
                 let returned = DispatchTime.now().uptimeNanoseconds
                 tracks.append(TrackRow(phase: phase, stage: stage, ordinal: ordinal, kind: kind, trackID: trackID,
@@ -92,7 +93,7 @@ private final class NativeItemAudioTrackControl {
             && Set(rows.map(\.trackID)).count == rows.count
             && rows.contains { $0.kind == 0 } && rows.contains { $0.kind == 1 }
             && rows.allSatisfy { row in
-                if row.kind == 0 { return !row.before && !row.after && !row.wrote }
+                if row.kind == 0 { return row.before && row.after && !row.wrote }
                 return row.before == row.after && !row.wrote && (row.kind != 1 || row.after)
             }
         if stage == 1 {
@@ -112,16 +113,16 @@ private final class NativeItemAudioTrackControl {
     }
     func stop() { stopped = true }
     func dumpAndAssert(cleanupAcknowledged: Bool) {
-        print("NativeItemAudioSummary schema=2 extraDisableRequested=\(enabled) productionDefaultAudioDisabled=true mode=observation-idempotence owners=\(owners.count) trackRows=\(tracks.count) ownerCapacity=6 trackCapacity=48 readyRequests=\(readyRequests.count) bytes=\(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6) stopped=\(stopped) failed=\(failed) cleanupAcknowledged=\(cleanupAcknowledged) configurationAt=production-before-existing-ready-hook originalAssetPreserved=true audioEngine=unchanged causalProof=false")
+        print("NativeItemAudioSummary schema=2 extraEnableRequested=\(enabled) productionNativeTimingAudioEnabled=true mode=observation-idempotence owners=\(owners.count) trackRows=\(tracks.count) ownerCapacity=6 trackCapacity=48 readyRequests=\(readyRequests.count) bytes=\(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6) stopped=\(stopped) failed=\(failed) cleanupAcknowledged=\(cleanupAcknowledged) configurationAt=production-before-existing-ready-hook originalAssetPreserved=true audioEngine=unchanged causalProof=false")
         XCTAssertTrue(stopped && cleanupAcknowledged); XCTAssertFalse(failed)
         XCTAssertEqual(owners.count, 6); XCTAssertEqual(readyRequests.count, 3)
         XCTAssertLessThan(MemoryLayout<TrackRow>.stride * 48 + MemoryLayout<OwnerRow>.stride * 6, 65_536)
         for owner in owners {
-            print("NativeItemAudioOwner schema=2 extraDisableRequested=\(enabled) mode=observation-idempotence phase=\(owner.phase) stage=\(owner.stage) request=\(owner.request) item=\(owner.item) entryNs=\(owner.entered) returnNs=\(owner.returned) tracks=\(owner.tracks) readyAfter=\(owner.readyAfter) qualified=\(owner.qualified)")
+            print("NativeItemAudioOwner schema=2 extraEnableRequested=\(enabled) mode=observation-idempotence phase=\(owner.phase) stage=\(owner.stage) request=\(owner.request) item=\(owner.item) entryNs=\(owner.entered) returnNs=\(owner.returned) tracks=\(owner.tracks) readyAfter=\(owner.readyAfter) qualified=\(owner.qualified)")
             XCTAssertTrue(owner.qualified && owner.readyAfter); XCTAssertGreaterThanOrEqual(owner.returned, owner.entered)
         }
         for row in tracks {
-            print("NativeItemAudioTrack schema=2 extraDisableRequested=\(enabled) mode=observation-idempotence phase=\(row.phase) stage=\(row.stage) ordinal=\(row.ordinal) kind=\(row.kind) trackID=\(row.trackID) before=\(row.before) after=\(row.after) wrote=\(row.wrote) entryNs=\(row.entered) returnNs=\(row.returned)")
+            print("NativeItemAudioTrack schema=2 extraEnableRequested=\(enabled) mode=observation-idempotence phase=\(row.phase) stage=\(row.stage) ordinal=\(row.ordinal) kind=\(row.kind) trackID=\(row.trackID) before=\(row.before) after=\(row.after) wrote=\(row.wrote) entryNs=\(row.entered) returnNs=\(row.returned)")
         }
         for phase in 0..<3 {
             let ready = owners.filter { $0.phase == phase && $0.stage == 0 }
@@ -130,7 +131,7 @@ private final class NativeItemAudioTrackControl {
             XCTAssertEqual(ready.first?.item, after.first?.item)
             let startAudio = tracks.filter { $0.phase == phase && $0.stage == 0 && $0.kind == 0 }
             XCTAssertFalse(startAudio.isEmpty)
-            XCTAssertTrue(startAudio.allSatisfy { !$0.before && !$0.after && !$0.wrote })
+            XCTAssertTrue(startAudio.allSatisfy { $0.before && $0.after && !$0.wrote })
         }
         XCTAssertEqual(owners.first(where: { $0.phase == 0 && $0.stage == 0 })?.item,
                        owners.first(where: { $0.phase == 2 && $0.stage == 0 })?.item,
@@ -411,6 +412,16 @@ final class PresentationClockBoundaryTrace {
 /// both generated movies, so a decoded asset or advancing audio clock cannot satisfy visibility.
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
+    private static let fixtureImageReadback = CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false])
+    /// Format-neutral readback for the bounded synthetic marker fixture only.
+    private static func fixtureBGRA(_ pixel: CVPixelBuffer) -> [UInt8]? {
+        guard CVPixelBufferGetWidth(pixel) == 160, CVPixelBufferGetHeight(pixel) == 96 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: 160 * 96 * 4)
+        fixtureImageReadback.render(CIImage(cvPixelBuffer: pixel), toBitmap: &bytes, rowBytes: 160 * 4,
+            bounds: CGRect(x: 0, y: 0, width: 160, height: 96), format: .BGRA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB())
+        return bytes
+    }
     // Stop targeted arms from creating more owners after an unacknowledged close.
     private static var targetedFixtureOwnershipLost = false
     private static var preparedPrerollToken: UInt64 = 0
@@ -506,8 +517,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await runNativePlayerReportedStateComparison([false, true], order: "off-then-on")
     }
 
-    func testNativeItemAudioTrackDisablingOffThenOn() async throws {
-        try await runNativeItemAudioTrackComparison([false, true], order: "off-then-on")
+    func testNativeTimingAudioIdempotenceOffThenOn() async throws {
+        try await runNativeTimingAudioComparison([false, true], order: "off-then-on")
     }
 
     func testNativeReaderWaitSamplingOffFirst() async throws {
@@ -730,17 +741,17 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
-    func testNativeItemAudioTrackDisablingOnThenOff() async throws {
-        try await runNativeItemAudioTrackComparison([true, false], order: "on-then-off")
+    func testNativeTimingAudioIdempotenceOnThenOff() async throws {
+        try await runNativeTimingAudioComparison([true, false], order: "on-then-off")
     }
 
-    private func runNativeItemAudioTrackComparison(_ modes: [Bool], order: String) async throws {
+    private func runNativeTimingAudioComparison(_ modes: [Bool], order: String) async throws {
         try recordRuntimeHost()
         for (ordinal, enabled) in modes.enumerated() {
-            print("NativeItemAudioArm schema=2 order=\(order) ordinal=\(ordinal) extraDisableRequested=\(enabled) productionDefaultAudioDisabled=true mode=observation-idempotence hook=existing-ready-callback zeroProbe=constant-on startupClock=constant-on originalGuards=unchanged")
+            print("NativeItemAudioArm schema=2 order=\(order) ordinal=\(ordinal) extraEnableRequested=\(enabled) productionNativeTimingAudioEnabled=true mode=observation-idempotence hook=existing-ready-callback zeroProbe=constant-on startupClock=constant-on originalGuards=unchanged")
             try await runProductionSelectionBenchmark(traceVideoSeeks: true, recordHost: false,
-                traceClockHandoff: true, nativeAudioTrackDisabling: enabled)
-            print("NativeItemAudioArmEnd schema=2 order=\(order) ordinal=\(ordinal) extraDisableRequested=\(enabled) mode=observation-idempotence helperReturned=true")
+                traceClockHandoff: true, nativeTimingAudioObservation: enabled)
+            print("NativeItemAudioArmEnd schema=2 order=\(order) ordinal=\(ordinal) extraEnableRequested=\(enabled) mode=observation-idempotence helperReturned=true")
         }
     }
 
@@ -3051,41 +3062,35 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             let zeroPTS = numericPTS && CMTimeCompare(returnedPTS, .zero) == 0
             var width = 0, height = 0, rowBytes = 0
             var pixelFormat: OSType = 0
-            var lockStatus: CVReturn = kCVReturnError
+            var readbackReady = false
             var greenFraction: Double?, redFraction: Double?, magentaFraction: Double?
             var blueX: Double?, blueY: Double?
             if let image = pixel {
                 width = CVPixelBufferGetWidth(image); height = CVPixelBufferGetHeight(image)
                 rowBytes = CVPixelBufferGetBytesPerRow(image)
                 pixelFormat = CVPixelBufferGetPixelFormatType(image)
-                // Fixed public fixture only. No copied image, decoded history, or retained frame queue.
-                if width == 160, height == 96, rowBytes >= width * 4, rowBytes <= 4096,
-                   pixelFormat == kCVPixelFormatType_32BGRA {
-                    lockStatus = CVPixelBufferLockBaseAddress(image, .readOnly)
-                    if lockStatus == kCVReturnSuccess {
-                        defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
-                        if let base = CVPixelBufferGetBaseAddress(image)?.assumingMemoryBound(to: UInt8.self) {
-                            var green = 0, red = 0, magenta = 0, blue = 0
-                            var sumX = 0.0, sumY = 0.0
-                            for y in 0..<height {
-                                for x in 0..<width {
-                                    let offset = y * rowBytes + x * 4
-                                    let b = base[offset], g = base[offset + 1], r = base[offset + 2]
-                                    if g > 150 && r < 100 && b < 100 { green += 1 }
-                                    if r > 150 && g < 100 && b < 100 { red += 1 }
-                                    if r > 150 && g < 100 && b > 150 { magenta += 1 }
-                                    if b > 150 && r < 100 && g < 100 {
-                                        blue += 1; sumX += Double(x); sumY += Double(y)
-                                    }
-                                }
+                // One bounded canonical readback, never retained across actions.
+                if let base = Self.fixtureBGRA(image) {
+                    readbackReady = true
+                    var green = 0, red = 0, magenta = 0, blue = 0
+                    var sumX = 0.0, sumY = 0.0
+                    for y in 0..<height {
+                        for x in 0..<width {
+                            let offset = (y * width + x) * 4
+                            let b = base[offset], g = base[offset + 1], r = base[offset + 2]
+                            if g > 150 && r < 100 && b < 100 { green += 1 }
+                            if r > 150 && g < 100 && b < 100 { red += 1 }
+                            if r > 150 && g < 100 && b > 150 { magenta += 1 }
+                            if b > 150 && r < 100 && g < 100 {
+                                blue += 1; sumX += Double(x); sumY += Double(y)
                             }
-                            let count = Double(width * height)
-                            greenFraction = Double(green) / count
-                            redFraction = Double(red) / count
-                            magentaFraction = Double(magenta) / count
-                            if blue >= 4 { blueX = sumX / Double(blue); blueY = sumY / Double(blue) }
                         }
                     }
+                    let count = Double(width * height)
+                    greenFraction = Double(green) / count
+                    redFraction = Double(red) / count
+                    magentaFraction = Double(magenta) / count
+                    if blue >= 4 { blueX = sumX / Double(blue); blueY = sumY / Double(blue) }
                 }
             }
             pixel = nil // Release the sole copied buffer before teardown or any later action.
@@ -3100,7 +3105,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 && validPixels && ownerStable && audioOwnerStable
             let classification = preexistingFrameProven ? "available-before-copy"
                 : returnedBuffer ? "copy-returned-without-preexisting-proof" : "no-buffer-returned"
-            print("PreparedNextFrameCapability schema=1 checkpointNs=\(checkpoint) queryEntryNs=\(queryEntry) queryReturnNs=\(queryReturn) copyEntryNs=\(copyEntry) copyReturnNs=\(copyReturn) queryCount=1 copyCount=1 setupValid=true initialBStatus=\(initialBStatus) ownerStable=\(ownerStable) audioOwnerStable=\(audioOwnerStable) reportedAvailable=\(reportedAvailable) returnedBuffer=\(returnedBuffer) numericPTS=\(numericPTS) zeroPTS=\(zeroPTS) ptsSeconds=\(numericPTS ? String(returnedPTS.seconds) : "invalid") width=\(width) height=\(height) rowBytes=\(rowBytes) pixelFormat=\(pixelFormat) lockStatus=\(lockStatus) greenFraction=\(greenFraction.map { String($0) } ?? "unavailable") redFraction=\(redFraction.map { String($0) } ?? "unavailable") magentaFraction=\(magentaFraction.map { String($0) } ?? "unavailable") blueX=\(blueX.map { String($0) } ?? "unavailable") blueY=\(blueY.map { String($0) } ?? "unavailable") retainedItems=\(buffer.retainedItemCount) availability=\(classification) preexistingFrameProven=\(preexistingFrameProven) decoderAbsenceProven=false latencyEvidence=false compositorPixels=unmeasured")
+            print("PreparedNextFrameCapability schema=1 checkpointNs=\(checkpoint) queryEntryNs=\(queryEntry) queryReturnNs=\(queryReturn) copyEntryNs=\(copyEntry) copyReturnNs=\(copyReturn) queryCount=1 copyCount=1 setupValid=true initialBStatus=\(initialBStatus) ownerStable=\(ownerStable) audioOwnerStable=\(audioOwnerStable) reportedAvailable=\(reportedAvailable) returnedBuffer=\(returnedBuffer) numericPTS=\(numericPTS) zeroPTS=\(zeroPTS) ptsSeconds=\(numericPTS ? String(returnedPTS.seconds) : "invalid") width=\(width) height=\(height) rowBytes=\(rowBytes) pixelFormat=\(pixelFormat) readbackReady=\(readbackReady) greenFraction=\(greenFraction.map { String($0) } ?? "unavailable") redFraction=\(redFraction.map { String($0) } ?? "unavailable") magentaFraction=\(magentaFraction.map { String($0) } ?? "unavailable") blueX=\(blueX.map { String($0) } ?? "unavailable") blueY=\(blueY.map { String($0) } ?? "unavailable") retainedItems=\(buffer.retainedItemCount) availability=\(classification) preexistingFrameProven=\(preexistingFrameProven) decoderAbsenceProven=false latencyEvidence=false compositorPixels=unmeasured")
             if let prerollOwner {
                 print("PreparedNextPrerollProbe schema=1 token=\(prerollOwner.token) order=\(prerollOwner.order) ordinal=\(prerollOwner.ordinal) enabled=\(prerollOwner.enabled) queryEntryNs=\(queryEntry) queryReturnNs=\(queryReturn) copyEntryNs=\(copyEntry) copyReturnNs=\(copyReturn) queryCount=1 copyCount=1 reportedAvailable=\(reportedAvailable) returnedBuffer=\(returnedBuffer) preexistingFrameProven=\(preexistingFrameProven) latencyEvidence=false compositorPixels=unmeasured")
             }
@@ -3117,8 +3122,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             if returnedBuffer {
                 XCTAssertTrue(numericPTS && zeroPTS, "A copied nonzero/invalid PTS cannot prove the initial frame")
                 XCTAssertEqual(width, 160); XCTAssertEqual(height, 96)
-                XCTAssertEqual(pixelFormat, kCVPixelFormatType_32BGRA)
-                XCTAssertEqual(lockStatus, kCVReturnSuccess)
+                XCTAssertNotEqual(pixelFormat, 0)
+                XCTAssertTrue(readbackReady)
                 XCTAssertTrue(validPixels, "The actual copied pixels must be B's initial green frame and blue marker")
             }
             // Nil with a false query is a retained observation, never a decoder-absence assertion.
@@ -3202,13 +3207,8 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let stable = owns()
         var green = 0, red = 0, magenta = 0, blue = 0, blueSum = 0.0
         let scan = {
-        if stable, let image, CVPixelBufferGetWidth(image) == 160, CVPixelBufferGetHeight(image) == 96,
-           CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_32BGRA,
-           CVPixelBufferGetBytesPerRow(image) >= 640, CVPixelBufferGetBytesPerRow(image) <= 4096,
-           CVPixelBufferLockBaseAddress(image, .readOnly) == kCVReturnSuccess {
-            defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
-            if let base = CVPixelBufferGetBaseAddress(image)?.assumingMemoryBound(to: UInt8.self) {
-                let stride = CVPixelBufferGetBytesPerRow(image)
+            if stable, let image, let base = Self.fixtureBGRA(image) {
+                let stride = 160 * 4
                 for y in 0..<96 {
                     for x in 0..<160 {
                         let offset = y * stride + x * 4
@@ -3220,7 +3220,6 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     }
                 }
             }
-        }
         }
         if let spans { spans.measure(.pixelScan, scan) } else { scan() }
         return .init(available: available, copied: image != nil, ownerStable: stable && owns(),
@@ -4050,7 +4049,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
-    func testProductionNativeAudioSuppressionPreservesRetainedVideoAndPCM() async throws {
+    func testMutedNativeTimingPreservesRetainedVideoAndPCM() async throws {
         #if DEBUG
         try await withOwnedNaturalFixture { fixture, audio, service, screen in
             service.isInteractingWithFeed = true
@@ -4063,6 +4062,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 try await self.requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: id)
                 let item = try XCTUnwrap(service.player.currentItem)
                 self.assertProductionNativeAudioTracks(item)
+                XCTAssertTrue(service.player.isMuted, "The PCM graph must remain the audible owner")
                 let source = audio.renderer.snapshot, submitted = service.submittedVideoFrameCount
                 let first = tap.begin()
                 try await Task.sleep(for: .milliseconds(240))
@@ -4091,7 +4091,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
-    func testNativeAudioSuppressionRejectsSupersessionAtEveryPrewriteRead() async throws {
+    func testNativeTimingConfigurationRejectsSupersessionAtEveryPrewriteRead() async throws {
         #if DEBUG
         try recordRuntimeHost()
         let boundaries: [PlaybackService.DebugNativeAudioBoundary] = [.tracksRead, .assetTrackRead, .mediaTypeRead, .isEnabledRead]
@@ -4105,13 +4105,15 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     fired = true; superseded = item
                     originalAudioTracks = item.tracks.filter { $0.assetTrack?.mediaType == .audio }
                     originalAudioIDs = originalAudioTracks.compactMap { $0.assetTrack?.trackID }
+                    // Exercise the restore path for a legacy retained item.
+                    for track in originalAudioTracks { track.isEnabled = false }
                     beforeAudio = originalAudioTracks.map(\.isEnabled)
                     service.start(playlistIDs: [fixture.playlist], at: fixture.bID)
                 }
                 defer { service.onDebugNativeAudioConfigurationBoundary = nil }
                 service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
                 try await self.requireNativeClockContractOwner(service, fixture: fixture, audio: audio, screen: screen, id: fixture.bID)
-                XCTAssertTrue(fired); XCTAssertFalse(beforeAudio.isEmpty); XCTAssertTrue(beforeAudio.allSatisfy { $0 })
+                XCTAssertTrue(fired); XCTAssertFalse(beforeAudio.isEmpty); XCTAssertTrue(beforeAudio.allSatisfy { !$0 })
                 let retired = try XCTUnwrap(superseded)
                 XCTAssertFalse(retired === service.player.currentItem)
                 XCTAssertFalse(originalAudioTracks.isEmpty)
@@ -4119,7 +4121,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 XCTAssertEqual(originalAudioIDs.count, originalAudioTracks.count)
                 XCTAssertEqual(Set(originalAudioIDs).count, originalAudioTracks.count)
                 XCTAssertEqual(originalAudioTracks.compactMap { $0.assetTrack?.trackID }, originalAudioIDs)
-                XCTAssertTrue(originalAudioTracks.allSatisfy(\.isEnabled),
+                XCTAssertEqual(originalAudioTracks.map(\.isEnabled), beforeAudio,
                     "A getter that changed the selected source must not authorize a later write to old A")
                 self.assertProductionNativeAudioTracks(try XCTUnwrap(service.player.currentItem))
                 _ = await self.assertVisibleFrame(service, screen: screen, identity: .b, label: "native-audio-superseded-" + String(describing: boundary))
@@ -4130,7 +4132,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         #endif
     }
 
-    func testNativeAudioSuppressionCannotUndoPauseOrDeniedInterruptionResume() async throws {
+    func testNativeTimingConfigurationCannotUndoPauseOrDeniedInterruptionResume() async throws {
         #if DEBUG
         try recordRuntimeHost()
         for explicitPause in [true, false] {
@@ -4171,7 +4173,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let audio = tracks.filter { $0.assetTrack?.mediaType == .audio }
         let video = tracks.filter { $0.assetTrack?.mediaType == .video }
         XCTAssertFalse(audio.isEmpty, file: file, line: line); XCTAssertFalse(video.isEmpty, file: file, line: line)
-        XCTAssertTrue(audio.allSatisfy { !$0.isEnabled }, "Only the independent PCM graph may present audio", file: file, line: line)
+        XCTAssertTrue(audio.contains { $0.isEnabled }, "The muted native transport must retain its timing track", file: file, line: line)
         XCTAssertTrue(video.allSatisfy(\.isEnabled), "Native audio configuration must preserve actual video", file: file, line: line)
     }
 
@@ -4774,7 +4776,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                                                 capClockBoundary: Bool? = nil,
                                                 joinSourceCallbackClockLedger: Bool = false,
                                                 nativePlayerReportedState: Bool? = nil,
-                                                nativeAudioTrackDisabling: Bool? = nil,
+                                                nativeTimingAudioObservation: Bool? = nil,
                                                 sameRetainedAssetAdmission: Bool? = nil,
                                                 nativeReaderWaitSampling: Bool? = nil,
                                                 initialVideoPolling: Bool? = nil,
@@ -4804,7 +4806,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let enabled = readyNotificationTiming {
             guard traceVideoSeeks, traceClockHandoff == true, queuedPreviousAdvance == nil,
                   initialVideoPolling == nil, nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
-                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  nativeTimingAudioObservation == nil, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
                   initialNativeStartCurrentItemTime == nil, frameMonitorAlternative == nil,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !traceNativeRefill,
@@ -4822,7 +4824,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let enabled = queuedPreviousAdvance {
             guard traceVideoSeeks, traceClockHandoff == true, traceReturnedAStereoZero == true,
                   initialVideoPolling == nil, nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
-                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  nativeTimingAudioObservation == nil, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
                   initialNativeStartCurrentItemTime == nil, frameMonitorAlternative == nil,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !traceNativeRefill,
@@ -4840,7 +4842,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         if let enabled = initialVideoPolling {
             guard queuedPreviousAdvance == nil, traceVideoSeeks, traceClockHandoff == true, traceReturnedAStereoZero == true,
                   nativeReaderWaitSampling == nil, sameRetainedAssetAdmission == nil,
-                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  nativeTimingAudioObservation == nil, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
                   initialNativeStartCurrentItemTime == nil, frameMonitorAlternative == nil,
                   renderAccounting == nil, traceDefaultFrameMonitor == nil, !traceNativeRefill,
@@ -4857,7 +4859,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("InitialVideoPollingScope schema=1 enabled=\(enabled) fastMilliseconds=16 ordinaryMilliseconds=33 maximumWindowSeconds=0.5 requestOwner=latest-only windowOrigin=first-eligible-generation-poll slowLoadCanExhaustWindow=true tasks=existing-single nativeConvergence=required videoIdentityAndFrames=unchanged audioOutputAndMemoryLimits=unchanged")
         }
         let returnedZeroEventMode: Bool? = traceReturnedAStereoZero
-            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeAudioTrackDisabling == nil && sameRetainedAssetAdmission == nil && nativeReaderWaitSampling == nil ? nil : true)
+            ?? (wholeFrameClockAcquisition == nil && firstZeroSourceCallbacks == nil && capClockBoundary == nil && nativePlayerReportedState == nil && nativeTimingAudioObservation == nil && sameRetainedAssetAdmission == nil && nativeReaderWaitSampling == nil ? nil : true)
         if let enabled = nativeReaderWaitSampling {
             #if !targetEnvironment(simulator)
             XCTFail("Own-reader native wait observation requires Simulator; a missing context is not a device control")
@@ -4865,7 +4867,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             #endif
             guard traceVideoSeeks, traceClockHandoff == true, sameRetainedAssetAdmission == nil,
                   initialVideoPolling == nil,
-                  nativeAudioTrackDisabling == nil, nativePlayerReportedState == nil,
+                  nativeTimingAudioObservation == nil, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
                   firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
                   frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
@@ -4881,7 +4883,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("NativeReaderWaitScope schema=1 enabled=\(enabled) phases=returned-A context=both-arms queries=on-only trigger=actual-zero-or-unchanged-copy300ms rows=6 frames=16 extraSampler=false noMediaQueries=true noExternalTask=true noExplicitSuspend=true kernelGetStateMayStop=true stackCoherent=false playbackPolicy=unchanged originalGuards=unchanged")
         }
         if let enabled = sameRetainedAssetAdmission {
-            guard traceVideoSeeks, traceClockHandoff == true, nativeAudioTrackDisabling == nil,
+            guard traceVideoSeeks, traceClockHandoff == true, nativeTimingAudioObservation == nil,
                   nativePlayerReportedState == nil, earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
                   firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
                   frameMonitorAlternative == nil, !traceNativeRefill, renderAccounting == nil,
@@ -4896,7 +4898,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             print("SameAssetAdmissionScope schema=1 enabled=\(enabled) identity=retained-AVURLAsset-instance maximumLeases=3 activeBudget=8 inactiveBudget=2 nativeAudioPolicy=default trace=constant firstZeroProbe=constant eventCapacity=256 maximumAssets=64 maximumLeaseIDs=128 addedClocks=0 crossThreadCancel=false releasePolicy=unchanged originalGuards=unchanged")
         }
-        if let enabled = nativeAudioTrackDisabling {
+        if let enabled = nativeTimingAudioObservation {
             guard traceVideoSeeks, traceClockHandoff == true, nativePlayerReportedState == nil,
                   earlyClockAcquisition == nil, wholeFrameClockAcquisition == nil,
                   firstZeroSourceCallbacks == nil, capClockBoundary == nil, traceReturnedAStereoZero == nil,
@@ -5105,7 +5107,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTFail("Same-retained-asset admission controls require DEBUG")
             throw SelectionVideoTestFailure.timeout
         }
-        if nativeAudioTrackDisabling != nil {
+        if nativeTimingAudioObservation != nil {
             XCTFail("Native audio-track comparison is unavailable outside DEBUG")
             throw SelectionVideoTestFailure.timeout
         }
@@ -5305,7 +5307,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             service.debugInitialVideoPollingControl = enabled
             XCTAssertEqual(service.debugInitialVideoPollingControl, enabled)
         }
-        let nativeAudioControl = nativeAudioTrackDisabling.map {
+        let nativeAudioControl = nativeTimingAudioObservation.map {
             NativeItemAudioTrackControl(enabled: $0, baseRequest: service.debugInitialVideoReadyState.generation,
                 aID: fixture.aID, bID: fixture.bID)
         }
@@ -8222,16 +8224,10 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         init(request: Int, tracePixel: Bool = false) {
             self.request = request; self.tracePixel = tracePixel; events.reserveCapacity(32)
         }
-        // One bounded fixture scan; no buffer copy or retained CV object.
+        // One bounded canonical fixture scan; no retained CV object or frame history.
         static func pixelColors(_ pixel: CVPixelBuffer) -> PixelColors? {
-            let stride = CVPixelBufferGetBytesPerRow(pixel)
-            guard CVPixelBufferGetWidth(pixel) == 160, CVPixelBufferGetHeight(pixel) == 96,
-                  CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
-                  !CVPixelBufferIsPlanar(pixel), stride >= 160 * 4, stride <= 4096,
-                  CVPixelBufferGetDataSize(pixel) >= stride * 96,
-                  CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
-            defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
-            guard let base = CVPixelBufferGetBaseAddress(pixel)?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            guard let base = PlaybackSelectionVideoRegressionTests.fixtureBGRA(pixel) else { return nil }
+            let stride = 160 * 4
             var minX = 160, maxX = -1, minY = 96, maxY = -1, blueCount = 0, redCount = 0
             for y in 0..<96 { for x in 0..<160 {
                 let index = y * stride + x * 4

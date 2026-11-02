@@ -11,6 +11,73 @@ import PlayerCore
 
 @MainActor
 final class PictureRecoveryTests: XCTestCase {
+    private let imageReadback = CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false])
+    func testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-1080", firstDuration: 6)
+        let service = fixture.service
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        var measuring = false, delivered = 0, invalidOwners = 0
+        var request = -1, token = 0, visit: Int64 = 0
+        var selectedItem: ObjectIdentifier?
+        var previous: UInt64 = 0, maximumGap: UInt64 = 0, maximumEnqueue: UInt64 = 0
+        service.onDebugCPPNativePullStamp = { stamp in
+            guard measuring, stamp.pull.stage == .enqueue else { return }
+            guard stamp.request == request, stamp.generation == request,
+                  stamp.sourceItem == selectedItem, stamp.sourceItemMatches, stamp.observedItemMatches,
+                  stamp.presentationMatches, stamp.cachedAudioToken == token, stamp.cachedAudioVisit == visit,
+                  stamp.pull.entryOwnerCoherent, stamp.pull.ownerUnchanged,
+                  stamp.pull.returnNs >= previous else { invalidOwners += 1; return }
+            maximumGap = max(maximumGap, stamp.pull.returnNs - previous)
+            maximumEnqueue = max(maximumEnqueue, stamp.pull.returnNs - stamp.pull.entryNs)
+            previous = stamp.pull.returnNs; delivered += 1
+        }
+        defer { service.onDebugCPPNativePullStamp = nil }
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && service.audioSnapshot.frame > 2_400 }
+        let oldPicture = try XCTUnwrap(smallPicture(layer))
+        let before = service.audioSnapshot
+        XCTAssertTrue(service.player.isMuted)
+        XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+        request = service.debugAlignedVideoPollState.generation
+        selectedItem = ObjectIdentifier(try XCTUnwrap(service.player.currentItem))
+        token = before.token; visit = before.visit
+        let start = DispatchTime.now().uptimeNanoseconds
+        previous = start; measuring = true
+        try await Task.sleep(for: .milliseconds(1200))
+        let end = DispatchTime.now().uptimeNanoseconds
+        measuring = false
+        maximumGap = max(maximumGap, end - previous)
+        let after = service.audioSnapshot
+        XCTAssertTrue(service.player.isMuted)
+        XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+        let newPicture = try XCTUnwrap(smallPicture(layer))
+        service.pause()
+        let elapsed = Double(end - start) / 1_000_000_000
+        let fps = Double(delivered) / elapsed, gapMs = Double(maximumGap) / 1_000_000
+        print("PRODUCTION_HD deliveredFPS=\(fps) maximumGapMs=\(gapMs) maximumEnqueueMs=\(Double(maximumEnqueue) / 1_000_000) audioAdvanced=\(after.frame - before.frame) underrunsAdded=\(after.underrunFrames - before.underrunFrames) actualPictureChanged=\(oldPicture != newPicture)")
+        XCTAssertGreaterThan(fps, 50, "The actual service must deliver the full-resolution 60fps source")
+        XCTAssertLessThan(gapMs, 100, "The actual audio clock must not hide a long video delivery gap")
+        XCTAssertEqual(invalidOwners, 0)
+        XCTAssertEqual(after.token, before.token); XCTAssertEqual(after.visit, before.visit)
+        XCTAssertGreaterThanOrEqual(after.frame - before.frame, Int64(elapsed * 48_000 * 0.85),
+            "Video throughput must not hide a stalled audio callback")
+        XCTAssertLessThanOrEqual(after.frame - before.frame, Int64(elapsed * 48_000 * 1.15))
+        XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+        XCTAssertNotEqual(oldPicture, newPicture, "Independently read the actual displayed image before and after")
+        XCTAssertNil(service.message)
+    }
+
+    private func smallPicture(_ layer: AVSampleBufferDisplayLayer) -> Data? {
+        guard let pixel = layer.sampleBufferRenderer.displayedPixelBuffer() else { return nil }
+        let image = CIImage(cvPixelBuffer: pixel).transformed(by: CGAffineTransform(
+            scaleX: 8 / CGFloat(CVPixelBufferGetWidth(pixel)), y: 8 / CGFloat(CVPixelBufferGetHeight(pixel))))
+        var bytes = [UInt8](repeating: 0, count: 8 * 8 * 4)
+        imageReadback.render(image, toBitmap: &bytes, rowBytes: 8 * 4,
+            bounds: CGRect(x: 0, y: 0, width: 8, height: 8), format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB())
+        return Data(bytes)
+    }
     func testRapidFeedReversalCoversDepartingPixelsUntilReturnedMediaIsReady() async throws {
         let fixture = try await PictureRecoveryFixture(test: self)
         let service = fixture.service
@@ -285,7 +352,7 @@ final class PictureRecoveryTests: XCTestCase {
         // The synthetic fixture is solid red or green; read its centre in RGB.
         let image = CIImage(cvPixelBuffer: pixel)
         var bytes = [UInt8](repeating: 0, count: 4)
-        CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false]).render(image,
+        imageReadback.render(image,
             toBitmap: &bytes, rowBytes: 4,
             bounds: CGRect(x: image.extent.midX.rounded(.down), y: image.extent.midY.rounded(.down), width: 1, height: 1),
             format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -306,18 +373,19 @@ private final class PictureRecoveryFixture {
     private weak var previousWindow: UIWindow?
     private let preferences = ["speakerSound", "automaticPiP", "audioOnly"].map { ($0, UserDefaults.standard.object(forKey: $0)) }
 
-    init(test: XCTestCase, nativeAudio: Bool = false) async throws {
+    init(test: XCTestCase, nativeAudio: Bool = false,
+         firstResourceName: String = "test-selection-a", firstDuration: Double = 30) async throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let cloud = OneDriveClient(account: MicrosoftAccount())
         let downloads = try OfflineDownloads(cloud: cloud, network: NetworkStatus(), debugLocalRoot: directory)
         let library = LibraryRepository(cloud: cloud, catalogURL: directory.appendingPathComponent("catalog.json"))
-        for (key, name) in [(mediaID, "test-selection-a"), (otherID, "test-selection-b")] {
+        for (key, name) in [(mediaID, firstResourceName), (otherID, "test-selection-b")] {
             let source = try XCTUnwrap(Bundle(for: PictureRecoveryTests.self).url(forResource: name, withExtension: "mp4"))
             _ = try await downloads.importLocal(source, mediaID: key)
         }
         try library.install(LibraryCatalog(libraryID: "local:picture-recovery", media: [
-            MediaRecord(id: mediaID, title: "Synthetic picture recovery A", duration: 30),
+            MediaRecord(id: mediaID, title: "Synthetic picture recovery A", duration: firstDuration),
             MediaRecord(id: otherID, title: "Synthetic picture recovery B", duration: 30)
         ], playlists: [PlaylistRecord(id: playlist, name: "Synthetic", itemIDs: [mediaID, otherID])]))
         if nativeAudio {

@@ -66,11 +66,10 @@ final class VideoPresentationContinuityTests: XCTestCase {
 
     func testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo() async throws {
         for trial in 0..<6 {
-            let disabled = trial >= 3
-            let fixture = try await PresentedVideo.make(disableAudioTrack: disabled)
+            let fixture = try await PresentedVideo.make()
             defer { fixture.close() }
             XCTAssertTrue(fixture.usedNativeGeometry, "The qualified production path must avoid an unnecessary compositor")
-            print("VIDEO_TRIAL ordinal=\(trial) unusedNativeAudioDisabled=\(disabled)")
+            print("VIDEO_TRIAL ordinal=\(trial) unusedNativeAudioDisabled=false")
             let rate = try await measuredRate(fixture)
             XCTAssertGreaterThan(rate, 50, "A 60 fps source must not be limited by a 30 Hz app timer")
         }
@@ -78,7 +77,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
 
     func testFullResolutionVideoKeepsItsCadenceAfterStarting() async throws {
         for trial in 0..<3 {
-            let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080", disableAudioTrack: true)
+            let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080")
             defer { fixture.close() }
             print("VIDEO_HD_TRIAL ordinal=\(trial)")
             let rate = try await measuredRate(fixture)
@@ -399,7 +398,7 @@ private final class PresentedVideo {
             let position = fixture.player.currentTime().seconds
             XCTAssertTrue(fixture.bridge.installTimeline(ticket, positionSeconds: position, durationSeconds: 6, isPlaying: false))
             XCTAssertTrue(fixture.bridge.activate(ticket))
-            while fixture.bridge.currentFrameReceipt(for: ticket) == nil || !fixture.bridge.displayLayer.isReadyForDisplay {
+            while fixture.bridge.currentFrameReceipt(for: ticket)?.matchesDisplayedImage(in: fixture.bridge.displayLayer) != true {
                 guard ContinuousClock.now < deadline else { throw PreparationFailed.notReady }
                 fixture.bridge.updatePlayback(positionSeconds: position, durationSeconds: 6, isPlaying: false)
                 try await Task.sleep(for: .milliseconds(10))

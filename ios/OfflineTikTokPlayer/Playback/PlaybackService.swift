@@ -347,7 +347,7 @@ final class PlaybackService: NSObject {
     // Timing-only seam: nil preserves the original callback path without an await.
     @ObservationIgnored var onDebugInitialVideoReady: (@MainActor (Int) async -> Void)? = nil
     enum DebugNativeAudioBoundary: Equatable {
-        case tracksRead, assetTrackRead, mediaTypeRead, isEnabledRead, audioTrackDisabled, statusRead
+        case tracksRead, assetTrackRead, mediaTypeRead, isEnabledRead, audioTrackEnabled, statusRead
     }
     @ObservationIgnored var onDebugNativeAudioConfigurationBoundary:
         (@MainActor (DebugNativeAudioBoundary, AVPlayerItem) -> Void)? = nil
@@ -1241,9 +1241,10 @@ final class PlaybackService: NSObject {
         persist(); updateNowPlaying()
     }
 
-    /// PCM owns audible content. Suppress unused native item audio while
-    /// preserving the native video and original source asset.
-    private func disableUnusedNativeAudio(on item: AVPlayerItem, request: Int) -> Bool {
+    /// Keep the muted player's selected audio track available to its native
+    /// transport clock. Disabling it can stall video output after startup.
+    /// The independent PCM graph owns audible playback; player.isMuted stays true.
+    private func configureMutedNativeTiming(on item: AVPlayerItem, request: Int) -> Bool {
         @MainActor func owns() -> Bool {
             guard generation == request, observedItem === item else { return false }
             let current = player.currentItem
@@ -1255,6 +1256,8 @@ final class PlaybackService: NSObject {
         onDebugNativeAudioConfigurationBoundary?(.tracksRead, item)
         #endif
         guard owns() else { return false }
+        var firstAudioTrack: AVPlayerItemTrack?
+        var hasEnabledAudio = false
         for track in tracks {
             let assetTrack = track.assetTrack
             #if DEBUG
@@ -1272,13 +1275,18 @@ final class PlaybackService: NSObject {
             onDebugNativeAudioConfigurationBoundary?(.isEnabledRead, item)
             #endif
             guard owns() else { return false }
-            if enabled {
-                track.isEnabled = false
-                #if DEBUG
-                onDebugNativeAudioConfigurationBoundary?(.audioTrackDisabled, item)
-                #endif
-                guard owns() else { return false }
-            }
+            if firstAudioTrack == nil { firstAudioTrack = track }
+            hasEnabledAudio = hasEnabledAudio || enabled
+        }
+        // Preserve the source's default language/track choice. Only a retained
+        // item with every audio track disabled needs one track restored.
+        if !hasEnabledAudio, let firstAudioTrack {
+            guard owns() else { return false }
+            firstAudioTrack.isEnabled = true
+            #if DEBUG
+            onDebugNativeAudioConfigurationBoundary?(.audioTrackEnabled, item)
+            #endif
+            guard owns() else { return false }
         }
         let ready = item.status == .readyToPlay
         #if DEBUG
@@ -1377,7 +1385,7 @@ final class PlaybackService: NSObject {
                         else { self.restoreNativePresentation() }
                         return
                     }
-                    guard self.disableUnusedNativeAudio(on: playerItem, request: request) else { return }
+                    guard self.configureMutedNativeTiming(on: playerItem, request: request) else { return }
                     self.statusHandledGeneration = request
                     #if DEBUG
                     if let gate = self.onDebugInitialVideoReady {
