@@ -7,6 +7,7 @@ import CoreMedia
 import CoreFoundation
 import CoreVideo
 import CoreImage
+import Accelerate
 import CryptoKit
 import PlayerCore
 #if DEBUG
@@ -413,11 +414,13 @@ final class PresentationClockBoundaryTrace {
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     private static let fixtureImageReadback = CIContext(options: [.cacheIntermediates: false])
+    private static var fixtureNV12FastReads = 0, fixtureCIFallbackReads = 0, fixtureCIOracleReads = 0
+    private static var fixtureMatrixCounts = [Int](repeating: 0, count: 4) // missing/601/709/other
     /// Format-neutral readback for the bounded synthetic marker fixture only.
-    private static func fixtureBGRA(_ pixel: CVPixelBuffer) -> [UInt8]? {
+    private static func fixtureBGRA(_ pixel: CVPixelBuffer, forceCoreImage: Bool = false) -> [UInt8]? {
         guard CVPixelBufferGetWidth(pixel) == 160, CVPixelBufferGetHeight(pixel) == 96 else { return nil }
         var bytes = [UInt8](repeating: 0, count: 160 * 96 * 4)
-        if CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA {
+        if !forceCoreImage, CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA {
             guard CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
             defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
             guard let base = CVPixelBufferGetBaseAddress(pixel),
@@ -431,6 +434,42 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             }
             return bytes
         }
+        if !forceCoreImage, CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+            let matrix = CVBufferCopyAttachment(pixel, kCVImageBufferYCbCrMatrixKey, nil)
+            let is601 = matrix.map { CFEqual($0, kCVImageBufferYCbCrMatrix_ITU_R_601_4) } ?? true
+            let is709 = matrix.map { CFEqual($0, kCVImageBufferYCbCrMatrix_ITU_R_709_2) } ?? false
+            fixtureMatrixCounts[matrix == nil ? 0 : (is601 ? 1 : (is709 ? 2 : 3))] += 1
+            if is601 || is709 {
+                guard CVPixelBufferGetPlaneCount(pixel) == 2,
+                      CVPixelBufferGetWidthOfPlane(pixel, 0) == 160, CVPixelBufferGetHeightOfPlane(pixel, 0) == 96,
+                      CVPixelBufferGetWidthOfPlane(pixel, 1) == 80, CVPixelBufferGetHeightOfPlane(pixel, 1) == 48,
+                      CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
+                defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+                guard let yp = CVPixelBufferGetBaseAddressOfPlane(pixel, 0),
+                      let cbcr = CVPixelBufferGetBaseAddressOfPlane(pixel, 1),
+                      CVPixelBufferGetBytesPerRowOfPlane(pixel, 0) >= 160,
+                      CVPixelBufferGetBytesPerRowOfPlane(pixel, 1) >= 160 else { return nil }
+                var range = vImage_YpCbCrPixelRange(Yp_bias: 16, CbCr_bias: 128,
+                    YpRangeMax: 235, CbCrRangeMax: 240, YpMax: 255, YpMin: 0, CbCrMax: 255, CbCrMin: 0)
+                var info = vImage_YpCbCrToARGB()
+                let conversionMatrix = is709 ? kvImage_YpCbCrToARGBMatrix_ITU_R_709_2 : kvImage_YpCbCrToARGBMatrix_ITU_R_601_4
+                guard vImageConvert_YpCbCrToARGB_GenerateConversion(conversionMatrix!, &range, &info,
+                    kvImage420Yp8_CbCr8, kvImageARGB8888, vImage_Flags(kvImageNoFlags)) == kvImageNoError else { return nil }
+                var sourceY = vImage_Buffer(data: yp, height: 96, width: 160,
+                    rowBytes: CVPixelBufferGetBytesPerRowOfPlane(pixel, 0))
+                var sourceCbCr = vImage_Buffer(data: cbcr, height: 48, width: 80,
+                    rowBytes: CVPixelBufferGetBytesPerRowOfPlane(pixel, 1))
+                let error = bytes.withUnsafeMutableBytes { destination -> vImage_Error in
+                    var output = vImage_Buffer(data: destination.baseAddress!, height: 96, width: 160, rowBytes: 160 * 4)
+                    return vImageConvert_420Yp8_CbCr8ToARGB8888(&sourceY, &sourceCbCr, &output,
+                        &info, [3, 2, 1, 0], 255, vImage_Flags(kvImageNoFlags))
+                }
+                guard error == kvImageNoError else { return nil }
+                fixtureNV12FastReads += 1
+                return bytes
+            }
+        }
+        if forceCoreImage { fixtureCIOracleReads += 1 } else { fixtureCIFallbackReads += 1 }
         fixtureImageReadback.render(CIImage(cvPixelBuffer: pixel), toBitmap: &bytes, rowBytes: 160 * 4,
             bounds: CGRect(x: 0, y: 0, width: 160, height: 96), format: .BGRA8,
             colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -7758,6 +7797,16 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
 
     func testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins() async throws {
         #if DEBUG
+        let calibrationStart = ProcessInfo.processInfo.systemUptime
+        let calibrationDeadline = calibrationStart + 45
+        Self.fixtureNV12FastReads = 0; Self.fixtureCIFallbackReads = 0; Self.fixtureCIOracleReads = 0
+        Self.fixtureMatrixCounts = [Int](repeating: 0, count: 4)
+        func requireBudget() throws {
+            guard ProcessInfo.processInfo.systemUptime < calibrationDeadline else {
+                XCTFail("Synthetic colour calibration exceeded its 45 second witness budget; do not restart the host")
+                throw SelectionVideoTestFailure.timeout
+            }
+        }
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .video)
@@ -7772,6 +7821,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             defer { reader.cancelReading() }
             var counts = [0, 0, 0], minimumBlue = Int.max, maximumBlue = 0
             for index in 0..<720 {
+                try requireBudget()
                 let step = index / 3, x = (step * 10) % 144
                 let y = (step / 72) * 24
                 let (pts, colors) = try autoreleasepool { () throws -> (Double, PausedFirstFrameTrace.PixelColors) in
@@ -7781,6 +7831,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                     let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
                     XCTAssertTrue(timestamp.isNumeric); XCTAssertEqual(timestamp.epoch, 0)
                     let colors = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(pixel))
+                    if format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                       [0, 9, 213, 216, 432, 648, 717].contains(index) {
+                        try self.assertFixtureColourOracle(pixel, greenBackground: false)
+                    }
+                    try requireBudget()
                     if index == 0 || index == 9 {
                         // Preserve every boundary pixel but corrupt a blue interior pixel.
                         // Geometry alone must never prove the source image's marker bin.
@@ -7812,12 +7867,64 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             XCTAssertEqual(counts, [714, 3, 3])
             print("PausedFirstPixelCalibration schema=3 pixelType=\(format) decodedFrames=720 width=160 height=96 initialBin=0 targetBin=3 initialFrames=\(counts[1]) targetFrames=\(counts[2]) otherFrames=\(counts[0]) minimumBlue=\(minimumBlue) maximumBlue=\(maximumBlue) classifier=exact-bounds-blue-interior-red-exterior boundaryExclusionPixels=1 corruptedInteriorControls=2 maximumInspectedPixelsPerFrame=15360 retainedPixelBuffers=0 exactFrameWithinThreeFrameBin=unavailable output=scalar-only")
         }
+        let bURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-b", withExtension: "mp4"))
+        let bAsset = AVURLAsset(url: bURL)
+        let bTracks = try await bAsset.loadTracks(withMediaType: .video)
+        let bTrack = try XCTUnwrap(bTracks.first)
+        let bReader = try AVAssetReader(asset: bAsset)
+        let bOutput = AVAssetReaderTrackOutput(track: bTrack,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
+        guard bReader.canAdd(bOutput) else { throw SelectionVideoTestFailure.timeout }
+        bReader.add(bOutput)
+        guard bReader.startReading() else { throw bReader.error ?? SelectionVideoTestFailure.timeout }
+        defer { bReader.cancelReading() }
+        for index in 0...216 {
+            try requireBudget()
+            try autoreleasepool {
+                let sample = try XCTUnwrap(bOutput.copyNextSampleBuffer())
+                if [0, 9, 213, 216].contains(index) {
+                    try self.assertFixtureColourOracle(try XCTUnwrap(CMSampleBufferGetImageBuffer(sample)), greenBackground: true)
+                }
+            }
+            try requireBudget()
+        }
+        print("FIXTURE_READBACK fastNV12=\(Self.fixtureNV12FastReads) fallbackCI=\(Self.fixtureCIFallbackReads) oracleCI=\(Self.fixtureCIOracleReads) matricesMissing601709Other=\(Self.fixtureMatrixCounts) elapsedSeconds=\(ProcessInfo.processInfo.systemUptime - calibrationStart) maximumSeconds=45 oracleSamplesA=7 oracleSamplesB=4")
         #else
         XCTFail("First copied-pixel calibration requires DEBUG audit helper")
         #endif
     }
 
     #if DEBUG
+    private func assertFixtureColourOracle(_ pixel: CVPixelBuffer, greenBackground: Bool) throws {
+        let actual = try XCTUnwrap(Self.fixtureBGRA(pixel))
+        let reference = try XCTUnwrap(Self.fixtureBGRA(pixel, forceCoreImage: true))
+        let a = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(bgra: actual))
+        let b = try XCTUnwrap(PausedFirstFrameTrace.pixelColors(bgra: reference))
+        XCTAssertEqual(a.minX, b.minX); XCTAssertEqual(a.maxX, b.maxX)
+        XCTAssertEqual(a.minY, b.minY); XCTAssertEqual(a.maxY, b.maxY)
+        XCTAssertEqual(a.classification, b.classification)
+        XCTAssertEqual(a.blueInterior, b.blueInterior); XCTAssertEqual(a.redExterior, b.redExterior)
+        XCTAssertTrue(a.blueInterior && b.blueInterior)
+        guard b.minX >= 0, b.maxX < 160, b.minY >= 0, b.maxY < 96 else {
+            throw SelectionVideoTestFailure.sample
+        }
+        let centre = ((b.minY + b.maxY) / 2, (b.minX + b.maxX) / 2)
+        let exteriorX = b.minX >= 4 ? b.minX - 4 : b.maxX + 4
+        guard exteriorX >= 0, exteriorX < 160 else { throw SelectionVideoTestFailure.sample }
+        for (row, column) in [centre, (centre.0, exteriorX)] {
+            let offset = (row * 160 + column) * 4
+            for channel in 0..<3 {
+                XCTAssertLessThanOrEqual(abs(Int(actual[offset + channel]) - Int(reference[offset + channel])), 8,
+                    "Independent Core Image and vImage must agree on interior primary colours")
+            }
+            XCTAssertEqual(actual[offset + 3], 255)
+        }
+        let background = (centre.0 * 160 + exteriorX) * 4
+        let primary = greenBackground ? 1 : 2
+        XCTAssertGreaterThan(actual[background + primary], 150)
+        XCTAssertGreaterThan(reference[background + primary], 150)
+    }
+
     private func runInitialClockBindingTransferControl(pausedTarget: Double?,
         beforeInitialStart: Bool = false, traceColdBoundary: Bool = false,
         completedOwnerPendingImage: Bool = false, tracePausedFirstFrame: Bool = false,

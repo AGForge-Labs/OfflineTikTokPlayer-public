@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Verify the complete native case profile and four distinct process witnesses."""
+import argparse
+import json
+from pathlib import Path
+import re
+import runpy
+import uuid
+
+HD = "OfflineTikTokPlayerTests.PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
+ACTIVATED = "OfflineTikTokPlayerTests.PictureRecoveryTests/testFullResolutionProductionPlaybackWithExplicitSessionActivation"
+BENCHMARK = "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn"
+MAIN_HOST_METHODS = frozenset({
+    "testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace",
+    "testMutedNativeTimingPreservesRetainedVideoAndPCM",
+    "testNativeTimingConfigurationCannotUndoPauseOrDeniedInterruptionResume",
+    "testNativeTimingConfigurationRejectsSupersessionAtEveryPrewriteRead",
+    "testPreparedNextVideoFirstFrameCapabilityBeforeSelection",
+})
+PHASE_FILES = {"main29": "native.log", "benchmark": "benchmark.log",
+               "hd-fresh-1": "hd-fresh-1.log", "hd-fresh-2": "hd-fresh-2.log"}
+
+
+def canonical_uuid(value):
+    parsed = uuid.UUID(value)
+    assert parsed.int and str(parsed) == value.lower(), value
+    return str(parsed)
+
+
+def phase_cases(root):
+    verifier = runpy.run_path(str(root / "scripts/verify-native-test-log.py"))
+    profile = json.loads((root / "tests/native-video-format-cases.json").read_text())["cases"]
+    cases = set(profile)
+    assert len(profile) == len(cases) == 31 and cases <= verifier["source_manifest"](root)
+    assert {HD, BENCHMARK} <= cases and ACTIVATED not in cases
+    groups = {"main29": cases - {HD, BENCHMARK}, "benchmark": {BENCHMARK},
+              "hd-fresh-1": {HD}, "hd-fresh-2": {ACTIVATED}}
+    assert [len(group) for group in groups.values()] == [29, 1, 1, 1]
+    assert set.union(*groups.values()) == cases | {ACTIVATED}
+    return verifier, groups
+
+
+def inspect_profile(root, texts, simulator, *, diagnose=False):
+    simulator = canonical_uuid(simulator)
+    verifier, groups = phase_cases(root)
+    assert set(texts) == set(groups)
+    results, hosts = {}, []
+    for name, cases in groups.items():
+        text = texts[name]
+        assert "Restarting after unexpected exit, crash, or test timeout" not in text, (name, "XCTest host restarted")
+        try:
+            verifier["verify_log"](text, cases, invocation="test-without-building")
+            results[name] = {"passed": True, "cases": len(cases)}
+        except verifier["EvidenceError"] as error:
+            results[name] = {"passed": False, "cases": len(cases), "reason": str(error)[:3000]}
+        clean = [re.sub(r"^\d{4}-\d\d-\d\dT\S+Z ", "", line) for line in text.splitlines()]
+        native = [line for line in clean if "NativeRuntimeHost " in line]
+        hd = [line for line in clean if "PRODUCTION_HD_HOST " in line]
+        if name in ("main29", "benchmark"):
+            assert not hd, (name, hd)
+            methods = MAIN_HOST_METHODS if name == "main29" else {BENCHMARK.split("/")[1]}
+            assert len(native) == len(methods), (name, native)
+            witnesses, observed = set(), set()
+            for line in native:
+                assert line.startswith("NativeRuntimeHost ")
+                row = json.loads(line.removeprefix("NativeRuntimeHost "))
+                assert row["schema"] == 1 and row["bundleIdentifier"] == "dev.galaxybigbird.OfflineTikTokPlayer"
+                assert type(row["pid"]) is int and row["pid"] > 0
+                assert canonical_uuid(row["simulatorUDID"]) == simulator
+                method = re.fullmatch(r"-\[PlaybackSelectionVideoRegressionTests (test[A-Za-z0-9_]+)\]", row["testName"])
+                assert method and method[1] in methods and method[1] not in observed
+                observed.add(method[1])
+                witnesses.add((row["pid"], canonical_uuid(row["moduleNonce"])))
+            assert observed == methods and len(witnesses) == 1, (name, observed, witnesses)
+            hosts.append(next(iter(witnesses)))
+        else:
+            assert not native and len(hd) == 1, (name, native, hd)
+            row = re.fullmatch(r"PRODUCTION_HD_HOST schema=1 processID=([1-9][0-9]*) moduleNonce=([0-9a-f-]{36}) explicitActivation=(true|false)", hd[0])
+            assert row and row[3] == ("true" if name == "hd-fresh-2" else "false"), (name, hd)
+            hosts.append((int(row[1]), canonical_uuid(row[2])))
+    assert len({pid for pid, _ in hosts}) == len({nonce for _, nonce in hosts}) == 4, hosts
+    report = {"phases": results, "distinctHosts": 4, "requiredUniqueCases": 31,
+              "executions": 32, "activationModes": [False, True],
+              "allPassed": all(row["passed"] for row in results.values())}
+    if not diagnose:
+        assert report["allPassed"], report
+    return report
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--folder", type=Path, required=True)
+    parser.add_argument("--simulator", required=True)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    texts = {role: (args.folder / file).read_text() for role, file in PHASE_FILES.items()}
+    report = inspect_profile(root, texts, args.simulator)
+    (args.folder / "verified-profile.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report))

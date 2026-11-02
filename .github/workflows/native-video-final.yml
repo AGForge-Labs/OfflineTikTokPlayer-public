@@ -2,7 +2,7 @@ name: Public final video presentation verification
 on:
   push:
     branches: [codex/native-video-final]
-    paths: ['ios/**', 'tests/native-video-format-cases.json', '.github/workflows/native-video-final.yml']
+    paths: ['ios/**', 'scripts/verify-video-profile.py', 'tests/native-video-format-cases.json', '.github/workflows/native-video-final.yml']
 permissions:
   contents: read
 concurrency:
@@ -54,7 +54,7 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
               stream.write('NATIVE_XCTESTRUN=' + str(plans[0].resolve()) + '\n')
           PY
-      - name: Real images rapid reversals and source frame pacing
+      - name: Real images rapid reversals and ownership checks
         id: native
         shell: bash
         run: |
@@ -92,16 +92,28 @@ jobs:
             -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests \
             -only-testing:OfflineTikTokPlayerTests/PictureRecoveryTests \
             -skip-testing:OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackWithExplicitSessionActivation \
+            -skip-testing:OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving \
             -only-testing:OfflineTikTokPlayerTests/VideoPresentationContinuityTests \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testInitialZeroClockBindingExplicitSeekDuringReadyAcceptanceWithFirstCopiedPixelTrace \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testMutedNativeTimingPreservesRetainedVideoAndPCM \
-            -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeTimingConfigurationCannotUndoPauseOrDeniedInterruptionResume \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testNativeTimingConfigurationRejectsSupersessionAtEveryPrewriteRead \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPausedFirstPixelAuditDistinguishesGeneratedInitialAndTargetMarkerBins \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels \
             -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testPreparedNextVideoFirstFrameCapabilityBeforeSelection \
             2>&1 | tee artifacts/native-format/native.log
+      - name: Measure the production startup policy in a fresh process
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild test-without-building -xctestrun "$NATIVE_XCTESTRUN" \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -resultBundlePath artifacts/native-format/Benchmark.xcresult \
+            -parallel-testing-enabled NO -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 \
+            -only-testing:OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testSourceCallbackExecutionTimingOffThenOn \
+            2>&1 | tee artifacts/native-format/benchmark.log
       - name: Observe two fresh full-resolution service starts without recompiling
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
@@ -127,29 +139,11 @@ jobs:
             if [ "${outcome[0]}" -ne 0 ] || [ "${outcome[1]}" -ne 0 ]; then result=1; fi
           done
           exit "$result"
-      - name: Require thirty one exact passing cases
+      - name: Require the complete isolated thirty one case profile
         if: ${{ always() }}
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, re, runpy
-          from pathlib import Path
-          v = runpy.run_path('scripts/verify-native-test-log.py')
-          cases = set(json.loads(Path('tests/native-video-format-cases.json').read_text())['cases'])
-          assert len(cases) == 31 and cases <= v['source_manifest'](Path.cwd())
-          v['verify_log'](Path('artifacts/native-format/native.log').read_text(), cases, invocation='test-without-building')
-          for arm, method in ((1, 'testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving'), (2, 'testFullResolutionProductionPlaybackWithExplicitSessionActivation')):
-              fresh = {'OfflineTikTokPlayerTests.PictureRecoveryTests/' + method}
-              v['verify_log'](Path(f'artifacts/native-format/hd-fresh-{arm}.log').read_text(), fresh, invocation='test-without-building')
-          hosts = []
-          for name in ('native.log', 'hd-fresh-1.log', 'hd-fresh-2.log'):
-              rows = re.findall(r'PRODUCTION_HD_HOST schema=1 processID=(\d+) moduleNonce=([0-9a-f-]{36}) explicitActivation=(true|false)', Path('artifacts/native-format', name).read_text())
-              assert len(rows) == 1, (name, rows)
-              hosts.append(rows[0])
-          assert len({pid for pid, _, _ in hosts}) == 3 and len({nonce for _, nonce, _ in hosts}) == 3
-          assert [mode for _, _, mode in hosts] == ['false', 'false', 'true']
-          print('Exact31 focused cases plus two fresh full-resolution service starts passed; phone cadence acceptance remains separate.')
-          PY
+          python3 scripts/verify-video-profile.py --simulator "$SIMULATOR_UDID" --folder artifacts/native-format
       - name: Preserve synthetic video evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
