@@ -47,7 +47,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 30c1a5d36da393743cd3155ac991a2221eb7a7bc
+          ref: 3b3758e383cda3d015e56e8035433de7a796c5ea
           fetch-depth: 2
           path: candidate
           persist-credentials: false

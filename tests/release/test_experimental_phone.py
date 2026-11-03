@@ -34,7 +34,8 @@ class ExperimentalPhoneTests(unittest.TestCase):
         checks = ((41388275137, "fe55925544585b85bb59b361eee450cc8cf60838",
             ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
             (41438316239, "f4dbfc8cff17f184d7f6a9c8e251f9b8d5bcaa09",
-            ".github/workflows/native-video-evidence.yml", "codex/native-video-evidence"))
+            ".github/workflows/native-video-evidence.yml", "codex/native-video-evidence"),
+            (41741373827, "3b3758e383cda3d015e56e8035433de7a796c5ea", ".github/workflows/audio-output-evidence.yml", "codex/audio-continuity-evidence"))
         for required in checks:
             proofs = (*phone.NATIVE_PROOFS, required)
             results = {run: dict(id=run, head_sha=source, status="completed", conclusion="success",

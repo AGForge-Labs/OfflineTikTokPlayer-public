@@ -10,16 +10,18 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "c8d942c25b3b350d0fe4b40a45282a8f16e15ec7"
-SOURCE = "30c1a5d36da393743cd3155ac991a2221eb7a7bc"
-APP_TREE = "3a7a7c5563bf51ff8c62e9b9db8dbaae3f8a7b66"
-BASE_APP_TREE = "3a7a7c5563bf51ff8c62e9b9db8dbaae3f8a7b66"
+SOURCE_BASE = "da51788aef457e668580a44840b361d0a9f1d7c6"
+SOURCE = "3b3758e383cda3d015e56e8035433de7a796c5ea"
+APP_TREE = "a8eb0a2051c8cb2aa79c43432e4130ad289301ee"
+BASE_APP_TREE = "a8eb0a2051c8cb2aa79c43432e4130ad289301ee"
 CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
-    '.github/workflows/native-video-final.yml',
+    '.github/workflows/audio-output-evidence.yml',
+    'docs/superpowers/plans/2026-11-03-audio-output-continuity.md',
+    'scripts/revalidate-audio-output.py',
     'scripts/verify-native-test-log.py',
-    'scripts/verify-video-profile.py',
+    'tests/validation-shell/test_audio_revalidation.py',
     'tests/validation-shell/test_native_test_evidence.py',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
@@ -220,6 +222,7 @@ NATIVE_PROOFS = (
     (41328715253, "6489eafb55ee67358e9aaf203368f27de8b5fc6b", ".github/workflows/original-image-proof.yml", "codex/media-image-proof"),
     (41388275137, "fe55925544585b85bb59b361eee450cc8cf60838", ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
     (41438316239, "f4dbfc8cff17f184d7f6a9c8e251f9b8d5bcaa09", ".github/workflows/native-video-evidence.yml", "codex/native-video-evidence"),
+    (41741373827, "3b3758e383cda3d015e56e8035433de7a796c5ea", ".github/workflows/audio-output-evidence.yml", "codex/audio-continuity-evidence"),
 )
 
 
