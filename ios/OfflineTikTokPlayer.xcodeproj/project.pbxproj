@@ -467,6 +467,16 @@
 			"isa" = "PBXBuildFile";
 			"fileRef" = "F970ED557707F60F58F84181";
 		};
+		"E3DB7A69BBAE838D9858CF48" = {
+			"isa" = "PBXFileReference";
+			"lastKnownFileType" = "sourcecode.swift";
+			"path" = "AudioOutputContinuityTests.swift";
+			"sourceTree" = "<group>";
+		};
+		"A710EDFDABFE72299292F56A" = {
+			"isa" = "PBXBuildFile";
+			"fileRef" = "E3DB7A69BBAE838D9858CF48";
+		};
 		"BD04BB254D2E5550C4EAD4E6" = {
 			"isa" = "PBXFileReference";
 			"lastKnownFileType" = "sourcecode.swift";
@@ -888,6 +898,7 @@
 			"children" = (
 				"8F9BEDA9685A913AF80355FA",
 				"F970ED557707F60F58F84181",
+				"E3DB7A69BBAE838D9858CF48",
 				"BD04BB254D2E5550C4EAD4E6",
 				"BC29A5B77D1436E7B0E55E25",
 				"657E5F20B00C53BE564A746D",
@@ -1209,6 +1220,7 @@
 			"files" = (
 				"797FC86A41111AC819E852B8",
 				"66400D17AF58BEFE5B9E324C",
+				"A710EDFDABFE72299292F56A",
 				"1246FA662366FC9E833FBED7",
 				"290DEDF05F11AA60B7713D0C",
 				"B413A86E2EEADE9875519E6B",
