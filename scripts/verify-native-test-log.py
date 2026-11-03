@@ -41,6 +41,12 @@ AQ_RETURN_CASE = re.compile(
     r"IsHardwareSupported: no plist loaded, retur"
     r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
 AQ_RETURN_TAIL = re.compile(r"ning false")
+AQ_FALSE_CASE = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215  "
+    r"IsHardwareSupported: no plist loaded, returning fal"
+    r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+AQ_FALSE_TAIL = re.compile(r"se")
 # One observed framework line was split inside the word LoudnessManager by a
 # complete XCTest terminal record. Validate the exact adjacent diagnostic tail;
 # do not relax CASE's word boundary or strip arbitrary process output.
@@ -278,9 +284,9 @@ def verify_log(text, expected, *, invocation="test"):
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
         if pending_return is not None:
-            raw, status, header_line = pending_return
+            raw, status, header_line, tail = pending_return
             pending_return = None
-            if AQ_RETURN_TAIL.fullmatch(clean):
+            if tail.fullmatch(clean):
                 event, reconstructed = (raw, status), True
             else:
                 problems.append(f"Unfinished AQ return interleave at line {header_line}: {raw}")
@@ -330,10 +336,12 @@ def verify_log(text, expected, *, invocation="test"):
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
             returned = AQ_RETURN_CASE.fullmatch(clean)
-            if returned:
-                pending_return = (*returned.groups(), number)
+            false = AQ_FALSE_CASE.fullmatch(clean)
+            if returned or false:
+                match = returned or false
+                pending_return = (*match.groups(), number, AQ_RETURN_TAIL if returned else AQ_FALSE_TAIL)
                 continue
-            if "returTest Case '" in clean:
+            if "returTest Case '" in clean or "falTest Case '" in clean:
                 problems.append(f"Malformed AQ return interleave at line {number}")
                 continue
             # A standalone SDK tail can come from SDK-with-SDK interleaving.
@@ -413,7 +421,7 @@ def verify_log(text, expected, *, invocation="test"):
         else:
             problems.append(f"Unsupported native/UI case status at line {number}: {status} {identity}")
     if pending_return is not None:
-        raw, status, header_line = pending_return
+        raw, status, header_line, _ = pending_return
         problems.append(f"Unfinished AQ return interleave at line {header_line}: {raw}")
 
     if pending is not None:

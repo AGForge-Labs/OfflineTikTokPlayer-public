@@ -93,6 +93,22 @@ class NativeTestEvidenceTests(unittest.TestCase):
             text = "\n".join([case_line(identity, "started"), *record, "** TEST EXECUTE SUCCEEDED **"])
             self.verifier.verify_log(text, {identity}, invocation="test-without-building")
 
+    def test_exact_adjacent_aq_false_split_keeps_all_case_guards(self):
+        identity = "OfflineTikTokPlayerTests.AudioOnlyContinuityTests/testLibraryAudioOnlyPersistsAndRestoresPausedPCMSelection"
+        head = "2026-11-03 23:27:02.452094+0000 OfflineTikTokPlayer[21765:64396] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning fal"
+        def record(status="passed", prefix=""):
+            return [prefix + head + case_line(identity, status), prefix + "se"]
+        for prefix in ("", "2026-11-03T23:27:02.7738390Z "):
+            self.verifier.verify_log("\n".join([case_line(identity, "started"), *record(prefix=prefix), "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+        variants = [record()[:1], [record()[0], "ning false"], [record()[0], "noise", "se"],
+                    [record()[0].replace("1215", "1216"), "se"], record("failed") + [case_line(identity)],
+                    record("skipped") + [case_line(identity)], record() + [case_line(identity)]]
+        for broken in variants:
+            with self.subTest(record=broken), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join([case_line(identity, "started"), *broken, "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+        with self.assertRaises(self.verifier.EvidenceError):
+            self.verifier.verify_log("\n".join([*record(), "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+
     def test_aq_return_sdk_noise_is_not_a_test_result(self):
         identity, _ = self.aq_return_record()
         noise = ["2026-11-03 23:02:28.781356+0000 OfflineTikTokPlayer[17291:56817] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, retur2026-11-03 23:02:28.787512+0000 OfflineTikTokPlayer[17291:56826] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false", "ning false"]

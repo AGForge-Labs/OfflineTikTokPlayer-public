@@ -1,0 +1,31 @@
+name: Revalidate frozen audio and HD native results
+on:
+  push:
+    branches: [codex/audio-continuity-evidence]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: audio-output-evidence
+  cancel-in-progress: false
+jobs:
+  evidence:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.actor_id == '105477711' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify strict revalidation rejection controls
+        run: python3 -B -m unittest discover -s tests/validation-shell -p test_audio_revalidation.py
+      - name: Verify the exact completed Mac run without recompiling
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/revalidate-audio-output.py
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: audio-output-revalidated
+          path: artifacts/audio-output-revalidation/report.json
+          retention-days: 1
