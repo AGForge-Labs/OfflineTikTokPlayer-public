@@ -1,5 +1,5 @@
 name: Audio output continuity regressions
-run-name: Reproduce audio output recovery gaps in 26.1
+run-name: Audio recovery with unchanged transition and video pipelines
 on:
   push:
     branches: [codex/audio-continuity-repair]
@@ -12,17 +12,40 @@ jobs:
   audio:
     if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false && github.actor_id == '105477711' }}
     runs-on: macos-26
-    timeout-minutes: 15
+    timeout-minutes: 17
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Verify the unchanged delivered production baseline
+          fetch-depth: 3
+      - name: Verify the audio-only change and preserved playback pipeline
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = 3a7a7c5563bf51ff8c62e9b9db8dbaae3f8a7b66
+          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = a8eb0a2051c8cb2aa79c43432e4130ad289301ee
           test "$(git rev-parse HEAD:ios/PlayerCore)" = f9b20964220eb867c397e9fa8334c673263d92a5
           python3 -B scripts/generate-ios-project.py --check
+          python3 - <<'PY'
+          import subprocess, json, runpy
+          from pathlib import Path
+          baseline = '30c1a5d36da393743cd3155ac991a2221eb7a7bc'
+          delta = subprocess.check_output(['git','diff','--name-only',baseline,'HEAD','--','ios/OfflineTikTokPlayer'],text=True).splitlines()
+          assert delta == ['ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift','ios/OfflineTikTokPlayer/Playback/PlaybackService.swift']
+          path = 'ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift'
+          accessor = '    var playbackControlRevision: UInt64 { playbackControlTicket }\n'
+          current = Path(path).read_text()
+          assert current.count(accessor) == 1
+          assert current.replace(accessor, '', 1) == subprocess.check_output(['git','show',baseline+':'+path],text=True)
+          profile = json.loads(Path('tests/audio-output-continuity.json').read_text())
+          cases = set(profile['cases'])
+          verifier = runpy.run_path('scripts/verify-native-test-log.py')
+          assert profile['version'] == 1 and len(cases) == len(profile['cases']) == 18
+          assert cases <= verifier['source_manifest'](Path('.'))
+          assert all(case.startswith('OfflineTikTokPlayerTests.') for case in cases)
+          selected = ["-only-testing:" + case.replace('.', '/', 1) for case in sorted(cases)]
+          folder = Path('artifacts/audio-output'); folder.mkdir(parents=True, exist_ok=True)
+          (folder / 'selectors.txt').write_text('\n'.join(selected) + '\n')
+          print('AUDIO_UNCHANGED_PIPELINE core=f9b20964220eb867c397e9fa8334c673263d92a5 renderer=unchanged decoder=unchanged dsp=unchanged video=unchanged')
+          PY
       - name: Begin one exact simulator boot
         run: |
           python3 - <<'PY'
@@ -39,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/audio-output
-          excluded="$(python3 -c 'from pathlib import Path; chosen={"AudioOutputContinuityTests.swift", "AudioOnlyContinuityTests.swift", "ContinuousAudioGraphTests.swift", "ContinuousAudioPlayerTests.swift", "PictureRecoveryTests.swift", "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift", "NativeReaderWaitObservation.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
+          excluded="$(python3 -c 'from pathlib import Path; chosen={"AudioOutputContinuityTests.swift", "PhonePlaybackReliabilityTests.swift", "AudioOnlyContinuityTests.swift", "ContinuousAudioGraphTests.swift", "ContinuousAudioPlayerTests.swift", "PictureRecoveryTests.swift", "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift", "NativeReaderWaitObservation.swift"}; files=list(Path("ios/OfflineTikTokPlayerTests").glob("*.swift")); assert chosen <= {p.name for p in files}; print(" ".join(sorted(p.name for p in files if p.name not in chosen)))')"
           xcodebuild -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -derivedDataPath artifacts/AudioOutputDerived -resultBundlePath artifacts/audio-output/Build.xcresult \
@@ -53,17 +76,31 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as stream:
               stream.write('NATIVE_XCTESTRUN=' + str(plans[0].resolve()) + '\n')
           PY
-      - name: Reproduce the output recovery failures with real native playback
+      - name: Verify audio recovery and existing loop switching and video controls
         run: |
           set -euo pipefail
           xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          selectors=()
+          while IFS= read -r selector; do selectors+=("$selector"); done < artifacts/audio-output/selectors.txt
+          test "${#selectors[@]}" = 18
           xcodebuild test-without-building -xctestrun "$NATIVE_XCTESTRUN" \
             -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -resultBundlePath artifacts/audio-output/Native.xcresult \
             -parallel-testing-enabled NO -test-timeouts-enabled YES \
             -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 60 \
-            -only-testing:OfflineTikTokPlayerTests/AudioOutputContinuityTests \
+            "${selectors[@]}" \
             2>&1 | tee artifacts/audio-output/native.log
+          python3 - <<'PY'
+          import json, runpy
+          from pathlib import Path
+          verifier = runpy.run_path('scripts/verify-native-test-log.py')
+          profile = json.loads(Path('tests/audio-output-continuity.json').read_text())
+          cases = set(profile['cases'])
+          assert profile['version'] == 1 and len(cases) == len(profile['cases']) == 18
+          assert cases <= verifier['source_manifest'](Path('.'))
+          verifier['verify_log'](Path('artifacts/audio-output/native.log').read_text(), cases, invocation='test-without-building')
+          print('AUDIO_OUTPUT_NATIVE_VERIFIED cases=18')
+          PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
