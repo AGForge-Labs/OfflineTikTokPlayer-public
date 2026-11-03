@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "cases": [
+    "OfflineTikTokPlayerTests.AudioOutputContinuityTests/testConfigurationChangeReactivatesSessionBeforeRestartingCurrentOutput",
+    "OfflineTikTokPlayerTests.AudioOutputContinuityTests/testOneEngineStartFailureRecoversWithoutManualPlayOrSelectionChange",
+    "OfflineTikTokPlayerTests.AudioOutputContinuityTests/testMediaServicesResetRetainsPlayingIntentAndCurrentSelection",
+    "OfflineTikTokPlayerTests.AudioOutputContinuityTests/testDelayedConfigurationRecoveryCannotUndoExplicitPauseOrDeniedInterruption",
+    "OfflineTikTokPlayerTests.AudioOutputContinuityTests/testRepeatedLoopsKeepRealSourceNodeOutputAudibleWithSpeakerProcessing",
+    "OfflineTikTokPlayerTests.AudioOutputContinuityTests/testStaleActivationFailureCannotSuspendNewerSameMediaPlay",
+    "OfflineTikTokPlayerTests.AudioOutputContinuityTests/testStaleActivationSuccessCannotOverrideNewerFailedActivation",
+    "OfflineTikTokPlayerTests.AudioOnlyContinuityTests/testLibraryAudioOnlyPersistsAndRestoresPausedPCMSelection",
+    "OfflineTikTokPlayerTests.AudioOnlyContinuityTests/testLibraryAudioOnlyHonorsCameraResumePermissionAndExplicitPause",
+    "OfflineTikTokPlayerTests.ContinuousAudioGraphTests/testActualSourceNodeJoinsPreparedFramesInsideRenderBlocks",
+    "OfflineTikTokPlayerTests.ContinuousAudioPlayerTests/testReentrantPlaybackControlPreservesNewerPauseResumeAndGraphOwner",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testMutedNativeTimingPreservesRetainedVideoAndPCM",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeTimingConfigurationCannotUndoPauseOrDeniedInterruptionResume",
+    "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testPreparedABAChangesActualAssetAudioTokenAndCompositePixels",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit",
+    "OfflineTikTokPlayerTests.PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving",
+    "OfflineTikTokPlayerTests.FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether",
+    "OfflineTikTokPlayerTests.PhonePlaybackReliabilityTests/testNativePlayableSavedVideoSurvivesPCMPreparationRejection"
+  ]
+}

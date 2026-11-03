@@ -14,6 +14,7 @@
 
 - Base implementation on delivered public source30c1a5d36da393743cd3155ac991a2221eb7a7bc in the existing public linked checkout; preserve pre-existing private-workspace changes.
 - Keep original media, queue/shuffle/history, source/visit ownership and the existing audio quality processing.
+- Latest user steering: minimize Codex usage; fix audio only. Preserve current gaps/buffering and video playback; defer all gap optimization. Do not change the renderer, decoder, DSP, video clock, paging or PiP presentation implementation.
 - No periodic restarts of healthy playback; no waveform-based restart on legitimate quiet passages.
 - A running flag alone cannot establish that the output is healthy. Conversely, advancing PCM does not establish audible physical output.
 - Configuration recovery currently omits session activation; an engine-start failure clears session permission, and the watchdog then refuses recovery. The media-reset handler explicitly clears user intent. Prove these branches before fixing them.
@@ -24,13 +25,13 @@
 
 Files: `ios/OfflineTikTokPlayerTests/AudioOutputContinuityTests.swift`, `ios/OfflineTikTokPlayer/Playback/PlaybackService.swift`; if needed, the existing continuous-audio player/graph.
 
-- [ ] Add native behavior tests requiring session reactivation before a stopped configured output restarts, automatic recovery after one engine-start failure, and preserved intent after media reset.
-- [ ] Add controls for explicit Pause, denied interruption resumption, current-source ownership and sustained real source-node output across many loops.
-- [ ] Run the failing tests against unchanged26.1 production source on one standard public Mac job. Validate actual named assertion failures; reject compile/fixture failures as reproduction.
-- [ ] Implement one coalesced, throttled recovery path. Reactivate the session before starting the current output, retain demand after transient failure, and recheck ownership/intent after SDK calls.
-- [ ] Recover stale output progress with the same renderer/selection; keep decoder starvation separate from a dead output and preserve genuine paused/ended states.
-- [ ] Run the new controls plus relevant existing interruption/PiP/presentation/graph tests and the full portable core suite on one standard public Mac job. Verify native results strictly and retain any failures.
-- [ ] Independently review the code and validation.
+- [x] Add native behavior tests requiring session reactivation before a stopped configured output restarts, automatic recovery after one engine-start failure, and preserved intent after media reset.
+- [x] Add controls for explicit Pause, denied interruption resumption, current-source ownership and sustained real source-node output across many loops.
+- [x] Run the failing tests against unchanged26.1 production source on one standard public Mac job. Validate actual named assertion failures; reject compile/fixture failures as reproduction.
+- [x] Implement one coalesced, throttled recovery path. Reactivate the session before starting the current output, retain demand after transient failure, and recheck ownership/intent after SDK calls.
+- [x] Keep the existing stopped-output watchdog; route its restart through guarded session recovery. Defer speculative running-graph rebuilding because advancing physical silence is not established by frozen PCM alone.
+- [ ] Run 18 focused native controls, including existing next/previous/repeat, exact output samples, HD picture cadence and rapid reversals. Reuse the previously verified, byte-identical Coref9 proof; rerun its suite only if Core changes. Verify results strictly and retain any failures.
+- [x] Independently review the code and validation.
 
 ## Task 2: Deliver the verified candidate
 
@@ -38,3 +39,12 @@ Files: `ios/OfflineTikTokPlayerTests/AudioOutputContinuityTests.swift`, `ios/Off
 - [ ] Check Apple's actual latest build and make one protected owner-only upload through the existing public workflow.
 - [ ] Require actual VALID/INTERNAL_ONLY/onlyApprovedOwner/assigned receipt before saying ready.
 - [ ] Record simulator/native and phone evidence separately. Keyboard, other-app, tucked PiP and long-loop acceptance require the phone; use the requested diagnostics to resolve any continuing silence.
+
+## Validation ledger
+
+- Baseline sourcef398e47f88c3deb215449e56878d4b76ba455931, native run41725470545/job126228976888: production App3a7a7c5/Coref9b2096 unchanged from26.1. Compilation succeeded. The three expected tests failed on session activation ordering, automatic retry after engine-start failure, and lost playback intent after media reset. The failures occurred after each test established actual PCM playback, with no initial fixture/compilation failure.
+- Explicit Pause/resume-denial controls passed. Real AVAudioSourceNode output across1000 loops/100 seconds of offline-rendered media passed: minimum RMS0.101525833 and zero underruns. This does not prove audible phone output or reproduce typing/other-app arbitration.
+- The scoped patch changes session/retry policy in PlaybackService and adds one read-only control-revision accessor in ContinuousAudioPlayer. Its renderer, decoder, DSP, frame scheduling, paging and PiP presentation code remain byte-identical. No running-graph rebuild heuristic or gap optimization is included.
+- Local project-generation, workflow Bash/YAML/inline Python, all18 source identities, and valid/five invalid native-log controls pass. The existing strict case-verifier implementation is unchanged; its native-only API avoids adding unrelated UI tests.
+
+- Confirmation41729702391 compiled successfully. All seven new audio controls passed, including1000-loop output with zero underruns. Existing audio-only, sample-join, rapid-reversal, native-fallback and HD/next/previous/repeat controls passed. The overall run remains failed: two compositor tests had no simulator screenshot bridge and timed out. The workflow correction starts the existing bounded capture helper immediately before native execution on the same exact simulator, with readiness and exit cleanup. No app, test assertions or verifier thresholds changed. A new first-attempt run is required.
