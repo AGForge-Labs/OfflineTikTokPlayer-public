@@ -120,6 +120,7 @@ final class ContinuousAudioPlayer {
         decoder.shutdown(); graph.engine.stop()
     }
     var isSelected: Bool { selectedID != nil }
+    var playbackControlRevision: UInt64 { playbackControlTicket }
 
     #if DEBUG
     func debugAcceptedPCMOriginSnapshot(_ completion: @escaping @Sendable (DebugAcceptedPCMOriginSnapshot?) -> Void) {

@@ -581,6 +581,16 @@ final class PlaybackService: NSObject {
         let since: Double
     }
     @ObservationIgnored private var audioProgress: AudioProgress?
+    @ObservationIgnored private var audioCommand = UUID()
+    @ObservationIgnored private var audioRecoveryNeeded = false
+    @ObservationIgnored private var audioRecoveryAfter = 0.0
+    @ObservationIgnored private var audioRecoveryAttempt = 0
+    private static let audioRecoveryMessage = "Waiting for audio to become available…"
+    private struct AudioRecoveryOwner: Equatable {
+        let command: UUID, request: Int, mediaID: String?
+        let graph: ObjectIdentifier
+        let control: UInt64
+    }
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var itemObservation: NSKeyValueObservation?
     @ObservationIgnored private let frameMonitor = PlaybackFrameMonitor()
@@ -723,6 +733,7 @@ final class PlaybackService: NSObject {
     }
 
     func restore() {
+        beginAudioCommand()
         guard queue.currentID == nil, let data = try? Data(contentsOf: bookmarkURL),
               let bookmark = try? PlaybackBookmark.restore(data, availableIDs: Set(library.catalog.queue(playlistIDs: [], localIDs: downloads.readyIDs))) else { return }
         queue = bookmark.queue; intent.pause()
@@ -730,7 +741,9 @@ final class PlaybackService: NSObject {
     }
 
     func start(playlistIDs: [String], at mediaID: String? = nil, shuffle: Bool = false, offlineOnly: Bool = false) {
+        let command = beginAudioCommand()
         recordPlaybackEvent("start")
+        guard audioCommand == command else { return }
         let ids = library.catalog.queue(playlistIDs: playlistIDs, localIDs: downloads.readyIDs,
             offlineOnly: offlineOnly || !downloads.network.isConnected)
         guard !ids.isEmpty else { message = "No playable videos here yet. Download this playlist or import local videos."; return }
@@ -738,15 +751,21 @@ final class PlaybackService: NSObject {
         queue = PlaybackQueue(ids: ids, startAt: mediaID, shuffle: shuffle)
         queue.repeatMode = repeatMode
         intent.requestPlay(); remoteRetries.removeAll(); nativeAudioFallbackIDs.formIntersection(Set(ids)); message = nil
-        activateAudio(); loadCurrent()
+        activateAudio()
+        guard audioCommand == command else { return }
+        loadCurrent()
     }
 
     func toggle() { wantsToPlay ? pause() : play() }
     func play() {
         guard current != nil else { return }
+        let command = beginAudioCommand()
         intent.requestPlay(); activateAudio()
+        guard audioCommand == command else { return }
         recordDiagnostic(.playRequested)
+        guard audioCommand == command else { return }
         resumeContinuousAudio()
+        guard audioCommand == command else { return }
         if intent.canPlay, resumeAfterPreparedEnd() { return }
         if player.currentItem == nil || (!continuousAudio.isSelected && !usesNativeAudio) { loadCurrent(position: clock.position) }
         else {
@@ -761,6 +780,7 @@ final class PlaybackService: NSObject {
         persist(); updateNowPlaying()
     }
     func pause() {
+        beginAudioCommand()
         imageProgressOwner = nil; imageProgress = VideoImageProgress(); lastImageProgressCheck = 0
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
@@ -817,20 +837,24 @@ final class PlaybackService: NSObject {
     #endif
 
     func next(explicit: Bool = true, autoplay: Bool = true) {
+        let command = beginAudioCommand()
         let previousVisit = audioVisit
         sampleContinuousAudio(handleEnd: false)
+        guard audioCommand == command else { return }
         if !explicit, audioVisit != previousVisit { return }
         recordPlaybackEvent("next")
         recordDiagnostic(.nextRequested)
         buffer.synchronize()
+        guard audioCommand == command else { return }
         endedDuringScroll = false
         let previous = queue.currentID
         guard let next = queue.next(explicit: explicit) else { pause(); return }
         if explicit && autoplay { intent.requestPlay(); activateAudio() }
+        guard audioCommand == command else { return }
         if next == previous, player.currentItem != nil {
             let request = generation
-            let prepared = buffer.advance(to: next, ifEligible: { self.generation == request && self.queue.currentID == next })
-            guard generation == request, queue.currentID == next else { return }
+            let prepared = buffer.advance(to: next, ifEligible: { self.audioCommand == command && self.generation == request && self.queue.currentID == next })
+            guard audioCommand == command, generation == request, queue.currentID == next else { return }
             if let prepared { loadCurrent(adopting: prepared) }
             else { seek(0) }
             return
@@ -839,13 +863,17 @@ final class PlaybackService: NSObject {
     }
 
     func previous(autoplay: Bool = true) {
+        let command = beginAudioCommand()
         sampleContinuousAudio(handleEnd: false)
+        guard audioCommand == command else { return }
         recordPlaybackEvent("previous")
         recordDiagnostic(.previousRequested)
         buffer.synchronize()
+        guard audioCommand == command else { return }
         endedDuringScroll = false
         guard queue.previous() != nil else { seek(0); return }
         if autoplay { intent.requestPlay(); activateAudio() }
+        guard audioCommand == command else { return }
         loadCurrent(preferRetainedPreviousStart: true)
     }
 
@@ -859,6 +887,7 @@ final class PlaybackService: NSObject {
     func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
+        beginAudioCommand()
         imageProgressOwner = nil
         imageProgress = VideoImageProgress()
         continuousPiP.beginReadinessUpdates()
@@ -1980,14 +2009,78 @@ final class PlaybackService: NSObject {
     private func resumeContinuousAudio() {
         guard intent.canPlay, audioLoadingID == nil, continuousAudio.isSelected,
               continuousAudio.selectedID == queue.currentID else { return }
+        let owner = audioRecoveryOwner
         do { try continuousAudio.setPlaying(true) }
         catch {
+            guard ownsAudioRecovery(owner, includingControl: false) else { return }
             transferInitialClockBinding(retainActivation: true)
             intent.activationCompleted(succeeded: false)
             continuousAudio.suspend(); player.pause()
-            message = "Audio could not restart. Tap Play to try again."
+            guard ownsAudioRecovery(owner, includingControl: false) else { return }
+            requestAudioOutputRecovery()
+            message = Self.audioRecoveryMessage
             recordPlaybackEvent("engineStartFailed")
         }
+    }
+
+    private var audioRecoveryOwner: AudioRecoveryOwner {
+        AudioRecoveryOwner(command: audioCommand, request: generation, mediaID: queue.currentID,
+            graph: ObjectIdentifier(continuousAudio.graph), control: continuousAudio.playbackControlRevision)
+    }
+
+    private func ownsAudioRecovery(_ owner: AudioRecoveryOwner, includingControl: Bool = true) -> Bool {
+        owner.command == audioCommand && owner.request == generation && owner.mediaID == queue.currentID
+            && owner.graph == ObjectIdentifier(continuousAudio.graph)
+            && (!includingControl || owner.control == continuousAudio.playbackControlRevision)
+    }
+
+    @discardableResult private func beginAudioCommand() -> UUID {
+        audioCommand = UUID()
+        audioRecoveryNeeded = false; audioRecoveryAfter = 0; audioRecoveryAttempt = 0
+        audioProgress = nil
+        if message == Self.audioRecoveryMessage { message = nil }
+        return audioCommand
+    }
+
+    private func requestAudioOutputRecovery() {
+        guard intent.wantsToPlay, !intent.isInterrupted else { return }
+        // Repeated notifications coalesce without defeating the retry deadline.
+        audioRecoveryNeeded = true
+    }
+
+    /// Event/failure driven only. Healthy playback does not reactivate or rebuild.
+    /// The prepared PCM sources, renderer cursor and video transition path survive.
+    private func retryAudioOutputIfNeeded() -> Bool {
+        guard intent.wantsToPlay, !intent.isInterrupted else {
+            audioRecoveryNeeded = false; return false
+        }
+        guard audioRecoveryNeeded || !intent.canPlay, audioLoadingID == nil,
+              current != nil, usesNativeAudio || (continuousAudio.isSelected && continuousAudio.selectedID == queue.currentID) else { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now >= audioRecoveryAfter else { return false }
+        let owner = audioRecoveryOwner
+        audioRecoveryNeeded = false
+        audioRecoveryAfter = now + Double(1 << min(3, audioRecoveryAttempt))
+        audioRecoveryAttempt = min(3, audioRecoveryAttempt + 1)
+        guard activateAudio() else {
+            if ownsAudioRecovery(owner, includingControl: false), intent.wantsToPlay, !intent.isInterrupted {
+                audioRecoveryNeeded = true
+            }
+            return true
+        }
+        guard ownsAudioRecovery(owner), intent.canPlay else { return true }
+        if usesNativeAudio { restoreNativePresentation() }
+        else {
+            resumeContinuousAudio()
+            guard ownsAudioRecovery(owner, includingControl: false), intent.canPlay else { return true }
+            if videoAllowed { player.play() }
+        }
+        guard ownsAudioRecovery(owner, includingControl: false) else { return true }
+        if message == Self.audioRecoveryMessage { message = nil }
+        audioProgress = nil
+        recordDiagnostic(.rendererStarted)
+        recordPlaybackEvent("audioOutputRecovery")
+        return true
     }
 
     // The renderer may already be on the successor while the service still
@@ -2041,39 +2134,51 @@ final class PlaybackService: NSObject {
 
     /// Observe progress without an SDK getter on healthy render ticks. A full
     /// second of stopped PCM lets interruption/configuration notifications settle.
-    private func recoverUnexpectedAudioStop(_ sample: ContinuousPCMRenderer.Snapshot) {
+    private func recoverUnexpectedAudioStop(_ sample: ContinuousPCMRenderer.Snapshot) -> Bool {
         guard intent.canPlay, !usesNativeAudio, audioLoadingID == nil,
               continuousAudio.isSelected, continuousAudio.selectedID == queue.currentID,
               !sample.ended || continuousAudio.isSelectionPending(in: sample) else {
-            audioProgress = nil; return
+            audioProgress = nil; return false
         }
         let now = ProcessInfo.processInfo.systemUptime
         let current = AudioProgress(request: generation, token: sample.token,
             selectionVersion: sample.selectionVersion, visit: sample.visit, frame: sample.frame, since: now)
-        guard let previous = audioProgress,
-              previous.request == current.request, previous.token == current.token,
-              previous.selectionVersion == current.selectionVersion,
-              previous.visit == current.visit, previous.frame == current.frame else {
-            audioProgress = current; return
+        guard let previous = audioProgress else { audioProgress = current; return false }
+        let sameOwner = previous.request == current.request && previous.token == current.token
+            && previous.selectionVersion == current.selectionVersion
+        if !sameOwner || previous.visit != current.visit || previous.frame != current.frame {
+            audioProgress = current
+            let advanced = sameOwner && (current.visit > previous.visit
+                || (current.visit == previous.visit && current.frame > previous.frame))
+            if advanced, audioRecoveryAttempt > 0, !audioRecoveryNeeded {
+                audioRecoveryAttempt = 0
+                audioRecoveryAfter = min(audioRecoveryAfter, now + 1)
+            }
+            return false
         }
-        guard now - previous.since >= 1 else { return }
+        guard now - previous.since >= 1 else { return false }
         audioProgress = current
         // Resume the same renderer/source; no queue movement, seek or re-selection.
         // setPlaying rechecks intent and refreshes a stopped engine's clock interval.
-        if !continuousAudio.graph.engine.isRunning {
-            resumeContinuousAudio()
-            recordPlaybackEvent("audioEngineRecovery")
+        let owner = audioRecoveryOwner
+        let running = continuousAudio.graph.engine.isRunning
+        guard ownsAudioRecovery(owner) else { return true }
+        if !running {
+            requestAudioOutputRecovery()
+            return retryAudioOutputIfNeeded()
         }
+        return false
     }
 
     private func sampleContinuousAudio(handleEnd: Bool = true) {
         defer { completePiPNavigationIfReady() }
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
+        if retryAudioOutputIfNeeded() { return }
         continuousAudio.settlePausedState()
         guard !usesNativeAudio, audioLoadingID == nil else { return }
         let sample = continuousAudio.snapshot
-        recoverUnexpectedAudioStop(sample)
+        if recoverUnexpectedAudioStop(sample) { return }
         // A natural boundary can publish an older visit after a selection is
         // requested. It must not replace the requested source/queue before that
         // exact command has been consumed by the audio thread.
@@ -2814,24 +2919,50 @@ final class PlaybackService: NSObject {
         catch { message = "Could not save your playback position." }
     }
 
+    private func recoverAfterAudioMediaServicesReset() {
+        beginAudioCommand()
+        let command = audioCommand, request = generation, mediaID = queue.currentID
+        let position = clock.position, oldGraph = continuousAudio.graph
+        func ownsRequest() -> Bool { audioCommand == command && generation == request && queue.currentID == mediaID }
+        intent.activationCompleted(succeeded: false)
+        continuousAudio.suspend(); player.pause()
+        guard ownsRequest() else { return }
+        continuousAudio.rebuildAfterMediaServicesReset()
+        guard ownsRequest(), continuousAudio.graph !== oldGraph else { return }
+        buffer.discardPrevious(); configureAudio()
+        guard ownsRequest() else { return }
+        requestAudioOutputRecovery()
+        loadCurrent(position: position)
+    }
+
     private func configureAudio() {
         do { try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers]) }
         catch { message = "Background audio could not be configured." }
     }
-    private func activateAudio() {
-        guard !intent.isInterrupted else { return }
+    @discardableResult private func activateAudio() -> Bool {
+        guard !intent.isInterrupted else { return false }
+        let owner = audioRecoveryOwner
         recordPlaybackEvent("activationRequested")
+        guard ownsAudioRecovery(owner) else { return false }
         do {
             try activateSession()
+            guard ownsAudioRecovery(owner) else { return false }
             intent.activationCompleted(succeeded: true); refreshAudioProcessing()
             recordDiagnostic(.audioSessionActivated)
             recordPlaybackEvent("activationCompleted")
+            return ownsAudioRecovery(owner) && intent.canPlay
         } catch {
+            guard ownsAudioRecovery(owner) else { return false }
             transferInitialClockBinding(retainActivation: true)
-            intent.activationCompleted(succeeded: false); continuousAudio.suspend(); player.pause(); cancelStallRecovery()
+            guard ownsAudioRecovery(owner) else { return false }
+            intent.activationCompleted(succeeded: false); continuousAudio.suspend(); player.pause()
+            guard ownsAudioRecovery(owner, includingControl: false) else { return false }
+            cancelStallRecovery()
+            requestAudioOutputRecovery()
             recordDiagnostic(.audioSessionActivationFailed, error: PlaybackDiagnosticError(family: .audioSession, code: (error as NSError).code))
-            message = "Audio is in use. Tap Play after the camera or call finishes."
+            message = Self.audioRecoveryMessage
             recordPlaybackEvent("activationFailed")
+            return false
         }
     }
 
@@ -2851,6 +2982,7 @@ final class PlaybackService: NSObject {
     }
 
     func handleInterruption(began: Bool, shouldResume: Bool = false) {
+        let command = beginAudioCommand()
         recordPlaybackEvent(began ? "interruptionBegan" : (shouldResume ? "interruptionEndedResumeAllowed" : "interruptionEndedNoResume"))
         if began {
             imageProgressOwner = nil; imageProgress = VideoImageProgress(); lastImageProgressCheck = 0
@@ -2860,7 +2992,9 @@ final class PlaybackService: NSObject {
             player.pause(); persist()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
             activateAudio()
+            guard audioCommand == command else { return }
             resumeContinuousAudio()
+            guard audioCommand == command else { return }
             if intent.canPlay, !resumeAfterPreparedEnd() {
                 if usesNativeAudio { restoreNativePresentation() }
                 else if videoAllowed { player.play() }
@@ -3078,7 +3212,7 @@ final class PlaybackService: NSObject {
             MainActor.assumeIsolated {
                 guard let self, note.object as? AVAudioEngine === self.continuousAudio.graph.engine else { return }
                 self.recordDiagnostic(.rendererStopped)
-                self.resumeContinuousAudio()
+                self.requestAudioOutputRecovery()
             }
         })
         notifications.append(center.addObserver(forName: .AVPlayerItemPlaybackStalled, object: nil, queue: .main) { [weak self] note in
@@ -3123,14 +3257,14 @@ final class PlaybackService: NSObject {
                 self?.recordDiagnostic(.audioRouteChanged, routeReason: note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? Int)
                 self?.refreshAudioProcessing()
                 if note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue { self?.pause() }
+                else { self?.requestAudioOutputRecovery() }
             }
         })
         notifications.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.recordDiagnostic(.audioMediaServicesReset)
-                self.pause(); self.continuousAudio.rebuildAfterMediaServicesReset(); self.buffer.discardPrevious(); self.configureAudio()
-                self.loadCurrent(position: self.clock.position)
+                self.recoverAfterAudioMediaServicesReset()
             }
         })
         notifications.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in

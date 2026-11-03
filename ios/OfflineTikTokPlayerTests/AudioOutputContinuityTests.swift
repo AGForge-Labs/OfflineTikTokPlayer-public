@@ -97,6 +97,54 @@ final class AudioOutputContinuityTests: XCTestCase {
         }
     }
 
+    func testStaleActivationFailureCannotSuspendNewerSameMediaPlay() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        weak var owned: PlaybackService?
+        var inject = false
+        let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads,
+            cloud: fixture.cloud, bookmarkURL: fixture.bookmark, activateSession: {
+                try AVAudioSession.sharedInstance().setActive(true)
+                if inject {
+                    inject = false
+                    owned?.pause(); owned?.play()
+                    throw SyntheticFailure.engineStart
+                }
+            }, continuousAudio: audio))
+        owned = service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until { service.audioSnapshot.frame > 4_800 }
+        let before = service.audioSnapshot
+        inject = true; service.play()
+        XCTAssertTrue(service.wantsToPlay, "An old failure must not revoke the newer successful Play")
+        let after = service.audioSnapshot
+        try await until { service.audioSnapshot.frame > after.frame + 4_800 }
+        assertSameSelection(service, before, id: fixture.aID)
+        service.pause()
+    }
+
+    func testStaleActivationSuccessCannotOverrideNewerFailedActivation() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let audio = ContinuousAudioPlayer()
+        weak var owned: PlaybackService?
+        var stage = 0
+        let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads,
+            cloud: fixture.cloud, bookmarkURL: fixture.bookmark, activateSession: {
+                if stage == 2 { throw SyntheticFailure.engineStart }
+                try AVAudioSession.sharedInstance().setActive(true)
+                if stage == 1 { stage = 2; owned?.play() }
+            }, continuousAudio: audio))
+        owned = service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until { service.audioSnapshot.frame > 4_800 }
+        stage = 1; service.play()
+        XCTAssertFalse(service.wantsToPlay, "The old success must not overwrite the newer session denial")
+        XCTAssertEqual(service.queue.currentID, fixture.aID)
+        service.pause()
+    }
+
     func testRepeatedLoopsKeepRealSourceNodeOutputAudibleWithSpeakerProcessing() throws {
         let renderer = ContinuousPCMRenderer(sampleRate: 48_000, channels: 2, prefixFrames: 4_800, ringFrames: 512)
         var input = [Float](); input.reserveCapacity(9_600)
