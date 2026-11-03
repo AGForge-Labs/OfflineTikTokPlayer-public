@@ -33,6 +33,14 @@ SPLIT_CASE = re.compile(
     r"Test Case '([^']+)'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[\] <<<< VRP >>>> signalled err=-?\d+ at <>:\d+")
 RESULT_SUFFIX = re.compile(r" (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+# One complete XCTest result bisected this exact AQ message at retur/ning.
+# Require its adjacent diagnostic tail and the existing unique-start/result guards.
+AQ_RETURN_CASE = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215  "
+    r"IsHardwareSupported: no plist loaded, retur"
+    r"Test Case '([^']+)' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+AQ_RETURN_TAIL = re.compile(r"ning false")
 # One observed framework line was split inside the word LoudnessManager by a
 # complete XCTest terminal record. Validate the exact adjacent diagnostic tail;
 # do not relax CASE's word boundary or strip arbitrary process output.
@@ -255,6 +263,7 @@ def verify_log(text, expected, *, invocation="test"):
     observed, problems, successes, last_case = set(), [], [], 0
     pending = None
     pending_word = None
+    pending_return = None
     pending_process = None
     pending_identity = None
     pending_started = None
@@ -268,6 +277,13 @@ def verify_log(text, expected, *, invocation="test"):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
         event, reconstructed = None, False
+        if pending_return is not None:
+            raw, status, header_line = pending_return
+            pending_return = None
+            if AQ_RETURN_TAIL.fullmatch(clean):
+                event, reconstructed = (raw, status), True
+            else:
+                problems.append(f"Unfinished AQ return interleave at line {header_line}: {raw}")
         if pending_thread is not None:
             raw, status, header_line = pending_thread
             pending_thread = None
@@ -313,6 +329,15 @@ def verify_log(text, expected, *, invocation="test"):
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
+            returned = AQ_RETURN_CASE.fullmatch(clean)
+            if returned:
+                pending_return = (*returned.groups(), number)
+                continue
+            if "returTest Case '" in clean:
+                problems.append(f"Malformed AQ return interleave at line {number}")
+                continue
+            # A standalone SDK tail can come from SDK-with-SDK interleaving.
+            # Only an exact pending XCTest head can credit a test result.
             thread = FIG_THREAD_CASE.fullmatch(clean)
             if thread:
                 pending_thread = (*thread.groups(), number)
@@ -387,6 +412,10 @@ def verify_log(text, expected, *, invocation="test"):
             outcomes[identity][status] += 1
         else:
             problems.append(f"Unsupported native/UI case status at line {number}: {status} {identity}")
+    if pending_return is not None:
+        raw, status, header_line = pending_return
+        problems.append(f"Unfinished AQ return interleave at line {header_line}: {raw}")
+
     if pending is not None:
         raw, header_line = pending
         problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")

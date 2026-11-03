@@ -80,6 +80,54 @@ class NativeTestEvidenceTests(unittest.TestCase):
         cls.verifier = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.verifier)
 
+    def aq_return_record(self, status="passed", timestamp=False):
+        identity = "OfflineTikTokPlayerTests.PlaybackSelectionVideoRegressionTests/testNativeTimingConfigurationCannotUndoPauseOrDeniedInterruptionResume"
+        prefix = "2026-11-03T23:02:29.4619220Z " if timestamp else ""
+        head = "2026-11-03 23:02:29.355913+0000 OfflineTikTokPlayer[17291:56817] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, retur"
+        return identity, [prefix + head + case_line(identity, status), prefix + "ning false"]
+
+    def test_accepts_exact_adjacent_aq_return_interleave(self):
+        for timestamp in (False, True):
+            identity, record = self.aq_return_record(timestamp=timestamp)
+            self.assertIn(identity, self.expected)
+            text = "\n".join([case_line(identity, "started"), *record, "** TEST EXECUTE SUCCEEDED **"])
+            self.verifier.verify_log(text, {identity}, invocation="test-without-building")
+
+    def test_aq_return_sdk_noise_is_not_a_test_result(self):
+        identity, _ = self.aq_return_record()
+        noise = ["2026-11-03 23:02:28.781356+0000 OfflineTikTokPlayer[17291:56817] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, retur2026-11-03 23:02:28.787512+0000 OfflineTikTokPlayer[17291:56826] [AQ]        LoudnessManager.mm:1215  IsHardwareSupported: no plist loaded, returning false", "ning false"]
+        self.verifier.verify_log("\n".join([case_line(identity, "started"), case_line(identity), *noise, "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+        for status in (None, "failed", "skipped"):
+            result = [] if status is None else [case_line(identity, status)]
+            with self.subTest(status=status), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join([case_line(identity, "started"), *result, *noise, "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+
+    def test_aq_return_interleave_requires_exact_adjacent_diagnostic(self):
+        identity, record = self.aq_return_record()
+        variants = [record[:1], [record[0], "ning true"], [record[0], "extra diagnostic", record[1]],
+                    [record[0].replace("1215", "1216"), record[1]], [record[1]],
+                    [record[0] + "extra", record[1]]]
+        for broken in variants:
+            with self.subTest(record=broken), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join([case_line(identity, "started"), *broken, "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+
+    def test_aq_return_interleave_preserves_failed_skipped_and_duplicate_rejection(self):
+        for status in ("failed", "skipped"):
+            identity, record = self.aq_return_record(status)
+            with self.subTest(status=status), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join([case_line(identity, "started"), *record, case_line(identity), "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+        identity, record = self.aq_return_record()
+        for before in ([], [case_line(identity, "started"), case_line(identity, "started")], [case_line(identity, "started"), case_line(identity)]):
+            with self.subTest(before=before), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join([*before, *record, "** TEST EXECUTE SUCCEEDED **"]), {identity}, invocation="test-without-building")
+
+    def test_aq_return_interleave_preserves_identity_completeness_and_success_guards(self):
+        identity, record = self.aq_return_record()
+        valid = [case_line(identity, "started"), *record]
+        for expected, marker in (({identity, "OfflineTikTokPlayerTests.Missing/testMissing"}, "** TEST EXECUTE SUCCEEDED **"), ({identity}, "** TEST SUCCEEDED **"), ({identity}, "** TEST EXECUTE FAILED **")):
+            with self.subTest(marker=marker, expected=expected), self.assertRaises(self.verifier.EvidenceError):
+                self.verifier.verify_log("\n".join([*valid, marker]), expected, invocation="test-without-building")
+
     def test_accepts_exact_adjacent_fig_thread_interleave(self):
         identity = "OfflineTikTokPlayerTests.PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit"
         self.assertIn(identity, self.expected)
