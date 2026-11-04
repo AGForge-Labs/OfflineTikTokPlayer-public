@@ -23,18 +23,83 @@ final class PlaybackClock {
 
 @MainActor @Observable
 final class PlaybackService: NSObject {
+    enum PlaybackEventDetail: Sendable {
+        // First policy and final event-name reads retain their original SDK
+        // call sites/count. These and publishedStatus are non-atomic snapshots;
+        // the native KVO publication can supply no newValue at all.
+        case timeControl(publishedStatus: Int?, notificationUptime: Double, observedStatus: Int, observedUptime: Double,
+                         finalStatus: Int, finalUptime: Double)
+        case buffer(PlaybackBuffer.DiagnosticEvent)
+        case nativePause(PlaybackBuffer.NativePauseEvent)
+        case nativeItemEnd(NativeItemEndEvent)
+    }
+    struct NativeItemEndEvent: Sendable {
+        let observedItemMatches: Bool
+        // Unknown for stale notifications: the selected-audio policy read is
+        // deliberately not performed until the original identity guard passes.
+        let selectedAudio: Bool?
+        // Handler delivery time, not the native item's underlying EOF instant.
+        let handlerEntryUptime: Double
+        let entryGeneration: Int
+    }
     struct PlaybackEvent {
         let name: String
         let uptime: Double
         let generation: Int
-        let position: Double
-        let retainedItems: Int
+        let clockPosition: Double
+        let detail: PlaybackEventDetail?
+    }
+    struct PlaybackEventPublicationCost {
+        let count: UInt64
+        let totalNanoseconds: UInt64
+        let maximumNanoseconds: UInt64
+        let saturated: Bool
     }
     typealias SeekPlayer = (AVQueuePlayer, CMTime, @escaping (Bool) -> Void) -> Void
     typealias SeekVideo = @MainActor (AVPlayer, CMTime, @escaping @Sendable (Bool) -> Void) -> Void
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
-    @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
+    @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)? {
+        didSet {
+            if onPlaybackEvent == nil {
+                buffer.onDiagnosticEvent = nil
+                #if DEBUG
+                buffer.onNativePauseDiagnostic = nil
+                #endif
+            }
+            else {
+                buffer.onDiagnosticEvent = { [weak self] event in
+                    self?.recordPlaybackEvent("bufferAction", detail: .buffer(event))
+                }
+                #if DEBUG
+                buffer.onNativePauseDiagnostic = { [weak self] event in
+                    self?.recordPlaybackEvent("nativePauseCompleted", detail: .nativePause(event))
+                }
+                #endif
+            }
+        }
+    }
+    @ObservationIgnored private(set) var playbackEventPublicationCost = PlaybackEventPublicationCost(
+        count: 0, totalNanoseconds: 0, maximumNanoseconds: 0, saturated: false)
     @ObservationIgnored private var firstProgressGeneration: Int?
+    @ObservationIgnored private var firstPreservedPresentationGeneration: Int?
+    #if DEBUG
+    // Explicit diagnostic cohort only. No production call enables this flag.
+    @ObservationIgnored var debugNativePlayerTraceEnabled = false {
+        didSet { buffer.debugNativePlayerTraceEnabled = debugNativePlayerTraceEnabled }
+    }
+    @ObservationIgnored private(set) var debugNativePlayerPauseCount: UInt64 = 0
+    // Explicit test control only. Nothing in normal playback calls the helper.
+    enum DebugVideoReanchorResult: Int {
+        case applied = 1, notPaused, generationChanged, currentItemChanged, notReady
+        case pendingAudioSeek, videoSeekInFlight, audioNotPermitted, videoNotAllowed, alreadyVideoReady
+        case notOrdinaryStartup, audioIdentityChanged, alreadyApplied, invalidClock
+    }
+    @ObservationIgnored private weak var debugOrdinaryStartupItem: AVPlayerItem?
+    @ObservationIgnored private var debugOrdinaryStartupGeneration: Int?
+    @ObservationIgnored private var debugStartupChangedSource = false
+    @ObservationIgnored private var debugReanchoredGeneration: Int?
+    @ObservationIgnored private(set) var debugVideoReanchorAppliedCount: UInt64 = 0
+    #endif
     var player: AVQueuePlayer { buffer.player }
     let clock = PlaybackClock()
     private(set) var queue = PlaybackQueue(ids: [])
@@ -73,7 +138,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private let downloads: OfflineDownloads
     @ObservationIgnored private let cloud: OneDriveClient
     @ObservationIgnored private let buffer: PlaybackBuffer
-    @ObservationIgnored private let continuousAudio = ContinuousAudioPlayer()
+    @ObservationIgnored private let continuousAudio: ContinuousAudioPlayer
     @ObservationIgnored private var audioPollTask: Task<Void, Never>?
     @ObservationIgnored private var audioVisit: Int64 = -1
     @ObservationIgnored private var audioToken = 0
@@ -86,6 +151,7 @@ final class PlaybackService: NSObject {
     var pausedFutureVideoFrameRejectionCount: UInt64 { continuousPiP.pausedFutureFrameRejectionCount }
     var videoFrameAcquisitionBlockedCount: UInt64 { continuousPiP.blockedFrameAcquisitionCount }
     var submittedVideoFrameCount: UInt64 { continuousPiP.submittedFrameCount }
+    var customVideoReadyForDisplay: Bool { continuousPiP.isVideoReadyForDisplay }
     var videoRequestedPositionSeconds: Double { continuousPiP.requestedPositionSeconds }
     var videoTimebasePositionSeconds: Double? { continuousPiP.timebasePositionSeconds }
     var preparedAudioCount: Int { continuousAudio.preparedCount }
@@ -126,6 +192,7 @@ final class PlaybackService: NSObject {
          bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
          activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) },
          buffer: PlaybackBuffer? = nil, speakerAudio: SpeakerAudioController? = nil,
+         continuousAudio injectedAudio: ContinuousAudioPlayer? = nil,
          audioRoutes: @escaping () -> [AVAudioSession.Port] = { AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType) },
          seekPlayer: @escaping SeekPlayer = { player, time, completion in
              player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: completion)
@@ -136,6 +203,7 @@ final class PlaybackService: NSObject {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
         self.buffer = buffer ?? PlaybackBuffer()
+        self.continuousAudio = injectedAudio ?? ContinuousAudioPlayer()
         self.speakerAudio = speakerAudio ?? SpeakerAudioController()
         self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
         self.seekVideo = seekVideo
@@ -174,7 +242,7 @@ final class PlaybackService: NSObject {
             if self.continuousAudio.isSelected { return }
             var advanced = self.queue
             guard advanced.next(explicit: false) == prepared.mediaID else {
-                self.player.pause(); self.loadCurrent(position: self.clock.position); return
+                self.pauseNativePlayer(reason: .queueAdvanceMismatch); self.loadCurrent(position: self.clock.position); return
             }
             self.queue = advanced
             self.loadCurrent(adopting: prepared)
@@ -266,7 +334,7 @@ final class PlaybackService: NSObject {
         continuousAudio.suspend()
         continuousPiP.updatePlayback(positionSeconds: clock.position, durationSeconds: clock.duration, isPlaying: false)
         cancelStallRecovery()
-        player.pause(); persist(); updateNowPlaying()
+        pauseNativePlayer(reason: .pauseRequested); persist(); updateNowPlaying()
     }
 
     func next(explicit: Bool = true) {
@@ -308,6 +376,10 @@ final class PlaybackService: NSObject {
     func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
     func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
     func seek(_ seconds: Double) {
+        #if DEBUG
+        // An explicit request cannot inherit this ordinary-startup experiment.
+        debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        #endif
         if continuousAudio.isSelected, let seek = clock.beginSeek(to: seconds),
            let version = continuousAudio.seek(seek.target) {
             pendingAudioSeek = (seek, version)
@@ -354,11 +426,17 @@ final class PlaybackService: NSObject {
             var following = queue
             if following.next(explicit: false) != nil {
                 if intent.canPlay { queue = following; loadCurrent(); return }
-            } else { intent.pause(); player.pause() }
+            } else { intent.pause(); pauseNativePlayer(reason: .scrollQueueExhausted) }
         }
         endedDuringScroll = false
         let resume = MediaResumePosition(mediaID: queue.currentID, seconds: position)
         generation += 1; let request = generation
+        #if DEBUG
+        debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        // Capture before selection. A same-ID repeat/reload is not an ordinary
+        // source handoff even when its prepared native item happens to be zero.
+        debugStartupChangedSource = continuousAudio.selectedID != queue.currentID
+        #endif
         recordPlaybackEvent("loadRequested")
         cancelStallRecovery()
         loadTask?.cancel(); itemObservation = nil; frameMonitor.cancel(); observedItem = nil; readyGeneration = nil
@@ -383,12 +461,13 @@ final class PlaybackService: NSObject {
             currentIsLocal = prepared.isLocal
             resumeContinuousAudio()
             recordPlaybackEvent("preparedAdoption")
-            observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
+            observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind,
+                           naturalHandoff: audioAlreadySelected)
             prepareUpcoming()
             return
         }
         if !selectedAtRequest && !audioAlreadySelected { continuousAudio.clearSelection() }
-        player.pause(); buffer.replace(with: nil)
+        pauseNativePlayer(reason: .coldReplacement); buffer.replace(with: nil)
         loadTask = Task { [weak self] in
             guard let self else { return }
             var visited = Set<String>()
@@ -424,8 +503,19 @@ final class PlaybackService: NSObject {
                     if !audioAlreadySelected && !selectedAtRequest { self.selectContinuousAudio(id: item.id, position: itemPosition) }
                     self.resumeContinuousAudio()
                     self.recordPlaybackEvent("coldAudioPrepared")
+                    // Begin successor PCM preparation as soon as audio plays.
+                    // Video metadata must not postpone a short clip's boundary.
+                    self.prepareUpcoming()
+                    // Keep normalization part of this item's prepared state. It
+                    // must not invalidate an already loading video on selection.
+                    await self.prepareVideoForPlayback(playerItem)
+                    try Task.checkCancellation()
+                    guard self.generation == request else { return }
                     self.buffer.replace(with: playerItem, mediaID: item.id, isLocal: local != nil)
-                    self.observeCurrent(playerItem, position: itemPosition, request: request)
+                    self.observeCurrent(playerItem, position: itemPosition, request: request,
+                                        naturalHandoff: audioAlreadySelected)
+                    // A warm video could not be staged while the buffer was
+                    // empty; reconcile it now without discarding prepared PCM.
                     self.prepareUpcoming()
                     self.persist(); return
                 } catch is CancellationError { return }
@@ -457,7 +547,22 @@ final class PlaybackService: NSObject {
         }
     }
 
-    private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false) {
+    private func prepareVideoForPlayback(_ item: AVPlayerItem) async {
+        guard let asset = item.asset as? AVURLAsset,
+              asset.url.isFileURL else { return }
+        do {
+            if item.videoComposition == nil {
+                let composition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset)
+                try Task.checkCancellation()
+                item.videoComposition = composition
+            }
+            try Task.checkCancellation()
+            ContinuousPictureInPicture.prepareVideoOutput(for: item)
+        } catch { /* The selected-item path retains its existing guarded retry. */ }
+    }
+
+    private func observeCurrent(_ playerItem: AVPlayerItem, position: Double, request: Int, rewind: Bool = false,
+                                naturalHandoff: Bool = false) {
         observedItem = playerItem
         continuousPiP.setCurrentItem(playerItem)
         refreshAudioProcessing()
@@ -481,7 +586,30 @@ final class PlaybackService: NSObject {
                     self.isLoading = false
                     self.recordPlaybackEvent("itemReady")
                     // A new or prebuffered item is already at zero; an exact zero seek discards that benefit.
-                    if position > 0 || rewind {
+                    let startsAtAudibleClock = naturalHandoff || (position == 0 && self.pendingAudioSeek == nil)
+                    if startsAtAudibleClock, !rewind, self.intent.canPlay, self.videoAllowed,
+                       self.continuousAudio.selectedID == self.queue.currentID,
+                       self.syncingVideoGeneration != request {
+                        // Audio already owns the selected timeline. Starting a
+                        // ready zero-position item at zero lets its native clock
+                        // fall behind and adds a catch-up seek before first frame.
+                        // Use the same fresh audio/host anchor as a natural handoff.
+                        let host = CMClockGetTime(CMClockGetHostTimeClock())
+                        let desired = self.continuousAudio.presentationPosition(at: host)
+                        self.continuousPiP.updatePlayback(positionSeconds: desired,
+                            durationSeconds: self.clock.duration, isPlaying: true)
+                        self.monitorFirstFrame(playerItem, request: request)
+                        self.player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
+                        #if DEBUG
+                        if !naturalHandoff, position == 0, self.pendingAudioSeek == nil,
+                           self.debugStartupChangedSource {
+                            self.debugOrdinaryStartupItem = playerItem
+                            self.debugOrdinaryStartupGeneration = request
+                        }
+                        #endif
+                        self.recordPlaybackEvent("videoHostClockStarted")
+                    } else if position > 0 || rewind {
+                        self.recordPlaybackEvent(rewind ? "videoRewindRequested" : "videoRestoreRequested")
                         // Audio already owns its position. Readiness of a reused
                         // muted video must never rewind the audible PCM cursor.
                         self.synchronizeVideoToAudio(force: true)
@@ -496,7 +624,18 @@ final class PlaybackService: NSObject {
     }
 
     private func monitorFirstFrame(_ playerItem: AVPlayerItem, request: Int) {
-        frameMonitor.start(item: playerItem, layer: surface.playerLayer) { [weak self, weak playerItem] in
+        var decodedFrameEpoch: (() -> UInt64?)?
+        if ContinuousPictureInPicture.preparedVideoOutput(for: playerItem) != nil {
+            // Observe the current epoch's actual submitted frame without adding
+            // a second late output or competing with its pixel-buffer consumer.
+            decodedFrameEpoch = { [weak self, weak playerItem] in
+                guard let self, let playerItem, self.generation == request,
+                      self.player.currentItem === playerItem,
+                      self.continuousPiP.lastFramePositionSeconds != nil else { return nil }
+                return self.continuousPiP.frameEpoch
+            }
+        }
+        frameMonitor.start(item: playerItem, layer: surface.playerLayer, decodedFrameEpoch: decodedFrameEpoch) { [weak self, weak playerItem] in
             guard let self, let playerItem, self.generation == request, self.player.currentItem === playerItem else { return }
             self.isVideoReady = true
             self.recordPlaybackEvent("firstFrame")
@@ -556,6 +695,11 @@ final class PlaybackService: NSObject {
                     playerItem.preferredForwardBufferDuration = 8
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: next.id, url: url) }
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
+                    // Link ready PCM before awaiting video-only metadata so an
+                    // approaching audible boundary never waits for orientation.
+                    self.updateAudioSuccessor()
+                    await self.prepareVideoForPlayback(playerItem)
+                    guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stage(.init(mediaID: next.id, item: playerItem, isLocal: saved != nil || cached != nil), after: active?.id)
                     self.updateAudioSuccessor()
                     self.refreshAudioProcessing()
@@ -574,6 +718,7 @@ final class PlaybackService: NSObject {
                     item.preferredForwardBufferDuration = 8
                     _ = await PlaybackPreparation.value(within: .milliseconds(500)) { try? await item.asset.load(.isPlayable) }
                     if url.isFileURL { _ = try? await self.continuousAudio.prepare(id: previous.id, url: url) }
+                    await self.prepareVideoForPlayback(item)
                     guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
                     self.buffer.stagePrevious(.init(mediaID: previous.id, item: item, isLocal: saved != nil || cached != nil))
                     self.refreshAudioProcessing()
@@ -593,6 +738,7 @@ final class PlaybackService: NSObject {
                     let requireLocal = !self.downloads.network.isConnected
                     if requireLocal || !self.buffer.hasPrepared(item.id) {
                         let playerItem = AVPlayerItem(url: url)
+                        await self.prepareVideoForPlayback(playerItem)
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
                         self.buffer.stage(.init(mediaID: item.id, item: playerItem, isLocal: true), requireLocal: requireLocal, after: active?.id)
                         self.updateAudioSuccessor()
@@ -615,7 +761,7 @@ final class PlaybackService: NSObject {
         do { try continuousAudio.setPlaying(true) }
         catch {
             intent.activationCompleted(succeeded: false)
-            continuousAudio.suspend(); player.pause()
+            continuousAudio.suspend(); pauseNativePlayer(reason: .engineRestartFailed)
             message = "Audio could not restart. Tap Play to try again."
             recordPlaybackEvent("engineStartFailed")
         }
@@ -659,7 +805,6 @@ final class PlaybackService: NSObject {
         if sample.visit != audioVisit {
             let changedSource = sample.token != audioToken
             audioVisit = sample.visit; audioToken = sample.token
-            continuousPiP.flushForSeek()
             continuousAudio.adoptRendered(id: entry.id)
             if changedSource, entry.id != queue.currentID {
                 var following = queue
@@ -669,7 +814,12 @@ final class PlaybackService: NSObject {
                 queue = following
                 let video = buffer.advance(to: entry.id)
                 loadCurrent(position: Double(sample.frame) / 48_000, adopting: video, audioAlreadySelected: true)
-            } else { synchronizeVideoToAudio(force: true) }
+            } else {
+                // The new selected item's video is already prepared at zero.
+                // Preserve it when aligned; actual loop/seek visits still force
+                // a new frame epoch, and ordinary drift still triggers a seek.
+                synchronizeVideoToAudio(force: !changedSource)
+            }
             prepareUpcoming()
         }
         clock.sample(position: Double(sample.frame) / 48_000)
@@ -692,12 +842,73 @@ final class PlaybackService: NSObject {
         if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
     }
 
+    #if DEBUG
+    /// One opt-in, once-per-generation startup experiment. The caller supplies
+    /// the final status from the existing KVO handler; this performs no extra
+    /// native status/item-clock query, exact seek, epoch flush, wait, or drift suppression.
+    /// A rejection is diagnostic evidence only, never a successful recovery.
+    func debugReanchorUnexpectedPausedVideo(item: AVPlayerItem, generation request: Int,
+                                           observedStatus: Int) -> DebugVideoReanchorResult {
+        guard generation == request else { return .generationChanged }
+        guard player.currentItem === item, observedItem === item else { return .currentItemChanged }
+        guard readyGeneration == request else { return .notReady }
+        guard pendingAudioSeek == nil else { return .pendingAudioSeek }
+        guard syncingVideoGeneration != request else { return .videoSeekInFlight }
+        guard intent.canPlay else { return .audioNotPermitted }
+        guard videoAllowed else { return .videoNotAllowed }
+        guard !isVideoReady else { return .alreadyVideoReady }
+        guard debugOrdinaryStartupGeneration == request, debugOrdinaryStartupItem === item else { return .notOrdinaryStartup }
+        guard audioLoadingID == nil, let id = queue.currentID, continuousAudio.selectedID == id,
+              continuousAudio.entry(forToken: audioToken)?.id == id else { return .audioIdentityChanged }
+        guard debugReanchoredGeneration != request else { return .alreadyApplied }
+        guard observedStatus == AVPlayer.TimeControlStatus.paused.rawValue else { return .notPaused }
+        let host = CMClockGetTime(CMClockGetHostTimeClock())
+        let desired = continuousAudio.presentationPosition(at: host)
+        guard host.isNumeric, desired.isFinite, desired >= 0 else { return .invalidClock }
+        // Set once state before the SDK can publish a synchronous status event.
+        debugReanchoredGeneration = request
+        debugVideoReanchorAppliedCount += 1
+        player.setRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000), atHostTime: host)
+        return .applied
+    }
+    #endif
+
     private func synchronizeVideoToAudio(force: Bool = false) {
+        // KVO's ready handler owns the initial host-clock anchor. The poll can
+        // see native readiness before that queued MainActor handler has run.
+        guard force || readyGeneration == generation else { return }
         guard videoAllowed, continuousAudio.isSelected, audioLoadingID == nil, syncingVideoGeneration != generation,
               let item = player.currentItem, item.status == .readyToPlay else { return }
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
         let position = continuousAudio.presentationPosition(at: hostTime)
-        guard force || abs(item.currentTime().seconds - position) > 0.080 else { return }
+        if !force {
+            let nativePosition = item.currentTime().seconds
+            guard abs(nativePosition - position) > 0.080 else { return }
+            // The inline overlay follows PCM independently of the muted native
+            // clock. Do not withdraw its aligned current epoch merely because that
+            // clock still reports the departing/start position. Recheck ownership
+            // now; a prior copied frame or latched readiness is insufficient.
+            let presentation: (frame: Double, timebase: Double)?
+            if readyGeneration == generation, let id = queue.currentID,
+               continuousAudio.selectedID == id, continuousAudio.entry(forToken: audioToken)?.id == id {
+                presentation = continuousPiP.currentSubmittedPresentation(for: item)
+            } else { presentation = nil }
+            guard PlaybackVideoSynchronization.requiresExactSeek(force: false, canPlay: intent.canPlay,
+                nativeRate: player.rate, nativePosition: nativePosition, audioPosition: position,
+                framePosition: presentation?.frame, timebasePosition: presentation?.timebase) else {
+                if firstPreservedPresentationGeneration != generation {
+                    firstPreservedPresentationGeneration = generation
+                    recordPlaybackEvent("videoAlignedPresentationKept")
+                }
+                return
+            }
+        }
+        #if DEBUG
+        // Any real correction ends ordinary startup eligibility. Its exact
+        // seek/callback/flush policy below is unchanged in all configurations.
+        debugOrdinaryStartupItem = nil; debugOrdinaryStartupGeneration = nil
+        #endif
+        recordPlaybackEvent(force ? "videoForcedSeek" : "videoDriftSeek")
         let request = generation
         syncingVideoGeneration = request
         let videoSeek = continuousPiP.beginSeek()
@@ -790,7 +1001,7 @@ final class PlaybackService: NSObject {
             recordDiagnostic(.audioSessionActivated)
             recordPlaybackEvent("activationCompleted")
         } catch {
-            intent.activationCompleted(succeeded: false); continuousAudio.suspend(); player.pause(); cancelStallRecovery()
+            intent.activationCompleted(succeeded: false); continuousAudio.suspend(); pauseNativePlayer(reason: .audioSessionActivationFailed); cancelStallRecovery()
             recordDiagnostic(.audioSessionActivationFailed, error: PlaybackDiagnosticError(family: .audioSession, code: (error as NSError).code))
             message = "Audio is in use. Tap Play after the camera or call finishes."
             recordPlaybackEvent("activationFailed")
@@ -802,7 +1013,7 @@ final class PlaybackService: NSObject {
         recordDiagnostic(.appForegrounded)
         let interrupted = intent.isInterrupted
         intent.enteredForeground()
-        if interrupted { continuousAudio.suspend(); player.pause(); message = "Audio was interrupted. Tap Play to resume." }
+        if interrupted { continuousAudio.suspend(); pauseNativePlayer(reason: .foregroundInterrupted); message = "Audio was interrupted. Tap Play to resume." }
         else { synchronizeVideoToAudio(force: true) }
     }
 
@@ -811,7 +1022,7 @@ final class PlaybackService: NSObject {
         if began {
             intent.interruptionBegan(); cancelStallRecovery()
             continuousAudio.suspend()
-            player.pause(); persist()
+            pauseNativePlayer(reason: .interruptionBegan); persist()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
             activateAudio()
             resumeContinuousAudio()
@@ -839,7 +1050,7 @@ final class PlaybackService: NSObject {
         surface.isHidden = audioOnly
         pip?.canStartPictureInPictureAutomaticallyFromInline = automaticPiP && presentationPolicy.allowsPictureInPicture
         if actions.stopPictureInPicture { pip?.stopPictureInPicture() }
-        if !videoAllowed { player.pause(); continuousPiP.suspendFrameFeed() }
+        if !videoAllowed { pauseNativePlayer(reason: .presentationVideoDisabled); continuousPiP.suspendFrameFeed() }
         else { continuousPiP.resumeFrameFeed() }
         if actions.restoreInlineVideo { synchronizeVideoToAudio(force: true) }
     }
@@ -876,8 +1087,11 @@ final class PlaybackService: NSObject {
         case .userSkipRequested: phase = .seekRequested
         case .frameFailed: phase = .sampled
         case .sourcePrepared:
+            recordPlaybackEvent("videoOutputPrepared")
             // Composition/output attachment can finish after an initial paused seek.
-            if !intent.canPlay { synchronizeVideoToAudio(force: true) }
+            // A preinstalled output can also be adopted before readiness observes
+            // this selection; that observer must establish its restore target first.
+            if !intent.canPlay, readyGeneration == generation { synchronizeVideoToAudio(force: true) }
             phase = .sourcePreparationCompleted
         case .sourcePreparationFailed: phase = .sourcePreparationFailed
         }
@@ -929,20 +1143,73 @@ final class PlaybackService: NSObject {
         } catch { return nil }
     }
 
-    private func recordPlaybackEvent(_ name: StaticString) {
-        // Fixed phase names and numerical state only: no media IDs, URLs or titles.
-        os_signpost(.event, log: Self.playbackLog, name: name, "generation=%d retained=%d", generation, buffer.retainedItemCount)
-        onPlaybackEvent?(PlaybackEvent(name: String(describing: name), uptime: ProcessInfo.processInfo.systemUptime,
-            generation: generation, position: player.currentTime().seconds, retainedItems: buffer.retainedItemCount))
+    private func pauseNativePlayer(reason: PlaybackBuffer.NativePauseReason) {
+        #if DEBUG
+        if debugNativePlayerTraceEnabled, onPlaybackEvent != nil {
+            let increment = debugNativePlayerPauseCount.addingReportingOverflow(1)
+            debugNativePlayerPauseCount = increment.overflow ? .max : increment.partialValue
+            let commandID = debugNativePlayerPauseCount
+            let entryGeneration = generation
+            let entry = ProcessInfo.processInfo.systemUptime
+            player.pause()
+            let returned = ProcessInfo.processInfo.systemUptime
+            // No observer runs before the native call. This interval includes
+            // existing synchronous KVO/reentrancy and is not pure SDK cost.
+            recordPlaybackEvent("nativePauseCompleted", detail: .nativePause(PlaybackBuffer.NativePauseEvent(
+                owner: .service, reason: reason, commandID: commandID, commandIDSaturated: increment.overflow,
+                entryUptime: entry, returnUptime: returned, entryGeneration: entryGeneration)))
+            return
+        }
+        #endif
+        player.pause()
+    }
+
+    private func recordPlaybackEvent(_ name: StaticString, detail: PlaybackEventDetail? = nil) {
+        // Phase recording must not query native player state or allocate an item
+        // inventory on the playback path. Resource checks remain separate.
+        os_signpost(.event, log: Self.playbackLog, name: name, "generation=%d", generation)
+        guard let observer = onPlaybackEvent else { return }
+        let begin = DispatchTime.now().uptimeNanoseconds
+        observer(PlaybackEvent(name: String(describing: name), uptime: ProcessInfo.processInfo.systemUptime,
+            generation: generation, clockPosition: clock.position, detail: detail))
+        let end = DispatchTime.now().uptimeNanoseconds
+        let elapsed = end >= begin ? end - begin : 0
+        let previous = playbackEventPublicationCost
+        let count = previous.count.addingReportingOverflow(1)
+        let total = previous.totalNanoseconds.addingReportingOverflow(elapsed)
+        // Fixed saturating counters include payload construction and inclusive
+        // observer delivery (including reentrant observer work). They exclude
+        // status/currentItem SDK reads, KVO/task delivery delay, upstream buffer
+        // diagnostic work and the signpost. This is neither total tracing cost
+        // nor CPU time or evidence of the cause of a playback delay.
+        playbackEventPublicationCost = PlaybackEventPublicationCost(
+            count: count.overflow ? .max : count.partialValue,
+            totalNanoseconds: total.overflow ? .max : total.partialValue,
+            maximumNanoseconds: max(previous.maximumNanoseconds, elapsed),
+            saturated: previous.saturated || count.overflow || total.overflow)
     }
 
     private func installObservers() {
-        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
-            Task { @MainActor in
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, change in
+            // The publication may precede actor delivery. Pass only numeric
+            // values across that boundary; never capture a native change object.
+            let publishedStatus = change.newValue?.rawValue
+            let notificationUptime = ProcessInfo.processInfo.systemUptime
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                if self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
+                let observedStatus = self.player.timeControlStatus
+                let observedUptime = ProcessInfo.processInfo.systemUptime
+                if observedStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
                 else if self.player.timeControlStatus == .playing { self.cancelStallRecovery() }
-                self.recordPlaybackEvent(self.player.timeControlStatus == .playing ? "playing" : "waitingOrPaused")
+                // Preserve the original native reads and recovery decisions.
+                // Bind the original final read, rather than add another native
+                // query to decide whether the explicit test control may run.
+                let finalStatus = self.player.timeControlStatus
+                let finalUptime = ProcessInfo.processInfo.systemUptime
+                self.recordPlaybackEvent(finalStatus == .playing ? "playing" : "waitingOrPaused",
+                    detail: .timeControl(publishedStatus: publishedStatus, notificationUptime: notificationUptime,
+                        observedStatus: observedStatus.rawValue, observedUptime: observedUptime,
+                        finalStatus: finalStatus.rawValue, finalUptime: finalUptime))
             }
         }
         let center = NotificationCenter.default
@@ -968,8 +1235,28 @@ final class PlaybackService: NSObject {
         })
         notifications.append(center.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
-                guard let self, note.object as? AVPlayerItem === self.observedItem else { return }
-                guard !self.continuousAudio.isSelected else { return }
+                guard let self else { return }
+                #if DEBUG
+                let traceEntry = self.debugNativePlayerTraceEnabled && self.onPlaybackEvent != nil
+                    ? (uptime: ProcessInfo.processInfo.systemUptime, generation: self.generation) : nil
+                var selectedAudio: Bool?
+                #endif
+                let observedItemMatches = note.object as? AVPlayerItem === self.observedItem
+                defer {
+                    #if DEBUG
+                    if let traceEntry {
+                        self.recordPlaybackEvent("nativeItemEndObserved", detail: .nativeItemEnd(NativeItemEndEvent(
+                            observedItemMatches: observedItemMatches, selectedAudio: selectedAudio,
+                            handlerEntryUptime: traceEntry.uptime, entryGeneration: traceEntry.generation)))
+                    }
+                    #endif
+                }
+                guard observedItemMatches else { return }
+                let isSelected = self.continuousAudio.isSelected
+                #if DEBUG
+                selectedAudio = isSelected
+                #endif
+                guard !isSelected else { return }
                 self.buffer.synchronize()
                 guard note.object as? AVPlayerItem === self.player.currentItem else { return }
                 if self.isInteractingWithFeed { self.endedDuringScroll = true }

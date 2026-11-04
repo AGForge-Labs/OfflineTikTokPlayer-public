@@ -6,8 +6,10 @@ cd "$repo_root"
 export SWIFTC_MAXIMUM_DETERMINISM=1
 mkdir -p artifacts/native
 native_log="artifacts/native/xcodebuild-test.log"
+worker_log="artifacts/native/worker-trace.log"
 # An early failure must never leave a previous run's successful evidence behind.
 : > "$native_log"
+: > "$worker_log"
 validation_complete=0
 validation_mode=full
 if [ "$#" -eq 0 ]; then
@@ -38,13 +40,14 @@ destination="${SIMULATOR_DESTINATION:-platform=iOS Simulator,name=iPhone 17 Pro 
 simulator_id="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination "$destination")"
 # Native window tests request real compositor pixels through their own app tmp.
 # Pin the test and capture to the same existing Simulator; one helper, no extra app launch.
-python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 &
+python3 scripts/capture-simulator-test-frames.py --udid "$simulator_id" --lifetime 1200 > "$worker_log" &
 capture_pid=$!
 cleanup_capture() {
   local cleanup_status=$?
   trap - EXIT
   kill "$capture_pid" 2>/dev/null || true
   wait "$capture_pid" 2>/dev/null || true
+  cat "$worker_log"
   if [ "$cleanup_status" -eq 0 ] && [ "$validation_complete" -ne 1 ]; then
     cleanup_status=1
   fi
@@ -61,5 +64,6 @@ if [ "$validation_mode" = selection-only ]; then
   python3 scripts/verify-native-test-log.py --log "$native_log" --selection-only
 else
   python3 scripts/verify-native-test-log.py --log "$native_log"
+  python3 scripts/verify-native-worker-trace.py --log "$worker_log"
 fi
 validation_complete=1

@@ -34,7 +34,9 @@ def generate():
     resources = {name: [] for name in build_sources}
     def group(path, target):
         children = []
-        for file in sorted(path.iterdir()):
+        # Path ordering folds case on Windows and preserves it on macOS/Linux.
+        # Compare names explicitly so every host writes the same project.
+        for file in sorted(path.iterdir(), key=lambda child: child.name):
             if file.is_dir() and file.suffix != ".xcassets": children.append(group(file, target)); continue
             if file.name.startswith("."): continue
             filetype = {".swift": "sourcecode.swift", ".plist": "text.plist.xml", ".entitlements": "text.plist.entitlements",
