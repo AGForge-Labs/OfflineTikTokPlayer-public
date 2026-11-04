@@ -11,6 +11,266 @@ import PlayerCore
 /// both generated movies, so a decoded asset or advancing audio clock cannot satisfy visibility.
 @MainActor
 final class PlaybackSelectionVideoRegressionTests: XCTestCase {
+    /// Real mixer output and actual custom-layer submission, without screenshot or SDK-position probes.
+    /// This is selected-frame readiness evidence, not compositor pixels or physical speaker output.
+    func testProductionSelectionLatencyAndStreamingContinuityWithoutCapture() async throws {
+        let fixture = try await SelectionVideoFixture()
+        var mayRemoveFixture = true
+        defer { if mayRemoveFixture { fixture.remove() } }
+        var references: [(samples: [Float], frequency: Double)] = []
+        for (id, frequency) in [(fixture.aID, 440.0), (fixture.bID, 880.0)] {
+            references.append((try await fixture.decodedTone(id: id), frequency))
+        }
+        let audio = ContinuousAudioPlayer()
+        let tap = ProductionSelectionOutputTap()
+        let seeks = ProductionSelectionSeekRecorder()
+        let service = fixture.service(continuousAudio: audio, seekVideo: seeks.seek)
+        let screen = try SelectionVideoScreen(service: service)
+        // From here, deletion requires the decoder's queued cleanup acknowledgement.
+        mayRemoveFixture = false
+        let originalSources = (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }
+        let originalBytes = audio.renderer.retainedPCMMemoryBytes
+        audio.graph.engine.mainMixerNode.installTap(onBus: 0, bufferSize: 256, format: nil) { buffer, time in
+            tap.append(buffer, time: time)
+        }
+        var measurements: [ProductionSelectionMeasurement] = []
+        var streams: [ProductionSelectionStream] = []
+        measurements.reserveCapacity(3); streams.reserveCapacity(3)
+        var returnedStart: Int?
+        var returnedEnd: Int?
+        var returnedOrigin: Double?
+        for phase in 0..<3 {
+            let id = phase == 1 ? fixture.bID : fixture.aID
+            let frequency = phase == 1 ? 880.0 : 440.0
+            let prepared = phase != 0
+            let preparedBefore: Bool
+            if prepared {
+                preparedBefore = await waitUntil(timeout: 5) {
+                    service.preparedAudioCount == 2 && audio.entry(for: id) != nil
+                }
+            } else { preparedBefore = true }
+            let measurement = await measureProductionSelection(service, screen: screen, fixture: fixture,
+                audio: audio, tap: tap, seeks: seeks, phase: phase, id: id,
+                frequency: frequency, prepared: prepared, preparedBefore: preparedBefore) {
+                switch phase {
+                case 0: service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+                case 1: service.next()
+                default: service.previous()
+                }
+            }
+            measurements.append(measurement)
+            if phase == 2 {
+                returnedOrigin = ProductionSelectionOutputTap.hostSeconds()
+                returnedStart = tap.begin()
+            }
+            let baseline = audio.renderer.snapshot
+            let before = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+            let probe = ProductionRendererProbe(renderer: audio.renderer)
+            try? await Task.sleep(for: .seconds(8))
+            let result = probe.stop()
+            let final = audio.renderer.snapshot
+            let after = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+            streams.append(ProductionSelectionStream(phase: phase, baseline: baseline, final: final,
+                before: before, after: after, quantum: service.audioRenderQuantumFrames, result: result,
+                memoryBytes: audio.renderer.retainedPCMMemoryBytes,
+                sameStorage: originalSources == (0..<3).map { ObjectIdentifier(audio.renderer.source(at: $0)) }))
+            if phase == 2 { returnedEnd = tap.stop() }
+        }
+
+        // No dumps, spectral analysis or assertions interrupt any streaming window.
+        tap.stop(); service.pause()
+        audio.graph.engine.mainMixerNode.removeTap(onBus: 0)
+        audio.graph.engine.stop(); screen.close()
+        let shutdown = ProductionSelectionShutdown()
+        let preparation = ProductionSelectionShutdown()
+        #if DEBUG
+        service.debugStopPreparation { preparation.complete(true) }
+        audio.debugShutdown { shutdown.complete($0) }
+        #endif
+        let cleanupReturned = await waitUntil(timeout: 3) { shutdown.result != nil && preparation.result != nil }
+        mayRemoveFixture = cleanupReturned && shutdown.result == true && preparation.result == true
+        print("ProductionSelectionCleanup completed=\(mayRemoveFixture) ownedTasksJoined=\(preparation.result == true) producerTracing=absent sdkInternalQuiescence=unverified syntheticFixtureRetained=\(!mayRemoveFixture)")
+        XCTAssertTrue(mayRemoveFixture, "Queued decoder cleanup must return before removing only this synthetic fixture")
+        for reference in references {
+            XCTAssertGreaterThanOrEqual(reference.samples.count, 10_000)
+            XCTAssertTrue(ProductionSelectionOutputTap.isTone(reference.samples, rate: 48_000, frequency: reference.frequency))
+            XCTAssertEqual(ProductionSelectionOutputTap.quietRun(reference.samples, rate: 48_000), 0,
+                           "Independently decoded encoded fixtures must contain no 10 ms RMS-silence windows")
+        }
+        XCTAssertEqual(originalBytes, 6_912_000)
+        XCTAssertEqual(Set(originalSources).count, 3)
+        XCTAssertEqual(audio.renderer.sampleRate, 48_000); XCTAssertEqual(audio.renderer.channels, 2)
+        for slot in 0..<3 {
+            XCTAssertEqual(audio.renderer.source(at: slot).prefixCapacityFrames, 96_000)
+            XCTAssertEqual(audio.renderer.source(at: slot).ringCapacityFrames, 192_000)
+        }
+        XCTAssertEqual(measurements.count, 3); XCTAssertEqual(streams.count, 3)
+        XCTAssertLessThanOrEqual(streams.reduce(0) { $0 + $1.result.samples.count }, 384)
+        for measurement in measurements { assertProductionSelection(measurement, tap: tap) }
+        for stream in streams { assertProductionStream(stream) }
+        if measurements.count == 3 {
+            XCTAssertGreaterThan(measurements[0].state.expectedToken, 0)
+            XCTAssertNotEqual(measurements[0].state.expectedToken, measurements[1].state.expectedToken)
+            XCTAssertEqual(measurements[0].state.expectedToken, measurements[2].state.expectedToken,
+                           "Previous must reuse the retained A preparation")
+            XCTAssertGreaterThan(measurements[1].state.audio.visit, measurements[0].state.audio.visit)
+            XCTAssertGreaterThan(measurements[2].state.audio.visit, measurements[1].state.audio.visit)
+        }
+        let returned = tap.samples(from: returnedStart ?? tap.count, to: returnedEnd ?? tap.count)
+        let returnedSeconds = returned.rate > 0 ? Double(returned.values.count) / returned.rate : 0
+        let returnedWall = returned.hosts.first.flatMap { first in returned.hosts.last.map { $0 - first + 1 / max(1, returned.rate) } } ?? 0
+        let returnedQuiet = ProductionSelectionOutputTap.quietRun(returned.values, rate: returned.rate)
+        let returnedHole = ProductionSelectionOutputTap.maximumTimelineHole(returned.hosts, rate: returned.rate)
+        let toneBlocks = ProductionSelectionOutputTap.toneBlocks(returned.values, rate: returned.rate, frequency: 440)
+        let validity = tap.validity()
+        print("ProductionSelectionReturnedOutput seconds=\(returnedSeconds) wallSeconds=\(returnedWall) firstHostOffsetMs=\(((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0)) * 1_000) lastHostOffsetMs=\(((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity)) * 1_000) frames=\(returned.values.count) rate=\(returned.rate) toneBlocks=\(toneBlocks.total) correctToneBlocks=\(toneBlocks.correct) quietMs=\(returnedQuiet * 1_000) maximumHoleMs=\(returnedHole * 1_000) invalidTimestamps=\(validity.invalidTimestamps) droppedFrames=\(validity.droppedFrames) retainedFrames=\(tap.count) capacityFrames=576000")
+        XCTAssertGreaterThanOrEqual(returnedSeconds, 7.5); XCTAssertGreaterThanOrEqual(returnedWall, 7.5)
+        XCTAssertTrue(returned.values.allSatisfy { $0.isFinite })
+        XCTAssertGreaterThanOrEqual(toneBlocks.total, 375); XCTAssertEqual(toneBlocks.correct, toneBlocks.total)
+        XCTAssertEqual(returnedQuiet, 0)
+        XCTAssertLessThanOrEqual(returnedHole, 0.5 / max(1, returned.rate))
+        XCTAssertEqual(validity.invalidTimestamps, 0); XCTAssertEqual(validity.droppedFrames, 0)
+        XCTAssertLessThanOrEqual(tap.count, 12 * 48_000)
+        XCTAssertLessThanOrEqual((returned.hosts.first ?? .infinity) - (returnedOrigin ?? 0), 0.25)
+        XCTAssertGreaterThanOrEqual((returned.hosts.last ?? -.infinity) - (returnedOrigin ?? .infinity), 7.5)
+        XCTAssertEqual(audio.renderer.snapshot.underrunFrames, 0,
+                       "Startup starvation cannot disappear behind a clean streaming baseline")
+        seeks.dumpAndAssert()
+    }
+
+    private func productionSelectionState(_ service: PlaybackService, fixture: SelectionVideoFixture,
+        audio: ContinuousAudioPlayer, id: String) -> ProductionSelectionState {
+        let asset = service.player.currentItem?.asset as? AVURLAsset
+        let expected = audio.entry(for: id)
+        return ProductionSelectionState(audio: audio.renderer.snapshot, expectedToken: expected?.token ?? 0,
+            metadataMatches: service.queue.currentID == id && service.current?.id == id,
+            assetMatches: asset?.url.standardizedFileURL == fixture.savedURLs[id]?.standardizedFileURL,
+            sourceIDMatches: expected?.id == id && audio.selectedID == id,
+            engineRunning: service.audioEngineRunning, wantsPlaying: service.wantsToPlay,
+            preparedCount: service.preparedAudioCount, submitted: service.submittedVideoFrameCount,
+            copied: service.copiedVideoFramePositionSeconds, frame: service.videoFramePositionSeconds,
+            requested: service.videoRequestedPositionSeconds, videoReady: service.isVideoReady,
+            loading: service.isLoading)
+    }
+
+    private func measureProductionSelection(_ service: PlaybackService, screen: SelectionVideoScreen,
+        fixture: SelectionVideoFixture, audio: ContinuousAudioPlayer, tap: ProductionSelectionOutputTap,
+        seeks: ProductionSelectionSeekRecorder, phase: Int, id: String, frequency: Double,
+        prepared: Bool, preparedBefore: Bool, command: () -> Void) async -> ProductionSelectionMeasurement {
+        let first = tap.begin()
+        if prepared { try? await Task.sleep(for: .milliseconds(120)) }
+        let before = audio.renderer.snapshot
+        let expectedTokenBefore = audio.entry(for: id)?.token ?? 0
+        let submitted = service.submittedVideoFrameCount
+        seeks.phase = phase
+        let origin = ProductionSelectionOutputTap.hostSeconds()
+        command()
+        var cursor = first
+        var outgoing: ProductionSelectionOutputTap.Tone?
+        var tone: ProductionSelectionOutputTap.Tone?
+        var displayReady: Double?
+        var ready: Double?
+        let deadline = ProcessInfo.processInfo.systemUptime + (prepared ? 1 : 5)
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            while tone == nil, let window = tap.window(at: cursor) {
+                cursor += max(1, Int(window.rate * 0.01))
+                if prepared, outgoing == nil, window.end <= origin,
+                   ProductionSelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: frequency == 440 ? 880 : 440) {
+                    outgoing = .init(start: window.start, end: window.end)
+                }
+                if window.end >= origin,
+                   ProductionSelectionOutputTap.isTone(window.samples, rate: window.rate, frequency: frequency) {
+                    tone = .init(start: window.start, end: window.end)
+                }
+            }
+            let state = productionSelectionState(service, fixture: fixture, audio: audio, id: id)
+            if ready == nil, state.selected, state.audio.visit > before.visit,
+               state.submitted > submitted, screen.customVideoLayer?.isReadyForDisplay == true,
+               let frame = state.frame, let copied = state.copied,
+               frame.isFinite, copied.isFinite, state.requested.isFinite, frame >= 0, copied >= 0,
+               abs(frame - state.requested) <= 0.080, abs(copied - frame) <= 0.080 {
+                if displayReady == nil { displayReady = ProductionSelectionOutputTap.hostSeconds() }
+                if state.videoReady && !state.loading {
+                    ready = ProductionSelectionOutputTap.hostSeconds()
+                }
+            }
+            if tone != nil && ready != nil { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        let last = tap.stop()
+        return ProductionSelectionMeasurement(phase: phase, prepared: prepared, preparedBefore: preparedBefore,
+            frequency: frequency, first: first, last: last, origin: origin, outgoing: outgoing, tone: tone,
+            displayReady: displayReady, ready: ready, before: before,
+            expectedTokenBefore: expectedTokenBefore, beforeSubmitted: submitted,
+            state: productionSelectionState(service, fixture: fixture, audio: audio, id: id))
+    }
+
+    private func assertProductionSelection(_ value: ProductionSelectionMeasurement, tap: ProductionSelectionOutputTap) {
+        let recorded = tap.samples(from: value.first, to: value.last)
+        let quiet = ProductionSelectionOutputTap.quietRun(recorded.values, rate: recorded.rate)
+        let hole = ProductionSelectionOutputTap.maximumTimelineHole(recorded.hosts, rate: recorded.rate)
+        let toneMs = value.tone.map { ($0.end - value.origin) * 1_000 }
+        let readyMs = value.ready.map { ($0 - value.origin) * 1_000 }
+        let state = value.state
+        print("ProductionSelectionLatency phase=\(value.phase) prepared=\(value.prepared) preparedBefore=\(value.preparedBefore) frequency=\(value.frequency) commandHostSeconds=\(value.origin) toneStartMs=\(value.tone.map { String(($0.start - value.origin) * 1_000) } ?? "missing") toneEndMs=\(toneMs.map { String($0) } ?? "missing") customDisplayReadyMs=\(value.displayReady.map { String(($0 - value.origin) * 1_000) } ?? "missing") videoReadyMs=\(readyMs.map { String($0) } ?? "missing") metadataMatches=\(state.metadataMatches) assetMatches=\(state.assetMatches) sourceIDMatches=\(state.sourceIDMatches) expectedToken=\(state.expectedToken) token=\(state.audio.token) visit=\(state.audio.visit) beforeVisit=\(value.before.visit) frame=\(state.audio.frame) ended=\(state.audio.ended) copiedPTS=\(state.copied.map { String($0) } ?? "missing") submittedPTS=\(state.frame.map { String($0) } ?? "missing") requested=\(state.requested) submitted=\(state.submitted) beforeSubmitted=\(value.beforeSubmitted) engineRunning=\(state.engineRunning) wantsPlaying=\(state.wantsPlaying) quietMs=\(quiet * 1_000) maximumHoleMs=\(hole * 1_000) underrunDelta=\(state.audio.underrunFrames - value.before.underrunFrames) producerTracing=absent physicalOutput=unverified compositorPixels=unverified")
+        XCTAssertTrue(value.preparedBefore)
+        XCTAssertNotNil(value.tone, "The independently classified target must reach the actual mixer tap")
+        XCTAssertNotNil(value.ready, "A fresh, selected and aligned actual custom submission must become ready")
+        XCTAssertTrue(state.selected); XCTAssertTrue(state.videoReady); XCTAssertFalse(state.loading)
+        XCTAssertGreaterThan(state.audio.visit, value.before.visit)
+        XCTAssertGreaterThan(state.submitted, value.beforeSubmitted)
+        if value.prepared {
+            XCTAssertGreaterThan(value.expectedTokenBefore, 0)
+            XCTAssertEqual(state.expectedToken, value.expectedTokenBefore)
+            XCTAssertEqual(state.preparedCount, 2)
+            XCTAssertNotNil(value.outgoing)
+            if let outgoing = value.outgoing, let tone = value.tone { XCTAssertLessThanOrEqual(outgoing.end, tone.start) }
+            XCTAssertLessThanOrEqual(toneMs ?? .infinity, 100)
+            XCTAssertLessThanOrEqual(readyMs ?? .infinity, 250)
+            XCTAssertEqual(state.audio.underrunFrames, value.before.underrunFrames)
+            XCTAssertEqual(quiet, 0)
+            XCTAssertTrue(recorded.values.allSatisfy { $0.isFinite })
+            XCTAssertLessThanOrEqual(hole, 0.5 / max(1, recorded.rate))
+        }
+    }
+
+    private func assertProductionStream(_ value: ProductionSelectionStream) {
+        let result = value.result
+        let samples = result.samples.filter { $0.end >= result.origin && $0.end - result.origin <= 8_000_000_000 }
+        let elapsed = samples.map { Double($0.end - result.origin) / 1_000_000_000 }
+        let gaps = zip(samples, samples.dropFirst()).map { before, after in Double(after.end - before.end) / 1_000_000_000 }
+        let acquisition = samples.map { Double($0.end - $0.begin) / 1_000_000_000 }.max() ?? .infinity
+        let wall = samples.first.flatMap { first in samples.last.map { Double($0.end - first.end) / 1_000_000_000 } } ?? -1
+        let pcm = samples.first.flatMap { first in samples.last.map { Double($0.audio.frame - first.audio.frame) / 48_000 } } ?? -1
+        let skew = zip(samples, samples.dropFirst()).map { before, after in
+            abs(Double(after.audio.frame - before.audio.frame) / 48_000 - Double(after.end - before.end) / 1_000_000_000)
+        }.max() ?? .infinity
+        let tolerance = 2 * Double(max(1, value.quantum)) / 48_000 + 0.005
+        print("ProductionSelectionStream phase=\(value.phase) seconds=8 samples=\(samples.count) rendererCoherentSamples=\(samples.count) firstMs=\((elapsed.first ?? .infinity) * 1_000) lastMs=\((elapsed.last ?? -1) * 1_000) maximumGapMs=\((gaps.max() ?? .infinity) * 1_000) maximumAcquisitionMs=\(acquisition * 1_000) wallSeconds=\(wall) pcmSeconds=\(pcm) maximumSkewMs=\(skew * 1_000) toleranceMs=\(tolerance * 1_000) quantum=\(value.quantum) dropped=\(result.dropped) acquisitionOutstanding=\(result.acquisitionOutstanding) baselineToken=\(value.baseline.token) finalToken=\(value.final.token) baselineVisit=\(value.baseline.visit) finalVisit=\(value.final.visit) baselineFrame=\(value.baseline.frame) finalFrame=\(value.final.frame) baselineUnderruns=\(value.baseline.underrunFrames) finalUnderruns=\(value.final.underrunFrames) retainedPCMBytes=\(value.memoryBytes) sameStorage=\(value.sameStorage) producerTracing=absent")
+        for sample in samples {
+            print("ProductionSelectionRenderSample phase=\(value.phase) originNs=\(result.origin) beginNs=\(sample.begin) endNs=\(sample.end) elapsedMs=\(Double(sample.end - result.origin) / 1_000_000) acquisitionMs=\(Double(sample.end - sample.begin) / 1_000_000) rendererCoherent=true token=\(sample.audio.token) visit=\(sample.audio.visit) frame=\(sample.audio.frame) ended=\(sample.audio.ended) underrunFrames=\(sample.audio.underrunFrames)")
+        }
+        XCTAssertGreaterThanOrEqual(samples.count, 40); XCTAssertLessThanOrEqual(samples.count, 128)
+        XCTAssertGreaterThanOrEqual(samples.count, 20, "Every returned renderer snapshot is coherent; no producer-coherence claim is made")
+        XCTAssertLessThanOrEqual(elapsed.first ?? .infinity, 0.25)
+        XCTAssertGreaterThanOrEqual(elapsed.last ?? -1, 7.5)
+        XCTAssertLessThanOrEqual(gaps.max() ?? .infinity, 0.25)
+        XCTAssertLessThanOrEqual(acquisition, 0.005)
+        XCTAssertEqual(result.dropped, 0); XCTAssertFalse(result.acquisitionOutstanding)
+        XCTAssertTrue(value.before.selected && value.after.selected)
+        XCTAssertEqual(value.before.expectedToken, value.after.expectedToken)
+        XCTAssertEqual(value.baseline.token, value.before.expectedToken)
+        XCTAssertEqual(value.final.token, value.baseline.token); XCTAssertEqual(value.final.visit, value.baseline.visit)
+        XCTAssertFalse(value.baseline.ended); XCTAssertFalse(value.final.ended)
+        XCTAssertEqual(value.final.underrunFrames, value.baseline.underrunFrames)
+        XCTAssertTrue(samples.allSatisfy { $0.audio.token == value.baseline.token && $0.audio.visit == value.baseline.visit
+            && !$0.audio.ended && $0.audio.underrunFrames == value.baseline.underrunFrames })
+        XCTAssertTrue(zip(samples, samples.dropFirst()).allSatisfy { before, after in after.audio.frame >= before.audio.frame })
+        XCTAssertGreaterThan(pcm, 0); XCTAssertEqual(pcm, wall, accuracy: tolerance)
+        XCTAssertLessThanOrEqual(skew, tolerance)
+        XCTAssertEqual(value.memoryBytes, 6_912_000); XCTAssertTrue(value.sameStorage)
+    }
+
     func testGeneratedSavedFixturesDecodeToExpectedDistinctTones() async throws {
         let fixture = try await SelectionVideoFixture()
         defer { fixture.remove() }
@@ -535,6 +795,291 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     }
 }
 
+private struct ProductionSelectionState {
+    let audio: ContinuousPCMRenderer.Snapshot
+    let expectedToken: Int
+    let metadataMatches: Bool
+    let assetMatches: Bool
+    let sourceIDMatches: Bool
+    let engineRunning: Bool
+    let wantsPlaying: Bool
+    let preparedCount: Int
+    let submitted: UInt64
+    let copied: Double?
+    let frame: Double?
+    let requested: Double
+    let videoReady: Bool
+    let loading: Bool
+    var selected: Bool {
+        expectedToken > 0 && audio.token == expectedToken && !audio.ended && metadataMatches
+            && assetMatches && sourceIDMatches && engineRunning && wantsPlaying
+    }
+}
+
+private struct ProductionSelectionMeasurement {
+    let phase: Int
+    let prepared: Bool
+    let preparedBefore: Bool
+    let frequency: Double
+    let first: Int
+    let last: Int
+    let origin: Double
+    let outgoing: ProductionSelectionOutputTap.Tone?
+    let tone: ProductionSelectionOutputTap.Tone?
+    let displayReady: Double?
+    let ready: Double?
+    let before: ContinuousPCMRenderer.Snapshot
+    let expectedTokenBefore: Int
+    let beforeSubmitted: UInt64
+    let state: ProductionSelectionState
+}
+
+private struct ProductionSelectionStream {
+    let phase: Int
+    let baseline: ContinuousPCMRenderer.Snapshot
+    let final: ContinuousPCMRenderer.Snapshot
+    let before: ProductionSelectionState
+    let after: ProductionSelectionState
+    let quantum: Int
+    let result: ProductionRendererProbe.Result
+    let memoryBytes: Int
+    let sameStorage: Bool
+}
+
+/// Independent serial observer of the unchanged renderer API. A read occurs outside the
+/// result lock: stop never waits for a seqlock acquisition, and an outstanding read fails coverage.
+private final class ProductionRendererProbe: @unchecked Sendable {
+    struct Sample: Sendable {
+        let begin: UInt64
+        let end: UInt64
+        let audio: ContinuousPCMRenderer.Snapshot
+    }
+    struct Result: Sendable {
+        let origin: UInt64
+        let samples: [Sample]
+        let dropped: Int
+        let acquisitionOutstanding: Bool
+    }
+    private let renderer: ContinuousPCMRenderer
+    private let origin = DispatchTime.now().uptimeNanoseconds
+    private let lock = NSLock()
+    private let timer: DispatchSourceTimer
+    private var samples: [Sample] = []
+    private var stopped = false
+    private var acquiring = false
+    private var dropped = 0
+
+    init(renderer: ContinuousPCMRenderer) {
+        self.renderer = renderer
+        samples.reserveCapacity(128)
+        timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "test.production-render-sampler", qos: .userInitiated))
+        timer.schedule(deadline: .now(), repeating: .milliseconds(100), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.sample() }
+        timer.resume()
+    }
+
+    private func sample() {
+        let begin = DispatchTime.now().uptimeNanoseconds
+        guard begin >= origin, begin - origin < 8_000_000_000 else { return }
+        lock.lock()
+        guard !stopped else { lock.unlock(); return }
+        acquiring = true
+        lock.unlock()
+        let audio = renderer.snapshot
+        let end = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        acquiring = false
+        if !stopped {
+            if samples.count < 128 { samples.append(Sample(begin: begin, end: end, audio: audio)) }
+            else { dropped += 1 }
+        }
+        lock.unlock()
+    }
+
+    func stop() -> Result {
+        timer.cancel()
+        lock.lock(); defer { lock.unlock() }
+        stopped = true
+        return Result(origin: origin, samples: samples, dropped: dropped, acquisitionOutstanding: acquiring)
+    }
+}
+
+/// Fixed 12-second storage for actual mixer PCM and its AVAudioTime host timeline.
+/// The tap is disabled during the first two 8-second renderer-only windows.
+private final class ProductionSelectionOutputTap: @unchecked Sendable {
+    struct Tone { let start: Double; let end: Double }
+    struct Window { let samples: [Float]; let rate: Double; let start: Double; let end: Double }
+    struct Recording { let values: [Float]; let hosts: [Double]; let rate: Double }
+    private let lock = NSLock()
+    private let capacity = 12 * 48_000
+    private var values: [Float] = []
+    private var hosts: [Double] = []
+    private var rate = 0.0
+    private var enabled = false
+    private var invalidTimestamps = 0
+    private var droppedFrames = 0
+
+    init() { values.reserveCapacity(capacity); hosts.reserveCapacity(capacity) }
+    static func hostSeconds() -> Double { CMClockGetTime(CMClockGetHostTimeClock()).seconds }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return values.count }
+    @discardableResult
+    func begin() -> Int { lock.lock(); defer { lock.unlock() }; enabled = true; return values.count }
+    @discardableResult
+    func stop() -> Int { lock.lock(); defer { lock.unlock() }; enabled = false; return values.count }
+
+    func append(_ buffer: AVAudioPCMBuffer, time: AVAudioTime) {
+        lock.lock(); defer { lock.unlock() }
+        guard enabled else { return }
+        guard time.isHostTimeValid, buffer.format.sampleRate.isFinite, buffer.format.sampleRate > 0,
+              buffer.format.commonFormat == .pcmFormatFloat32, let channels = buffer.floatChannelData else {
+            invalidTimestamps += 1; return
+        }
+        let actualRate = buffer.format.sampleRate
+        if rate == 0 { rate = actualRate }
+        guard abs(actualRate - rate) < 0.1 else { invalidTimestamps += 1; return }
+        let start = AVAudioTime.seconds(forHostTime: time.hostTime)
+        let channelCount = Int(buffer.format.channelCount)
+        guard channelCount > 0, start.isFinite else { invalidTimestamps += 1; return }
+        let frames = min(Int(buffer.frameLength), capacity - values.count)
+        droppedFrames += Int(buffer.frameLength) - frames
+        for frame in 0..<frames {
+            let left = channels[0][buffer.format.isInterleaved ? frame * channelCount : frame]
+            let right = channelCount > 1
+                ? (buffer.format.isInterleaved ? channels[0][frame * channelCount + 1] : channels[1][frame]) : left
+            values.append((left + right) * 0.5)
+            hosts.append(start + Double(frame) / actualRate)
+        }
+    }
+
+    func window(at index: Int) -> Window? {
+        lock.lock(); defer { lock.unlock() }
+        let frames = Int(rate * 0.02)
+        guard frames > 0, index >= 0, index + frames <= values.count else { return nil }
+        return Window(samples: Array(values[index..<(index + frames)]), rate: rate,
+                      start: hosts[index], end: hosts[index + frames - 1] + 1 / rate)
+    }
+
+    func samples(from first: Int, to last: Int) -> Recording {
+        lock.lock(); defer { lock.unlock() }
+        let lower = min(max(0, first), values.count), upper = min(max(first, last), values.count)
+        return Recording(values: Array(values[lower..<upper]), hosts: Array(hosts[lower..<upper]), rate: rate)
+    }
+
+    func validity() -> (invalidTimestamps: Int, droppedFrames: Int) {
+        lock.lock(); defer { lock.unlock() }; return (invalidTimestamps, droppedFrames)
+    }
+
+    static func isTone(_ samples: [Float], rate: Double, frequency: Double) -> Bool {
+        guard !samples.isEmpty, rate.isFinite, rate > 0, samples.allSatisfy({ $0.isFinite }) else { return false }
+        func power(_ hz: Double) -> Double {
+            var real = 0.0, imaginary = 0.0
+            for (index, value) in samples.enumerated() {
+                let phase = 2 * Double.pi * hz * Double(index) / rate
+                real += Double(value) * cos(phase); imaginary += Double(value) * sin(phase)
+            }
+            return (real * real + imaginary * imaginary) / pow(Double(samples.count), 2)
+        }
+        let expected = power(frequency)
+        return expected > 0.001 && expected > 10 * max(power(frequency == 440 ? 880 : 440), 1e-12)
+    }
+
+    static func toneBlocks(_ samples: [Float], rate: Double, frequency: Double) -> (correct: Int, total: Int) {
+        let frames = Int(rate * 0.02)
+        guard frames > 0, samples.count >= frames else { return (0, 0) }
+        var correct = 0, total = 0
+        for start in stride(from: 0, through: samples.count - frames, by: frames) {
+            total += 1
+            if isTone(Array(samples[start..<(start + frames)]), rate: rate, frequency: frequency) { correct += 1 }
+        }
+        return (correct, total)
+    }
+
+    static func quietRun(_ samples: [Float], rate: Double) -> Double {
+        let frames = Int(rate * 0.01)
+        guard frames > 0, samples.count >= frames else { return 0 }
+        var longest = 0, run = 0
+        for start in stride(from: 0, through: samples.count - frames, by: frames) {
+            var square = 0.0
+            for value in samples[start..<(start + frames)] { square += Double(value) * Double(value) }
+            if sqrt(square / Double(frames)) < 0.01 { run += 1; longest = max(longest, run) } else { run = 0 }
+        }
+        return Double(longest * frames) / rate
+    }
+
+    static func maximumTimelineHole(_ hosts: [Double], rate: Double) -> Double {
+        guard rate > 0, hosts.count > 1 else { return 0 }
+        var maximum = 0.0
+        for index in 1..<hosts.count {
+            let interval = hosts[index] - hosts[index - 1]
+            guard interval.isFinite, interval > 0 else { return .infinity }
+            maximum = max(maximum, interval - 1 / rate)
+        }
+        return maximum
+    }
+}
+
+/// Only seek forwarding timestamps/targets; no native player state getter or event hook.
+private final class ProductionSelectionSeekRecorder: @unchecked Sendable {
+    struct Event {
+        let phase: Int
+        let target: Double
+        let entered: Double
+        var completed: Double?
+        var finished: Bool?
+    }
+    private let lock = NSLock()
+    private var currentPhase = -1
+    private var events: [Event] = []
+    private var dropped = 0
+    init() { events.reserveCapacity(32) }
+    var phase: Int {
+        get { lock.lock(); defer { lock.unlock() }; return currentPhase }
+        set { lock.lock(); currentPhase = newValue; lock.unlock() }
+    }
+
+    @MainActor
+    func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
+        let entered = ProductionSelectionOutputTap.hostSeconds()
+        lock.lock()
+        let index: Int?
+        if events.count < 32 {
+            index = events.count
+            events.append(Event(phase: currentPhase, target: time.seconds, entered: entered))
+        } else { dropped += 1; index = nil }
+        lock.unlock()
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [self] finished in
+            let completed = ProductionSelectionOutputTap.hostSeconds()
+            completion(finished)
+            // Forward the real completion before recorder mutation or logging.
+            lock.lock(); defer { lock.unlock() }
+            if let index {
+                if events[index].completed == nil {
+                    events[index].completed = completed; events[index].finished = finished
+                } else { dropped += 1 }
+            }
+        }
+    }
+
+    func dumpAndAssert() {
+        lock.lock(); let result = events, lost = dropped; lock.unlock()
+        print("ProductionSelectionSeekSummary events=\(result.count) capacity=32 dropped=\(lost) nativePositionGetters=0 producerTracing=absent")
+        XCTAssertLessThanOrEqual(result.count, 32); XCTAssertEqual(lost, 0)
+        for (index, event) in result.enumerated() {
+            print("ProductionSelectionSeek ordinal=\(index) phase=\(event.phase) target=\(event.target) enteredHostSeconds=\(event.entered) completedHostSeconds=\(event.completed.map { String($0) } ?? "missing") finished=\(event.finished.map { String($0) } ?? "missing")")
+            XCTAssertTrue((0...2).contains(event.phase)); XCTAssertTrue(event.target.isFinite)
+            XCTAssertTrue(event.entered.isFinite)
+            if let completed = event.completed { XCTAssertGreaterThanOrEqual(completed, event.entered) }
+        }
+    }
+}
+
+private final class ProductionSelectionShutdown: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool?
+    var result: Bool? { lock.lock(); defer { lock.unlock() }; return value }
+    func complete(_ result: Bool) { lock.lock(); value = result; lock.unlock() }
+}
+
 enum SelectionVideoIdentity: String { case a, b }
 private enum SelectionVideoTestFailure: Error {
     case timeout, sample, capture, unsafeCapturePath
@@ -581,14 +1126,16 @@ final class SelectionVideoFixture {
         } catch { remove(); throw error }
     }
 
-    func service(buffer: PlaybackBuffer? = nil, seekVideo: PlaybackService.SeekVideo? = nil) -> PlaybackService {
+    func service(buffer: PlaybackBuffer? = nil, continuousAudio: ContinuousAudioPlayer? = nil,
+                 seekVideo: PlaybackService.SeekVideo? = nil) -> PlaybackService {
         let result: PlaybackService
         if let seekVideo {
             result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
-                                     bookmarkURL: bookmark, activateSession: {}, buffer: buffer, seekVideo: seekVideo)
+                                     bookmarkURL: bookmark, activateSession: {}, buffer: buffer,
+                                     continuousAudio: continuousAudio, seekVideo: seekVideo)
         } else {
             result = PlaybackService(library: library, downloads: downloads, cloud: cloud,
-                                     bookmarkURL: bookmark, activateSession: {}, buffer: buffer)
+                                     bookmarkURL: bookmark, activateSession: {}, buffer: buffer, continuousAudio: continuousAudio)
         }
         result.speakerSound = false
         result.automaticPiP = false
