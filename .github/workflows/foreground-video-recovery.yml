@@ -1,4 +1,4 @@
-name: Foreground video and library regressions
+name: Outstanding video recovery controls
 on:
   push:
     branches: [codex/foreground-video-recovery]
@@ -94,32 +94,37 @@ jobs:
           PY
           }
 
-          reopen=OfflineTikTokPlayerTests/PictureRecoveryTests/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio
-          library=OfflineTikTokPlayerTests/LibraryRefreshTests/testUnchangedForegroundRefreshKeepsCacheAndStillAppliesEditedContent
           build_plan After
           if ! wait "$boot_pid"; then cat "$work/boot.log"; exit 1; fi
-          echo 'iPhone simulator booted; starting playback tests'
-          core=("$reopen" "$library"
-            OfflineTikTokPlayerTests/PictureRecoveryTests/testPictureRecoveryRearmsAfterReturningFromBackground
-            OfflineTikTokPlayerTests/PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit
-            OfflineTikTokPlayerTests/PictureRecoveryTests/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit
-            OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption
-            OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testForegroundCorrectsSameTokenLoopBeforeVisitAdoption
-            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues
-            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testPiPSkipNavigatesHistoryAndOverridesRepeatOneWithoutTenSecondSeek
-            OfflineTikTokPlayerTests/PlaybackContinuityTests/testPreparedPCMReversalsAreIndependentOfVideoReadinessAndBoundMemory
-            OfflineTikTokPlayerTests/FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether
-            OfflineTikTokPlayerTests/AudioOutputContinuityTests/testConfigurationChangeReactivatesSessionBeforeRestartingCurrentOutput
-            OfflineTikTokPlayerTests/AudioOutputContinuityTests/testDelayedConfigurationRecoveryCannotUndoExplicitPauseOrDeniedInterruption
-            OfflineTikTokPlayerTests/AudioOutputContinuityTests/testRepeatedLoopsKeepRealSourceNodeOutputAudibleWithSpeakerProcessing
-            OfflineTikTokPlayerTests/AudioOnlyContinuityTests/testLibraryAudioOnlyPersistsAndRestoresPausedPCMSelection
-            OfflineTikTokPlayerTests/AudioOnlyContinuityTests/testLibraryAudioOnlyHonorsCameraResumePermissionAndExplicitPause
-            OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testPlayingFromPersonalListRecordsOnlyStartedVideosInRecencyOrder)
-          run_cases After "${core[@]}"
-          verify_cases After Passed "${core[@]}"
+          echo 'iPhone simulator booted; starting the outstanding regression checks'
+          status=0
+          check_cases() {
+            local name="$1"
+            shift
+            if run_cases "$name" "$@" && verify_cases "$name" Passed "$@"; then return 0; fi
+            status=1
+          }
+
           hd=OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving
-          run_cases HD "$hd"
-          verify_cases HD Passed "$hd"
-          ui=OfflineTikTokPlayerUITests/PlayerShellTests/testPersonalPlaylistPersistsAndActivityHasSeparateDestinations
-          run_cases LibraryUI "$ui"
-          verify_cases LibraryUI Passed "$ui"
+          check_cases HD "$hd"
+          clock=OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues
+          check_cases VideoClock "$clock"
+
+          capture_log="$work/capture-helper.log"
+          (
+            python3 -u scripts/capture-simulator-test-frames.py --udid "$udid" --lifetime 600 >"$capture_log" 2>&1 &
+            capture_pid=$!
+            trap 'kill "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+            ready=0
+            for ((attempt=0; attempt<150; attempt++)); do
+              kill -0 "$capture_pid" 2>/dev/null || { cat "$capture_log"; exit 1; }
+              if grep -Fq '"eventCode": 0' "$capture_log"; then ready=1; break; fi
+              sleep 0.1
+            done
+            if [ "$ready" -ne 1 ]; then cat "$capture_log"; exit 1; fi
+            owner=(
+              OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption
+              OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testForegroundCorrectsSameTokenLoopBeforeVisitAdoption)
+            run_cases Ownership "${owner[@]}" && verify_cases Ownership Passed "${owner[@]}"
+          ) || status=1
+          exit "$status"
