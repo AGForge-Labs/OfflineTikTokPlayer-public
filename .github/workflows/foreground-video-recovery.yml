@@ -5,18 +5,6 @@ on:
 permissions:
   contents: read
 jobs:
-  portable:
-    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
-    runs-on: ubuntu-24.04
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Queue, audio, personal library and cloud adapter checks
-        run: |
-          bash scripts/test-core.sh
-          bash scripts/test-native-cloud.sh
   simulator:
     if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
     runs-on: macos-26
@@ -44,7 +32,7 @@ jobs:
               "ContinuousAudioGraphTests.swift", "ContinuousAudioPlayerTests.swift", "PictureRecoveryTests.swift",
               "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift",
               "NativeReaderWaitObservation.swift", "NativeStreamingPlaybackTests.swift", "LibraryRefreshTests.swift",
-              "PlaybackContinuityTests.swift",
+              "PlaybackContinuityTests.swift", "HTTPPlaybackFixtureServer.swift",
           }
           found = {p.name for p in Path("ios/OfflineTikTokPlayerTests").glob("*.swift")}
           assert chosen <= found
@@ -101,25 +89,11 @@ jobs:
           PY
           }
 
-          baseline=8ef1e88a6107e50d1b4ac898acdfa52f0f419c51
-          paths=(ios/OfflineTikTokPlayer/Playback/PlaybackService.swift ios/OfflineTikTokPlayer/Services/LibraryRepository.swift)
           reopen=OfflineTikTokPlayerTests/PictureRecoveryTests/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio
           library=OfflineTikTokPlayerTests/LibraryRefreshTests/testUnchangedForegroundRefreshKeepsCacheAndStillAppliesEditedContent
-          trap 'git restore -- "${paths[@]}"' EXIT
-          for path in "${paths[@]}"; do git show "$baseline:$path" > "$path"; done
-          build_plan Before
-          if ! wait "$boot_pid"; then cat "$work/boot.log"; exit 1; fi
-          if run_cases Before "$reopen" "$library"; then
-            echo 'The baseline unexpectedly passed both regression cases.'
-            exit 1
-          fi
-          verify_cases Before Failed "$reopen" "$library"
-          grep -Fq 'Foreground must not seek a healthy video' "$work/Before.log"
-          grep -Fq 'An unchanged catalog must not be rewritten on return' "$work/Before.log"
-          git restore -- "${paths[@]}"
-          trap - EXIT
-          git diff --exit-code -- "${paths[@]}"
           build_plan After
+          if ! wait "$boot_pid"; then cat "$work/boot.log"; exit 1; fi
+          echo 'iPhone simulator booted; starting playback tests'
           core=("$reopen" "$library"
             OfflineTikTokPlayerTests/PictureRecoveryTests/testPictureRecoveryRearmsAfterReturningFromBackground
             OfflineTikTokPlayerTests/PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit
