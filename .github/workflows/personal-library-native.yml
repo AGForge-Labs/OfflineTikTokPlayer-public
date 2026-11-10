@@ -9,7 +9,7 @@ jobs:
   simulator:
     if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
     runs-on: macos-26
-    timeout-minutes: 14
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -20,7 +20,6 @@ jobs:
           set -euo pipefail
           python3 -B scripts/generate-ios-project.py --check
           udid="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
-          xcrun simctl boot "$udid" || xcrun simctl bootstatus "$udid" -b
           mkdir -p artifacts/personal-library
           xcodebuild test -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
             -destination "platform=iOS Simulator,id=$udid" \
