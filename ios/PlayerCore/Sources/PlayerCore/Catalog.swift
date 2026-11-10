@@ -117,9 +117,10 @@ public struct LibraryCatalog: Codable, Sendable {
 
     public static func decode(_ data: Data) throws -> LibraryCatalog { try JSONDecoder().decode(Self.self, from: data) }
 
-    public func queue(playlistIDs: [String], localIDs: Set<String> = [], offlineOnly: Bool = false) -> [String] {
+    public func queue(playlistIDs: [String], localIDs: Set<String> = [], offlineOnly: Bool = false,
+                      within itemIDs: [String]? = nil) -> [String] {
         let selected = Set(playlistIDs)
-        let ordered = selected.isEmpty ? media.map(\.id) : playlists.filter { selected.contains($0.id) }.flatMap(\.itemIDs)
+        let ordered = itemIDs ?? (selected.isEmpty ? media.map(\.id) : playlists.filter { selected.contains($0.id) }.flatMap(\.itemIDs))
         var seen = Set<String>()
         return ordered.filter { id in
             guard let item = mediaByID[id], seen.insert(id).inserted else { return false }

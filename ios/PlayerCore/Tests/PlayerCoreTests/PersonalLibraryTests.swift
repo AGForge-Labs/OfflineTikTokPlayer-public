@@ -3,7 +3,7 @@ import XCTest
 
 final class PersonalLibraryTests: XCTestCase {
     @MainActor
-    func testRecentVideosAreUniqueAndRestoreInLastPlayedOrder() throws {
+    func testRecentVideosAreUniqueAndRestoreInLastPlayedOrder() async throws {
         let (defaults, name) = try isolatedDefaults()
         defer { defaults.removePersistentDomain(forName: name) }
         let library = PersonalLibrary(defaults: defaults)
@@ -15,7 +15,7 @@ final class PersonalLibraryTests: XCTestCase {
     }
 
     @MainActor
-    func testLikesAndBookmarksAreIndependentAndPersistWithoutDuplicateMembership() throws {
+    func testLikesAndBookmarksAreIndependentAndPersistWithoutDuplicateMembership() async throws {
         let (defaults, name) = try isolatedDefaults()
         defer { defaults.removePersistentDomain(forName: name) }
         let library = PersonalLibrary(defaults: defaults)
@@ -23,17 +23,17 @@ final class PersonalLibraryTests: XCTestCase {
         library.toggleLike("a")
         library.toggleLike("b")
         library.toggleLike("a")
-        library.toggleMembership("b", in: playlist.id)
+        try library.toggleMembership("b", in: playlist.id)
         let reopened = PersonalLibrary(defaults: defaults)
         XCTAssertEqual(reopened.liked, ["b"])
         XCTAssertEqual(reopened.playlists, [PlaylistRecord(id: playlist.id, name: "Fav 1", itemIDs: ["a", "b"])])
-        reopened.toggleMembership("a", in: playlist.id)
+        try reopened.toggleMembership("a", in: playlist.id)
         XCTAssertEqual(PersonalLibrary(defaults: defaults).playlists.first?.itemIDs, ["b"])
         XCTAssertEqual(reopened.liked, ["b"])
     }
 
     @MainActor
-    func testEmptyAndDuplicateNamesDoNotCreatePlaylists() throws {
+    func testEmptyAndDuplicateNamesDoNotCreatePlaylists() async throws {
         let (defaults, name) = try isolatedDefaults()
         defer { defaults.removePersistentDomain(forName: name) }
         let library = PersonalLibrary(defaults: defaults)
