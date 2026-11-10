@@ -1,0 +1,116 @@
+name: Stalled video and continuous audio
+on:
+  push:
+    branches: [codex/stalled-video-recovery]
+permissions:
+  contents: read
+jobs:
+  simulator:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: macos-26
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Check video recovery, streaming, audio continuity and HD pacing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/generate-ios-project.py --check
+          work=artifacts/stalled-video-checks
+          mkdir -p "$work"
+          udid=''
+          for attempt in 1 2; do
+            if udid="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"; then break; fi
+            echo "Simulator service lookup attempt $attempt failed"
+          done
+          [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
+          common=(-project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug
+            -destination "platform=iOS Simulator,id=$udid" -derivedDataPath "$work/Derived"
+            -jobs 2)
+          excluded="$(python3 - <<'PY'
+          from pathlib import Path
+          chosen = {
+              "AudioOutputContinuityTests.swift", "PhonePlaybackReliabilityTests.swift", "AudioOnlyContinuityTests.swift",
+              "ContinuousAudioGraphTests.swift", "ContinuousAudioPlayerTests.swift", "PictureRecoveryTests.swift",
+              "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift",
+              "NativeReaderWaitObservation.swift", "NativeStreamingPlaybackTests.swift", "LibraryRefreshTests.swift",
+              "PlaybackContinuityTests.swift", "HTTPPlaybackFixtureServer.swift",
+          }
+          found = {p.name for p in Path("ios/OfflineTikTokPlayerTests").glob("*.swift")}
+          assert chosen <= found
+          print(" ".join(sorted(found - chosen)))
+          PY
+          )"
+          python3 - "$udid" > "$work/boot.log" 2>&1 <<'PY' &
+          import subprocess
+          import sys
+          subprocess.run(["xcrun", "simctl", "bootstatus", sys.argv[1], "-b"], timeout=300, check=True)
+          PY
+          boot_pid=$!
+          build_plan() {
+            xcodebuild build-for-testing "${common[@]}" CODE_SIGNING_ALLOWED=NO \
+              "EXCLUDED_SOURCE_FILE_NAMES=$excluded" 2>&1 | tee "$work/$1-build.log"
+            local plans=("$work/Derived/Build/Products/"*.xctestrun)
+            test "${#plans[@]}" = 1 && test -f "${plans[0]}"
+            plan="${plans[0]}"
+          }
+          run_cases() {
+            local phase="$1" test
+            shift
+            local args=()
+            for test in "$@"; do args+=("-only-testing:$test"); done
+            xcodebuild test-without-building -xctestrun "$plan" -destination "platform=iOS Simulator,id=$udid" \
+              -resultBundlePath "$work/$phase.xcresult" -parallel-testing-enabled NO -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
+              "${args[@]}" 2>&1 | tee "$work/$phase.log"
+          }
+          verify_cases() {
+            local phase="$1" expected="$2"
+            shift 2
+            xcrun xcresulttool get test-results tests --path "$work/$phase.xcresult" > "$work/$phase.json"
+            python3 - "$work/$phase.json" "$expected" "$@" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path, expected, *selectors = sys.argv[1:]
+          remaining = {case.split('/', 1)[1] for case in selectors}
+          nodes = list(json.loads(Path(path).read_text())['testNodes'])
+          count = 0
+          while nodes:
+              node = nodes.pop()
+              nodes.extend(node.get('children', []))
+              if node['nodeType'] != 'Test Case':
+                  continue
+              identity = node['nodeIdentifier'].removesuffix('()')
+              assert identity in remaining and node['result'] == expected, node
+              remaining.remove(identity)
+              count += 1
+          assert not remaining, remaining
+          print(f'{Path(path).stem}: {count} exact cases reported {expected}')
+          PY
+          }
+
+          build_plan Candidate
+          if ! wait "$boot_pid"; then cat "$work/boot.log"; exit 1; fi
+          echo 'iPhone simulator booted; testing stalled video and audio continuity'
+          checks=(
+            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testRepeatedDecoderStopsRecoverDisplayedFramesWithoutInterruptingAudio
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testPictureRecoveryRearmsAfterReturningFromBackground
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testPauseAndAudioOnlyPreventPictureRepair
+            OfflineTikTokPlayerTests/PlaybackContinuityTests/testPreparedPCMReversalsAreIndependentOfVideoReadinessAndBoundMemory
+            OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph
+            OfflineTikTokPlayerTests/AudioOnlyContinuityTests/testLibraryAudioOnlyHonorsCameraResumePermissionAndExplicitPause)
+          status=0
+          run_cases Playback "${checks[@]}" && verify_cases Playback Passed "${checks[@]}" || status=1
+
+          # The cadence benchmark uses a fresh process, with no screenshot polling.
+          hd=OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving
+          run_cases HD "$hd" && verify_cases HD Passed "$hd" || status=1
+          exit "$status"

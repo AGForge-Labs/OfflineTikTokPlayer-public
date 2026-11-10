@@ -358,7 +358,8 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
     func testStoppedEstablishedVideoRecoversWhilePCMContinues() async throws {
         let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }
-        let service = fixture.service()
+        let audio = ContinuousAudioPlayer()
+        let service = fixture.service(continuousAudio: audio)
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         try await until {
@@ -366,25 +367,38 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
                 && service.audioSnapshot.frame > 12_000
         }
         let before = service.audioSnapshot
+        let control = audio.playbackControlRevision
+        let graph = audio.graph
+        let item = try XCTUnwrap(service.player.currentItem)
+        let originalOutput = try XCTUnwrap(item.outputs.first)
         // Reproduce a video-only stop after startup has already shown moving frames.
         // Audio remains on the real production PCM engine throughout this test.
         service.player.pause()
         let stoppedPosition = service.player.currentTime().seconds
         let stoppedFrames = service.submittedVideoFrameCount
+        defer {
+            print("EstablishedVideoRecovery videoFrames=\(service.submittedVideoFrameCount - stoppedFrames) lastVideoPTS=\(service.videoFramePositionSeconds ?? -1) nativePosition=\(service.player.currentTime().seconds) audioFrames=\(service.audioSnapshot.frame - before.frame) outputReplaced=\(item.outputs.first !== originalOutput)")
+            service.pause()
+        }
         try await until {
             service.player.rate > 0 && service.submittedVideoFrameCount >= stoppedFrames + 4
                 && (service.videoFramePositionSeconds ?? 0) > stoppedPosition + 0.15
+                && item.outputs.first !== originalOutput
         }
         let after = service.audioSnapshot
         XCTAssertEqual(service.queue.currentID, fixture.aID)
         XCTAssertEqual(after.token, before.token)
         XCTAssertEqual(after.visit, before.visit)
+        XCTAssertEqual(after.selectionVersion, before.selectionVersion)
+        XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+        XCTAssertTrue(audio.graph === graph)
+        XCTAssertEqual(audio.playbackControlRevision, control, "Video recovery must not stop or restart the audio graph")
+        XCTAssertTrue(service.player.currentItem === item)
+        XCTAssertEqual(item.outputs.count, 1)
         XCTAssertGreaterThan(after.frame, before.frame + 12_000)
         XCTAssertTrue(service.wantsToPlay)
         XCTAssertTrue(service.audioEngineRunning)
         XCTAssertNil(service.message)
-        print("EstablishedVideoRecovery audioTokenUnchanged=\(after.token == before.token) audioFrames=\(after.frame - before.frame) videoFrames=\(service.submittedVideoFrameCount - stoppedFrames)")
-        service.pause()
     }
 
 

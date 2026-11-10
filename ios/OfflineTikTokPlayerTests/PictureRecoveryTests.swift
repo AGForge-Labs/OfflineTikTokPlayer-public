@@ -345,6 +345,41 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertGreaterThan(after.frame, before.frame)
     }
 
+    func testRepeatedDecoderStopsRecoverDisplayedFramesWithoutInterruptingAudio() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self)
+        let service = fixture.service
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until {
+            service.isVideoReady && service.audioSnapshot.frame > 12_000
+                && service.debugDisplayedVideoPositionSeconds != nil
+        }
+        let item = try XCTUnwrap(service.player.currentItem)
+        let before = service.audioSnapshot
+        for _ in 0..<2 {
+            let output = try XCTUnwrap(item.outputs.first)
+            let displayed = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+            let frames = service.submittedVideoFrameCount
+            service.player.pause()
+            try await until {
+                service.submittedVideoFrameCount >= frames + 4 && item.outputs.first !== output
+                    && (service.debugDisplayedVideoPositionSeconds ?? 0) > displayed + 0.25
+            }
+            let after = service.audioSnapshot
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertEqual(item.outputs.count, 1)
+            XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+            XCTAssertEqual(after.token, before.token)
+            XCTAssertEqual(after.visit, before.visit)
+            XCTAssertEqual(after.selectionVersion, before.selectionVersion)
+            XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+            XCTAssertTrue(service.wantsToPlay)
+            XCTAssertTrue(service.audioEngineRunning)
+            XCTAssertNil(service.message)
+        }
+        XCTAssertGreaterThan(service.audioSnapshot.frame, before.frame + 48_000)
+    }
+
     func testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit() async throws {
         let fixture = try await PictureRecoveryFixture(test: self)
         let service = fixture.service

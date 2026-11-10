@@ -1251,6 +1251,20 @@ final class ContinuousPictureInPicture: NSObject {
         readinessUpdatePending = true
     }
 
+    /// Replace the muted decoder's output while its recovery seek already
+    /// owns the frame barrier. Keep the current image until the new output
+    /// produces a frame; do not open another barrier or touch the audio graph.
+    func rebuildFrameOutput(for ticket: PresentationTicket, duringSeek seek: UInt64,
+                            ifEligible: () -> Bool) -> Bool {
+        guard let resource = currentResource else { return false }
+        func eligible() -> Bool {
+            owns(ticket) && presentationActive && frameFeedEnabled && currentResource === resource
+                && activeSeekTicket == seek && seekTicket == seek && ifEligible()
+        }
+        guard eligible() else { return false }
+        return resource.rebuildOutput(ifEligible: eligible) { self.videoOutput = $0 }
+    }
+
     /// Restore a starved output in either audio mode without seeking AVPlayer.
     @discardableResult
     func rebuildFrameOutput(for ticket: PresentationTicket) -> Bool {

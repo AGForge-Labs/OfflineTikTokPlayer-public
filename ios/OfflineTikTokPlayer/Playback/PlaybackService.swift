@@ -503,6 +503,9 @@ final class PlaybackService: NSObject {
     }
     @ObservationIgnored var onDebugVideoOutputRecovery: (() -> Void)?
     var debugVideoPresentationItem: AVPlayerItem? { continuousPiP.debugPresentationItem }
+    var debugDisplayedVideoPositionSeconds: Double? {
+        videoPresentation.flatMap { continuousPiP.displayedFramePosition(for: $0.ticket) }
+    }
     var debugUsesIsolatedVideo: Bool { continuousPiP.debugUsesIsolatedVideo }
     #endif
     var audioSnapshot: ContinuousPCMRenderer.Snapshot { continuousAudio.snapshot }
@@ -2486,7 +2489,7 @@ final class PlaybackService: NSObject {
         return true
     }
 
-    private func readOrdinaryVideoPosition(_ item: AVPlayerItem) -> Double {
+    private func readOrdinaryVideoPosition(_ item: AVPlayerItem) -> (position: Double, stopped: Bool) {
         #if DEBUG
         let kind: DebugVideoPositionReadKind = .itemTimebase
         let observer = onDebugVideoPositionRead
@@ -2495,8 +2498,8 @@ final class PlaybackService: NSObject {
         var sampledEffectiveRate: Double?
         var sampledRawPosition: Double?
         #endif
-        @MainActor func read() -> Double {
-            guard let timebase = item.timebase else { return .nan }
+        @MainActor func read() -> (Double, Bool) {
+            guard let timebase = item.timebase else { return (.nan, false) }
             let time = CMTimebaseGetTime(timebase)
             let effectiveRate = CMTimebaseGetEffectiveRate(timebase)
             #if DEBUG
@@ -2505,7 +2508,7 @@ final class PlaybackService: NSObject {
                 sampledRawPosition = time.isNumeric ? time.seconds : nil
             }
             #endif
-            guard time.isNumeric else { return .nan }
+            guard time.isNumeric else { return (.nan, false) }
             let seconds = time.seconds
             // A scheduled/starting native item can report "playing" while its
             // actual timebase is still stopped. Seeking that frozen clock keeps
@@ -2520,15 +2523,18 @@ final class PlaybackService: NSObject {
             } else {
                 self.stoppedVideoClock = nil; stoppedRecovery = false
             }
-            guard !self.intent.canPlay || (effectiveRate.isFinite
-                && (effectiveRate > 0 || (effectiveRate == 0 && (explicitStart || stoppedRecovery)))) else { return .nan }
-            return seconds.isFinite ? seconds : .nan
+            guard seconds.isFinite, !self.intent.canPlay || (effectiveRate.isFinite
+                && (effectiveRate > 0 || (effectiveRate == 0 && (explicitStart || stoppedRecovery)))) else { return (.nan, false) }
+            let establishedStop = stoppedRecovery && self.readyGeneration == self.generation
+                && self.pendingInitialClockBinding == nil
+            return (seconds, establishedStop)
         }
         #if DEBUG
         onDebugVideoPositionReadAttempt?(kind, ObjectIdentifier(item))
         if let observer, let enteredSeek {
             let entered = DispatchTime.now().uptimeNanoseconds
-            let position = read()
+            let reading = read()
+            let position = reading.0
             let returned = DispatchTime.now().uptimeNanoseconds
             let returnedPresentation = videoPresentation
             let stamp = DebugVideoPositionRead(kind: kind, item: ObjectIdentifier(item),
@@ -2548,7 +2554,7 @@ final class PlaybackService: NSObject {
             if debugEarlyClockAcquisitionControl?.request == request, generation == request {
                 debugLastOrdinaryPositionRead = stamp
             }
-            return position
+            return reading
         }
         #endif
         return read()
@@ -2604,6 +2610,7 @@ final class PlaybackService: NSObject {
         let readReadyGeneration = readyGeneration, readExplicitSeekGeneration = explicitVideoSeekGeneration
         let bindingAtRead = pendingInitialClockBinding
         var sampledNativePosition: Double?
+        var sampledStoppedClock = false
         var sampledAudioGoal: Double?
         var decisionSample: ContinuousPCMRenderer.Snapshot?
         var currentItemAfterRead = true
@@ -2613,24 +2620,25 @@ final class PlaybackService: NSObject {
         var ordinaryDriftReadReturnNs: UInt64? = nil
         #endif
         let correction = PlaybackTimeline.videoCorrectionTarget(force: force, readVideoPosition: {
-            let sampledPosition: Double
+            let reading: (position: Double, stopped: Bool)
             #if DEBUG
             if self.onDebugVideoSeekStamp != nil {
                 ordinaryDriftReadEntryNs = DispatchTime.now().uptimeNanoseconds
-                sampledPosition = self.readOrdinaryVideoPosition(item)
+                reading = self.readOrdinaryVideoPosition(item)
                 ordinaryDriftReadReturnNs = DispatchTime.now().uptimeNanoseconds
             } else {
-                sampledPosition = self.readOrdinaryVideoPosition(item)
+                reading = self.readOrdinaryVideoPosition(item)
             }
-            ordinaryDriftVideoPositionSeconds = sampledPosition
+            ordinaryDriftVideoPositionSeconds = reading.position
             #else
-            sampledPosition = self.readOrdinaryVideoPosition(item)
+            reading = self.readOrdinaryVideoPosition(item)
             #endif
-            sampledNativePosition = sampledPosition
+            sampledNativePosition = reading.position
+            sampledStoppedClock = reading.stopped
             // Revalidate the SDK-owned queue before taking the fresh audio goal.
             // No SDK item/position query follows that goal in this decision.
             currentItemAfterRead = self.player.currentItem === item
-            return sampledPosition
+            return reading.position
         }, readAudioPosition: {
             let host = CMClockGetTime(CMClockGetHostTimeClock())
             let goal = self.continuousAudio.presentationPosition(at: host)
@@ -2724,7 +2732,7 @@ final class PlaybackService: NSObject {
                 return
             }
         }
-        guard let position = correction else { return }
+        guard let correction else { return }
         var bindingBeforeSeek = pendingInitialClockBinding
         if var binding = bindingBeforeSeek, binding.issued,
            ownsInitialClockBinding(binding, item: item) {
@@ -2741,6 +2749,35 @@ final class PlaybackService: NSObject {
             return
         }
         syncingVideoSeek = videoSeek
+        let position: Double
+        let restartingStoppedClock: Bool
+        if sampledStoppedClock, let presentation {
+            func ownsRepair() -> Bool {
+                let sample = continuousAudio.snapshot
+                return generation == request && syncingVideoGeneration == request && syncingVideoSeek == videoSeek
+                    && intent.canPlay && videoAllowed && observedItem === item && !usesNativeAudio
+                    && audioLoadingID == nil && pendingAudioSeek == nil && readyGeneration == request
+                    && continuousAudio.selectedID == selectedID && queue.currentID == selectedID
+                    && videoPresentation?.ticket == presentation.ticket && sample.token == visit.token
+                    && sample.visit == visit.visit && sample.selectionVersion == visit.selectionVersion
+                    && !sample.ended && !continuousAudio.isSelectionPending(in: sample)
+            }
+            func abandonRepair() {
+                if syncingVideoSeek == videoSeek { syncingVideoSeek = nil; syncingVideoGeneration = nil }
+                continuousPiP.completeSeek(videoSeek)
+            }
+            guard ownsRepair(), player.currentItem === item, ownsRepair() else { abandonRepair(); return }
+            restartingStoppedClock = continuousPiP.rebuildFrameOutput(for: presentation.ticket,
+                duringSeek: videoSeek, ifEligible: ownsRepair)
+            // SDK output replacement can take time while PCM keeps advancing.
+            guard ownsRepair(), player.currentItem === item, ownsRepair() else { abandonRepair(); return }
+            let fresh = continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+            guard ownsRepair(), fresh.isFinite else { abandonRepair(); return }
+            position = fresh
+        } else {
+            position = correction
+            restartingStoppedClock = false
+        }
         if let binding = bindingBeforeSeek, binding.issued,
            pendingInitialClockBinding != binding || !ownsInitialClockBinding(binding, item: item) {
             if syncingVideoSeek == videoSeek { syncingVideoSeek = nil; syncingVideoGeneration = nil }
@@ -2865,7 +2902,11 @@ final class PlaybackService: NSObject {
                 guard ownsPresentation() else { return }
                 // AVPlayer schedules the muted video on the system host clock;
                 // it never gates the audio render callback or its next boundary.
-                if self.intent.canPlay {
+                if self.intent.canPlay, restartingStoppedClock, abs(position - desired) <= 1.0 / 30 {
+                    // The recovery seek just loaded this position. Resume it
+                    // without a second native seek for a fractional-frame delta.
+                    self.player.playImmediately(atRate: 1)
+                } else if self.intent.canPlay {
                     #if DEBUG
                     self.debugSetVideoRate(1, time: CMTime(seconds: desired, preferredTimescale: 48_000),
                         atHostTime: host, item: item, request: request, cause: .correctionCompletion)
