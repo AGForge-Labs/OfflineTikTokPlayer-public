@@ -1,6 +1,38 @@
 import XCTest
 
 final class PlayerShellTests: XCTestCase {
+    func testPersonalPlaylistPersistsAndActivityHasSeparateDestinations() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launch()
+        app.buttons["tab.library"].tap()
+        XCTAssertTrue(app.navigationBars["Library"].waitForExistence(timeout: 10))
+        let newPlaylist = app.buttons["New playlist"]
+        if !newPlaylist.isHittable { app.swipeUp() }
+        XCTAssertTrue(newPlaylist.isHittable)
+        newPlaylist.tap()
+        let name = app.textFields["Playlist name"]
+        XCTAssertTrue(name.waitForExistence(timeout: 5))
+        name.tap()
+        let title = "Test mix \(UUID().uuidString.prefix(6))"
+        name.typeText(title)
+        app.buttons["Create playlist"].tap()
+        XCTAssertTrue(app.staticTexts[title].waitForExistence(timeout: 5))
+
+        app.terminate()
+        app.launch()
+        app.buttons["tab.library"].tap()
+        for destination in ["History", "Liked", title] {
+            let row = app.staticTexts[destination]
+            if !row.isHittable { app.swipeUp() }
+            XCTAssertTrue(row.isHittable, "Missing Library row \(destination)")
+            row.tap()
+            let nav = app.navigationBars[destination]
+            XCTAssertTrue(nav.waitForExistence(timeout: 5))
+            nav.buttons["Library"].tap()
+        }
+    }
+
     func testLibraryAndPlaybackSettingsAreReachable() {
         continueAfterFailure = false
         let app = XCUIApplication()

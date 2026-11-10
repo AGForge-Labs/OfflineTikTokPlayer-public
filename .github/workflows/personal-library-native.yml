@@ -1,0 +1,56 @@
+name: Personal library iPhone Simulator checks
+on:
+  push:
+    branches: [codex/personal-library]
+    paths: ['ios/**', '.github/workflows/personal-library-native.yml']
+permissions:
+  contents: read
+jobs:
+  simulator:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: macos-26
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Compile and test the personal library and existing Library settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/generate-ios-project.py --check
+          udid="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          mkdir -p artifacts/personal-library
+          xcodebuild test -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination "platform=iOS Simulator,id=$udid" \
+            -derivedDataPath artifacts/PersonalLibraryDerived \
+            -resultBundlePath artifacts/personal-library/Tests.xcresult \
+            -jobs 2 -parallel-testing-enabled NO -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 \
+            -only-testing:OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testPlayingFromPersonalListRecordsOnlyStartedVideosInRecencyOrder \
+            -only-testing:OfflineTikTokPlayerUITests/PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable \
+            -only-testing:OfflineTikTokPlayerUITests/PlayerShellTests/testPersonalPlaylistPersistsAndActivityHasSeparateDestinations \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee artifacts/personal-library/tests.log
+          xcrun xcresulttool get test-results tests --path artifacts/personal-library/Tests.xcresult > artifacts/personal-library/results.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          expected = {
+              'NativeStreamingPlaybackTests/testPlayingFromPersonalListRecordsOnlyStartedVideosInRecencyOrder',
+              'PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable',
+              'PlayerShellTests/testPersonalPlaylistPersistsAndActivityHasSeparateDestinations',
+          }
+          pending = list(json.loads(Path('artifacts/personal-library/results.json').read_text())['testNodes'])
+          passed = set()
+          while pending:
+              node = pending.pop()
+              pending.extend(node.get('children', []))
+              if node['nodeType'] != 'Test Case':
+                  continue
+              identity = node['nodeIdentifier'].removesuffix('()')
+              assert identity in expected and identity not in passed and node['result'] == 'Passed', node
+              passed.add(identity)
+          assert passed == expected, passed
+          print('PERSONAL_LIBRARY_SIMULATOR_PASSED cases=3')
+          PY

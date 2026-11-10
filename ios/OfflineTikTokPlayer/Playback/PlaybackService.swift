@@ -377,6 +377,7 @@ final class PlaybackService: NSObject {
     private static let playbackLog = OSLog(subsystem: "OfflineTikTokPlayer", category: "Playback")
     @ObservationIgnored var onPlaybackEvent: ((PlaybackEvent) -> Void)?
     @ObservationIgnored private var firstProgressGeneration: Int?
+    @ObservationIgnored private var historyGeneration: Int?
     var player: AVQueuePlayer { buffer.player }
     let clock = PlaybackClock()
     private(set) var queue = PlaybackQueue(ids: []) {
@@ -431,6 +432,7 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var lastUnderrun: Int64 = 0
     private var videoAllowed: Bool { presentationPolicy.allowsVideoRendering }
     @ObservationIgnored var requestPlayerUI: (() -> Void)?
+    @ObservationIgnored var didPlayMedia: (@MainActor @Sendable (String) -> Void)?
     @ObservationIgnored private(set) var surface: PlayerSurface!
     @ObservationIgnored private var pip: AVPictureInPictureController?
     @ObservationIgnored private let library: LibraryRepository
@@ -740,12 +742,17 @@ final class PlaybackService: NSObject {
         loadCurrent(position: bookmark.position)
     }
 
-    func start(playlistIDs: [String], at mediaID: String? = nil, shuffle: Bool = false, offlineOnly: Bool = false) {
+    func start(playlistIDs: [String], at mediaID: String? = nil, shuffle: Bool = false, offlineOnly: Bool = false,
+               within itemIDs: [String]? = nil) {
         let command = beginAudioCommand()
         recordPlaybackEvent("start")
         guard audioCommand == command else { return }
         let ids = library.catalog.queue(playlistIDs: playlistIDs, localIDs: downloads.readyIDs,
-            offlineOnly: offlineOnly || !downloads.network.isConnected)
+            offlineOnly: offlineOnly || !downloads.network.isConnected, within: itemIDs)
+        if itemIDs != nil, let mediaID, !ids.contains(mediaID) {
+            message = "This video is unavailable right now."
+            return
+        }
         guard !ids.isEmpty else { message = "No playable videos here yet. Download this playlist or import local videos."; return }
         let repeatMode = queue.repeatMode
         queue = PlaybackQueue(ids: ids, startAt: mediaID, shuffle: shuffle)
@@ -2253,6 +2260,7 @@ final class PlaybackService: NSObject {
         if firstProgressGeneration != generation, sample.frame >= 2_400 {
             firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
         }
+        if historyGeneration != generation, sample.frame >= 2_400 { recordPlayed(entry.id) }
         if handleEnd, sample.ended, intent.canPlay {
             if isInteractingWithFeed { endedDuringScroll = true }
             else {
@@ -2302,7 +2310,16 @@ final class PlaybackService: NSObject {
         if firstProgressGeneration != generation, item.currentTime().seconds >= 0.05 {
             firstProgressGeneration = generation; recordPlaybackEvent("clock50ms")
         }
+        if historyGeneration != generation, intent.canPlay, position >= 0.05, player.rate > 0,
+           let id = queue.currentID { recordPlayed(id) }
         if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
+    }
+
+    private func recordPlayed(_ id: String) {
+        guard intent.canPlay, queue.currentID == id, let didPlayMedia else { return }
+        historyGeneration = generation
+        // Keep preferences and view updates outside the time-sampling callback.
+        DispatchQueue.main.async { didPlayMedia(id) }
     }
 
     #if DEBUG

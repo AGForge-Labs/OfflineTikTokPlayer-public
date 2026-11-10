@@ -7,6 +7,25 @@ import PlayerCore
 /// a fake cloud URL resolver. This tests service/clock ownership, not HTTP or a phone.
 @MainActor
 final class NativeStreamingPlaybackTests: XCTestCase {
+    func testPlayingFromPersonalListRecordsOnlyStartedVideosInRecencyOrder() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let service = try await makeStreamService(fixture)
+        let suite = "PersonalStreamingHistory-" + UUID().uuidString
+        let preferences = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { preferences.removePersistentDomain(forName: suite) }
+        let personal = PersonalLibrary(defaults: preferences)
+        service.didPlayMedia = { personal.recordPlayed($0) }
+        service.isInteractingWithFeed = true
+        service.start(playlistIDs: [], at: fixture.bID, within: [fixture.bID, fixture.aID])
+        try await until { personal.history == [fixture.bID] }
+        service.next()
+        try await until { personal.history == [fixture.aID, fixture.bID] }
+        service.previous()
+        try await until { personal.history == [fixture.bID, fixture.aID] }
+        XCTAssertTrue(fixture.downloads.readyIDs.isEmpty)
+    }
+
     func testUncachedCloudSelectionPlaysAndNavigatesWithoutAnOfflineCopy() async throws {
         let fixture = try await SelectionVideoFixture(test: self)
         defer { fixture.remove() }

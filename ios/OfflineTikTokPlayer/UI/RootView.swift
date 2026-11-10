@@ -26,7 +26,11 @@ struct RootView: View {
         }
         .background(.black)
         .sheet(item: $app.sheet) { destination in
-            switch destination { case .settings: SettingsView() }
+            switch destination {
+            case .settings: SettingsView()
+            case .newPlaylist: PersonalPlaylistEditor(mediaID: nil)
+            case .playlistsForVideo(let id): PersonalPlaylistEditor(mediaID: id)
+            }
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.movie, .json], allowsMultipleSelection: true) { result in
             Task { @MainActor in

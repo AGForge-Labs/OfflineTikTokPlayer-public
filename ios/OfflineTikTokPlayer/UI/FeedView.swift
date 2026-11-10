@@ -78,6 +78,18 @@ private struct FeedPage: View {
                         }.font(.caption).foregroundStyle(.white.opacity(0.85))
                     }.frame(maxWidth: .infinity, alignment: .leading)
                     VStack(spacing: 18) {
+                        let liked = app.personal.likedIDs.contains(item.id)
+                        let bookmarked = app.personal.bookmarkedIDs.contains(item.id)
+                        action(liked ? "Liked" : "Like", icon: liked ? "heart.fill" : "heart", active: liked,
+                               accessibilityTitle: liked ? "Unlike video" : "Like video") {
+                            guard app.playback.queue.currentID == item.id else { return }
+                            app.personal.toggleLike(item.id)
+                        }
+                        action("Playlist", icon: bookmarked ? "bookmark.fill" : "bookmark", active: bookmarked,
+                               accessibilityTitle: "Add to playlist") {
+                            guard app.playback.queue.currentID == item.id else { return }
+                            app.sheet = .playlistsForVideo(item.id)
+                        }
                         action("Shuffle", icon: "shuffle", active: app.playback.queue.isShuffled) { app.playback.setShuffle(!app.playback.queue.isShuffled) }
                         action(repeatLabel, icon: app.playback.queue.repeatMode == .one ? "repeat.1" : "repeat", active: app.playback.queue.repeatMode != .off) { app.playback.cycleRepeat() }
                         action(app.downloads.readyIDs.contains(item.id) ? "Saved" : "Save", icon: app.downloads.readyIDs.contains(item.id) ? "checkmark.circle.fill" : "arrow.down.circle") {
@@ -95,13 +107,14 @@ private struct FeedPage: View {
     private var repeatLabel: String {
         switch app.playback.queue.repeatMode { case .off: return "Loop off"; case .all: return "Loop all"; case .one: return "Loop one" }
     }
-    private func action(_ label: String, icon: String, active: Bool = false, run: @escaping () -> Void) -> some View {
+    private func action(_ label: String, icon: String, active: Bool = false,
+                        accessibilityTitle: String? = nil, run: @escaping () -> Void) -> some View {
         Button(action: run) {
             VStack(spacing: 3) {
                 Image(systemName: icon).font(.system(size: 27, weight: .semibold)).frame(width: 44, height: 36)
                 Text(label).font(.caption2.weight(.semibold))
             }.foregroundStyle(active ? .cyan : .white).shadow(color: .black.opacity(0.7), radius: 3)
-        }.buttonStyle(.plain).accessibilityLabel(label).accessibilityAddTraits(active ? .isSelected : [])
+        }.buttonStyle(.plain).accessibilityLabel(accessibilityTitle ?? label).accessibilityAddTraits(active ? .isSelected : [])
     }
 }
 
