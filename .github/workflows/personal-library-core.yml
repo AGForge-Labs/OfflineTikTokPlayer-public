@@ -1,0 +1,16 @@
+name: Personal library portable checks
+on:
+  push:
+    branches: [codex/personal-library]
+permissions:
+  contents: read
+jobs:
+  core:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: bash scripts/test-core.sh
