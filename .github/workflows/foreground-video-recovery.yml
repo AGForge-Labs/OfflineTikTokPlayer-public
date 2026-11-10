@@ -21,7 +21,12 @@ jobs:
           python3 -B scripts/generate-ios-project.py --check
           work=artifacts/foreground-checks
           mkdir -p "$work"
-          udid="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          udid=''
+          for attempt in 1 2; do
+            if udid="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"; then break; fi
+            echo "Simulator service lookup attempt $attempt failed"
+          done
+          [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
           common=(-project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug
             -destination "platform=iOS Simulator,id=$udid" -derivedDataPath "$work/Derived"
             -jobs 2)
