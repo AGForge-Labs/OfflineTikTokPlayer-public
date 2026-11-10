@@ -26,7 +26,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 3
-      - name: Reproduce and validate in one iPhone 17 Pro Max simulator
+      - name: Boot, build, and run the focused iPhone 17 Pro Max checks
         shell: bash
         run: |
           set -euo pipefail
@@ -36,15 +36,43 @@ jobs:
           udid="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           common=(-project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug
             -destination "platform=iOS Simulator,id=$udid" -derivedDataPath "$work/Derived"
-            -jobs 2 -parallel-testing-enabled NO -test-timeouts-enabled YES
-            -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120)
+            -jobs 2)
+          excluded="$(python3 - <<'PY'
+          from pathlib import Path
+          chosen = {
+              "AudioOutputContinuityTests.swift", "PhonePlaybackReliabilityTests.swift", "AudioOnlyContinuityTests.swift",
+              "ContinuousAudioGraphTests.swift", "ContinuousAudioPlayerTests.swift", "PictureRecoveryTests.swift",
+              "FeedPresentationTests.swift", "VideoPresentationContinuityTests.swift", "PlaybackSelectionVideoRegressionTests.swift",
+              "NativeReaderWaitObservation.swift", "NativeStreamingPlaybackTests.swift", "LibraryRefreshTests.swift",
+              "PlaybackContinuityTests.swift",
+          }
+          found = {p.name for p in Path("ios/OfflineTikTokPlayerTests").glob("*.swift")}
+          assert chosen <= found
+          print(" ".join(sorted(found - chosen)))
+          PY
+          )"
+          python3 - "$udid" > "$work/boot.log" 2>&1 <<'PY' &
+          import subprocess
+          import sys
+          subprocess.run(["xcrun", "simctl", "bootstatus", sys.argv[1], "-b"], timeout=300, check=True)
+          PY
+          boot_pid=$!
+          build_plan() {
+            xcodebuild build-for-testing "${common[@]}" CODE_SIGNING_ALLOWED=NO \
+              "EXCLUDED_SOURCE_FILE_NAMES=$excluded" 2>&1 | tee "$work/$1-build.log"
+            local plans=("$work/Derived/Build/Products/"*.xctestrun)
+            test "${#plans[@]}" = 1 && test -f "${plans[0]}"
+            plan="${plans[0]}"
+          }
           run_cases() {
-            local action="$1" phase="$2" test
-            shift 2
+            local phase="$1" test
+            shift
             local args=()
             for test in "$@"; do args+=("-only-testing:$test"); done
-            xcodebuild "$action" "${common[@]}" -resultBundlePath "$work/$phase.xcresult" \
-              "${args[@]}" CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$phase.log"
+            xcodebuild test-without-building -xctestrun "$plan" -destination "platform=iOS Simulator,id=$udid" \
+              -resultBundlePath "$work/$phase.xcresult" -parallel-testing-enabled NO -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
+              "${args[@]}" 2>&1 | tee "$work/$phase.log"
           }
           verify_cases() {
             local phase="$1" expected="$2"
@@ -77,18 +105,21 @@ jobs:
           paths=(ios/OfflineTikTokPlayer/Playback/PlaybackService.swift ios/OfflineTikTokPlayer/Services/LibraryRepository.swift)
           reopen=OfflineTikTokPlayerTests/PictureRecoveryTests/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio
           library=OfflineTikTokPlayerTests/LibraryRefreshTests/testUnchangedForegroundRefreshKeepsCacheAndStillAppliesEditedContent
-          (
-            trap 'git restore -- "${paths[@]}"' EXIT
-            for path in "${paths[@]}"; do git show "$baseline:$path" > "$path"; done
-            if run_cases test Before "$reopen" "$library"; then
-              echo 'The baseline unexpectedly passed both regression cases.'
-              exit 1
-            fi
-            verify_cases Before Failed "$reopen" "$library"
-            grep -Fq 'Foreground must not seek a healthy video' "$work/Before.log"
-            grep -Fq 'An unchanged catalog must not be rewritten on return' "$work/Before.log"
-          )
+          trap 'git restore -- "${paths[@]}"' EXIT
+          for path in "${paths[@]}"; do git show "$baseline:$path" > "$path"; done
+          build_plan Before
+          if ! wait "$boot_pid"; then cat "$work/boot.log"; exit 1; fi
+          if run_cases Before "$reopen" "$library"; then
+            echo 'The baseline unexpectedly passed both regression cases.'
+            exit 1
+          fi
+          verify_cases Before Failed "$reopen" "$library"
+          grep -Fq 'Foreground must not seek a healthy video' "$work/Before.log"
+          grep -Fq 'An unchanged catalog must not be rewritten on return' "$work/Before.log"
+          git restore -- "${paths[@]}"
+          trap - EXIT
           git diff --exit-code -- "${paths[@]}"
+          build_plan After
           core=("$reopen" "$library"
             OfflineTikTokPlayerTests/PictureRecoveryTests/testPictureRecoveryRearmsAfterReturningFromBackground
             OfflineTikTokPlayerTests/PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit
@@ -105,11 +136,11 @@ jobs:
             OfflineTikTokPlayerTests/AudioOnlyContinuityTests/testLibraryAudioOnlyPersistsAndRestoresPausedPCMSelection
             OfflineTikTokPlayerTests/AudioOnlyContinuityTests/testLibraryAudioOnlyHonorsCameraResumePermissionAndExplicitPause
             OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testPlayingFromPersonalListRecordsOnlyStartedVideosInRecencyOrder)
-          run_cases test After "${core[@]}"
+          run_cases After "${core[@]}"
           verify_cases After Passed "${core[@]}"
           hd=OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving
-          run_cases test-without-building HD "$hd"
+          run_cases HD "$hd"
           verify_cases HD Passed "$hd"
           ui=OfflineTikTokPlayerUITests/PlayerShellTests/testPersonalPlaylistPersistsAndActivityHasSeparateDestinations
-          run_cases test LibraryUI "$ui"
+          run_cases LibraryUI "$ui"
           verify_cases LibraryUI Passed "$ui"
