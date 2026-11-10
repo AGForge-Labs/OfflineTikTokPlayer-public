@@ -10,19 +10,15 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "da51788aef457e668580a44840b361d0a9f1d7c6"
-SOURCE = "3b3758e383cda3d015e56e8035433de7a796c5ea"
-APP_TREE = "a8eb0a2051c8cb2aa79c43432e4130ad289301ee"
-BASE_APP_TREE = "a8eb0a2051c8cb2aa79c43432e4130ad289301ee"
-CORE_TREE = "f9b20964220eb867c397e9fa8334c673263d92a5"
+SOURCE_BASE = "36cfaf81fd57d3f5fe7d2c04ee6a04b080511efe"
+SOURCE = "d278ea838fca7c7e5105aade87d7aa7db1438ac5"
+APP_TREE = "f7899548930ac9673b304c07fc53503da1420d0a"
+BASE_APP_TREE = "f7899548930ac9673b304c07fc53503da1420d0a"
+CORE_TREE = "5383179d1de06b6c24c00691bc0101e64d771935"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
-    '.github/workflows/audio-output-evidence.yml',
-    'docs/superpowers/plans/2026-11-03-audio-output-continuity.md',
-    'scripts/revalidate-audio-output.py',
-    'scripts/verify-native-test-log.py',
-    'tests/validation-shell/test_audio_revalidation.py',
-    'tests/validation-shell/test_native_test_evidence.py',
+    '.github/workflows/stalled-video-recovery.yml',
+    'ios/OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests.swift',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -223,6 +219,7 @@ NATIVE_PROOFS = (
     (41388275137, "fe55925544585b85bb59b361eee450cc8cf60838", ".github/workflows/reverse-swipe.yml", "codex/reverse-swipe"),
     (41438316239, "f4dbfc8cff17f184d7f6a9c8e251f9b8d5bcaa09", ".github/workflows/native-video-evidence.yml", "codex/native-video-evidence"),
     (41741373827, "3b3758e383cda3d015e56e8035433de7a796c5ea", ".github/workflows/audio-output-evidence.yml", "codex/audio-continuity-evidence"),
+    (42925893598, "d278ea838fca7c7e5105aade87d7aa7db1438ac5", ".github/workflows/stalled-video-recovery.yml", "codex/stalled-video-recovery"),
 )
 
 
@@ -269,7 +266,7 @@ def main():
     verify_checkouts(ROOT, candidate, environment["EXPECTED_CONTROL_COMMIT"])
     if args.command == "check":
         require_native_result()
-        print("Exact candidate, reviewed reversal delta and exact focused native results verified. Full-suite and phone acceptance remain unresolved.")
+        print("Exact candidate, source changes and focused native results verified. Full-suite and phone acceptance remain unresolved.")
         return
     require(sys.platform == "darwin", "Signing requires the existing standard macOS runner.")
     if args.command == "sign-upload":
