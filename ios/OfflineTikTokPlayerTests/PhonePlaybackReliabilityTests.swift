@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import UIKit
 import PlayerCore
 @testable import OfflineTikTokPlayer
 
@@ -360,30 +361,42 @@ final class PhonePlaybackReliabilityTests: XCTestCase {
         defer { fixture.remove() }
         let audio = ContinuousAudioPlayer()
         let service = fixture.service(continuousAudio: audio)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previous = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let host = UIViewController()
+        window.frame = scene.coordinateSpace.bounds
+        window.windowLevel = .alert + 1
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        service.surface.frame = host.view.bounds
+        service.surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        host.view.addSubview(service.surface)
+        host.view.layoutIfNeeded()
+        defer { window.isHidden = true; window.rootViewController = nil; previous?.makeKey() }
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
         try await until {
             service.isVideoReady && service.submittedVideoFrameCount >= 3
-                && service.audioSnapshot.frame > 12_000
+                && service.audioSnapshot.frame > 12_000 && service.debugDisplayedVideoPositionSeconds != nil
         }
         let before = service.audioSnapshot
         let control = audio.playbackControlRevision
         let graph = audio.graph
         let item = try XCTUnwrap(service.player.currentItem)
         let originalOutput = try XCTUnwrap(item.outputs.first)
+        let displayedPosition = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
         // Reproduce a video-only stop after startup has already shown moving frames.
         // Audio remains on the real production PCM engine throughout this test.
         service.player.pause()
-        let stoppedPosition = service.player.currentTime().seconds
         let stoppedFrames = service.submittedVideoFrameCount
         defer {
             print("EstablishedVideoRecovery videoFrames=\(service.submittedVideoFrameCount - stoppedFrames) lastVideoPTS=\(service.videoFramePositionSeconds ?? -1) nativePosition=\(service.player.currentTime().seconds) audioFrames=\(service.audioSnapshot.frame - before.frame) outputReplaced=\(item.outputs.first !== originalOutput)")
             service.pause()
         }
         try await until {
-            service.player.rate > 0 && service.submittedVideoFrameCount >= stoppedFrames + 4
-                && (service.videoFramePositionSeconds ?? 0) > stoppedPosition + 0.15
-                && item.outputs.first !== originalOutput
+            service.submittedVideoFrameCount >= stoppedFrames + 4 && item.outputs.first !== originalOutput
+                && (service.debugDisplayedVideoPositionSeconds ?? 0) > displayedPosition + 0.25
         }
         let after = service.audioSnapshot
         XCTAssertEqual(service.queue.currentID, fixture.aID)
