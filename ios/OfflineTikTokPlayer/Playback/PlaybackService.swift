@@ -2984,18 +2984,40 @@ final class PlaybackService: NSObject {
     }
 
     func enteredForeground() {
+        if !presentationPolicy.applicationIsActive {
+            // A new foreground interval may need one fresh picture repair,
+            // even if the same audio visit survived the last one.
+            imageProgressOwner = nil
+            lastImageProgressCheck = 0
+        }
         applyPresentation(presentationPolicy.applicationDidBecomeActive())
         recordDiagnostic(.appForegrounded)
         let interrupted = intent.isInterrupted
         intent.enteredForeground()
         if interrupted { continuousAudio.suspend(); player.pause(); message = "Audio was interrupted. Tap Play to resume." }
-        else {
+        else if !hasCurrentForegroundPicture() {
             #if DEBUG
             synchronizeVideoToAudio(force: true, reason: .foreground)
             #else
             synchronizeVideoToAudio(force: true)
             #endif
         }
+    }
+
+    private func hasCurrentForegroundPicture() -> Bool {
+        guard videoAllowed, intent.canPlay, continuousAudio.isSelected, audioLoadingID == nil,
+              readyGeneration == generation, isVideoReady, syncingVideoGeneration == nil,
+              let id = queue.currentID, continuousAudio.selectedID == id, displayedVideoMediaID == id,
+              let presentation = videoPresentation, presentation.request == generation,
+              continuousPiP.currentFrameReceipt(for: presentation.ticket) != nil,
+              let position = continuousPiP.lastFramePositionSeconds else { return false }
+        let sample = continuousAudio.snapshot
+        guard sample.token > 0, sample.token == audioToken, sample.visit == audioVisit,
+              !sample.ended, !continuousAudio.isSelectionPending(in: sample) else { return false }
+        // This is a cached freshness check, not a sync decision. Allow for a
+        // few frames and the PCM render-ahead; precise drift and missing
+        // displayed images are still checked by the normal playback tick.
+        return abs(Double(sample.frame) / 48_000 - position) <= 0.12
     }
 
     func handleInterruption(began: Bool, shouldResume: Bool = false) {

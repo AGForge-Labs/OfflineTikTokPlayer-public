@@ -122,6 +122,37 @@ final class LibraryRefreshTests: XCTestCase {
         XCTAssertEqual(try LibraryCatalog.decode(Data(contentsOf: url)).media.map(\.id), ["new", "local:mine"])
     }
 
+    func testUnchangedForegroundRefreshKeepsCacheAndStillAppliesEditedContent() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cloud = OneDriveClient(account: MicrosoftAccount())
+        let updatedAt = "2026-01-01T00:00:00Z"
+        let remote = MediaRecord(id: "cloud", title: "Cloud video")
+        let local = MediaRecord(id: "local:mine", title: "Phone video")
+        let playlist = PlaylistRecord(id: "imported", name: "Imported", itemIDs: [remote.id])
+        let localPlaylist = PlaylistRecord(id: "local:videos", name: "On your iPhone", itemIDs: [local.id])
+        var fetched = try LibraryCatalog(libraryID: "private", media: [remote], playlists: [playlist], updatedAt: updatedAt)
+        let library = LibraryRepository(cloud: cloud, catalogURL: url, fetchCatalog: { fetched })
+        try library.install(LibraryCatalog(libraryID: "private", media: [remote, local],
+            playlists: [playlist, localPlaylist], updatedAt: updatedAt))
+        let marker = Date(timeIntervalSince1970: 946_684_800)
+        try FileManager.default.setAttributes([.modificationDate: marker], ofItemAtPath: url.path)
+        func modificationTime() throws -> Date? {
+            try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
+        }
+        XCTAssertEqual(try modificationTime(), marker)
+        await library.refresh(silently: true)
+        XCTAssertEqual(try modificationTime(), marker, "An unchanged catalog must not be rewritten on return")
+        XCTAssertEqual(library.catalog.playlists, [playlist, localPlaylist])
+
+        var edited = remote
+        edited.title = "Edited on the PC"
+        fetched = try LibraryCatalog(libraryID: "private", media: [edited], playlists: [playlist], updatedAt: updatedAt)
+        await library.refresh(silently: true)
+        XCTAssertEqual(library.catalog.media, [edited, local])
+        XCTAssertEqual(try LibraryCatalog.decode(Data(contentsOf: url)).media, [edited, local])
+    }
+
     func testQuickBackgroundAndForegroundDoesNotLoseTheRefresh() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
         defer { try? FileManager.default.removeItem(at: url) }

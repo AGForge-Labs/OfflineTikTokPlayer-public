@@ -67,11 +67,19 @@ final class LibraryRepository {
             throw AppError.message("This catalog belongs to a different library. Use the original Microsoft account.")
         }
         // Locally added videos remain available when the cloud catalog is refreshed.
-        let remoteIDs = Set(replacement.media.map(\.id))
-        let local = catalog.media.filter { $0.id.hasPrefix("local:") && !remoteIDs.contains($0.id) }
-        let localLists = catalog.playlists.filter { $0.id.hasPrefix("local:") }
-        let result = try LibraryCatalog(libraryID: replacement.libraryID, media: replacement.media + local,
-            playlists: replacement.playlists + localLists.filter { list in !replacement.playlists.contains(where: { $0.id == list.id }) }, updatedAt: replacement.updatedAt)
+        let local = catalog.media.filter { $0.id.hasPrefix("local:") && replacement.mediaByID[$0.id] == nil }
+        let localLists = catalog.playlists.filter { list in
+            list.id.hasPrefix("local:") && !replacement.playlists.contains { $0.id == list.id }
+        }
+        let media = local.isEmpty ? replacement.media : replacement.media + local
+        let playlists = localLists.isEmpty ? replacement.playlists : replacement.playlists + localLists
+        // Automatic refresh often returns the same catalog. Avoid both the
+        // synchronous cache write and a feed update unless the content changed.
+        guard catalog.libraryID != replacement.libraryID || catalog.updatedAt != replacement.updatedAt
+            || catalog.media != media || catalog.playlists != playlists else { return }
+        let result = local.isEmpty && localLists.isEmpty ? replacement
+            : try LibraryCatalog(libraryID: replacement.libraryID, media: media, playlists: playlists,
+                updatedAt: replacement.updatedAt, schemaVersion: replacement.schemaVersion)
         try AppFiles.save(result, to: url); catalog = result
     }
 

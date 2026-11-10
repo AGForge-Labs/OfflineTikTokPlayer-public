@@ -1,0 +1,115 @@
+name: Foreground video and library regressions
+on:
+  push:
+    branches: [codex/foreground-video-recovery]
+permissions:
+  contents: read
+jobs:
+  portable:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Queue, audio, personal library and cloud adapter checks
+        run: |
+          bash scripts/test-core.sh
+          bash scripts/test-native-cloud.sh
+  simulator:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Reproduce and validate in one iPhone 17 Pro Max simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/generate-ios-project.py --check
+          work=artifacts/foreground-checks
+          mkdir -p "$work"
+          udid="$(python3 scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          common=(-project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug
+            -destination "platform=iOS Simulator,id=$udid" -derivedDataPath "$work/Derived"
+            -jobs 2 -parallel-testing-enabled NO -test-timeouts-enabled YES
+            -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120)
+          run_cases() {
+            local action="$1" phase="$2" test
+            shift 2
+            local args=()
+            for test in "$@"; do args+=("-only-testing:$test"); done
+            xcodebuild "$action" "${common[@]}" -resultBundlePath "$work/$phase.xcresult" \
+              "${args[@]}" CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$phase.log"
+          }
+          verify_cases() {
+            local phase="$1" expected="$2"
+            shift 2
+            xcrun xcresulttool get test-results tests --path "$work/$phase.xcresult" > "$work/$phase.json"
+            python3 - "$work/$phase.json" "$expected" "$@" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path, expected, *selectors = sys.argv[1:]
+          remaining = {case.split('/', 1)[1] for case in selectors}
+          nodes = list(json.loads(Path(path).read_text())['testNodes'])
+          count = 0
+          while nodes:
+              node = nodes.pop()
+              nodes.extend(node.get('children', []))
+              if node['nodeType'] != 'Test Case':
+                  continue
+              identity = node['nodeIdentifier'].removesuffix('()')
+              assert identity in remaining and node['result'] == expected, node
+              remaining.remove(identity)
+              count += 1
+          assert not remaining, remaining
+          print(f'{Path(path).stem}: {count} exact cases reported {expected}')
+          PY
+          }
+
+          baseline=8ef1e88a6107e50d1b4ac898acdfa52f0f419c51
+          paths=(ios/OfflineTikTokPlayer/Playback/PlaybackService.swift ios/OfflineTikTokPlayer/Services/LibraryRepository.swift)
+          reopen=OfflineTikTokPlayerTests/PictureRecoveryTests/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio
+          library=OfflineTikTokPlayerTests/LibraryRefreshTests/testUnchangedForegroundRefreshKeepsCacheAndStillAppliesEditedContent
+          (
+            trap 'git restore -- "${paths[@]}"' EXIT
+            for path in "${paths[@]}"; do git show "$baseline:$path" > "$path"; done
+            if run_cases test Before "$reopen" "$library"; then
+              echo 'The baseline unexpectedly passed both regression cases.'
+              exit 1
+            fi
+            verify_cases Before Failed "$reopen" "$library"
+            grep -Fq 'Foreground must not seek a healthy video' "$work/Before.log"
+            grep -Fq 'An unchanged catalog must not be rewritten on return' "$work/Before.log"
+          )
+          git diff --exit-code -- "${paths[@]}"
+          core=("$reopen" "$library"
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testPictureRecoveryRearmsAfterReturningFromBackground
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit
+            OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testForegroundDoesNotSeekStaleVideoOwnerBeforeNaturalVisitAdoption
+            OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests/testForegroundCorrectsSameTokenLoopBeforeVisitAdoption
+            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues
+            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testPiPSkipNavigatesHistoryAndOverridesRepeatOneWithoutTenSecondSeek
+            OfflineTikTokPlayerTests/PlaybackContinuityTests/testPreparedPCMReversalsAreIndependentOfVideoReadinessAndBoundMemory
+            OfflineTikTokPlayerTests/FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether
+            OfflineTikTokPlayerTests/AudioOutputContinuityTests/testConfigurationChangeReactivatesSessionBeforeRestartingCurrentOutput
+            OfflineTikTokPlayerTests/AudioOutputContinuityTests/testDelayedConfigurationRecoveryCannotUndoExplicitPauseOrDeniedInterruption
+            OfflineTikTokPlayerTests/AudioOutputContinuityTests/testRepeatedLoopsKeepRealSourceNodeOutputAudibleWithSpeakerProcessing
+            OfflineTikTokPlayerTests/AudioOnlyContinuityTests/testLibraryAudioOnlyPersistsAndRestoresPausedPCMSelection
+            OfflineTikTokPlayerTests/AudioOnlyContinuityTests/testLibraryAudioOnlyHonorsCameraResumePermissionAndExplicitPause
+            OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testPlayingFromPersonalListRecordsOnlyStartedVideosInRecencyOrder)
+          run_cases test After "${core[@]}"
+          verify_cases After Passed "${core[@]}"
+          hd=OfflineTikTokPlayerTests/PictureRecoveryTests/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving
+          run_cases test-without-building HD "$hd"
+          verify_cases HD Passed "$hd"
+          ui=OfflineTikTokPlayerUITests/PlayerShellTests/testPersonalPlaylistPersistsAndActivityHasSeparateDestinations
+          run_cases test LibraryUI "$ui"
+          verify_cases LibraryUI Passed "$ui"

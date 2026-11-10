@@ -276,6 +276,75 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertNil(service.message)
     }
 
+    func testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self)
+        let service = fixture.service
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && service.submittedVideoFrameCount >= 4 && service.audioSnapshot.frame > 12_000 }
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        // Model a return with PiP/the background playback pipeline still healthy.
+        try await until {
+            guard let position = service.videoFramePositionSeconds else { return false }
+            return service.isVideoReady && abs(Double(service.audioSnapshot.frame) / 48_000 - position) < 0.10
+                && layer.sampleBufferRenderer.displayedPixelBuffer() != nil
+        }
+        let before = service.audioSnapshot
+        let frameCount = service.submittedVideoFrameCount
+        let position = try XCTUnwrap(service.videoFramePositionSeconds)
+        var foregroundSeeks = 0
+        service.onDebugVideoSeekStamp = { if $0.reason == .foreground { foregroundSeeks += 1 } }
+        NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        service.enteredForeground()
+        XCTAssertEqual(foregroundSeeks, 0, "Foreground must not seek a healthy video")
+        try await until {
+            service.submittedVideoFrameCount >= frameCount + 4
+                && (service.videoFramePositionSeconds ?? 0) > position + 0.1
+                && service.audioSnapshot.frame > before.frame + 4_800
+        }
+        let after = service.audioSnapshot
+        XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+        XCTAssertEqual(after.token, before.token)
+        XCTAssertEqual(after.visit, before.visit)
+        XCTAssertEqual(after.selectionVersion, before.selectionVersion)
+        XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+        XCTAssertTrue(service.wantsToPlay)
+    }
+
+    func testPictureRecoveryRearmsAfterReturningFromBackground() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self)
+        let service = fixture.service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && service.submittedVideoFrameCount >= 4 && service.audioSnapshot.frame > 12_000 }
+        let before = service.audioSnapshot
+        var repairs = 0
+        service.onDebugVideoOutputRecovery = {
+            repairs += 1
+            service.shouldDebugAcquireVideoFrame = nil
+        }
+        func stallAndWaitForRepair(_ expected: Int) async throws {
+            let frames = service.submittedVideoFrameCount
+            service.shouldDebugAcquireVideoFrame = { _ in false }
+            try await until { repairs >= expected && service.submittedVideoFrameCount >= frames + 4 && service.isVideoReady }
+        }
+        try await stallAndWaitForRepair(1)
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        service.enteredForeground()
+        // Let a fresh picture establish the post-return watchdog baseline.
+        let resumedFrames = service.submittedVideoFrameCount
+        try await until { service.submittedVideoFrameCount >= resumedFrames + 4 && service.isVideoReady }
+        try await stallAndWaitForRepair(2)
+        let after = service.audioSnapshot
+        XCTAssertEqual(repairs, 2)
+        XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+        XCTAssertEqual(after.token, before.token)
+        XCTAssertEqual(after.visit, before.visit)
+        XCTAssertEqual(after.selectionVersion, before.selectionVersion)
+        XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+        XCTAssertGreaterThan(after.frame, before.frame)
+    }
+
     func testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit() async throws {
         let fixture = try await PictureRecoveryFixture(test: self)
         let service = fixture.service
