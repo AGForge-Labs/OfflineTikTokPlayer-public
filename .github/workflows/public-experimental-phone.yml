@@ -1,10 +1,10 @@
 name: Experimental owner phone build
-run-name: Experimental phone candidate - native acceptance unresolved
+run-name: Owner-only picture recovery candidate
 on:
   workflow_dispatch:
     inputs:
       authorize_experimental_upload:
-        description: Build an experimental internal-only phone candidate with the retained native failures
+        description: Build the verified internal-only phone candidate
         required: true
         default: false
         type: boolean
@@ -13,7 +13,7 @@ on:
         required: true
         type: string
       build_number:
-        description: Apple-checked increasing build number after 23.1
+        description: Apple-checked increasing build number
         required: true
         type: string
 permissions:
@@ -47,7 +47,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: d278ea838fca7c7e5105aade87d7aa7db1438ac5
+          ref: 6d13bb9960510a10f73f757be38e21721206699d
           fetch-depth: 2
           path: candidate
           persist-credentials: false
