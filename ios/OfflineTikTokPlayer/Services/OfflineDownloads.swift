@@ -28,20 +28,39 @@ final class OfflineDownloads: NSObject {
     @ObservationIgnored private var policyRestarts = Set<String>()
     @ObservationIgnored private var backgroundGate = BackgroundTransferGate()
     @ObservationIgnored var backgroundCompletion: (() -> Void)? { didSet { finishBackgroundEvents() } }
-    nonisolated private let staging = AppFiles.directory("Staging", excludeFromBackup: true)
-    private let files = AppFiles.directory("Offline", excludeFromBackup: true)
-    private let transfers = AppFiles.directory("Transfers", excludeFromBackup: true)
-    private let ledgerURL = AppFiles.root.appendingPathComponent("downloads.json")
+    nonisolated private let staging: URL
+    private let files: URL
+    private let transfers: URL
+    private let ledgerURL: URL
+    @ObservationIgnored private let usesBackgroundSession: Bool
+    @ObservationIgnored private var localSessionShutDown = false
     @ObservationIgnored private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
-        config.sessionSendsLaunchEvents = true
+        let config: URLSessionConfiguration
+        if usesBackgroundSession {
+            config = .background(withIdentifier: Self.sessionIdentifier)
+            config.sessionSendsLaunchEvents = true
+        } else { config = .ephemeral }
         config.waitsForConnectivity = true
         config.httpMaximumConnectionsPerHost = 2
         return URLSession(configuration: config, delegate: self, delegateQueue: .main)
     }()
 
-    init(cloud: OneDriveClient, network: NetworkStatus) {
+    /// Production keeps its existing background session and application paths.
+    /// Local fixtures can own both their storage and a disposable session.
+    init(cloud: OneDriveClient, network: NetworkStatus, storageRoot: URL? = nil, usesBackgroundSession: Bool = true) {
         self.cloud = cloud; self.network = network
+        self.usesBackgroundSession = usesBackgroundSession
+        if let storageRoot {
+            staging = Self.localDirectory("Staging", root: storageRoot)
+            files = Self.localDirectory("Offline", root: storageRoot)
+            transfers = Self.localDirectory("Transfers", root: storageRoot)
+            ledgerURL = storageRoot.appendingPathComponent("downloads.json")
+        } else {
+            staging = AppFiles.directory("Staging", excludeFromBackup: true)
+            files = AppFiles.directory("Offline", excludeFromBackup: true)
+            transfers = AppFiles.directory("Transfers", excludeFromBackup: true)
+            ledgerURL = AppFiles.root.appendingPathComponent("downloads.json")
+        }
         wifiOnly = UserDefaults.standard.object(forKey: "wifiOnlyDownloads") as? Bool ?? true
         super.init()
         do {
@@ -54,7 +73,7 @@ final class OfflineDownloads: NSObject {
         network.didChange = { [weak self] in self?.pump() }
         session.getAllTasks { [weak self] existing in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, !self.localSessionShutDown else { return }
                 for task in existing {
                     guard let id = task.taskDescription, self.records[id] != nil,
                           let download = task as? URLSessionDownloadTask else { task.cancel(); continue }
@@ -69,6 +88,27 @@ final class OfflineDownloads: NSObject {
                 self.applyNetworkPolicy(); self.persist(); self.pump()
             }
         }
+    }
+
+    private static func localDirectory(_ name: String, root: URL) -> URL {
+        var url = root.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+        var values = URLResourceValues(); values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
+        return url
+    }
+
+    /// Dispose only an explicitly local session. This never invalidates the
+    /// production background session or removes files/checkpoints.
+    func shutdownLocalSession() {
+        guard !usesBackgroundSession, !localSessionShutDown else { return }
+        localSessionShutDown = true
+        for job in resolutionJobs.values { job.cancel() }
+        resolutionJobs.removeAll()
+        for task in tasks.values { task.cancel() }
+        tasks.removeAll()
+        session.invalidateAndCancel()
     }
 
     private func updateSummary() {
@@ -117,7 +157,7 @@ final class OfflineDownloads: NSObject {
         let originalWiFiOnly = tasks[id]?.originalRequest?.allowsCellularAccess == false
         tasks[id]?.cancel { [weak self] data in
             Task { @MainActor in
-                guard let self, let data, self.records[id]?.state == .paused else { return }
+                guard let self, !self.localSessionShutDown, let data, self.records[id]?.state == .paused else { return }
                 try? AppFiles.save(ResumeCheckpoint(data: data, wifiOnly: originalWiFiOnly), to: self.resumeURL(record.asset))
             }
         }
@@ -171,6 +211,7 @@ final class OfflineDownloads: NSObject {
     }
 
     private func pump() {
+        guard !localSessionShutDown else { return }
         guard TransferNetworkPolicy(wifiOnly: wifiOnly).canSchedule(isConnected: network.isConnected, isWiFi: network.isWiFi) else { return }
         var busyHashes = Set(tasks.keys.compactMap { records[$0]?.asset.sha256 })
         busyHashes.formUnion(resolutionJobs.keys.compactMap { records[$0]?.asset.sha256 })
@@ -229,7 +270,7 @@ final class OfflineDownloads: NSObject {
             try? FileManager.default.removeItem(at: url)
             backgroundGate.endVerification(String(taskID)); finishBackgroundEvents()
         }
-        guard let record = records[id], tasks[id]?.taskIdentifier == taskID else { return }
+        guard !localSessionShutDown, let record = records[id], tasks[id]?.taskIdentifier == taskID else { return }
         tasks.removeValue(forKey: id)
         policyRestarts.remove(id)
         if [401, 403].contains(status), retries.insert(id).inserted {
@@ -239,6 +280,7 @@ final class OfflineDownloads: NSObject {
         guard [200, 206].contains(status) else { records[id]?.state = .failed; records[id]?.error = "Download failed (\(status)). Retry when connected."; persist(); pump(); return }
         records[id]?.state = .verifying; persist()
         let result = await Task.detached(priority: .utility) { Result { try AppFiles.hash(url) } }.value
+        guard !localSessionShutDown else { return }
         do {
             let digest = try result.get()
             var completed = record
@@ -257,6 +299,7 @@ final class OfflineDownloads: NSObject {
     }
 
     private func failed(id: String, taskID: Int, error: Error?) {
+        guard !localSessionShutDown else { return }
         guard let error else { return } // Success is finalized by didFinishDownloadingTo, after verification.
         guard tasks[id]?.taskIdentifier == taskID else { return }
         let policyWiFiOnly = tasks[id]?.originalRequest?.allowsCellularAccess == false
@@ -294,6 +337,7 @@ final class OfflineDownloads: NSObject {
 
 extension OfflineDownloads: URLSessionDownloadDelegate {
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard MainActor.assumeIsolated({ !self.localSessionShutDown }) else { return }
         guard let id = downloadTask.taskDescription else { return }
         let stable = staging.appendingPathComponent(UUID().uuidString + ".download")
         do { try FileManager.default.moveItem(at: location, to: stable) }
@@ -321,7 +365,8 @@ extension OfflineDownloads: URLSessionDownloadDelegate {
                                totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let id = downloadTask.taskDescription else { return }
         MainActor.assumeIsolated {
-            guard self.records[id] != nil, Date().timeIntervalSince(self.lastProgress[id] ?? .distantPast) > 0.25 else { return }
+            guard !self.localSessionShutDown, self.records[id] != nil,
+                  Date().timeIntervalSince(self.lastProgress[id] ?? .distantPast) > 0.25 else { return }
             self.lastProgress[id] = Date(); self.records[id]?.receivedBytes = totalBytesWritten
         }
     }

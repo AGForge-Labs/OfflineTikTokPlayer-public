@@ -21,14 +21,15 @@ final class ContinuousAudioPlayer {
     private var failedTokens = Set<Int>()
     private var pendingPosition: (version: Int, position: Double)?
 
-    init() {
+    init(nativeInputPlacement: ContinuousPCMDecoder.NativeInputPlacement = .converterCallback) {
         graph = ContinuousAudioGraph(renderer: renderer)
-        decoder = ContinuousPCMDecoder(renderer: renderer)
+        decoder = ContinuousPCMDecoder(renderer: renderer, nativeInputPlacement: nativeInputPlacement)
     }
     deinit { decoder.shutdown(); graph.engine.stop() }
     var isSelected: Bool { selectedID != nil }
     var preparedCount: Int { entries.count }
     var snapshot: ContinuousPCMRenderer.Snapshot { renderer.snapshot }
+    var producerProgressRecorder: ContinuousPCMDecoder.ProgressRecorder { decoder.progressRecorder }
     var currentEntry: Entry? { entries.values.first { $0.token == renderer.snapshot.token } }
     func entry(for id: String) -> Entry? {
         entries[id].flatMap { failedTokens.contains($0.token) ? nil : $0 }

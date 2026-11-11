@@ -32,6 +32,56 @@ SPLIT_CASE = re.compile(
     r"Test Case '([^']+)'\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
     r"OfflineTikTokPlayer\[\d+:\d+\] \[\] <<<< VRP >>>> signalled err=-?\d+ at <>:\d+")
 RESULT_SUFFIX = re.compile(r" (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.")
+# Observed AQ interleaves interrupt a class or method identifier. Keep the exact
+# diagnostic and require that identifier's remaining tail on the next line.
+LOUDNESS_DIAGNOSTIC = (
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+\d{4} "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215 {2}"
+    r"IsHardwareSupported: no plist loaded, returning false")
+SPLIT_IDENTITY_CASE = re.compile(
+    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.[A-Za-z_]\w*)"
+    + LOUDNESS_DIAGNOSTIC, re.ASCII)
+SPLIT_METHOD_CASE = re.compile(
+    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.[A-Za-z_]\w* [A-Za-z_]\w*)"
+    + LOUDNESS_DIAGNOSTIC, re.ASCII)
+IDENTITY_RESULT_SUFFIX = re.compile(
+    r"([A-Za-z0-9_]+ [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+METHOD_RESULT_SUFFIX = re.compile(
+    r"([A-Za-z0-9_]+\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+# A complete terminal can also interrupt this diagnostic immediately after its
+# UTC timestamp. Require the exact next physical line before counting it.
+SPLIT_DIAGNOSTIC_TIMESTAMP_CASE = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000"
+    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\."
+    r"[A-Za-z_]\w* [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+# In the observed 2026 AQ record, the terminal interrupts the timestamp after
+# its first digit. Neither an arbitrary prefix nor a later continuation counts.
+SPLIT_DIAGNOSTIC_FIRST_DIGIT_CASE = re.compile(
+    r"2Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\."
+    r"[A-Za-z_]\w* [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+LOUDNESS_DIAGNOSTIC_FIRST_DIGIT_TAIL = re.compile(
+    r"026-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000 "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215 {2}"
+    r"IsHardwareSupported: no plist loaded, returning false", re.ASCII)
+SPLIT_DIAGNOSTIC_NAME_CASE = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000 "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManage"
+    r"Test Case '(-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\."
+    r"[A-Za-z_]\w* [A-Za-z_]\w*\])' (passed|failed|skipped) \(\d+(?:\.\d+)? seconds\)\.", re.ASCII)
+LOUDNESS_DIAGNOSTIC_NAME_TAIL = re.compile(
+    r"r\.mm:1215 {2}IsHardwareSupported: no plist loaded, returning false", re.ASCII)
+LOUDNESS_DIAGNOSTIC_TAIL = re.compile(
+    r" OfflineTikTokPlayer\[\d+:\d+\] \[AQ\] {8}LoudnessManager\.mm:1215 {2}"
+    r"IsHardwareSupported: no plist loaded, returning false", re.ASCII)
+# The observed ordinary Fig record can interrupt an AQ diagnostic after its
+# timestamp. This exact adjacent pair contains no case identity or outcome.
+ORDINARY_DIAGNOSTIC_HEADER = re.compile(
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000"
+    r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\+0000 "
+    r"OfflineTikTokPlayer\[\d+:\d+\] \[\] \(Fig\) signalled err=-12785 at <>:1469", re.ASCII)
+# Deliberately no word-boundary requirement: a malformed timestamp interleave
+# can adjoin the header with a digit, and must not disappear beside another pass.
+NATIVE_HEADER_PREFIX = re.compile(r"Test Case '-\[(?:OfflineTikTokPlayerTests|OfflineTikTokPlayerUITests)\.")
 SUCCESS = re.compile(r"^(?:\d{4}-\d\d-\d\dT\S+\s+)?\s*\*\* TEST SUCCEEDED \*\*\s*$")
 FAILURE = re.compile(r"\*\* TEST(?: [A-Z]+)* FAILED \*\*")
 
@@ -209,34 +259,71 @@ def verify_log(text, expected):
     starts, outcomes = Counter(), defaultdict(Counter)
     observed, problems, successes, last_case = set(), [], [], 0
     pending = None
+    previous_ordinary_header = False
     for number, line in enumerate(text.splitlines(), 1):
         if SUCCESS.fullmatch(line):
             successes.append(number)
         if FAILURE.search(line):
             problems.append(f"TEST FAILED marker at line {number}")
         clean = GITHUB_TIMESTAMP.sub("", line, count=1)
+        ordinary_tail = previous_ordinary_header and LOUDNESS_DIAGNOSTIC_TAIL.fullmatch(clean)
+        previous_ordinary_header = ORDINARY_DIAGNOSTIC_HEADER.fullmatch(clean) is not None
         event, reconstructed = None, False
         if pending is not None:
-            raw, header_line = pending
+            raw, header_line, tail_pattern, terminal_status = pending
             pending = None
-            suffix = RESULT_SUFFIX.fullmatch(clean)
+            suffix = (tail_pattern if tail_pattern is not None else RESULT_SUFFIX).fullmatch(clean)
             if suffix:
-                event, reconstructed = (raw, suffix.group(1)), True
+                if terminal_status is not None:
+                    event = (raw, terminal_status)
+                elif tail_pattern is not None:
+                    event = (raw + suffix.group(1), suffix.group(2))
+                else:
+                    event = (raw, suffix.group(1))
+                reconstructed = True
             else:
                 problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
         if event is None:
+            if ordinary_tail:
+                continue
+            timestamp_split = SPLIT_DIAGNOSTIC_TIMESTAMP_CASE.fullmatch(clean)
+            first_digit_split = SPLIT_DIAGNOSTIC_FIRST_DIGIT_CASE.fullmatch(clean)
+            name_split = SPLIT_DIAGNOSTIC_NAME_CASE.fullmatch(clean)
+            if timestamp_split:
+                pending = (timestamp_split.group(1), number, LOUDNESS_DIAGNOSTIC_TAIL, timestamp_split.group(2))
+                continue
+            if first_digit_split:
+                pending = (first_digit_split.group(1), number, LOUDNESS_DIAGNOSTIC_FIRST_DIGIT_TAIL, first_digit_split.group(2))
+                continue
+            if name_split:
+                pending = (name_split.group(1), number, LOUDNESS_DIAGNOSTIC_NAME_TAIL, name_split.group(2))
+                continue
             match = CASE.search(line)
             if match:
+                prefix = NATIVE_HEADER_PREFIX.search(line)
+                if prefix and prefix.start() != match.start():
+                    problems.append(f"Malformed native/UI case prefix at line {number}")
                 event = match.groups()
             else:
                 header = CASE_HEADER.search(line)
-                if header and any(target + "." in header.group(1) for target in TARGETS):
+                identity_split = SPLIT_IDENTITY_CASE.fullmatch(clean)
+                method_split = SPLIT_METHOD_CASE.fullmatch(clean)
+                if identity_split:
+                    pending = (identity_split.group(1), number, IDENTITY_RESULT_SUFFIX, None)
+                elif method_split:
+                    pending = (method_split.group(1), number, METHOD_RESULT_SUFFIX, None)
+                elif header and any(target + "." in header.group(1) for target in TARGETS):
                     split = SPLIT_CASE.fullmatch(clean)
                     if split:
-                        pending = (split.group(1), number)
+                        pending = (split.group(1), number, None, None)
                     else:
                         problems.append(f"Malformed native/UI case at line {number}: {header.group(1)}")
-                elif RESULT_SUFFIX.fullmatch(clean):
+                elif NATIVE_HEADER_PREFIX.search(line):
+                    problems.append(f"Malformed native/UI case prefix at line {number}")
+                elif (RESULT_SUFFIX.fullmatch(clean) or IDENTITY_RESULT_SUFFIX.fullmatch(clean)
+                      or METHOD_RESULT_SUFFIX.fullmatch(clean) or LOUDNESS_DIAGNOSTIC_TAIL.fullmatch(clean)
+                      or LOUDNESS_DIAGNOSTIC_FIRST_DIGIT_TAIL.fullmatch(clean)
+                      or LOUDNESS_DIAGNOSTIC_NAME_TAIL.fullmatch(clean)):
                     problems.append(f"Orphan case result suffix at line {number}")
                 continue
         raw, status = event
@@ -262,7 +349,7 @@ def verify_log(text, expected):
         else:
             problems.append(f"Unsupported native/UI case status at line {number}: {status} {identity}")
     if pending is not None:
-        raw, header_line = pending
+        raw, header_line, _, _ = pending
         problems.append(f"Unfinished interleaved case at line {header_line}: {raw}")
     if len(successes) != 1:
         problems.append(f"Expected exactly one TEST SUCCEEDED marker; found {len(successes)}")

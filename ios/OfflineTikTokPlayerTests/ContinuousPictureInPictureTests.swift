@@ -1,10 +1,96 @@
 import XCTest
 import AVFoundation
 import CoreVideo
+import UIKit
 @testable import OfflineTikTokPlayer
 
 @MainActor
 final class ContinuousPictureInPictureTests: XCTestCase {
+    func testPreparedOutputSurvivesSelectionReturnWithoutDuplicatesAndFallbackIsRemoved() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let a = AVPlayerItem(url: url), b = AVPlayerItem(url: url), fallback = AVPlayerItem(url: url)
+        for item in [a, b] {
+            item.videoComposition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: item.asset)
+        }
+        let aOutput = ContinuousPictureInPicture.prepareVideoOutput(for: a)
+        let bOutput = ContinuousPictureInPicture.prepareVideoOutput(for: b)
+        XCTAssertTrue(ContinuousPictureInPicture.prepareVideoOutput(for: a) === aOutput)
+        let bridge = ContinuousPictureInPicture()
+        defer { bridge.invalidate() }
+        bridge.setCurrentItem(a); bridge.setCurrentItem(b); bridge.setCurrentItem(a)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Output ownership alone is not a submitted frame")
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: b), "A different item's evidence cannot preserve presentation")
+        XCTAssertTrue(bridge.orientationPrepared)
+        XCTAssertTrue(a.outputs.contains { $0 === aOutput })
+        XCTAssertTrue(b.outputs.contains { $0 === bOutput })
+        XCTAssertEqual(a.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
+        XCTAssertEqual(b.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
+        XCTAssertFalse(aOutput.suppressesPlayerRendering)
+        let monitor = PlaybackFrameMonitor()
+        monitor.start(item: a, layer: AVPlayerLayer(), decodedFrameEpoch: { nil }) { XCTFail("No decoded frame is available") }
+        XCTAssertEqual(a.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1,
+                       "Even false external evidence must not create a second late output")
+        monitor.cancel()
+        XCTAssertTrue(a.outputs.contains { $0 === aOutput }, "Observation cannot remove the shared prepared output")
+        bridge.setCurrentItem(fallback)
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while !bridge.orientationPrepared, ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(bridge.orientationPrepared)
+        XCTAssertEqual(fallback.outputs.filter { $0 is AVPlayerItemVideoOutput }.count, 1)
+        bridge.setCurrentItem(a)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 160, height: 160)
+        window.windowLevel = .alert + 1
+        window.rootViewController = UIViewController()
+        window.rootViewController?.view.layer.addSublayer(bridge.displayLayer)
+        bridge.displayLayer.frame = window.bounds
+        window.makeKeyAndVisible()
+        window.rootViewController?.view.layoutIfNeeded()
+        defer {
+            bridge.displayLayer.removeFromSuperlayer()
+            window.isHidden = true; window.rootViewController = nil
+            previousKeyWindow?.makeKey()
+        }
+        let player = AVPlayer(playerItem: a)
+        player.isMuted = true
+        defer { player.pause() }
+        let duration = try await a.asset.load(.duration).seconds
+        let playbackStart = ProcessInfo.processInfo.systemUptime
+        player.play()
+        while bridge.currentSubmittedPresentation(for: a) == nil,
+              ProcessInfo.processInfo.systemUptime - playbackStart < 3 {
+            bridge.updatePlayback(positionSeconds: ProcessInfo.processInfo.systemUptime - playbackStart,
+                                  durationSeconds: duration, isPlaying: true)
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        _ = try XCTUnwrap(bridge.currentSubmittedPresentation(for: a),
+                          "A live ready frame must supply positive presentation evidence before testing its invalidation")
+        XCTAssertGreaterThan(bridge.submittedFrameCount, 0)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: b), "A different item cannot borrow A's ready frame")
+        bridge.suspendFrameFeed()
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Suspending the feed withdraws otherwise ready evidence")
+        bridge.resumeFrameFeed()
+        XCTAssertNotNil(bridge.currentSubmittedPresentation(for: a))
+        let pausePosition = bridge.requestedPositionSeconds
+        bridge.updatePlayback(positionSeconds: pausePosition, durationSeconds: duration, isPlaying: false)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Paused presentation cannot bypass native recovery")
+        bridge.updatePlayback(positionSeconds: pausePosition, durationSeconds: duration, isPlaying: true)
+        XCTAssertNotNil(bridge.currentSubmittedPresentation(for: a), "Resume retains this same current frame before testing seek invalidation")
+        let seek = bridge.beginSeek()
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "An active seek withdraws epoch evidence")
+        bridge.completeSeek(seek)
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a), "Completing a seek cannot restore the preceding epoch's frame")
+        XCTAssertTrue(fallback.outputs.isEmpty, "Unprepared fallback outputs retain their existing detach lifecycle")
+        XCTAssertTrue(a.outputs.contains { $0 === aOutput })
+        bridge.invalidate()
+        XCTAssertNil(bridge.currentSubmittedPresentation(for: a))
+        XCTAssertTrue(a.outputs.isEmpty, "Invalidation detaches the active prepared output")
+    }
+
     func testOnlyExplicitPiPCommandsReachAudioIntent() {
         let bridge = ContinuousPictureInPicture()
         defer { bridge.invalidate() }
@@ -66,7 +152,8 @@ final class ContinuousPictureInPictureTests: XCTestCase {
             let tracks = try await asset.loadTracks(withMediaType: .video)
             let track = try XCTUnwrap(tracks.first)
             let duration = try await asset.load(.duration)
-            let composition = try await ContinuousPictureInPicture.makeVideoComposition(for: asset)
+            let preparedComposition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset)
+            let composition = try XCTUnwrap(preparedComposition)
             XCTAssertEqual(composition.renderSize, expectedSize)
             XCTAssertEqual(composition.sourceTrackIDForFrameTiming, track.trackID)
             XCTAssertEqual(CMTimeCompare(try XCTUnwrap(composition.instructions.first).timeRange.duration, duration), 0)
@@ -107,7 +194,33 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertNil(item.videoComposition)
     }
 
-    private func makeAsymmetricVideo(transform: CGAffineTransform) async throws -> URL {
+    func testIdentityGeometryKeepsNativeOutputWithoutInstallingACompositor() async throws {
+        let url = try await makeAsymmetricVideo(transform: .identity)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        let composition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: asset)
+        XCTAssertNil(composition, "Ordinary identity geometry must not add a video compositor")
+        let item = AVPlayerItem(asset: asset)
+        let bridge = ContinuousPictureInPicture()
+        defer { bridge.invalidate() }
+        bridge.setCurrentItem(item)
+        for _ in 0..<100 where !bridge.orientationPrepared { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(bridge.orientationPrepared)
+        XCTAssertFalse(item.outputs.isEmpty)
+        XCTAssertNil(item.videoComposition)
+        let unchangedDuration = try await asset.load(.duration)
+        XCTAssertEqual(CMTimeCompare(unchangedDuration, duration), 0)
+    }
+
+    func testIdentityTransformWithNonSquarePixelsStillUsesNormalization() async throws {
+        let url = try await makeAsymmetricVideo(transform: .identity, nonSquarePixels: true)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let composition = try await ContinuousPictureInPicture.videoCompositionIfNeeded(for: AVURLAsset(url: url))
+        XCTAssertNotNil(composition, "Identity transform alone cannot bypass pixel-aspect normalization")
+    }
+
+    private func makeAsymmetricVideo(transform: CGAffineTransform, nonSquarePixels: Bool = false) async throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension("mov")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
         var completed = false
@@ -117,9 +230,14 @@ final class ContinuousPictureInPictureTests: XCTestCase {
                 try? FileManager.default.removeItem(at: url)
             }
         }
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+        var settings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: 32, AVVideoHeightKey: 16
-        ])
+        ]
+        if nonSquarePixels {
+            settings[AVVideoPixelAspectRatioKey] = [AVVideoPixelAspectRatioHorizontalSpacingKey: 2,
+                                                   AVVideoPixelAspectRatioVerticalSpacingKey: 1]
+        }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.transform = transform
         let attributes: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: 32, kCVPixelBufferHeightKey as String: 16,
