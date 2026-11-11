@@ -10,6 +10,7 @@ import contextlib
 import io
 import base64
 import json
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("experimental_phone", ROOT / "scripts/experimental-phone.py")
@@ -88,7 +89,8 @@ class ExperimentalPhoneTests(unittest.TestCase):
                         GITHUB_TRIGGERING_ACTOR="Galaxybigbird", GITHUB_RUN_ATTEMPT="1",
                         GITHUB_WORKFLOW_REF=phone.REPOSITORY + "/.github/workflows/public-experimental-phone.yml@refs/heads/main",
                         GITHUB_SHA=self.sha, GITHUB_WORKFLOW_SHA=self.sha, EXPECTED_CONTROL_COMMIT=self.sha,
-                        EXPERIMENTAL_PHONE_AUTHORIZED="true", EXPERIMENTAL_BUILD_NUMBER="24.1")
+                        EXPERIMENTAL_PHONE_AUTHORIZED="true", EXPERIMENTAL_BUILD_NUMBER="24.1",
+                        RELEASE_PREFLIGHT_RESULT="success")
         self.event = {"repository": {"full_name": phone.REPOSITORY, "private": False}}
 
     def test_exact_public_owner_main_workflow_and_first_attempt_are_required(self):
@@ -113,6 +115,29 @@ class ExperimentalPhoneTests(unittest.TestCase):
                 phone.validate_context(dict(signing, EXPERIMENTAL_BUILD_NUMBER=value), self.event, signing=True)
         with self.assertRaises(ValueError):
             phone.validate_context(dict(signing, APPLE_PRIVATE_DELIVERY="unexpected"), self.event, signing=True)
+
+    def test_linux_preflight_keeps_owner_pins_and_refuses_apple_inputs(self):
+        preflight = dict(self.env, RUNNER_OS="Linux")
+        preflight.pop("RELEASE_PREFLIGHT_RESULT")
+        self.assertEqual(phone.validate_context(preflight, self.event, linux_preflight=True), "24.1")
+        for env in (self.env, dict(preflight, APP_STORE_CONNECT_KEY_BASE64="unexpected"),
+                    dict(preflight, GITHUB_TRIGGERING_ACTOR="another-owner")):
+            with self.subTest(env=env), self.assertRaises(ValueError):
+                phone.validate_context(env, self.event, linux_preflight=True)
+        with self.assertRaises(ValueError):
+            phone.validate_context(dict(preflight, RELEASE_ENVIRONMENT="release"), self.event, signing=True)
+
+    def test_native_receipt_uses_read_token_and_sanitizes_http_failure(self):
+        run_id = phone.NATIVE_PROOFS[0][0]
+        api = "https://api.github.com/repos/" + phone.REPOSITORY + "/actions/runs/" + str(run_id)
+        with mock.patch.dict(phone.os.environ, GITHUB_RELEASE_RECEIPT_TOKEN="fixture-token"), \
+                mock.patch("urllib.request.urlopen", side_effect=HTTPError(api, 403, "private-marker", {}, None)) as open_url:
+            with self.assertRaisesRegex(ValueError, rf"^Native run {run_id} returned HTTP 403\.$"):
+                phone.require_native_result()
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.full_url, api)
+        self.assertEqual(request.get_header("Authorization"), "Bearer fixture-token")
+        self.assertNotIn("Authorization", request.headers)
 
     def test_wrong_source_tree_signer_dirty_or_private_inputs_are_refused(self):
         test_root = Path(__file__).resolve().parent

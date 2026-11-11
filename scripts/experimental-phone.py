@@ -73,13 +73,19 @@ def seal_diagnostic(raw, phase, exit_code, directory, *, openssl="openssl"):
     return base64.b64encode(result.stdout).decode("ascii")
 
 
+class PreflightError(ValueError):
+    """A diagnostic composed exclusively from public release evidence."""
+
+
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise PreflightError(message)
 
-def validate_context(environment, event, *, signing=False):
+def validate_context(environment, event, *, signing=False, linux_preflight=False):
+    require(not (signing and linux_preflight), "The Linux preflight cannot sign a build.")
     expected = environment.get("EXPECTED_CONTROL_COMMIT", "")
-    checks = dict(GITHUB_ACTIONS="true", RUNNER_OS="macOS", RUNNER_ENVIRONMENT="github-hosted",
+    checks = dict(GITHUB_ACTIONS="true", RUNNER_OS="Linux" if linux_preflight else "macOS",
+                  RUNNER_ENVIRONMENT="github-hosted",
                   GITHUB_REPOSITORY=REPOSITORY, GITHUB_REF="refs/heads/main",
                   GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_ACTOR_ID="105477711",
                   GITHUB_TRIGGERING_ACTOR="Galaxybigbird", GITHUB_RUN_ATTEMPT="1",
@@ -89,6 +95,9 @@ def validate_context(environment, event, *, signing=False):
     require(re.fullmatch(r"[0-9a-f]{40}", expected) is not None
             and all(environment.get(key) == value for key, value in checks.items()),
             "An exact owner/main/first manual experimental request is required.")
+    if not linux_preflight:
+        require(environment.get("RELEASE_PREFLIGHT_RESULT") == "success",
+                "The same-run Linux preflight must pass before Mac work.")
     repository = event.get("repository", {})
     require(repository.get("full_name") == REPOSITORY and repository.get("private") is False,
             "Only the existing public source repository is admitted.")
@@ -234,14 +243,23 @@ def require_native_result(read=None):
     # Its workflow freezes app/core and rejects failed, skipped or missing cases.
     # Full-suite and physical-phone acceptance remain separate.
     if read is None:
+        import urllib.error
         import urllib.request
+        token = os.environ.get("GITHUB_RELEASE_RECEIPT_TOKEN")
         def read(run_id):
             request = urllib.request.Request("https://api.github.com/repos/" + REPOSITORY + "/actions/runs/" + str(run_id),
                 headers={"Accept": "application/vnd.github+json", "User-Agent": "OfflinePlayer-owner-delivery"})
-            with urllib.request.urlopen(request, timeout=20) as response:
-                data = response.read(128 * 1024 + 1)
-                require(len(data) <= 128 * 1024, "Native receipt exceeded its bound.")
+            if token:
+                request.add_unredirected_header("Authorization", "Bearer " + token)
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    data = response.read(128 * 1024 + 1)
+                require(len(data) <= 128 * 1024, f"Native run {run_id} receipt exceeded its bound.")
                 return json.loads(data)
+            except urllib.error.HTTPError as error:
+                raise PreflightError(f"Native run {run_id} returned HTTP {error.code}.") from None
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                raise PreflightError(f"Native run {run_id} receipt could not be read.") from None
     for run_id, source, path, branch in NATIVE_PROOFS:
         result = read(run_id)
         require(isinstance(result, dict) and isinstance(result.get("repository"), dict), "Invalid native run receipt.")
@@ -256,20 +274,22 @@ def require_native_result(read=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "sign-upload", "child"))
+    parser.add_argument("command", choices=("preflight", "check", "sign-upload", "child"))
     args = parser.parse_args()
     environment = dict(os.environ)
     with Path(environment["GITHUB_EVENT_PATH"]).open(encoding="utf-8") as stream:
         event = json.load(stream)
-    build = validate_context(environment, event, signing=args.command != "check")
+    checking = args.command in ("preflight", "check")
+    build = validate_context(environment, event, signing=not checking, linux_preflight=args.command == "preflight")
     workspace = Path(environment["GITHUB_WORKSPACE"]).resolve(strict=True)
     candidate = workspace / "candidate"
     require(ROOT == workspace / "control" and not (workspace / "control").is_symlink()
             and not candidate.is_symlink() and candidate.resolve(strict=True).parent == workspace,
             "Only the two owned workspace checkouts are admitted.")
     verify_checkouts(ROOT, candidate, environment["EXPECTED_CONTROL_COMMIT"])
-    if args.command == "check":
-        require_native_result()
+    if checking:
+        if args.command == "preflight":
+            require_native_result()
         print("Exact candidate, source changes and focused native results verified. Full-suite and phone acceptance remain unresolved.")
         return
     require(sys.platform == "darwin", "Signing requires the existing standard macOS runner.")
@@ -306,7 +326,6 @@ def main():
             with Path(environment["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
                 stream.write(message + "\n")
         return
-    require_native_result()
     helper = load_module("existing_private_delivery", candidate / "scripts/private-delivery.py")
     configuration = helper.public_configuration(environment)
     helper.validate_configuration(configuration)
@@ -329,6 +348,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (KeyError, ValueError, RuntimeError, OSError, subprocess.SubprocessError):
-        print("Experimental phone build stopped. Check Apple before any new dispatch; private output is suppressed.", file=sys.stderr)
+    except (KeyError, ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+        if sys.argv[1:] in (["preflight"], ["check"]) and isinstance(error, PreflightError):
+            print("Release preflight stopped. " + str(error), file=sys.stderr)
+        else:
+            print("Experimental phone build stopped. Check Apple before any new dispatch; private output is suppressed.", file=sys.stderr)
         sys.exit(1)
