@@ -1,12 +1,45 @@
-name: Stalled video recovery on a visible player
+name: Picture freeze recovery
 on:
   push:
-    branches: [codex/stalled-video-recovery]
+    branches: [codex/picture-freeze-recovery]
 permissions:
   contents: read
 jobs:
+  player-core:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Reproduce the missing second recovery and run the portable suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$(mktemp -d)"
+          source=Sources/PlayerCore/VideoImageProgress.swift
+          tests=Tests/PlayerCoreTests/VideoImageProgressTests.swift
+          mkdir -p "$baseline/$(dirname "$source")" "$baseline/$(dirname "$tests")/Fixtures"
+          touch "$baseline/$(dirname "$tests")/Fixtures/placeholder"
+          cp ios/PlayerCore/Package.swift "$baseline/Package.swift"
+          cp "ios/PlayerCore/$tests" "$baseline/$tests"
+          git show "HEAD^:ios/PlayerCore/$source" | sed 's/nativePosition/playbackPosition/g' > "$baseline/$source"
+          if swift test --jobs 2 --package-path "$baseline" \
+            --filter testSustainedMovingPicturesAllowRecoveryFromAnotherFreeze > "$baseline/before.log" 2>&1; then
+            cat "$baseline/before.log"
+            exit 1
+          fi
+          cat "$baseline/before.log"
+          grep -F 'testSustainedMovingPicturesAllowRecoveryFromAnotherFreeze : XCTAssertTrue failed' "$baseline/before.log"
+          python3 -B scripts/generate-ios-project.py --check
+          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/PlaybackService.swift \
+            ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift
+          bash scripts/test-core.sh
   simulator:
     if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    needs: player-core
     runs-on: macos-26
     timeout-minutes: 22
     steps:
@@ -14,7 +47,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 3
-      - name: Recheck the established decoder stop with a visible player
+      - name: Verify displayed frames and audio continuity on one simulator
         shell: bash
         run: |
           set -euo pipefail
@@ -96,7 +129,17 @@ jobs:
 
           build_plan Candidate
           if ! wait "$boot_pid"; then cat "$work/boot.log"; exit 1; fi
-          echo 'iPhone simulator booted; testing stalled video and audio continuity'
-          visible=OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues
-          run_cases Playback "$visible"
-          verify_cases Playback Passed "$visible"
+          echo 'iPhone simulator booted; testing picture recovery and audio continuity'
+          picture=OfflineTikTokPlayerTests/PictureRecoveryTests
+          cases=(
+            "$picture/testPictureFeedRecoversTwiceWithinTheSamePlayingVisit"
+            "$picture/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio"
+            "$picture/testPictureRecoveryRearmsAfterReturningFromBackground"
+            "$picture/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
+            "$picture/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit"
+            "$picture/testPauseAndAudioOnlyPreventPictureRepair"
+            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues
+            OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph
+          )
+          run_cases Playback "${cases[@]}"
+          verify_cases Playback Passed "${cases[@]}"

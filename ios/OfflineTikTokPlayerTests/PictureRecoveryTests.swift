@@ -416,6 +416,48 @@ final class PictureRecoveryTests: XCTestCase {
         print("IMAGE_PROGRESS_RECOVERY repairs=\(repairs) sameToken=\(after.token == before.token) sameVisit=\(after.visit == before.visit) audioFrames=\(after.frame - before.frame) newVideoFrames=\(service.submittedVideoFrameCount - framesBefore)")
     }
 
+    func testPictureFeedRecoversTwiceWithinTheSamePlayingVisit() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self)
+        let service = fixture.service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until {
+            service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.25
+        }
+        let item = try XCTUnwrap(service.player.currentItem)
+        let audio = service.audioSnapshot
+        for attempt in 1...2 {
+            let held = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+            let output = try XCTUnwrap(item.outputs.first)
+            let audible = service.audioSnapshot.frame
+            let native = item.currentTime().seconds
+            service.shouldDebugAcquireVideoFrame = { _ in false }
+            try await until { service.audioSnapshot.frame > audible + 24_000 }
+            XCTAssertGreaterThan(item.currentTime().seconds, native + 0.25)
+            XCTAssertLessThanOrEqual(try XCTUnwrap(service.debugDisplayedVideoPositionSeconds), held + 0.08)
+            try await until { item.outputs.first !== output }
+            service.shouldDebugAcquireVideoFrame = nil
+            try await until {
+                service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > held + 0.5
+            }
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertTrue(service.audioEngineRunning)
+            XCTAssertTrue(service.wantsToPlay)
+            XCTAssertNil(service.message)
+            XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+            let after = service.audioSnapshot
+            XCTAssertGreaterThan(after.frame, audible + 24_000)
+            XCTAssertEqual(after.token, audio.token)
+            XCTAssertEqual(after.visit, audio.visit)
+            XCTAssertEqual(after.selectionVersion, audio.selectionVersion)
+            XCTAssertEqual(after.underrunFrames, audio.underrunFrames)
+            if attempt == 1 {
+                let resumed = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+                try await until { (service.debugDisplayedVideoPositionSeconds ?? 0) > resumed + 2.25 }
+            }
+        }
+        print("REPEATED_PICTURE_RECOVERY repairs=2 audioFrames=\(service.audioSnapshot.frame - audio.frame) underruns=\(service.audioSnapshot.underrunFrames - audio.underrunFrames)")
+    }
+
     func testNativeAudioOwnerRecoversAgainAfterPauseWithoutSeekingTheAudiblePlayer() async throws {
         let fixture = try await PictureRecoveryFixture(test: self, nativeAudio: true)
         let service = fixture.service
