@@ -16,15 +16,18 @@ actor OneDriveClient {
     private let cache = AssetURLCache()
     init(account: MicrosoftAccount, session: URLSession = .shared) { self.account = account; self.session = session }
 
-    private func graph(_ path: String, query: [URLQueryItem] = [], method: String = "GET", body: Data? = nil) async throws -> Data {
+    private func graph(_ path: String, query: [URLQueryItem] = [], method: String = "GET", body: Data? = nil,
+                       forceTokenRefresh: Bool = false) async throws -> Data {
         var components = URLComponents(string: "https://graph.microsoft.com/v1.0" + path)!
         components.queryItems = query.isEmpty ? nil : query
         for attempt in 0..<3 {
             var request = URLRequest(url: components.url!)
             request.timeoutInterval = 15
+            if forceTokenRefresh { request.cachePolicy = .reloadIgnoringLocalCacheData }
             request.httpMethod = method; request.httpBody = body
             if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
-            request.setValue("Bearer " + (try await account.token(forceRefresh: attempt > 0)), forHTTPHeaderField: "Authorization")
+            request.setValue("Bearer " + (try await account.token(forceRefresh: forceTokenRefresh || attempt > 0)),
+                             forHTTPHeaderField: "Authorization")
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { throw AppError.message("OneDrive returned no response.") }
             if http.statusCode == 401, attempt == 0 { continue }
@@ -52,7 +55,8 @@ actor OneDriveClient {
         try await cache.resolve(asset, forceRefresh: forceRefresh) { [self] ref in
             let path = try "/drives/" + segment(ref.driveID) + "/items/" + segment(ref.itemID)
             // Personal OneDrive can omit the download annotation under a field filter.
-            let data = try await graph(path)
+            // Graph can return metadata from a token whose content links no longer play.
+            let data = try await graph(path, forceTokenRefresh: forceRefresh)
             let item = try JSONDecoder().decode(DriveItem.self, from: data)
             guard let url = item.downloadURL, url.scheme == "https" else { throw AppError.message("OneDrive did not provide a playable download link.") }
             return url

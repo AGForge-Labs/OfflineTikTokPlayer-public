@@ -1130,6 +1130,11 @@ final class PlaybackService: NSObject {
                         guard self.generation == request else { return }
                         self.audioLoadingID = nil
                         self.recordPlaybackEvent("nativeStreamSelected")
+                        if !source.usesPCM, self.generation == request {
+                            // A remote asset can stop answering during track inspection,
+                            // before an AVPlayerItem has been installed to report a stall.
+                            self.armStallRecovery(waitingForRemoteItem: true)
+                        }
                     }
                     // Prepared PCM starts first; streamed audio starts when the native item is ready.
                     #if DEBUG
@@ -2956,11 +2961,25 @@ final class PlaybackService: NSObject {
         }
     }
 
-    private func handlePlaybackFailure() {
+    private func handlePlaybackFailure(startupTimedOut: Bool = false) {
         cancelStallRecovery()
         guard let item = current else { return }
         if !currentIsLocal, remoteRetries.insert(item.id).inserted {
             loadCurrent(position: clock.position, forceRemote: true); return
+        }
+        if startupTimedOut {
+            let request = generation
+            loadTask?.cancel()
+            itemObservation = nil
+            audioLoadingID = nil
+            isLoading = false
+            remoteRetries.remove(item.id)
+            pause()
+            guard buffer.replace(with: nil, ifEligible: {
+                self.generation == request && self.queue.currentID == item.id
+            }) else { return }
+            message = "OneDrive didn’t start this stream. Tap Play to retry."
+            return
         }
         queue.markUnavailable(item.id)
         if queue.next() != nil { loadCurrent() }
@@ -2969,19 +2988,21 @@ final class PlaybackService: NSObject {
 
     private func cancelStallRecovery() { stallTask?.cancel(); stallTask = nil }
 
-    private func armStallRecovery() {
+    private func armStallRecovery(waitingForRemoteItem: Bool = false) {
         guard !continuousAudio.isSelected else { return } // A video stall cannot skip audible PCM.
-        guard intent.canPlay, stallTask == nil, player.currentItem != nil, let id = queue.currentID else { return }
+        guard intent.canPlay, stallTask == nil, waitingForRemoteItem || player.currentItem != nil,
+              let id = queue.currentID else { return }
         let ticket = PlaybackStallTicket(generation: generation, mediaID: id, position: clock.position,
                                          deadline: Date().addingTimeInterval(12))
         stallTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(12)) } catch { return }
             guard let self, !Task.isCancelled else { return }
             self.stallTask = nil
+            guard !self.continuousAudio.isSelected else { return }
             if ticket.shouldRecover(generation: self.generation, mediaID: self.queue.currentID,
                                     position: self.clock.position, wantsToPlay: self.intent.canPlay, now: Date()) {
-                // Refresh a remote URL once, then skip the failed item through the bounded queue.
-                self.handlePlaybackFailure()
+                let startupTimedOut = !self.currentIsLocal && self.isLoading && self.readyGeneration != self.generation
+                self.handlePlaybackFailure(startupTimedOut: startupTimedOut)
             } else if self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate { self.armStallRecovery() }
         }
     }

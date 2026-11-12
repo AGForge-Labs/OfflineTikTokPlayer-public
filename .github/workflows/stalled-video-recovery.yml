@@ -1,7 +1,7 @@
-name: Picture freeze recovery
+name: Cold stream startup recovery
 on:
   push:
-    branches: [codex/picture-freeze-recovery]
+    branches: [codex/stream-start-recovery]
 permissions:
   contents: read
 jobs:
@@ -14,28 +14,27 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
-      - name: Reproduce the missing second recovery and run the portable suite
+      - name: Verify OneDrive token renewal and portable playback
         shell: bash
         run: |
           set -euo pipefail
-          baseline="$(mktemp -d)"
-          source=Sources/PlayerCore/VideoImageProgress.swift
-          tests=Tests/PlayerCoreTests/VideoImageProgressTests.swift
-          mkdir -p "$baseline/$(dirname "$source")" "$baseline/$(dirname "$tests")/Fixtures"
-          touch "$baseline/$(dirname "$tests")/Fixtures/placeholder"
-          cp ios/PlayerCore/Package.swift "$baseline/Package.swift"
-          cp "ios/PlayerCore/$tests" "$baseline/$tests"
-          git show "HEAD^:ios/PlayerCore/$source" | sed 's/nativePosition/playbackPosition/g' > "$baseline/$source"
-          if swift test --jobs 2 --package-path "$baseline" \
-            --filter testSustainedMovingPicturesAllowRecoveryFromAnotherFreeze > "$baseline/before.log" 2>&1; then
-            cat "$baseline/before.log"
+          bash scripts/test-native-cloud.sh
+          cloud=artifacts/native-cloud-package
+          client=ios/OfflineTikTokPlayer/Services/OneDriveClient.swift
+          cp "$client" "$cloud/verified-client.swift"
+          git show "HEAD^:$client" > "$cloud/Sources/CloudAdapter/OneDriveClient.swift"
+          if PLAYER_CORE_PATH="$PWD/ios/PlayerCore" swift test --jobs 1 --package-path "$cloud" \
+            --scratch-path artifacts/native-cloud-build \
+            --filter testPlaybackURLRefreshRenewsMicrosoftTokenBeforeResolvingTheLink > "$cloud/before.log" 2>&1; then
+            cat "$cloud/before.log"
             exit 1
           fi
-          cat "$baseline/before.log"
-          grep -F 'testSustainedMovingPicturesAllowRecoveryFromAnotherFreeze : XCTAssertTrue failed' "$baseline/before.log"
+          cat "$cloud/before.log"
+          grep -F 'testPlaybackURLRefreshRenewsMicrosoftTokenBeforeResolvingTheLink : XCTAssertEqual failed' "$cloud/before.log"
+          mv "$cloud/verified-client.swift" "$cloud/Sources/CloudAdapter/OneDriveClient.swift"
           python3 -B scripts/generate-ios-project.py --check
           swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/PlaybackService.swift \
-            ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift
+            ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift ios/OfflineTikTokPlayerTests/HTTPPlaybackFixtureServer.swift
           bash scripts/test-core.sh
   simulator:
     if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
@@ -47,12 +46,12 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 3
-      - name: Verify displayed frames and audio continuity on one simulator
+      - name: Verify stream startup and audio continuity on one simulator
         shell: bash
         run: |
           set -euo pipefail
           python3 -B scripts/generate-ios-project.py --check
-          work=artifacts/stalled-video-checks
+          work=artifacts/stream-start-checks
           mkdir -p "$work"
           udid=''
           for attempt in 1 2; do
@@ -129,16 +128,14 @@ jobs:
 
           build_plan Candidate
           if ! wait "$boot_pid"; then cat "$work/boot.log"; exit 1; fi
-          echo 'iPhone simulator booted; testing picture recovery and audio continuity'
+          echo 'iPhone simulator booted; testing stream startup and audio continuity'
           picture=OfflineTikTokPlayerTests/PictureRecoveryTests
           cases=(
             "$picture/testPictureFeedRecoversTwiceWithinTheSamePlayingVisit"
-            "$picture/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio"
-            "$picture/testPictureRecoveryRearmsAfterReturningFromBackground"
-            "$picture/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
             "$picture/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit"
-            "$picture/testPauseAndAudioOnlyPreventPictureRepair"
-            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testStoppedEstablishedVideoRecoversWhilePCMContinues
+            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testColdRemoteResolutionFailureRefreshesOnceAndPlaysChosenVideo
+            OfflineTikTokPlayerTests/PhonePlaybackReliabilityTests/testFailedRemoteItemUsesFreshResolverOnceAndKeepsChosenVideo
+            OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testUnansweredStreamStartupRetriesOnceAndTheSameClipCanPlayAgain
             OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph
           )
           run_cases Playback "${cases[@]}"

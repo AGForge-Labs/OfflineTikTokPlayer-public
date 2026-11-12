@@ -189,6 +189,26 @@ final class OneDriveClientTests: XCTestCase {
         XCTAssertEqual(url.absoluteString, "https://content.example.test/video")
     }
 
+    func testPlaybackURLRefreshRenewsMicrosoftTokenBeforeResolvingTheLink() async throws {
+        let drive = client { request in
+            XCTAssertEqual(request.url?.host, "graph.microsoft.com")
+            if request.value(forHTTPHeaderField: "Authorization") == "Bearer fixture-renewed-token" {
+                XCTAssertEqual(request.cachePolicy, .reloadIgnoringLocalCacheData)
+                return (200, Data(#"{"id":"asset","@microsoft.graph.downloadUrl":"https://content.example.test/renewed"}"#.utf8))
+            }
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer fixture-token")
+            return (200, Data(#"{"id":"asset","@microsoft.graph.downloadUrl":"https://content.example.test/stale"}"#.utf8))
+        }
+        let asset = AssetReference(driveID: "drive", itemID: "asset", fileName: "video.mp4", byteSize: 100,
+                                   sha256: String(repeating: "a", count: 64), contentType: "video/mp4")
+        let initial = try await drive.downloadURL(asset)
+        let renewed = try await drive.downloadURL(asset, forceRefresh: true)
+        let cached = try await drive.downloadURL(asset)
+        XCTAssertEqual(initial.absoluteString, "https://content.example.test/stale")
+        XCTAssertEqual(renewed.absoluteString, "https://content.example.test/renewed")
+        XCTAssertEqual(cached, renewed)
+    }
+
     func testPersonalDriveCatalogLoadsAndKeepsCredentialsOffContentHost() async throws {
         let drive = client { try Self.catalogResponse($0) }
         let catalog = try await drive.catalog()

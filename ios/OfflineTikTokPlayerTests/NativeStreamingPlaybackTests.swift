@@ -255,8 +255,60 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         return service
     }
 
-    private func until(_ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    func testUnansweredStreamStartupRetriesOnceAndTheSameClipCanPlayAgain() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let source = try XCTUnwrap(fixture.savedURLs[fixture.aID])
+        let media = try Data(contentsOf: source)
+        let hash = try AppFiles.hash(source)
+        fixture.downloads.remove(fixture.aID)
+        let asset = AssetReference(driveID: "synthetic-http", itemID: fixture.aID, fileName: "video.mp4",
+            byteSize: hash.size, sha256: hash.sha256, contentType: "video/mp4")
+        try fixture.library.install(LibraryCatalog(libraryID: "local:http-startup", media: [
+            MediaRecord(id: fixture.aID, title: "Synthetic stalled stream", duration: 30, status: .ready, asset: asset)
+        ], playlists: [PlaylistRecord(id: fixture.playlist, name: "Synthetic", itemIDs: [fixture.aID])]))
+        let server = try HTTPPlaybackFixtureServer(files: ["/video.mp4": media], stalledPaths: ["/first.mp4", "/retry.mp4"])
+        let base = try await server.start()
+        let cache = try PlaybackMediaCache(directory: fixture.temporary.appendingPathComponent("stalled-http-cache"), byteLimit: 1) { _ in
+            throw CatalogError.invalid("No cache is needed to recover a stream")
+        }
+        var lookups = 0, refreshes = 0
+        let service = fixture.own(PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
+            bookmarkURL: fixture.bookmark, activateSession: {}, mediaCache: cache,
+            resolveRemote: { _ in
+                lookups += 1
+                return base.appendingPathComponent(lookups == 1 ? "first.mp4" : "video.mp4")
+            },
+            refreshRemote: { _ in
+                refreshes += 1
+                return base.appendingPathComponent("retry.mp4")
+            }))
+        addTeardownBlock { server.stop() }
+        service.setAudioOnly(false)
+        service.automaticPiP = false
+        service.speakerSound = false
+        try await until { fixture.downloads.network.isConnected }
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until(timeout: .seconds(29)) { !service.isLoading && service.message != nil }
+        XCTAssertGreaterThanOrEqual(server.snapshot().stalled, 2)
+        XCTAssertEqual(lookups, 1)
+        XCTAssertEqual(refreshes, 1)
+        XCTAssertEqual(service.queue.currentID, fixture.aID)
+        XCTAssertFalse(service.wantsToPlay)
+        XCTAssertTrue(service.message?.contains("OneDrive") == true)
+
+        service.play()
+        try await until { !service.isLoading && service.player.rate > 0 && service.clock.position > 0.15 }
+        XCTAssertEqual(service.queue.currentID, fixture.aID)
+        XCTAssertEqual(lookups, 2)
+        XCTAssertEqual(refreshes, 1)
+        XCTAssertNil(service.message)
+        print("STREAM_START_RECOVERY freshLookups=\(refreshes) unansweredRequests=\(server.snapshot().stalled) position=\(service.clock.position)")
+        service.pause()
+    }
+
+    private func until(timeout: Duration = .seconds(5), _ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
         XCTAssertTrue(condition(), "The actual native streaming ownership condition must complete")
         guard condition() else { throw CatalogError.invalid("Native stream did not become ready") }

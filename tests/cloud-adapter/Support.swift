@@ -5,7 +5,9 @@ import Foundation
 
 @MainActor
 final class MicrosoftAccount {
-    func token(forceRefresh: Bool = false) async throws -> String { "fixture-token" }
+    func token(forceRefresh: Bool = false) async throws -> String {
+        forceRefresh ? "fixture-renewed-token" : "fixture-token"
+    }
 }
 
 enum AppError: Error, LocalizedError {

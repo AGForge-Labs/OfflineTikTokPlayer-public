@@ -4,16 +4,18 @@ import Network
 /// Test-only, loopback-bound HTTP server. All state belongs to its serial queue;
 /// the only readable resources are the supplied, small synthetic fixture files.
 final class HTTPPlaybackFixtureServer: @unchecked Sendable {
-    struct Counts { var requests = 0; var ranges = 0; var bytes = 0 }
+    struct Counts { var requests = 0; var ranges = 0; var bytes = 0; var stalled = 0 }
     private let queue = DispatchQueue(label: "HTTPPlaybackFixtureServer")
     private let listener: NWListener
     private let files: [String: Data]
+    private let stalledPaths: Set<String>
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var ready: CheckedContinuation<URL, Error>?
     private var counts = Counts()
 
-    init(files: [String: Data]) throws {
+    init(files: [String: Data], stalledPaths: Set<String> = []) throws {
         self.files = files
+        self.stalledPaths = stalledPaths
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
         listener = try NWListener(using: parameters)
@@ -93,8 +95,15 @@ final class HTTPPlaybackFixtureServer: @unchecked Sendable {
         guard let text = String(data: header, encoding: .utf8) else { close(connection); return }
         let lines = text.components(separatedBy: "\r\n")
         let first = (lines.first ?? "").split(separator: " ")
-        guard first.count == 3, first[0] == "GET" || first[0] == "HEAD",
-              let file = files[String(first[1])] else {
+        guard first.count == 3, first[0] == "GET" || first[0] == "HEAD" else {
+            send(connection, status: "404 Not Found", fields: "Content-Length: 0\r\n", body: Data()); return
+        }
+        let path = String(first[1])
+        if stalledPaths.contains(path) {
+            counts.stalled += 1
+            return // stop() releases the unanswered request with the rest of the fixture.
+        }
+        guard let file = files[path] else {
             send(connection, status: "404 Not Found", fields: "Content-Length: 0\r\n", body: Data()); return
         }
         counts.requests += 1
