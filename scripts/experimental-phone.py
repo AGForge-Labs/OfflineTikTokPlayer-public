@@ -10,18 +10,20 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "d278ea838fca7c7e5105aade87d7aa7db1438ac5"
-SOURCE = "6d13bb9960510a10f73f757be38e21721206699d"
-APP_TREE = "69e89b9beef030856e31df27ec26141571f3e900"
-BASE_APP_TREE = "f7899548930ac9673b304c07fc53503da1420d0a"
+SOURCE_BASE = "6d13bb9960510a10f73f757be38e21721206699d"
+SOURCE = "fb5fb3efbaef7ca8a3f70561eb466f564b61620f"
+APP_TREE = "156e2b23189f3fd613796c11df263e0ae497ba7d"
+BASE_APP_TREE = "69e89b9beef030856e31df27ec26141571f3e900"
 CORE_TREE = "7a5e1aa80ed7cfd6eec1d52f39baa6f08439e8eb"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
     '.github/workflows/stalled-video-recovery.yml',
     'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
-    'ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift',
-    'ios/PlayerCore/Sources/PlayerCore/VideoImageProgress.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/VideoImageProgressTests.swift',
+    'ios/OfflineTikTokPlayer/Services/OneDriveClient.swift',
+    'ios/OfflineTikTokPlayerTests/HTTPPlaybackFixtureServer.swift',
+    'ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift',
+    'tests/cloud-adapter/OneDriveClientTests.swift',
+    'tests/cloud-adapter/Support.swift',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -232,7 +234,8 @@ NATIVE_PROOFS = (
     (41438316239, "f4dbfc8cff17f184d7f6a9c8e251f9b8d5bcaa09", ".github/workflows/native-video-evidence.yml", "codex/native-video-evidence"),
     (41741373827, "3b3758e383cda3d015e56e8035433de7a796c5ea", ".github/workflows/audio-output-evidence.yml", "codex/audio-continuity-evidence"),
     (42925893598, "d278ea838fca7c7e5105aade87d7aa7db1438ac5", ".github/workflows/stalled-video-recovery.yml", "codex/stalled-video-recovery"),
-    (42961684284, SOURCE, ".github/workflows/stalled-video-recovery.yml", "codex/picture-freeze-recovery"),
+    (42961684284, SOURCE_BASE, ".github/workflows/stalled-video-recovery.yml", "codex/picture-freeze-recovery"),
+    (43318289392, SOURCE, ".github/workflows/stalled-video-recovery.yml", "codex/stream-start-recovery"),
 )
 
 

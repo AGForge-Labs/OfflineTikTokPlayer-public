@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only picture recovery candidate
+run-name: Owner-only OneDrive playback recovery
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +48,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 6d13bb9960510a10f73f757be38e21721206699d
+          ref: fb5fb3efbaef7ca8a3f70561eb466f564b61620f
           fetch-depth: 2
           path: candidate
           persist-credentials: false
@@ -79,7 +79,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 6d13bb9960510a10f73f757be38e21721206699d
+          ref: fb5fb3efbaef7ca8a3f70561eb466f564b61620f
           fetch-depth: 2
           path: candidate
           persist-credentials: false
