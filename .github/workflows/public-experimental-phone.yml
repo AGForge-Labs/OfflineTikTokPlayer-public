@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only TikTok post links
+run-name: Owner-only streaming quality
 on:
   workflow_dispatch:
     inputs:
@@ -48,8 +48,8 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 416618a3ddbbdc0340d7e578a9937bc6a256c598
-          fetch-depth: 3
+          ref: 113be8cf2b35021a1d4ae090cd61d0bd9a539baa
+          fetch-depth: 2
           path: candidate
           persist-credentials: false
       - name: Verify exact source and native evidence before release review
@@ -79,8 +79,8 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 416618a3ddbbdc0340d7e578a9937bc6a256c598
-          fetch-depth: 3
+          ref: 113be8cf2b35021a1d4ae090cd61d0bd9a539baa
+          fetch-depth: 2
           path: candidate
           persist-credentials: false
       - name: Verify experimental owner request and exact runtime source without credentials
