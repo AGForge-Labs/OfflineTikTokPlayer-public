@@ -141,6 +141,9 @@
         "artwork": {
           "$ref": "#/$defs/optionalAsset"
         },
+        "streamEnhancement": {
+          "$ref": "#/$defs/streamEnhancement"
+        },
         "audioLoudness": {
           "anyOf": [
             {
@@ -193,6 +196,17 @@
             "$ref": "#/$defs/identity"
           }
         }
+      }
+    },
+    "streamEnhancement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "sourceSHA256", "asset", "audioMastered"],
+      "properties": {
+        "version": {"const": 1},
+        "sourceSHA256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "asset": {"$ref": "#/$defs/asset"},
+        "audioMastered": {"type": "boolean"}
       }
     },
     "audioLoudness": {

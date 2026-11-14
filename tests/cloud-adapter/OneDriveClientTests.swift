@@ -215,6 +215,40 @@ final class OneDriveClientTests: XCTestCase {
         XCTAssertEqual(catalog.libraryID, "cloud-library")
     }
 
+    func testOptionalPrivateQualityIndexCanAppearAfterAnUnavailableResponse() async throws {
+        let archive = AssetReference(driveID: "drive", itemID: "archive", fileName: "base.mp4", byteSize: 21,
+                                     sha256: String(repeating: "a", count: 64), contentType: "video/mp4")
+        let variant = AssetReference(driveID: "drive", itemID: "enhanced", fileName: "enhanced.mp4", byteSize: 30,
+                                     sha256: String(repeating: "b", count: 64), contentType: "video/mp4")
+        let base = try LibraryCatalog(libraryID: "cloud-library",
+            media: [.init(id: "clip", title: "Example", status: .ready, asset: archive)],
+            playlists: [.init(id: "one", name: "One", itemIDs: ["clip"])])
+        let catalogBytes = try JSONEncoder().encode(base)
+        let assets = try JSONEncoder().encode(["clip": StreamEnhancement(sourceSHA256: archive.sha256, asset: variant, audioMastered: true)])
+        let quality = Data((#"{"version":1,"libraryId":"cloud-library","items":"# + String(decoding: assets, as: UTF8.self) + "}").utf8)
+        let listed = try JSONSerialization.data(withJSONObject: ["value": [
+            ["id": "catalog", "name": "catalog.json", "@microsoft.graph.downloadUrl": "https://content.example.test/catalog"],
+            ["id": "quality", "name": "stream-quality-v1.json", "size": quality.count, "eTag": "current",
+             "@microsoft.graph.downloadUrl": "https://content.example.test/quality"]
+        ]])
+        let state = RequestState()
+        let drive = client { request in
+            if request.url?.host == "graph.microsoft.com" { return (200, listed) }
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            if request.url?.path == "/catalog" { return (200, catalogBytes) }
+            XCTAssertEqual(request.url?.path, "/quality")
+            if state.get()["available"] as? Bool == true { return (200, quality) }
+            return (503, Data())
+        }
+        let first = try await drive.catalog()
+        XCTAssertEqual(first.media[0].preferredStream, archive)
+        state.set(["available": true])
+        let second = try await drive.catalog()
+        XCTAssertEqual(second.media[0].preferredStream, variant)
+        XCTAssertEqual(second.media[0].asset, archive)
+        XCTAssertEqual(second.playlists, base.playlists)
+    }
+
     func testOptionalQuotaDenialDoesNotPreventCatalogRefresh() async throws {
         let drive = client { request in
             if request.url!.path == "/v1.0/me/drive" { return (403, Data(#"{"error":{"code":"accessDenied"}}"#.utf8)) }

@@ -30,4 +30,34 @@ public enum PlaybackMediaSource: Equatable, Sendable {
         try Task.checkCancellation()
         return .stream(url)
     }
+
+    /// Preserve explicit saved files, use a verified cached copy when possible,
+    /// and fall back to the archive if the optional derivative is unavailable.
+    public static func resolve(saved: URL?, media: MediaRecord, cache: PlaybackMediaCache?,
+        allowRemote: Bool, forceRemote: Bool = false, useOriginal: Bool = false,
+        remoteURL: (AssetReference) async throws -> URL) async throws -> (source: Self, mastered: Bool, enhanced: Bool) {
+        try Task.checkCancellation()
+        let original = media.asset
+        let preferred = useOriginal ? original : media.preferredStream
+        if let saved { return (.verifiedFile(saved), false, false) }
+        if !forceRemote, let preferred, let cached = await cache?.file(for: preferred) {
+            try Task.checkCancellation()
+            return (.verifiedFile(cached), media.hasMasteredAudio(for: preferred), preferred != original)
+        }
+        if !forceRemote, original != preferred, let original, let cached = await cache?.file(for: original) {
+            try Task.checkCancellation()
+            return (.verifiedFile(cached), false, false)
+        }
+        if let preferred, preferred != original, allowRemote {
+            do {
+                return (try await resolve(saved: nil, asset: preferred, cache: nil, allowRemote: true,
+                                          forceRemote: forceRemote, remoteURL: remoteURL), media.hasMasteredAudio(for: preferred), true)
+            } catch {
+                try Task.checkCancellation()
+                if error is CancellationError { throw error }
+            }
+        }
+        return (try await resolve(saved: nil, asset: original, cache: nil, allowRemote: allowRemote,
+                                  forceRemote: forceRemote, remoteURL: remoteURL), false, false)
+    }
 }

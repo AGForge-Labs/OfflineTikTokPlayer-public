@@ -26,6 +26,25 @@ final class MeasuredAudioIntegrationTests: XCTestCase {
         XCTAssertNil(loud.audioMix)
     }
 
+    func testMasteredNativeAudioDoesNotLoadOrAttachAnotherTap() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        let mastered = AVPlayerItem(url: url), archive = AVPlayerItem(url: url)
+        var loads = [AVPlayerItem]()
+        let controller = SpeakerAudioController(loadTracks: { item in
+            loads.append(item)
+            return try? await item.asset.loadTracks(withMediaType: .audio)
+        })
+        controller.update(items: [], enabled: true)
+        controller.configureNormalization(18, for: mastered, mastered: true)
+        controller.configureNormalization(18, for: archive)
+        await controller.prepare(mastered)
+        await controller.prepare(archive)
+        controller.update(items: [mastered, archive], enabled: true)
+        XCTAssertEqual(loads.map(ObjectIdentifier.init), [ObjectIdentifier(archive)])
+        XCTAssertNil(mastered.audioMix)
+        XCTAssertNotNil(archive.audioMix)
+    }
+
     func testASecondVersionOfOnePostCannotChangeTheRetainedPCMFilesGain() async throws {
         let first = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-a", withExtension: "mp4"))
         let other = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-selection-b", withExtension: "mp4"))

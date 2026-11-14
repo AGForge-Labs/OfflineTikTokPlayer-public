@@ -95,6 +95,53 @@ final class PlaybackMediaSourceTests: XCTestCase {
         let counts = await calls.counts
         XCTAssertEqual(counts.resolves, 1)
     }
+
+    func testQualityIndexBindsVariantsToOriginalBytesAndKeepsLocalCopy() async throws {
+        let archive = asset("a"), enhanced = asset("b"), changed = asset("c")
+        let first = MediaRecord(id: "first", title: "First", status: .ready, asset: archive, original: archive)
+        let second = MediaRecord(id: "second", title: "Second", status: .ready, asset: changed)
+        let base = try LibraryCatalog(libraryID: "example", media: [first, second],
+            playlists: [.init(id: "playlist", name: "Playlist", itemIDs: [first.id, second.id])])
+        let variant = StreamEnhancement(sourceSHA256: archive.sha256, asset: enhanced, audioMastered: true)
+        let assetJSON = try JSONEncoder().encode([first.id: variant, second.id: variant])
+        let data = Data(("{\"version\":1,\"libraryId\":\"example\",\"items\":" + String(decoding: assetJSON, as: UTF8.self) + "}").utf8)
+        let index = try JSONDecoder().decode(StreamQualityIndex.self, from: data)
+        let catalog = try index.applying(to: base)
+        let media = try XCTUnwrap(catalog.mediaByID[first.id])
+        XCTAssertEqual(catalog.playlists, base.playlists)
+        XCTAssertEqual(media.asset, archive)
+        XCTAssertEqual(media.original, archive)
+        XCTAssertEqual(media.preferredStream, enhanced)
+        XCTAssertEqual(catalog.mediaByID[second.id]?.preferredStream, changed)
+        let saved = URL(fileURLWithPath: "/Saved/a.mp4")
+        let local = try await PlaybackMediaSource.resolve(saved: saved, media: media, cache: nil, allowRemote: false) { _ in
+            XCTFail("Explicit saved copies stay available without the network")
+            throw URLError(.notConnectedToInternet)
+        }
+        XCTAssertEqual(local.source, .verifiedFile(saved)); XCTAssertFalse(local.mastered)
+    }
+
+    func testEnhancedStreamAndArchiveFallbackIdentifyTheActualAudioProfile() async throws {
+        let archive = asset("a"), enhanced = asset("b")
+        let media = MediaRecord(id: "clip", title: "Clip", status: .ready, asset: archive,
+            streamEnhancement: .init(sourceSHA256: archive.sha256, asset: enhanced, audioMastered: true))
+        let remote = URL(string: "https://example.invalid/video.mp4")!
+        let chosen = try await PlaybackMediaSource.resolve(saved: nil, media: media, cache: nil, allowRemote: true) { reference in
+            XCTAssertEqual(reference, enhanced); return remote
+        }
+        XCTAssertEqual(chosen.source, .stream(remote)); XCTAssertTrue(chosen.mastered); XCTAssertTrue(chosen.enhanced)
+        var attempted = [AssetReference]()
+        let fallback = try await PlaybackMediaSource.resolve(saved: nil, media: media, cache: nil, allowRemote: true) { reference in
+            attempted.append(reference)
+            if reference == enhanced { throw URLError(.resourceUnavailable) }
+            return remote
+        }
+        XCTAssertEqual(attempted, [enhanced, archive])
+        XCTAssertEqual(fallback.source, .stream(remote)); XCTAssertFalse(fallback.mastered); XCTAssertFalse(fallback.enhanced)
+        try await _ = PlaybackMediaSource.resolve(saved: nil, media: media, cache: nil, allowRemote: true, useOriginal: true) { reference in
+            XCTAssertEqual(reference, archive); return remote
+        }
+    }
 }
 
 private actor SourceCalls {

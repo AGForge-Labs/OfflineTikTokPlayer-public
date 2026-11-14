@@ -15,6 +15,7 @@ final class ContinuousAudioPlayer {
         let slot: Int
         let sourceURL: URL
         let normalizationGainDB: Double?
+        let mastered: Bool
         var runner: Task<Void, Never>?
         var invalidated = false
         var waiters: [UUID: ContinuousAudioPreparationWaiter] = [:]
@@ -77,13 +78,13 @@ final class ContinuousAudioPlayer {
     private var nextToken = 1
     private var window = Set<String>()
     private var successors: [Int: Int] = [:]
-    private var sourceLoudness: [String: (url: URL, gainDB: Double?)] = [:]
+    private var sourceLoudness: [String: (url: URL, gainDB: Double?, mastered: Bool)] = [:]
 
-    func configureLoudness(id: String, url: URL, gainDB: Double?) {
-        sourceLoudness[id] = (url, gainDB)
+    func configureLoudness(id: String, url: URL, gainDB: Double?, mastered: Bool = false) {
+        sourceLoudness[id] = (url, gainDB, mastered)
         // An older retained version of this same post must keep its own gain.
         if let entry = entries[id], entry.sourceURL == url {
-            renderer.setNormalizationGainDB(gainDB, for: entry.token)
+            renderer.setNormalizationGainDB(gainDB, for: entry.token, mastered: mastered)
         }
     }
     private(set) var selectedID: String?
@@ -256,8 +257,9 @@ final class ContinuousAudioPlayer {
         guard let slot = available else { throw PreparationError.windowBusy }
         let token = nextToken; nextToken += 1
         reservedSlots.insert(slot); reservedTokens.insert(token)
-        let gain = sourceLoudness[id].flatMap { $0.url == url ? $0.gainDB : nil }
-        preparing[id] = PreparationJob(token: token, slot: slot, sourceURL: url, normalizationGainDB: gain)
+        let profile = sourceLoudness[id].flatMap { $0.url == url ? $0 : nil }
+        preparing[id] = PreparationJob(token: token, slot: slot, sourceURL: url,
+                                       normalizationGainDB: profile?.gainDB, mastered: profile?.mastered ?? false)
         let subscription = subscribeToPreparation(id: id, token: token)
         // Exactly one runner observes the real decoder result. Neither the job
         // nor CAP is captured strongly across the native/metadata await.
@@ -320,10 +322,11 @@ final class ContinuousAudioPlayer {
         }
         switch outcome {
         case .success(let entry):
-            let gain: Double?
-            if let current = sourceLoudness[id], current.url == job.sourceURL { gain = current.gainDB }
-            else { gain = job.normalizationGainDB }
-            renderer.setNormalizationGainDB(gain, for: entry.token)
+            if let current = sourceLoudness[id], current.url == job.sourceURL {
+                renderer.setNormalizationGainDB(current.gainDB, for: entry.token, mastered: current.mastered)
+            } else {
+                renderer.setNormalizationGainDB(job.normalizationGainDB, for: entry.token, mastered: job.mastered)
+            }
             entries[id] = entry
             evictUnused()
         case .failure:

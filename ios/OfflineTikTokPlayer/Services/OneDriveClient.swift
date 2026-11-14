@@ -70,7 +70,31 @@ actor OneDriveClient {
         }
         let (data, response) = try await session.data(from: url)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { throw AppError.message("The catalog download was interrupted. Try Refresh again.") }
-        return try LibraryCatalog.decode(data)
+        let catalog = try LibraryCatalog.decode(data)
+        // The quality worker never rewrites the importer's catalog. A stale,
+        // unavailable or mismatched index must leave the original library usable.
+        let quality = children.value.first(where: { $0.name == "stream-quality-v1.json" })
+        return await withStreamQuality(catalog, item: quality)
+    }
+
+    private func withStreamQuality(_ catalog: LibraryCatalog, item: DriveItem?) async -> LibraryCatalog {
+        guard let item, let url = item.downloadURL, url.scheme == "https",
+              let size = item.size, (1...10 * 1024 * 1024).contains(size) else { return catalog }
+        if let cached = qualityIndex, let etag = item.eTag, cached.etag == etag,
+           cached.itemID == item.id, cached.libraryID == catalog.libraryID {
+            return (try? cached.index.applying(to: catalog)) ?? catalog
+        }
+        let fallback = qualityIndex.flatMap { cached in
+            cached.itemID == item.id && cached.libraryID == catalog.libraryID ? (try? cached.index.applying(to: catalog)) : nil
+        } ?? catalog
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200, data.count == size,
+              let index = try? JSONDecoder().decode(StreamQualityIndex.self, from: data),
+              let merged = try? index.applying(to: catalog) else { return fallback }
+        if let etag = item.eTag { qualityIndex = (item.id, catalog.libraryID, etag, index) }
+        return merged
     }
 
     /// Ask the PC that owns the TikTok session; never move that session to the phone.
@@ -152,11 +176,13 @@ actor OneDriveClient {
     }
 
     private struct Children: Decodable { let value: [DriveItem] }
+    private var qualityIndex: (itemID: String, libraryID: String, etag: String, index: StreamQualityIndex)?
     private struct DriveItem: Decodable {
         let id: String
         let name: String?
         let downloadURL: URL?
         let size: Int?
-        enum CodingKeys: String, CodingKey { case id, name, size, downloadURL = "@microsoft.graph.downloadUrl" }
+        let eTag: String?
+        enum CodingKeys: String, CodingKey { case id, name, size, eTag, downloadURL = "@microsoft.graph.downloadUrl" }
     }
 }

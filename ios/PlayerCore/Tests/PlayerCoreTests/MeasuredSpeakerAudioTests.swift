@@ -53,6 +53,27 @@ final class MeasuredSpeakerAudioTests: XCTestCase {
         XCTAssertFalse(renderer.snapshot.ended)
     }
 
+    func testMasteredSourceBypassesSpeakerProcessingAcrossNextAndLoopWithNoAddedFrames() {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 256, ringFrames: 256)
+        let original = Array(repeating: Float(0.03), count: 192)
+        let mastered = (0..<192).map { Float($0 + 1) * 0.001 }
+        XCTAssertTrue(original.withUnsafeBufferPointer { renderer.source(at: 0).prepare(token: 1, totalFrames: 192, prefix: $0) })
+        XCTAssertTrue(mastered.withUnsafeBufferPointer { renderer.source(at: 1).prepare(token: 2, totalFrames: 192, prefix: $0) })
+        renderer.setNormalizationGainDB(18, for: 1)
+        renderer.setNormalizationGainDB(18, for: 2, mastered: true)
+        renderer.setSpeakerEnabled(true)
+        renderer.setSuccessor(token: 2, for: 1)
+        renderer.setSuccessor(token: 2, for: 2)
+        renderer.select(token: 1)
+        renderer.setPlaying(true)
+        var output = Array(repeating: Float(0), count: 416)
+        output.withUnsafeMutableBufferPointer { renderer.render(interleaved: $0, frameCount: 416) }
+        XCTAssertNotEqual(Array(output.prefix(192)), original)
+        XCTAssertEqual(Array(output[192..<384]), mastered)
+        XCTAssertEqual(Array(output[384...]), Array(mastered.prefix(32)))
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+
     private func render(amplitude: Double, gain: Double) -> (rms: Double, peak: Float) {
         let processor = SpeakerAudioProcessor(sampleRate: 48000, channels: 1, enabled: true)
         processor.setNormalizationGainDB(gain)

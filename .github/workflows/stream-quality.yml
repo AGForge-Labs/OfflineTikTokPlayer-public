@@ -1,0 +1,71 @@
+name: Enhanced streaming quality
+on:
+  push:
+    branches: [codex/stream-quality]
+permissions:
+  contents: read
+jobs:
+  portable:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify quality selection, catalog fallback and exact PCM boundaries
+        run: |
+          set -euo pipefail
+          bash scripts/test-core.sh
+          bash scripts/test-native-cloud.sh
+          python3 -B scripts/generate-ios-project.py --check
+          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{PlaybackService,SpeakerAudioMix,ContinuousAudioPlayer}.swift ios/OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests.swift
+  simulator:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    needs: portable
+    runs-on: macos-26
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Compile iPhone player and verify native audio, streaming and playback recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          udid="$(python3 -B scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
+          work=artifacts/stream-quality
+          mkdir -p "$work"
+          cases=(
+            OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests/testMasteredNativeAudioDoesNotLoadOrAttachAnotherTap
+            OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests/testASecondVersionOfOnePostCannotChangeTheRetainedPCMFilesGain
+            OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testUncachedCloudSelectionPlaysAndNavigatesWithoutAnOfflineCopy
+            OfflineTikTokPlayerTests/NativeStreamingPlaybackTests/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit
+            OfflineTikTokPlayerTests/PictureRecoveryTests/testPictureFeedRecoversTwiceWithinTheSamePlayingVisit
+          )
+          args=()
+          for test in "${cases[@]}"; do args+=("-only-testing:$test"); done
+          xcodebuild test -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination "platform=iOS Simulator,id=$udid" -derivedDataPath "$work/Derived" \
+            -resultBundlePath "$work/Tests.xcresult" -jobs 2 -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
+            "${args[@]}" CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/tests.log"
+          xcrun xcresulttool get test-results tests --path "$work/Tests.xcresult" > "$work/results.json"
+          python3 - "$work/results.json" "${cases[@]}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          expected = {case.split('/', 1)[1] for case in sys.argv[2:]}
+          pending = list(json.loads(Path(sys.argv[1]).read_text())['testNodes'])
+          while pending:
+              node = pending.pop()
+              pending.extend(node.get('children', []))
+              if node['nodeType'] == 'Test Case':
+                  assert node['result'] == 'Passed', node
+                  expected.remove(node['nodeIdentifier'].removesuffix('()'))
+          assert not expected, expected
+          print(f'Streaming quality and playback simulator checks passed ({len(sys.argv) - 2})')
+          PY

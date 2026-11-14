@@ -104,7 +104,7 @@ final class SpeakerAudioController {
         var retryWhenReady = false
         var gainDB: Double? = nil
     }
-    private struct Loudness { weak var item: AVPlayerItem?; let gainDB: Double? }
+    private struct Loudness { weak var item: AVPlayerItem?; let gainDB: Double?; let mastered: Bool }
     private var loudness: [ObjectIdentifier: Loudness] = [:]
     private var entries: [ObjectIdentifier: Entry] = [:]
     private var enabled = false
@@ -112,10 +112,10 @@ final class SpeakerAudioController {
     private let loadTracks: TrackLoader
 
     /// Bound once to the item created from this exact asset URL, not its post ID.
-    func configureNormalization(_ gainDB: Double?, for item: AVPlayerItem) {
+    func configureNormalization(_ gainDB: Double?, for item: AVPlayerItem, mastered: Bool = false) {
         let id = ObjectIdentifier(item)
-        if loudness[id]?.item === item, loudness[id]?.gainDB == gainDB { return }
-        loudness[id] = Loudness(item: item, gainDB: gainDB)
+        if loudness[id]?.item === item, loudness[id]?.gainDB == gainDB, loudness[id]?.mastered == mastered { return }
+        loudness[id] = Loudness(item: item, gainDB: gainDB, mastered: mastered)
         entries[id]?.task?.cancel()
         entries.removeValue(forKey: id)
     }
@@ -129,19 +129,21 @@ final class SpeakerAudioController {
     /// Configure before the item enters AVQueuePlayer, so play doesn't rebuild its audio path.
     func prepare(_ item: AVPlayerItem, within budget: Duration? = nil) async {
         let id = ObjectIdentifier(item), token = UUID()
+        let useTap = enabled && !(loudness[id]?.item === item && loudness[id]?.mastered == true)
         entries[id]?.task?.cancel()
-        entries[id] = Entry(item: item, enabled: enabled, token: token, task: nil, awaitingEnqueue: true)
+        entries[id] = Entry(item: item, enabled: useTap, token: token, task: nil, awaitingEnqueue: true)
         let loader = loadTracks
-        let tracks = enabled ? await PlaybackPreparation.value(within: budget ?? preparationBudget) { await loader(item) } : nil
+        let tracks = useTap ? await PlaybackPreparation.value(within: budget ?? preparationBudget) { await loader(item) } : nil
         guard !Task.isCancelled, entries[id]?.token == token else {
             if entries[id]?.token == token { entries.removeValue(forKey: id) }
             return
         }
         // A route or Original-sound change can happen while metadata is loading.
         let gain = loudness[id]?.item === item ? loudness[id]?.gainDB : nil
-        item.audioMix = enabled ? tracks.flatMap { SpeakerAudioMix.make(tracks: $0, normalizationGainDB: gain) } : nil
-        entries[id] = Entry(item: item, enabled: enabled, token: token, task: nil, awaitingEnqueue: true,
-                            retryWhenReady: enabled && tracks == nil, gainDB: gain)
+        let stillUsesTap = enabled && !(loudness[id]?.item === item && loudness[id]?.mastered == true)
+        item.audioMix = stillUsesTap ? tracks.flatMap { SpeakerAudioMix.make(tracks: $0, normalizationGainDB: gain) } : nil
+        entries[id] = Entry(item: item, enabled: stillUsesTap, token: token, task: nil, awaitingEnqueue: true,
+                            retryWhenReady: stillUsesTap && tracks == nil, gainDB: gain)
     }
 
     func update(items: [AVPlayerItem], enabled: Bool) {
@@ -154,12 +156,13 @@ final class SpeakerAudioController {
         for item in items {
             let id = ObjectIdentifier(item)
             let gain = loudness[id]?.item === item ? loudness[id]?.gainDB : nil
+            let useTap = enabled && !(loudness[id]?.item === item && loudness[id]?.mastered == true)
             entries[id]?.awaitingEnqueue = false
-            if let entry = entries[id], entry.item === item, entry.enabled == enabled, entry.gainDB == gain,
+            if let entry = entries[id], entry.item === item, entry.enabled == useTap, entry.gainDB == gain,
                !(entry.retryWhenReady && item.status == .readyToPlay) { continue }
             entries[id]?.task?.cancel()
             let token = UUID()
-            if !enabled {
+            if !useTap {
                 item.audioMix = nil
                 entries[id] = Entry(item: item, enabled: false, token: token, task: nil, gainDB: gain)
                 continue

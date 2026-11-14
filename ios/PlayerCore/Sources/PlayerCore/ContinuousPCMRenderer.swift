@@ -468,12 +468,14 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     public func setSpeakerEnabled(_ value: Bool) { enhance.store(value, ordering: .releasing) }
 
     /// Serial control owner; a token always names one retained preparation.
-    public func setNormalizationGainDB(_ gain: Double?, for token: Int) {
+    public func setNormalizationGainDB(_ gain: Double?, for token: Int, mastered: Bool = false) {
         guard token > 0, let source = find(token) else { return }
         // The serial control owner also owns retirement/entry replacement, so
         // this non-suspending token lookup cannot configure a reused slot.
         let linear = SpeakerAudioProcessor.linearNormalizationGain(for: gain)
-        source.normalizationGainBits.store((linear ?? .nan).bitPattern, ordering: .releasing)
+        // Zero is reserved for an already mastered source; every actual linear
+        // gain is positive. Use a single atomic decision at a source boundary.
+        source.normalizationGainBits.store((mastered ? 0.0 : (linear ?? .nan)).bitPattern, ordering: .releasing)
     }
 
     /// Coherent source-frame cursor. Read off the audio thread.
@@ -610,9 +612,11 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     continue
                 }
                 var starved = false
+                var processSpeaker = shouldEnhance
                 if shouldEnhance {
                     let gain = Double(bitPattern: source.normalizationGainBits.load(ordering: .acquiring))
-                    speaker.useNormalizationGain(gain.isFinite ? gain : nil)
+                    processSpeaker = gain != 0
+                    if processSpeaker { speaker.useNormalizationGain(gain.isFinite ? gain : nil) }
                 }
                 // Hold the single-reader claim for this source span. Decoder ring
                 // writes remain independent; retirement never races a live span.
@@ -623,7 +627,7 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     #else
                     guard source.copyFrame(cursor, into: destination) else { starved = true; break }
                     #endif
-                    if shouldEnhance { speaker.process(UnsafeMutableBufferPointer(start: destination, count: channels)) }
+                    if processSpeaker { speaker.process(UnsafeMutableBufferPointer(start: destination, count: channels)) }
                     cursor += 1; outputFrame += 1
                 }
                 #if DEBUG

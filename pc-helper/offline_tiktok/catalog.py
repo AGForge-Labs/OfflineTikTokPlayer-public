@@ -62,6 +62,29 @@ class AudioLoudness:
         return result
 
 
+@dataclass(frozen=True)
+class StreamEnhancement:
+    source_sha256: str
+    asset: AssetRef
+    audio_mastered: bool
+    version: int = 1
+
+    def validate(self, source):
+        self.asset.validate()
+        if (type(self.version) is not int or self.version != 1 or type(self.audio_mastered) is not bool
+                or not source or source.sha256 != self.source_sha256 or self.asset.drive_id != source.drive_id
+                or self.asset.sha256 == source.sha256 or self.asset.content_type != "video/mp4"):
+            raise ValueError("Enhanced playback is not bound to its archived source")
+
+    def wire(self):
+        return dict(version=self.version, sourceSHA256=self.source_sha256, asset=self.asset.wire(),
+                    audioMastered=self.audio_mastered)
+
+    @classmethod
+    def decode(cls, data):
+        return cls(data["sourceSHA256"], AssetRef.decode(data["asset"]), data["audioMastered"], data["version"])
+
+
 @dataclass
 class MediaItem:
     id: str
@@ -75,6 +98,7 @@ class MediaItem:
     original: AssetRef | None = None
     artwork: AssetRef | None = None
     audio_loudness: AudioLoudness | None = None
+    stream_enhancement: StreamEnhancement | None = None
 
     def wire(self):
         result = dict(id=self.id, title=self.title, creator=self.creator, sourceURL=self.source_url,
@@ -84,6 +108,9 @@ class MediaItem:
                     artwork=self.artwork.wire() if self.artwork else None)
         if self.audio_loudness is not None:
             result["audioLoudness"] = self.audio_loudness.wire()
+        if self.stream_enhancement and self.asset and self.stream_enhancement.source_sha256 == self.asset.sha256:
+            self.stream_enhancement.validate(self.asset)
+            result["streamEnhancement"] = self.stream_enhancement.wire()
         return result
 
     @classmethod
@@ -91,7 +118,8 @@ class MediaItem:
         return cls(data["id"], data["title"], data.get("creator", ""), data.get("sourceURL", ""),
                    data.get("duration", 0), data.get("kind", "video"), data.get("status", "ready"),
                    *[AssetRef.decode(data[key]) if data.get(key) else None for key in ("asset", "original", "artwork")],
-                   AudioLoudness.decode(data["audioLoudness"]) if data.get("audioLoudness") is not None else None)
+                   AudioLoudness.decode(data["audioLoudness"]) if data.get("audioLoudness") is not None else None,
+                   StreamEnhancement.decode(data["streamEnhancement"]) if data.get("streamEnhancement") is not None else None)
 
 
 @dataclass
@@ -131,6 +159,8 @@ class Catalog:
                     ref.validate()
             if item.audio_loudness is not None:
                 item.audio_loudness.validate()
+            if item.stream_enhancement is not None:
+                item.stream_enhancement.validate(item.asset)
         for playlist in self.playlists:
             if not playlist.id or len(set(playlist.item_ids)) != len(playlist.item_ids):
                 raise ValueError("Invalid playlist identity or duplicate membership")

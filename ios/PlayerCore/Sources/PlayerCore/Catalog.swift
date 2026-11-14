@@ -46,7 +46,16 @@ public struct MediaRecord: Codable, Hashable, Identifiable, Sendable {
     public var original: AssetReference?
     public var artwork: AssetReference?
     public var audioLoudness: AudioLoudness?
+    public var streamEnhancement: StreamEnhancement?
     public var normalizationGainDB: Double? { audioLoudness?.normalizationGainDB(for: asset) }
+    public var preferredStream: AssetReference? {
+        streamEnhancement.flatMap { $0.matches(asset) ? $0.asset : nil } ?? asset
+    }
+
+    public func hasMasteredAudio(for reference: AssetReference?) -> Bool {
+        guard let value = streamEnhancement, value.matches(asset) else { return false }
+        return value.audioMastered && value.asset == reference
+    }
 
     public var tiktokPostURL: URL? {
         guard var link = URLComponents(string: sourceURL), link.scheme?.lowercased() == "https",
@@ -67,11 +76,50 @@ public struct MediaRecord: Codable, Hashable, Identifiable, Sendable {
 
     public init(id: String, title: String, creator: String = "", sourceURL: String = "", duration: Double = 0,
                 kind: Kind = .video, status: Status = .pending, asset: AssetReference? = nil,
-                original: AssetReference? = nil, artwork: AssetReference? = nil, audioLoudness: AudioLoudness? = nil) {
+                original: AssetReference? = nil, artwork: AssetReference? = nil, audioLoudness: AudioLoudness? = nil,
+                streamEnhancement: StreamEnhancement? = nil) {
         self.id = id; self.title = title; self.creator = creator; self.sourceURL = sourceURL
         self.duration = duration; self.kind = kind; self.status = status
         self.asset = asset; self.original = original; self.artwork = artwork
         self.audioLoudness = audioLoudness
+        self.streamEnhancement = streamEnhancement
+    }
+}
+
+public struct StreamEnhancement: Codable, Hashable, Sendable {
+    public let version: Int
+    public let sourceSHA256: String
+    public let asset: AssetReference
+    public let audioMastered: Bool
+
+    public init(version: Int = 1, sourceSHA256: String, asset: AssetReference, audioMastered: Bool) {
+        self.version = version; self.sourceSHA256 = sourceSHA256; self.asset = asset; self.audioMastered = audioMastered
+    }
+
+    public func matches(_ source: AssetReference?) -> Bool {
+        guard let source, version == 1, source.sha256 == sourceSHA256, asset.sha256 != source.sha256,
+              asset.driveID == source.driveID, asset.contentType == "video/mp4" else { return false }
+        return (try? asset.validate()) != nil
+    }
+}
+
+public struct StreamQualityIndex: Decodable, Sendable {
+    let version: Int
+    let libraryId: String
+    let items: [String: StreamEnhancement]
+
+    public func applying(to catalog: LibraryCatalog) throws -> LibraryCatalog {
+        guard version == 1, libraryId == catalog.libraryID else { return catalog }
+        let media = catalog.media.map { original -> MediaRecord in
+            guard original.status == .ready, let enhancement = items[original.id], enhancement.matches(original.asset) else {
+                return original
+            }
+            var item = original
+            item.streamEnhancement = enhancement
+            return item
+        }
+        return try LibraryCatalog(libraryID: catalog.libraryID, media: media, playlists: catalog.playlists,
+                                  updatedAt: catalog.updatedAt, schemaVersion: catalog.schemaVersion)
     }
 }
 
