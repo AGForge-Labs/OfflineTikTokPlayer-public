@@ -11,6 +11,33 @@ final class CatalogTests: XCTestCase {
         XCTAssertEqual(catalog.mediaByID["1"]?.asset?.itemID, "asset")
     }
 
+    func testTikTokPostLinkUsesTheOriginalURLFromAnExistingCatalog() throws {
+        let catalog = try LibraryCatalog.decode(Data(Self.fixture.utf8))
+        XCTAssertEqual(catalog.mediaByID["1"]?.tiktokPostURL?.absoluteString,
+                       "https://www.tiktok.com/@fixture_creator_4/video/1")
+        XCTAssertNil(catalog.mediaByID["3"]?.tiktokPostURL)
+    }
+
+    func testTikTokPhotoLinkIsAvailableWithoutAnArchivedVideo() {
+        let item = MediaRecord(id: "2", title: "Photo post",
+                               sourceURL: "https://www.tiktok.com/@creator/photo/2?share=1#post",
+                               kind: .slideshow, status: .unavailable)
+        XCTAssertEqual(item.tiktokPostURL?.absoluteString, "https://www.tiktok.com/@creator/photo/2")
+    }
+
+    func testTikTokPostLinkRequiresAnHTTPSPostForTheSameItem() {
+        for sourceURL in ["", "http://www.tiktok.com/@creator/video/1", "file:///video/1",
+                          "https://www.tiktok.com.example.org/@creator/video/1",
+                          "https://www.tiktok.com@other.example/@creator/video/1",
+                          "https://name@www.tiktok.com/@creator/video/1",
+                          "https://www.tiktok.com:8443/@creator/video/1",
+                          "https://www.tiktok.com/@creator%2Fother/video/1",
+                          "https://www.tiktok.com/@creator/collection/1",
+                          "https://www.tiktok.com/@creator/video/10"] {
+            XCTAssertNil(MediaRecord(id: "1", title: "Post", sourceURL: sourceURL).tiktokPostURL, sourceURL)
+        }
+    }
+
     func testMalformedCatalogCannotReplaceLibrary() {
         for raw in [Self.fixture.replacingOccurrences(of: "\"schemaVersion\":1", with: "\"schemaVersion\":99"),
                     Self.fixture.replacingOccurrences(of: "\"itemIds\":[\"1\",\"2\",\"3\"]", with: "\"itemIds\":[\"missing\"]"),

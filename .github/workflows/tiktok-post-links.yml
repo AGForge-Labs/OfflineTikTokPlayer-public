@@ -1,0 +1,23 @@
+name: TikTok post links
+on:
+  push:
+    branches: [codex/tiktok-post-links]
+    paths: ['ios/**', '.github/workflows/tiktok-post-links.yml']
+permissions:
+  contents: read
+jobs:
+  core:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify archived TikTok destinations and existing playback logic
+        run: bash scripts/test-core.sh
+      - name: Verify the SwiftUI source and generated project
+        run: |
+          set -euo pipefail
+          swiftc -frontend -parse ios/OfflineTikTokPlayer/UI/FeedView.swift ios/OfflineTikTokPlayer/UI/LibraryView.swift
+          python3 -B scripts/generate-ios-project.py --check
