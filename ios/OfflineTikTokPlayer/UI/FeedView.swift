@@ -76,6 +76,19 @@ private struct FeedPage: View {
                             Text(isActive && app.playback.hasAudioTrack == false ? "No audio in this archived post" :
                                 (app.downloads.readyIDs.contains(item.id) ? "Saved on your iPhone" : "From your private library"))
                         }.font(.caption).foregroundStyle(.white.opacity(0.85))
+                        if let url = item.tiktokPostURL {
+                            Link(destination: url) {
+                                Label("Open in TikTok", systemImage: "arrow.up.right.square")
+                                    .font(.caption.weight(.semibold))
+                                    .frame(minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.7), radius: 3)
+                            .disabled(!isActive)
+                            .accessibilityHidden(!isActive)
+                        }
                     }.frame(maxWidth: .infinity, alignment: .leading)
                     VStack(spacing: 18) {
                         let liked = app.personal.likedIDs.contains(item.id)

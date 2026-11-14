@@ -21,3 +21,45 @@ jobs:
           set -euo pipefail
           swiftc -frontend -parse ios/OfflineTikTokPlayer/UI/FeedView.swift ios/OfflineTikTokPlayer/UI/LibraryView.swift
           python3 -B scripts/generate-ios-project.py --check
+  simulator:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    needs: core
+    runs-on: macos-26
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Compile the iPhone app and verify feed and library navigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          udid="$(python3 -B scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
+          mkdir -p artifacts/tiktok-links
+          xcodebuild test -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+            -destination "platform=iOS Simulator,id=$udid" -derivedDataPath artifacts/tiktok-links/Derived \
+            -resultBundlePath artifacts/tiktok-links/Tests.xcresult -jobs 2 -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 120 \
+            -only-testing:OfflineTikTokPlayerTests/FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether \
+            -only-testing:OfflineTikTokPlayerUITests/PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee artifacts/tiktok-links/tests.log
+          xcrun xcresulttool get test-results tests --path artifacts/tiktok-links/Tests.xcresult > artifacts/tiktok-links/results.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          expected = {
+              'FeedPresentationTests/testImmediateReverseGesturesKeepTheSelectedVisitAndViewportTogether',
+              'PlayerShellTests/testLibraryAndPlaybackSettingsAreReachable',
+          }
+          pending = list(json.loads(Path('artifacts/tiktok-links/results.json').read_text())['testNodes'])
+          while pending:
+              node = pending.pop()
+              pending.extend(node.get('children', []))
+              if node['nodeType'] == 'Test Case':
+                  assert node['result'] == 'Passed', node
+                  expected.remove(node['nodeIdentifier'].removesuffix('()'))
+          assert not expected, expected
+          print('Feed and library simulator checks passed (2)')
+          PY

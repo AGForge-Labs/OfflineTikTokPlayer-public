@@ -48,6 +48,23 @@ public struct MediaRecord: Codable, Hashable, Identifiable, Sendable {
     public var audioLoudness: AudioLoudness?
     public var normalizationGainDB: Double? { audioLoudness?.normalizationGainDB(for: asset) }
 
+    public var tiktokPostURL: URL? {
+        guard var link = URLComponents(string: sourceURL), link.scheme?.lowercased() == "https",
+              let host = link.host?.lowercased(), host == "www.tiktok.com" || host == "tiktok.com",
+              link.user == nil, link.password == nil, link.port == nil else { return nil }
+
+        let path = link.path
+        let postPath = path.hasSuffix("/") ? path.dropLast() : path[...]
+        let parts = postPath.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 4, parts[0].isEmpty, parts[1].hasPrefix("@"), parts[1].count > 1,
+              parts[2] == "video" || parts[2] == "photo", parts[3] == id,
+              !id.isEmpty, id.utf8.allSatisfy({ (48...57).contains($0) }) else { return nil }
+
+        link.query = nil
+        link.fragment = nil
+        return link.url
+    }
+
     public init(id: String, title: String, creator: String = "", sourceURL: String = "", duration: Double = 0,
                 kind: Kind = .video, status: Status = .pending, asset: AssetReference? = nil,
                 original: AssetReference? = nil, artwork: AssetReference? = nil, audioLoudness: AudioLoudness? = nil) {

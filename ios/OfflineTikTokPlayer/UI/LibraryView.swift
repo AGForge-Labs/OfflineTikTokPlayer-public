@@ -212,6 +212,7 @@ struct MediaRow: View {
     let playlistIDs: [String]
     var itemIDs: [String]? = nil
     @Environment(AppModel.self) private var app
+    @Environment(\.openURL) private var openURL
     private var saved: Bool { app.downloads.records[item.id]?.isReady == true }
     private var playable: Bool { saved || (item.status == .ready && item.asset != nil) }
 
@@ -238,6 +239,9 @@ struct MediaRow: View {
             }
         }
         .contextMenu {
+            if let url = item.tiktokPostURL {
+                Button("Open in TikTok", systemImage: "arrow.up.right.square") { openURL(url) }
+            }
             if saved { Button("Remove offline copy", systemImage: "trash", role: .destructive) { app.downloads.remove(item.id) } }
             else if item.asset != nil { Button("Save offline", systemImage: "arrow.down.circle") { app.downloads.enqueue([item]); if let message = app.downloads.message { app.alert = message } } }
         }
