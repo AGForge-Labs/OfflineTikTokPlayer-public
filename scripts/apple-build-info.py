@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import uuid
 
 APP = "6824156409"
@@ -60,6 +61,18 @@ def key_configuration(environment):
         raise ValueError("Protected Apple API key inputs are invalid; values are suppressed.") from None
 
 
+def apple_lookup_failure(error):
+    reason = "other"
+    try:
+        payload = json.loads(error.read(32 * 1024))
+        if error.code == 403 and any(value.get("code") == "FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED"
+                                     for value in payload.get("errors", []) if isinstance(value, dict)):
+            reason = "required-agreement"
+    except (ValueError, AttributeError, TypeError, OSError):
+        pass
+    return f"Apple build lookup returned HTTP {error.code} ({reason})."
+
+
 def summarize_builds(records, number):
     require(isinstance(records, list) and 1 <= len(records) <= 200)
     safe = []
@@ -107,12 +120,29 @@ def main():
     spec = importlib.util.spec_from_file_location("existing_apple_owner", ROOT / "scripts/apple-owner-runner.py")
     owner = importlib.util.module_from_spec(spec); spec.loader.exec_module(owner)
     require(owner.APP == APP)
-    configuration = key_configuration(environment)
+    try:
+        configuration = key_configuration(environment)
+    except ValueError:
+        print("Protected Apple API key inputs did not pass validation.", file=sys.stderr)
+        raise SystemExit(1) from None
     with tempfile.TemporaryDirectory(prefix="apple-build-read-", dir=environment["RUNNER_TEMP"]) as temporary:
         directory = Path(temporary); directory.chmod(0o700)
-        apple = owner.Apple(configuration, directory)
+        try:
+            apple = owner.Apple(configuration, directory)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            print("Apple build lookup could not create its signed API token.", file=sys.stderr)
+            raise SystemExit(1) from None
         # Existing client permits exactly this app's GET build-list route here.
-        report = summarize_builds(owner.builds(apple), owner.number)
+        try:
+            builds = owner.builds(apple)
+        except ValueError as error:
+            # The existing client suppresses Apple HTTP bodies at the public boundary.
+            if isinstance(error.__context__, urllib.error.HTTPError):
+                print(apple_lookup_failure(error.__context__), file=sys.stderr)
+                raise SystemExit(1) from None
+            print("Apple build lookup received an invalid build list.", file=sys.stderr)
+            raise SystemExit(1) from None
+        report = summarize_builds(builds, owner.number)
     report["checkedAtUTC"] = dt.datetime.now(dt.timezone.utc).isoformat()
     print("APPLE_BUILD_INFO " + json.dumps(report, sort_keys=True))
     if environment.get("GITHUB_STEP_SUMMARY"):

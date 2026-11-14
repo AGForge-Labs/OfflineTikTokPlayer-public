@@ -1,7 +1,9 @@
 """Synthetic lookup tests: never use real Apple keys or network."""
 import base64
 import importlib.util
+import io
 from pathlib import Path
+from urllib.error import HTTPError
 import uuid
 
 import pytest
@@ -89,6 +91,16 @@ def test_build_report_selects_numeric_latest_and_only_safe_fields(lookup, owner)
     assert report["latestVersion"] == "23.1" and report["suggestedNextBuild"] == "24.1"
     assert [b["version"] for b in report["builds"]] == ["23.1", "20.1", "9.1"]
     assert "SYNTHETIC-PRIVATE-MARKER" not in str(report)
+
+
+@pytest.mark.parametrize("status,body,expected", [
+    (403, b'{"errors":[{"code":"FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED","detail":"SYNTHETIC-PRIVATE-MARKER"}]}', "required-agreement"),
+    (401, b'{"errors":[{"code":"SYNTHETIC-PRIVATE-MARKER"}]}', "other"),
+    (502, b"SYNTHETIC-PRIVATE-MARKER", "other"),
+])
+def test_read_only_lookup_reports_status_without_apple_response_details(lookup, status, body, expected):
+    error = HTTPError("https://example.invalid/SYNTHETIC-PRIVATE-MARKER", status, "private", {}, io.BytesIO(body))
+    assert lookup.apple_lookup_failure(error) == f"Apple build lookup returned HTTP {status} ({expected})."
 
 
 @pytest.mark.parametrize("bad", [[], [dict(id=str(uuid.UUID(int=1)), attributes=dict(version="$(bad)"))],
