@@ -152,7 +152,7 @@ class ExperimentalPhoneTests(unittest.TestCase):
             digest = hashlib.sha256(signer.read_bytes()).hexdigest()
             data = {(control, "rev-parse", "HEAD"): self.sha,
                     (candidate, "rev-parse", "HEAD"): phone.SOURCE,
-                    (candidate, "rev-parse", "HEAD^"): phone.SOURCE_BASE,
+                    (candidate, "rev-parse", "HEAD~2"): phone.SOURCE_BASE,
                     (candidate, "rev-parse", phone.SOURCE_BASE + ":ios/OfflineTikTokPlayer"): phone.BASE_APP_TREE,
                     (candidate, "diff", "--name-only", phone.SOURCE_BASE, phone.SOURCE): "\n".join(phone.SOURCE_CHANGES),
                     (candidate, "rev-parse", "HEAD:ios/OfflineTikTokPlayer"): phone.APP_TREE,

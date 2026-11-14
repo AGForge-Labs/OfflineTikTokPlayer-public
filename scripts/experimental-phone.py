@@ -10,20 +10,18 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "6d13bb9960510a10f73f757be38e21721206699d"
-SOURCE = "fb5fb3efbaef7ca8a3f70561eb466f564b61620f"
-APP_TREE = "156e2b23189f3fd613796c11df263e0ae497ba7d"
-BASE_APP_TREE = "69e89b9beef030856e31df27ec26141571f3e900"
-CORE_TREE = "7a5e1aa80ed7cfd6eec1d52f39baa6f08439e8eb"
+SOURCE_BASE = "fb5fb3efbaef7ca8a3f70561eb466f564b61620f"
+SOURCE = "416618a3ddbbdc0340d7e578a9937bc6a256c598"
+APP_TREE = "ed3b6376540dd4ead4cfad1b6c991cabf72e88ec"
+BASE_APP_TREE = "156e2b23189f3fd613796c11df263e0ae497ba7d"
+CORE_TREE = "a1fa4fd7c1bd5d922d93b1d05e565fcc8eb87e5b"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
-    '.github/workflows/stalled-video-recovery.yml',
-    'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
-    'ios/OfflineTikTokPlayer/Services/OneDriveClient.swift',
-    'ios/OfflineTikTokPlayerTests/HTTPPlaybackFixtureServer.swift',
-    'ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift',
-    'tests/cloud-adapter/OneDriveClientTests.swift',
-    'tests/cloud-adapter/Support.swift',
+    '.github/workflows/tiktok-post-links.yml',
+    'ios/OfflineTikTokPlayer/UI/FeedView.swift',
+    'ios/OfflineTikTokPlayer/UI/LibraryView.swift',
+    'ios/PlayerCore/Sources/PlayerCore/Catalog.swift',
+    'ios/PlayerCore/Tests/PlayerCoreTests/CatalogTests.swift',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -123,7 +121,7 @@ def verify_checkouts(control, candidate, expected, *, git=None, signer_sha=SIGNE
                                            stdin=subprocess.DEVNULL, timeout=10).decode().strip()
     pins = {(control, "rev-parse", "HEAD"): expected,
             (candidate, "rev-parse", "HEAD"): SOURCE,
-            (candidate, "rev-parse", "HEAD^"): SOURCE_BASE,
+            (candidate, "rev-parse", "HEAD~2"): SOURCE_BASE,
             (candidate, "rev-parse", SOURCE_BASE + ":ios/OfflineTikTokPlayer"): BASE_APP_TREE,
             (candidate, "diff", "--name-only", SOURCE_BASE, SOURCE): "\n".join(SOURCE_CHANGES),
             (candidate, "rev-parse", "HEAD:ios/OfflineTikTokPlayer"): APP_TREE,
@@ -234,8 +232,9 @@ NATIVE_PROOFS = (
     (41438316239, "f4dbfc8cff17f184d7f6a9c8e251f9b8d5bcaa09", ".github/workflows/native-video-evidence.yml", "codex/native-video-evidence"),
     (41741373827, "3b3758e383cda3d015e56e8035433de7a796c5ea", ".github/workflows/audio-output-evidence.yml", "codex/audio-continuity-evidence"),
     (42925893598, "d278ea838fca7c7e5105aade87d7aa7db1438ac5", ".github/workflows/stalled-video-recovery.yml", "codex/stalled-video-recovery"),
-    (42961684284, SOURCE_BASE, ".github/workflows/stalled-video-recovery.yml", "codex/picture-freeze-recovery"),
-    (43318289392, SOURCE, ".github/workflows/stalled-video-recovery.yml", "codex/stream-start-recovery"),
+    (42961684284, "6d13bb9960510a10f73f757be38e21721206699d", ".github/workflows/stalled-video-recovery.yml", "codex/picture-freeze-recovery"),
+    (43318289392, SOURCE_BASE, ".github/workflows/stalled-video-recovery.yml", "codex/stream-start-recovery"),
+    (43550382812, SOURCE, ".github/workflows/tiktok-post-links.yml", "codex/tiktok-post-links"),
 )
 
 

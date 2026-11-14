@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only OneDrive playback recovery
+run-name: Owner-only TikTok post links
 on:
   workflow_dispatch:
     inputs:
@@ -48,8 +48,8 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: fb5fb3efbaef7ca8a3f70561eb466f564b61620f
-          fetch-depth: 2
+          ref: 416618a3ddbbdc0340d7e578a9937bc6a256c598
+          fetch-depth: 3
           path: candidate
           persist-credentials: false
       - name: Verify exact source and native evidence before release review
@@ -79,8 +79,8 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: fb5fb3efbaef7ca8a3f70561eb466f564b61620f
-          fetch-depth: 2
+          ref: 416618a3ddbbdc0340d7e578a9937bc6a256c598
+          fetch-depth: 3
           path: candidate
           persist-credentials: false
       - name: Verify experimental owner request and exact runtime source without credentials
