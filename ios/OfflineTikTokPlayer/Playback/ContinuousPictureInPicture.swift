@@ -924,8 +924,9 @@ final class ContinuousPictureInPicture: NSObject {
     /// can update this state, but cannot authorize a newly adopted presentation.
     @discardableResult
     func installTimeline(_ ticket: PresentationTicket, positionSeconds: Double,
-                         durationSeconds: Double, isPlaying: Bool) -> Bool {
+                         durationSeconds: Double, isPlaying: Bool, atHostTime: CMTime? = nil) -> Bool {
         guard owns(ticket) else { return false }
+        let host = atHostTime ?? CMClockGetTime(CMClockGetHostTimeClock())
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
         let seek = seekTicket, activeSeek = activeSeekTicket
@@ -933,7 +934,7 @@ final class ContinuousPictureInPicture: NSObject {
         installedTimeline = nil
         stopFrameTimer()
         applyPlayback(positionSeconds: positionSeconds, durationSeconds: durationSeconds,
-                      isPlaying: isPlaying, forceAnchor: true)
+                      isPlaying: isPlaying, forceAnchor: true, atHostTime: host)
         guard owns(ticket), seekTicket == seek, activeSeekTicket == activeSeek else { return false }
         installedTimeline = ticket
         return true
@@ -1144,8 +1145,9 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     private func applyPlayback(positionSeconds: Double, durationSeconds: Double, isPlaying: Bool,
-                               forceAnchor: Bool) {
+                               forceAnchor: Bool, atHostTime: CMTime? = nil) {
         guard !invalidated else { return }
+        let host = atHostTime ?? CMClockGetTime(CMClockGetHostTimeClock())
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
         let revision = presentationRevision
@@ -1168,12 +1170,14 @@ final class ContinuousPictureInPicture: NSObject {
                 flushForSeek()
                 guard !invalidated, presentationRevision == revision,
                       seekTicket == seek, activeSeekTicket == activeSeek else { return }
-                CMTimebaseSetTime(timebase, time: anchorTime)
-            } else if previous.isPlaying != isPlaying || !isPlaying {
-                CMTimebaseSetTime(timebase, time: anchorTime)
             }
             if needsAnchor || previous.isPlaying != isPlaying {
-                CMTimebaseSetRate(timebase, rate: isPlaying ? 1 : 0)
+                // A flush can take longer than a frame. Both the decoder and
+                // display must share the host time of the original position.
+                CMTimebaseSetRateAndAnchorTime(timebase, rate: isPlaying ? 1 : 0,
+                    anchorTime: anchorTime, immediateSourceTime: host)
+            } else if !isPlaying {
+                CMTimebaseSetTime(timebase, time: anchorTime)
             }
         }
         if previous.isPlaying != isPlaying || previous.duration != duration {

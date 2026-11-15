@@ -148,6 +148,20 @@ final class VideoPresentationContinuityTests: XCTestCase {
         XCTAssertTrue(continued, "Decoded HD frames must still reach the visible layer")
     }
 
+    func testPlayingPictureClockKeepsItsAnchorAcrossAStalledImageFlush() async throws {
+        let fixture = try await PresentedVideo.make()
+        defer { fixture.close() }
+        let bridge = fixture.bridge
+        let ticket = try XCTUnwrap(bridge.debugAlignedPollState.ticket)
+        bridge.onCurrentFrameInvalidated = { Thread.sleep(forTimeInterval: 0.09) }
+        defer { bridge.onCurrentFrameInvalidated = nil }
+
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0.25, durationSeconds: 6, isPlaying: true))
+
+        let position = try XCTUnwrap(bridge.timebasePositionSeconds)
+        XCTAssertGreaterThan(position, 0.32, "Flushing the picture must not delay the running clock by the time spent flushing")
+    }
+
     func testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo() async throws {
         for trial in 0..<6 {
             let fixture = try await PresentedVideo.make()

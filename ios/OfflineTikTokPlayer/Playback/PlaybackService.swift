@@ -575,9 +575,10 @@ final class PlaybackService: NSObject {
     }
     @ObservationIgnored private var stoppedVideoClock: StoppedVideoClock?
     private struct ImageProgressOwner: Equatable {
-        let request: Int, item: ObjectIdentifier, token: Int, visit: Int64, selectionVersion: Int
+        let request: Int, item: ObjectIdentifier, token: Int, selectionVersion: Int
     }
     @ObservationIgnored private var imageProgressOwner: ImageProgressOwner?
+    @ObservationIgnored private var imageProgressFirstVisit: Int64 = 0
     @ObservationIgnored private var imageProgress = VideoImageProgress()
     @ObservationIgnored private var lastImageProgressCheck = 0.0
     private struct AudioProgress {
@@ -1507,8 +1508,8 @@ final class PlaybackService: NSObject {
                             let host = CMClockGetTime(CMClockGetHostTimeClock())
                             let desired = self.continuousAudio.presentationPosition(at: host)
                             installed = self.continuousPiP.installTimeline(ticket,
-                                positionSeconds: desired,
-                                durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay)
+                                positionSeconds: desired, durationSeconds: self.clock.duration,
+                                isPlaying: self.intent.canPlay, atHostTime: host)
                             if installed { playbackAnchor = (host, desired) }
                         }
                         guard ownsAcceptedStatus() else { return }
@@ -2423,9 +2424,10 @@ final class PlaybackService: NSObject {
                   !continuousAudio.isSelectionPending(in: sample) else { return }
         }
         let owner = ImageProgressOwner(request: generation, item: ObjectIdentifier(item), token: pcm ? sample.token : -1,
-            visit: pcm ? sample.visit : 0, selectionVersion: pcm ? sample.selectionVersion : 0)
+            selectionVersion: pcm ? sample.selectionVersion : 0)
         if owner != imageProgressOwner {
             imageProgressOwner = owner
+            imageProgressFirstVisit = sample.visit
             imageProgress = VideoImageProgress(graceSeconds: continuousPiP.imageRecoveryGraceSeconds)
         }
         // A matching in-flight correction retains the bounded-attempt latch.
@@ -2436,22 +2438,29 @@ final class PlaybackService: NSObject {
         lastImageProgressCheck = now
         guard player.currentItem === item else { return }
         let position: Double
+        let loopOffset: Double
         if pcm {
-            position = Double(sample.frame) / 48_000
+            guard sample.visit >= imageProgressFirstVisit,
+                  let entry = continuousAudio.entry(forToken: sample.token) else { return }
+            // A natural repeat keeps the token and selection version. Its
+            // position wraps, but the time without a current picture continues.
+            loopOffset = Double(sample.visit - imageProgressFirstVisit) * (Double(entry.frames) / 48_000)
+            position = loopOffset + Double(sample.frame) / 48_000
         } else {
+            loopOffset = 0
             guard let timebase = item.timebase else { return }
             let rate = CMTimebaseGetEffectiveRate(timebase)
             guard rate.isFinite, rate > 0 else { return }
             position = CMTimebaseGetTime(timebase).seconds
         }
-        let displayed = continuousPiP.displayedFramePosition(for: presentation.ticket)
+        let displayed = continuousPiP.displayedFramePosition(for: presentation.ticket).map { loopOffset + $0 }
         func ownsPicture() -> Bool {
             guard player.currentItem === item, generation == owner.request, observedItem === item,
                   intent.canPlay, videoAllowed, videoPresentation?.ticket == presentation.ticket,
                   continuousPiP.activeTimelineReceipt(for: presentation.ticket) == timeline else { return false }
             if !pcm { return usesNativeAudio && !continuousAudio.isSelected }
             let fresh = continuousAudio.snapshot
-            return continuousAudio.isSelected && fresh.token == owner.token && fresh.visit == owner.visit
+            return continuousAudio.isSelected && fresh.token == owner.token && fresh.visit == sample.visit
                 && fresh.selectionVersion == owner.selectionVersion && !fresh.ended
                 && !continuousAudio.isSelectionPending(in: fresh)
         }
@@ -2478,7 +2487,8 @@ final class PlaybackService: NSObject {
                 }
                 let audioPosition = continuousAudio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
                 guard ownsPicture() else { return }
-                if audioPosition.isFinite, runningPosition.map({ abs($0 - audioPosition) <= 0.080 }) != true {
+                if audioPosition.isFinite, imageProgress.repairAttempts > 1
+                    || runningPosition.map({ abs($0 - audioPosition) <= 0.080 }) != true {
                     synchronizeVideoToAudio(force: true, repairingPictureClock: true)
                     return
                 }
@@ -2928,7 +2938,7 @@ final class PlaybackService: NSObject {
                 }
                 guard ownsPresentation(),
                       self.continuousPiP.installTimeline(ticket, positionSeconds: desired,
-                          durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay) else { return }
+                          durationSeconds: self.clock.duration, isPlaying: self.intent.canPlay, atHostTime: host) else { return }
                 guard ownsPresentation() else { return }
                 self.continuousPiP.completeSeek(videoSeek)
                 if !self.isVideoReady { self.monitorFirstFrame(item, request: request) }
