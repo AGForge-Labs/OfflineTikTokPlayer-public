@@ -19,6 +19,18 @@ final class VideoImageProgressTests: XCTestCase {
         XCTAssertFalse(progress.shouldRecover(now: 1.7, playbackPosition: 1.8, displayedPosition: 0))
         XCTAssertFalse(progress.shouldRecover(now: 4, playbackPosition: 4.1, displayedPosition: 0))
     }
+    func testARepairThatDisplaysNothingAllowsOneMoreAttemptAfterTheGracePeriod() {
+        var progress = VideoImageProgress()
+        XCTAssertFalse(progress.shouldRecover(now: 0, playbackPosition: 0.2, displayedPosition: 0.2))
+        XCTAssertTrue(progress.shouldRecover(now: 1.6, playbackPosition: 1.8, displayedPosition: 0.2))
+        XCTAssertFalse(progress.shouldRecover(now: 1.8, playbackPosition: 2, displayedPosition: nil))
+        XCTAssertFalse(progress.shouldRecover(now: 2.9, playbackPosition: 3.1, displayedPosition: nil))
+        XCTAssertTrue(progress.shouldRecover(now: 3.4, playbackPosition: 3.6, displayedPosition: nil))
+        for tick in 4...15 {
+            XCTAssertFalse(progress.shouldRecover(now: Double(tick), playbackPosition: Double(tick) + 0.2,
+                displayedPosition: nil))
+        }
+    }
     func testHealthySlowAndVFRHoldsCannotCauseRepeatedRepairsWithinOneOwner() {
         var progress = VideoImageProgress()
         XCTAssertFalse(progress.shouldRecover(now: 0, playbackPosition: 0.2, displayedPosition: 0.2))

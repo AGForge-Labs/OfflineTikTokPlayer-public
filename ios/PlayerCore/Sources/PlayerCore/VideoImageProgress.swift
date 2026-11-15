@@ -1,14 +1,15 @@
 import Foundation
 
-/// A held picture can trigger one repair. Only a stretch of timely, moving
-/// pictures rearms recovery within the same playback visit.
+/// A held picture can trigger one repair. Continued loss of all current
+/// images permits one more attempt. Moving pictures rearm recovery.
 public struct VideoImageProgress {
     private var since: Double?
     private var playbackAtProgress = 0.0
     private var previousPlayback = 0.0
     private var previousHost = 0.0
     private var latestImage = 0.0
-    private var attempted = false
+    public private(set) var repairAttempts = 0
+    private var missingSince: Double?
     private var resumedSince: Double?
     private let grace: Double
     public init(graceSeconds: Double = 1.5) {
@@ -18,23 +19,25 @@ public struct VideoImageProgress {
                                        displayedPosition: Double?) -> Bool {
         guard now.isFinite, playbackPosition.isFinite, playbackPosition >= 0,
               displayedPosition.map({ $0.isFinite && $0 >= 0 }) ?? true else {
-            let used = attempted
-            self = Self(graceSeconds: grace); attempted = used
+            let used = repairAttempts
+            self = Self(graceSeconds: grace); repairAttempts = used
             return false
         }
         if since == nil || now < previousHost || playbackPosition < previousPlayback - 0.080 {
             since = now; playbackAtProgress = playbackPosition
             latestImage = displayedPosition ?? 0
-            resumedSince = nil
+            resumedSince = nil; missingSince = nil
         }
         previousHost = now; previousPlayback = playbackPosition
+        if displayedPosition != nil { missingSince = nil }
+        else if missingSince == nil { missingSince = now }
         if let displayedPosition, displayedPosition > latestImage + 1.0 / 48_000 {
-            if attempted {
+            if repairAttempts > 0 {
                 let timely = abs(playbackPosition - displayedPosition) <= 0.35
                 if timely {
                     if resumedSince == nil || now - (since ?? now) > 0.75 { resumedSince = now }
                     if let resumedSince, now - resumedSince >= 1.5 {
-                        attempted = false
+                        repairAttempts = 0
                         self.resumedSince = nil
                     }
                 } else { resumedSince = nil }
@@ -42,12 +45,17 @@ public struct VideoImageProgress {
             latestImage = displayedPosition
             since = now; playbackAtProgress = playbackPosition
         }
-        guard let since, !attempted, now - since >= grace,
+        guard let since, now - since >= grace,
               playbackPosition - playbackAtProgress >= 0.5,
               playbackPosition - latestImage >= 0.5 else { return false }
-        // A long source frame can resemble a freeze. A repeated or isolated
-        // image after repair is insufficient to trigger another one.
-        attempted = true
+        if repairAttempts > 0 {
+            // A legitimately long frame remains present. A failed repair that
+            // never gets a current image may retry after another full window.
+            guard repairAttempts == 1, let missingSince, now - missingSince >= grace else { return false }
+        }
+        repairAttempts += 1
+        self.since = now
+        playbackAtProgress = playbackPosition
         return true
     }
 }

@@ -276,6 +276,112 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertNil(service.message)
     }
 
+    func testPictureStarvedAcrossShortLoopsRecoversWhileAudioKeepsLooping() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-video", firstDuration: 1.2)
+        let service = fixture.service
+        service.cycleRepeat(); service.cycleRepeat()
+        XCTAssertEqual(service.queue.repeatMode, .one)
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until {
+            service.isVideoReady && service.debugDisplayedVideoPositionSeconds != nil
+                && service.audioSnapshot.frame > 9_600
+        }
+        let before = service.audioSnapshot
+        let item = try XCTUnwrap(service.player.currentItem)
+        var repairs = 0
+        // Withhold decoder images across several real PCM wraps, then permit
+        // the rebuilt output to deliver them to the actual display layer.
+        service.shouldDebugAcquireVideoFrame = { _ in repairs > 0 }
+        service.onDebugVideoOutputRecovery = { repairs += 1 }
+        let frames = service.submittedVideoFrameCount
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if service.audioSnapshot.visit >= before.visit + 2 && repairs > 0,
+               service.submittedVideoFrameCount >= frames + 4 && service.debugDisplayedVideoPositionSeconds != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let after = service.audioSnapshot
+        print("SHORT_LOOP_PICTURE wraps=\(after.visit - before.visit) repairs=\(repairs) newFrames=\(service.submittedVideoFrameCount - frames) underruns=\(after.underrunFrames - before.underrunFrames)")
+        XCTAssertGreaterThanOrEqual(after.visit, before.visit + 2)
+        XCTAssertEqual(repairs, 1, "A frozen picture must recover even when every audio loop is shorter than the recovery window")
+        XCTAssertGreaterThanOrEqual(service.submittedVideoFrameCount, frames + 4)
+        XCTAssertNotNil(service.debugDisplayedVideoPositionSeconds)
+        XCTAssertTrue(service.player.currentItem === item)
+        XCTAssertEqual(after.token, before.token)
+        XCTAssertEqual(after.selectionVersion, before.selectionVersion)
+        XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+    }
+
+    func testRepeatedLoopsAndRapidReversalsKeepDisplayingTheCurrentVideo() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-video", firstDuration: 1.2,
+            otherResourceName: "test-motion-1080", otherDuration: 6)
+        let service = fixture.service
+        service.cycleRepeat(); service.cycleRepeat()
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.1 }
+        var audio = service.audioSnapshot
+        for loop in 0..<4 {
+            let previous = audio
+            try await until {
+                service.audioSnapshot.visit > previous.visit && service.isVideoReady
+                    && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.12
+                    && (service.debugDisplayedVideoPositionSeconds ?? 2) < 0.75
+            }
+            audio = service.audioSnapshot
+            XCTAssertEqual(audio.token, previous.token, "Audio owner during loop \(loop + 1)")
+            XCTAssertEqual(audio.selectionVersion, previous.selectionVersion)
+            XCTAssertEqual(audio.underrunFrames, previous.underrunFrames)
+        }
+        for _ in 0..<5 {
+            service.next()
+            try await Task.sleep(for: .milliseconds(22))
+            service.previous()
+            try await Task.sleep(for: .milliseconds(17))
+        }
+        try await until {
+            service.queue.currentID == fixture.mediaID && service.isVideoReady
+                && service.hasRetainedVideoFrame && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.1
+        }
+
+        service.handlePiPSkip(10) {}
+        try await until {
+            service.queue.currentID == fixture.otherID && service.isVideoReady
+                && service.hasRetainedVideoFrame && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.15
+        }
+        let before = service.audioSnapshot
+        let start = ContinuousClock.now
+        var lastChange = start
+        var largestGap = Duration.zero
+        var displayed = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+        var distinctFrames = 0
+        // Measure changing rendered PTS, including the largest gap. A good
+        // average could otherwise conceal several visibly frozen stretches.
+        while ContinuousClock.now - start < .milliseconds(900) {
+            try await Task.sleep(for: .milliseconds(8))
+            if let position = service.debugDisplayedVideoPositionSeconds, position > displayed {
+                let now = ContinuousClock.now
+                largestGap = max(largestGap, now - lastChange)
+                lastChange = now
+                displayed = position
+                distinctFrames += 1
+            }
+        }
+        largestGap = max(largestGap, ContinuousClock.now - lastChange)
+        print("AFTER_LOOP_HD distinctFrames=\(distinctFrames) largestGap=\(largestGap)")
+        XCTAssertGreaterThanOrEqual(distinctFrames, 31, "HD playback must keep moving after loop and switch churn")
+        XCTAssertLessThan(largestGap, .milliseconds(200), "A good average must not hide a freeze")
+        let after = service.audioSnapshot
+        XCTAssertEqual(after.token, before.token)
+        XCTAssertEqual(after.visit, before.visit)
+        XCTAssertEqual(after.underrunFrames, before.underrunFrames)
+
+        service.handlePiPSkip(-10) {}
+        try await until {
+            service.queue.currentID == fixture.mediaID && service.isVideoReady
+                && service.hasRetainedVideoFrame && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.1
+        }
+    }
+
     func testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio() async throws {
         let fixture = try await PictureRecoveryFixture(test: self)
         let service = fixture.service
@@ -665,6 +771,7 @@ private final class PictureRecoveryFixture {
 
     init(test: XCTestCase, nativeAudio: Bool = false,
          firstResourceName: String = "test-selection-a", firstDuration: Double = 30,
+         otherResourceName: String = "test-selection-b", otherDuration: Double = 30,
          actualSessionActivation: Bool = false) async throws {
         let activation = PictureActivationProbe(actual: actualSessionActivation)
         activationProbe = activation
@@ -673,13 +780,13 @@ private final class PictureRecoveryFixture {
         let cloud = OneDriveClient(account: MicrosoftAccount())
         let downloads = try OfflineDownloads(cloud: cloud, network: NetworkStatus(), debugLocalRoot: directory)
         let library = LibraryRepository(cloud: cloud, catalogURL: directory.appendingPathComponent("catalog.json"))
-        for (key, name) in [(mediaID, firstResourceName), (otherID, "test-selection-b")] {
+        for (key, name) in [(mediaID, firstResourceName), (otherID, otherResourceName)] {
             let source = try XCTUnwrap(Bundle(for: PictureRecoveryTests.self).url(forResource: name, withExtension: "mp4"))
             _ = try await downloads.importLocal(source, mediaID: key)
         }
         try library.install(LibraryCatalog(libraryID: "local:picture-recovery", media: [
             MediaRecord(id: mediaID, title: "Synthetic picture recovery A", duration: firstDuration),
-            MediaRecord(id: otherID, title: "Synthetic picture recovery B", duration: 30)
+            MediaRecord(id: otherID, title: "Synthetic picture recovery B", duration: otherDuration)
         ], playlists: [PlaylistRecord(id: playlist, name: "Synthetic", itemIDs: [mediaID, otherID])]))
         if nativeAudio {
             service = PlaybackService(library: library, downloads: downloads, cloud: cloud,
