@@ -1,0 +1,179 @@
+name: iPhone picture during loops and switching
+on:
+  push:
+    branches: [codex/verified-loop-picture]
+permissions:
+  contents: read
+jobs:
+  portable:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Exercise the shipped recovery limit and verify the change
+        run: |
+          set -euo pipefail
+          shipped=28bf19eefec7485defd37bc448f63dcb32797295
+          test "$(git rev-parse HEAD^)" = "$shipped"
+          recovery=ios/PlayerCore/Sources/PlayerCore/VideoImageProgress.swift
+          trap 'git restore --source=HEAD -- "$recovery"' EXIT
+          git restore --source="$shipped" -- "$recovery"
+          mkdir -p artifacts/loop-picture
+          if swift test --jobs 1 --package-path ios/PlayerCore --scratch-path artifacts/swift-build \
+              --filter VideoImageProgressTests.testARepairThatDisplaysNothingAllowsOneMoreAttemptAfterTheGracePeriod \
+              2>&1 | tee artifacts/loop-picture/shipped-limit.log; then
+            echo 'The shipped recovery limit unexpectedly allowed a backed-off second attempt.'
+            exit 1
+          fi
+          grep -E 'VideoImageProgressTests\.swift:.*testARepairThatDisplaysNothingAllowsOneMoreAttemptAfterTheGracePeriod.*XCTAssertTrue failed' artifacts/loop-picture/shipped-limit.log
+          git restore --source=HEAD -- "$recovery"
+          python3 -B scripts/generate-ios-project.py --check
+          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{ContinuousPictureInPicture,PlaybackService}.swift ios/OfflineTikTokPlayerTests/{PictureRecoveryTests,VideoPresentationContinuityTests}.swift
+          bash scripts/test-core.sh
+          bash scripts/test-native-cloud.sh
+  simulator:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    needs: portable
+    runs-on: macos-26
+    timeout-minutes: 27
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify loop and switch sequences with the simulator compositor
+        run: |
+          set -euo pipefail
+          # Run 43701487888 reproduced both faults in 33.1. The production
+          # source and test fixtures below are identical to the comparison.
+          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = b43cc02e9c07519b4167b7c858c694f21f9c196d
+          test "$(git rev-parse HEAD:ios/PlayerCore)" = 58f68c2009389313025ce253acec28c003565ebf
+          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayerTests)" = 215e507cb1d7b5da6adef01d2f166143eb55727f
+          udid="$(python3 -B scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
+          work=artifacts/loop-picture
+          mkdir -p "$work"
+          capture_pid=''
+          cleanup_capture() {
+            if [ -n "$capture_pid" ]; then
+              kill "$capture_pid" 2>/dev/null || true
+              wait "$capture_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_capture EXIT
+          recovery=OfflineTikTokPlayerTests/PictureRecoveryTests
+          video=OfflineTikTokPlayerTests/VideoPresentationContinuityTests
+          native=OfflineTikTokPlayerTests/NativeStreamingPlaybackTests
+          selection=OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests
+          regressions=(
+            "$recovery/testPictureStarvedAcrossShortLoopsRecoversWhileAudioKeepsLooping"
+            "$video/testPlayingPictureClockKeepsItsAnchorAcrossAStalledImageFlush"
+          )
+          controls=(
+            "$recovery/testRepeatedLoopsAndRapidReversalsKeepDisplayingTheCurrentVideo"
+            "$recovery/testRepeatedDecoderStopsRecoverDisplayedFramesWithoutInterruptingAudio"
+            "$recovery/testNativeAudioOwnerRecoversAgainAfterPauseWithoutSeekingTheAudiblePlayer"
+            "$recovery/testPictureRecoveryRearmsAfterReturningFromBackground"
+            "$recovery/testPauseAndAudioOnlyPreventPictureRepair"
+            "$recovery/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit"
+            "$video/testRunningDisplayLinkOwnsVideoPullsDuringProgressAndPresentationUpdates"
+            "$video/testShortTrailingAudioKeepsNativeVideoAndAFreshLastFrameWhilePaused"
+            "$native/testReturningToAHealthyNativeStreamDoesNotRestartItsPicture"
+            "$native/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph"
+            "$selection/testRapidABASupersedesPendingVideoSeekAndPreservesExplicitPause"
+            "$selection/testIssuedVideoSeekCompletionCannotActivateStaleABeforeNaturalBVisitAdoption"
+          )
+          boot_simulator() {
+            python3 -B scripts/ensure-simulator-booted.py --udid "$udid"
+          }
+          start_capture() {
+            local capture_log="$work/capture-helper.log"
+            python3 -u scripts/capture-simulator-test-frames.py \
+              --udid "$udid" --lifetime 1200 >"$capture_log" 2>&1 &
+            capture_pid=$!
+            for ((attempt=0; attempt<100; attempt++)); do
+              kill -0 "$capture_pid" 2>/dev/null || { cat "$capture_log"; return 1; }
+              if grep -Fq '"eventCode": 0' "$capture_log"; then return 0; fi
+              sleep 0.1
+            done
+            cat "$capture_log"
+            return 1
+          }
+          build_cases() {
+            xcodebuild build-for-testing -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+              -configuration Debug -destination "platform=iOS Simulator,id=$udid" \
+              -derivedDataPath "$work/Derived" -jobs 2 CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$1-build.log"
+            local plans=("$work/Derived/Build/Products/"*.xctestrun)
+            test "${#plans[@]}" = 1
+            test -f "${plans[0]}"
+            plan="${plans[0]}"
+          }
+          run_cases() {
+            local phase="$1" selector
+            shift
+            local args=()
+            for selector in "$@"; do args+=("-only-testing:$selector"); done
+            run_once() {
+              xcodebuild test-without-building -xctestrun "$plan" -destination "platform=iOS Simulator,id=$udid" \
+                -resultBundlePath "$work/$phase.xcresult" -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES -default-test-execution-time-allowance 90 -maximum-test-execution-time-allowance 90 \
+                "${args[@]}" 2>&1 | tee "$work/$phase.log"
+            }
+            local status=0
+            run_once || status=$?
+            if (( status != 0 )) \
+              && grep -Fq 'operation never finished bootstrapping' "$work/$phase.log" \
+              && ! grep -Eq 'Test Case .* started' "$work/$phase.log"; then
+              echo "Restarting the test simulator once after a pre-test bootstrap abort."
+              mv "$work/$phase.log" "$work/$phase-bootstrap.log" || return
+              if [[ -d "$work/$phase.xcresult" ]]; then
+                mv "$work/$phase.xcresult" "$work/$phase-bootstrap.xcresult" || return
+              fi
+              cleanup_capture
+              xcrun simctl shutdown "$udid" || return
+              boot_simulator || return
+              start_capture || return
+              status=0
+              run_once || status=$?
+            fi
+            return "$status"
+          }
+          check_cases() {
+            local phase="$1" result="$2"
+            shift 2
+            xcrun xcresulttool get test-results tests --path "$work/$phase.xcresult" > "$work/$phase.json"
+            python3 - "$work/$phase.json" "$result" "$@" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report, result, *selectors = sys.argv[1:]
+          expected = {selector.split('/', 1)[1] for selector in selectors}
+          nodes = list(json.loads(Path(report).read_text())['testNodes'])
+          while nodes:
+              node = nodes.pop()
+              nodes.extend(node.get('children', ()))
+              if node['nodeType'] == 'Test Case':
+                  identity = node['nodeIdentifier'].removesuffix('()')
+                  assert identity in expected, node
+                  assert node['result'] == result, node
+                  expected.remove(identity)
+          assert not expected, expected
+          print(Path(report).stem, result, len(selectors))
+          PY
+          }
+          boot_simulator
+          build_cases Fixed
+          start_capture
+          run_cases Fixed "${regressions[@]}" "${controls[@]}"
+          check_cases Fixed Passed "${regressions[@]}" "${controls[@]}"
+          cadence=(
+            "$recovery/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
+            "$video/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames"
+          )
+          run_cases Cadence "${cadence[@]}"
+          check_cases Cadence Passed "${cadence[@]}"
