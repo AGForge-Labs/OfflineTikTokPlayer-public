@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only smooth picture
+run-name: Owner-only loop and switching recovery
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +48,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 28bf19eefec7485defd37bc448f63dcb32797295
+          ref: 566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36
           fetch-depth: 2
           path: candidate
           persist-credentials: false
@@ -79,7 +79,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 28bf19eefec7485defd37bc448f63dcb32797295
+          ref: 566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36
           fetch-depth: 2
           path: candidate
           persist-credentials: false
