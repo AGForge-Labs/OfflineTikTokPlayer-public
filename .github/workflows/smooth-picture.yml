@@ -1,0 +1,111 @@
+name: Smooth iPhone picture
+on:
+  push:
+    branches: [codex/smooth-picture]
+permissions:
+  contents: read
+jobs:
+  portable:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify existing queue, cloud media and PCM behavior
+        run: |
+          set -euo pipefail
+          python3 -B scripts/generate-ios-project.py --check
+          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{ContinuousPictureInPicture,PlaybackService}.swift ios/OfflineTikTokPlayerTests/{NativeStreamingPlaybackTests,VideoPresentationContinuityTests}.swift
+          bash scripts/test-core.sh
+          bash scripts/test-native-cloud.sh
+  simulator:
+    if: github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private
+    needs: portable
+    runs-on: macos-26
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Compare shipped and fixed playback on one iPhone simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          shipped=113be8cf2b35021a1d4ae090cd61d0bd9a539baa
+          test "$(git rev-parse HEAD^)" = "$shipped"
+          udid="$(python3 -B scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
+          work=artifacts/smooth-picture
+          mkdir -p "$work"
+          playback=ios/OfflineTikTokPlayer/Playback
+          paths=("$playback/ContinuousPictureInPicture.swift" "$playback/PlaybackService.swift")
+          restore() { git restore --source=HEAD -- "${paths[@]}"; }
+          trap restore EXIT
+          testRoot=OfflineTikTokPlayerTests
+          recovery="$testRoot/PictureRecoveryTests"
+          native="$testRoot/NativeStreamingPlaybackTests"
+          continuity="$testRoot/VideoPresentationContinuityTests"
+          regressions=(
+            "$continuity/testRunningDisplayLinkOwnsVideoPullsDuringProgressAndPresentationUpdates"
+            "$native/testReturningToAHealthyNativeStreamDoesNotRestartItsPicture"
+          )
+          controls=(
+            "$continuity/testShortTrailingAudioKeepsNativeVideoAndAFreshLastFrameWhilePaused"
+            "$recovery/testReturningWithCurrentPictureDoesNotSeekOrInterruptAudio"
+            "$recovery/testPictureRecoveryRearmsAfterReturningFromBackground"
+            "$recovery/testRepeatedDecoderStopsRecoverDisplayedFramesWithoutInterruptingAudio"
+            "$recovery/testNextPreviousAndRepeatOneKeepRealPicturesAndTheExpectedAudioVisit"
+            "$native/testHTTPPlaybackWarmsTemporaryFilesAndKeepsNavigationAndRepeatOnOneGraph"
+            "$testRoot/MeasuredAudioIntegrationTests/testMasteredNativeAudioDoesNotLoadOrAttachAnotherTap"
+          )
+          run_cases() {
+            local phase="$1" selector
+            shift
+            local args=()
+            for selector in "$@"; do args+=("-only-testing:$selector"); done
+            xcodebuild test -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer -configuration Debug \
+              -destination "platform=iOS Simulator,id=$udid" -derivedDataPath "$work/Derived" \
+              -resultBundlePath "$work/$phase.xcresult" -jobs 2 -parallel-testing-enabled NO \
+              -test-timeouts-enabled YES -default-test-execution-time-allowance 90 -maximum-test-execution-time-allowance 90 \
+              "${args[@]}" CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$phase.log"
+          }
+          check_cases() {
+            local phase="$1" expected="$2"
+            shift 2
+            xcrun xcresulttool get test-results tests --path "$work/$phase.xcresult" > "$work/$phase.json"
+            python3 - "$work/$phase.json" "$expected" "$@" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report, result, *selectors = sys.argv[1:]
+          expected = {selector.split('/', 1)[1] for selector in selectors}
+          nodes = list(json.loads(Path(report).read_text())['testNodes'])
+          while nodes:
+              node = nodes.pop()
+              nodes.extend(node.get('children', ()))
+              if node['nodeType'] == 'Test Case':
+                  assert node['result'] == result, node
+                  expected.remove(node['nodeIdentifier'].removesuffix('()'))
+          assert not expected, expected
+          print(Path(report).stem, result, len(selectors))
+          PY
+          }
+          git restore --source="$shipped" -- "${paths[@]}"
+          if run_cases Shipped "${regressions[@]}"; then
+            echo 'The shipped app unexpectedly passed the regression controls.'
+            exit 1
+          fi
+          check_cases Shipped Failed "${regressions[@]}"
+          grep -F 'An active frame timer exclusively owns steady video pulls' "$work/Shipped.log"
+          grep -F 'Healthy foreground return must not flush the advancing picture' "$work/Shipped.log"
+          restore
+          run_cases Fixed "${regressions[@]}" "${controls[@]}"
+          check_cases Fixed Passed "${regressions[@]}" "${controls[@]}"
+          # Measure HD with the actual playback service in a fresh test host.
+          hd="$recovery/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
+          run_cases HD "$hd"
+          check_cases HD Passed "$hd"

@@ -3083,12 +3083,12 @@ final class PlaybackService: NSObject {
             imageProgressOwner = nil
             lastImageProgressCheck = 0
         }
-        applyPresentation(presentationPolicy.applicationDidBecomeActive())
+        let restoredPicture = applyPresentation(presentationPolicy.applicationDidBecomeActive())
         recordDiagnostic(.appForegrounded)
         let interrupted = intent.isInterrupted
         intent.enteredForeground()
         if interrupted { continuousAudio.suspend(); player.pause(); message = "Audio was interrupted. Tap Play to resume." }
-        else if !hasCurrentForegroundPicture() {
+        else if !restoredPicture && !hasCurrentForegroundPicture() {
             #if DEBUG
             synchronizeVideoToAudio(force: true, reason: .foreground)
             #else
@@ -3098,12 +3098,21 @@ final class PlaybackService: NSObject {
     }
 
     private func hasCurrentForegroundPicture() -> Bool {
-        guard videoAllowed, intent.canPlay, continuousAudio.isSelected, audioLoadingID == nil,
+        guard videoAllowed, intent.canPlay, audioLoadingID == nil,
               readyGeneration == generation, isVideoReady, syncingVideoGeneration == nil,
-              let id = queue.currentID, continuousAudio.selectedID == id, displayedVideoMediaID == id,
+              let id = queue.currentID, displayedVideoMediaID == id,
               let presentation = videoPresentation, presentation.request == generation,
               continuousPiP.currentFrameReceipt(for: presentation.ticket) != nil,
               let position = continuousPiP.lastFramePositionSeconds else { return false }
+        if usesNativeAudio {
+            guard nativeSeekTicket == nil, let item = observedItem, player.currentItem === item,
+                  let timebase = item.timebase, CMTimebaseGetEffectiveRate(timebase) > 0,
+                  let displayed = continuousPiP.displayedFramePosition(for: presentation.ticket) else { return false }
+            let now = CMTimebaseGetTime(timebase).seconds
+            return generation == presentation.request && observedItem === item
+                && videoPresentation?.ticket == presentation.ticket && abs(now - displayed) <= 0.12
+        }
+        guard continuousAudio.isSelected, continuousAudio.selectedID == id else { return false }
         let sample = continuousAudio.snapshot
         guard sample.token > 0, sample.token == audioToken, sample.visit == audioVisit,
               !sample.ended, !continuousAudio.isSelectionPending(in: sample) else { return false }
@@ -3151,7 +3160,8 @@ final class PlaybackService: NSObject {
         continuousAudio.setSpeakerEnabled(!usesNativeAudio && enhance)
     }
 
-    private func applyPresentation(_ actions: PlaybackPresentationPolicy.Actions) {
+    @discardableResult
+    private func applyPresentation(_ actions: PlaybackPresentationPolicy.Actions) -> Bool {
         continuousPiP.beginReadinessUpdates()
         defer { continuousPiP.endReadinessUpdates() }
         surface.isHidden = audioOnly
@@ -3166,19 +3176,19 @@ final class PlaybackService: NSObject {
             continuousPiP.suspendFrameFeed()
         }
         else {
-            surface.playerLayer.player = player
+            if surface.playerLayer.player !== player { surface.playerLayer.player = player }
             continuousPiP.resumeFrameFeed()
         }
         // AVKit can restore a suspended PiP window while the app stays in the
         // background. Restart its native video clock as well as the frame feed.
-        if actions.restoreInlineVideo || restoringSuspendedVideo {
-            imageProgressOwner = nil
-            #if DEBUG
-            synchronizeVideoToAudio(force: true, reason: .surfaceRestore)
-            #else
-            synchronizeVideoToAudio(force: true)
-            #endif
-        }
+        guard actions.restoreInlineVideo || restoringSuspendedVideo else { return false }
+        imageProgressOwner = nil
+        #if DEBUG
+        synchronizeVideoToAudio(force: true, reason: .surfaceRestore)
+        #else
+        synchronizeVideoToAudio(force: true)
+        #endif
+        return true
     }
 
     private func samplePiPState() {

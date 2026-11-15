@@ -1163,7 +1163,8 @@ final class ContinuousPictureInPicture: NSObject {
                 ? CMTime(value: Int64(frame), timescale: 48_000)
                 : CMTime(seconds: position, preferredTimescale: 48_000)
             let current = CMTimeGetSeconds(CMTimebaseGetTime(timebase))
-            if forceAnchor || !current.isFinite || abs(current - position) > 0.08 {
+            let needsAnchor = forceAnchor || !current.isFinite || abs(current - position) > 0.08
+            if needsAnchor {
                 flushForSeek()
                 guard !invalidated, presentationRevision == revision,
                       seekTicket == seek, activeSeekTicket == activeSeek else { return }
@@ -1171,16 +1172,23 @@ final class ContinuousPictureInPicture: NSObject {
             } else if previous.isPlaying != isPlaying || !isPlaying {
                 CMTimebaseSetTime(timebase, time: anchorTime)
             }
-            CMTimebaseSetRate(timebase, rate: isPlaying ? 1 : 0)
+            if needsAnchor || previous.isPlaying != isPlaying {
+                CMTimebaseSetRate(timebase, rate: isPlaying ? 1 : 0)
+            }
         }
         if previous.isPlaying != isPlaying || previous.duration != duration {
             controller?.invalidatePlaybackState()
         }
         if !isPlaying { cancelIsolatedPreparation() }
         synchronizeIsolatedVideo(force: forceAnchor)
-        if frameFeedEnabled && isPlaying && currentItem != nil { startFrameTimer() }
-        else { stopFrameTimer() }
-        renderFrame()
+        if frameFeedEnabled && isPlaying && currentItem != nil {
+            // The scheduled callback queries AVFoundation at a display deadline.
+            // A progress update must not consume the same decoder's frames off-cycle.
+            startFrameTimer()
+        } else {
+            stopFrameTimer()
+            renderFrame() // Paused frames still need a one-shot pull.
+        }
     }
 
     /// A seek starts a new frame epoch, including the image held by a paused timebase.
@@ -1300,13 +1308,12 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     func resumeFrameFeed() {
-        guard !invalidated else { return }
+        guard !invalidated, !frameFeedEnabled else { return }
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
-        let wasSuspended = !frameFeedEnabled
         frameFeedEnabled = true
-        if wasSuspended { readinessUpdatePending = true }
-        synchronizeIsolatedVideo(force: wasSuspended)
+        readinessUpdatePending = true
+        synchronizeIsolatedVideo(force: true)
         renderFrame()
         if playbackState.read().isPlaying && currentItem != nil { startFrameTimer() }
     }
@@ -1387,7 +1394,7 @@ final class ContinuousPictureInPicture: NSObject {
         // Display links stop while background PiP is active. Keep its pulls at
         // the same source cadence using a single main-runloop timer.
         let timer = Timer(timeInterval: 1.0 / Double(rate), repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.renderFrame() }
+            MainActor.assumeIsolated { self?.renderFrame(targetHostTime: CACurrentMediaTime()) }
         }
         timer.tolerance = 1.0 / (Double(rate) * 4)
         frameTimer = timer

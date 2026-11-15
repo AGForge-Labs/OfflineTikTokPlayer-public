@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import UIKit
 import PlayerCore
 @testable import OfflineTikTokPlayer
 
@@ -49,6 +50,41 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         try await until { service.queue.currentID == fixture.aID && !service.isLoading && service.clock.position > 0.15 }
         XCTAssertFalse(service.player.isMuted)
         XCTAssertTrue(fixture.downloads.readyIDs.isEmpty)
+    }
+
+    func testReturningToAHealthyNativeStreamDoesNotRestartItsPicture() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let service = try await makeStreamService(fixture)
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let oldKey = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let host = UIViewController()
+        window.rootViewController = host
+        window.windowLevel = .alert + 1
+        window.frame = scene.coordinateSpace.bounds
+        window.makeKeyAndVisible()
+        service.surface.frame = host.view.bounds
+        service.surface.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        host.view.addSubview(service.surface)
+        service.surface.layoutIfNeeded()
+        defer { window.isHidden = true; window.rootViewController = nil; oldKey?.makeKey() }
+
+        service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
+        try await until { service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.2 }
+        let item = try XCTUnwrap(service.player.currentItem)
+        XCTAssertFalse(service.player.isMuted)
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        let previous = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+        try await until {
+            guard let image = service.debugDisplayedVideoPositionSeconds, image > previous + 0.1 else { return false }
+            return abs(item.currentTime().seconds - image) < 0.1
+        }
+        let epoch = service.debugAlignedVideoPollState.frame.imageEpoch
+        service.enteredForeground()
+        XCTAssertEqual(service.debugAlignedVideoPollState.frame.imageEpoch, epoch, "Healthy foreground return must not flush the advancing picture")
+        XCTAssertTrue(service.player.currentItem === item)
+        try await until { (service.debugDisplayedVideoPositionSeconds ?? 0) > previous + 0.25 }
     }
 
     func testStreamingAudioOnlySeeksAndHonorsCameraPermissionAndExplicitPause() async throws {

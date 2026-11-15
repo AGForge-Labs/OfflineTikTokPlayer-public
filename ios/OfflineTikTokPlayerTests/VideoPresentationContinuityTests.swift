@@ -114,6 +114,40 @@ final class VideoPresentationContinuityTests: XCTestCase {
         #endif
     }
 
+    func testRunningDisplayLinkOwnsVideoPullsDuringProgressAndPresentationUpdates() async throws {
+        let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080")
+        defer { fixture.close() }
+        let bridge = fixture.bridge
+        let ticket = try XCTUnwrap(bridge.debugAlignedPollState.ticket)
+        let startPosition = fixture.player.currentTime().seconds
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: startPosition, durationSeconds: 6, isPlaying: true))
+        fixture.player.playImmediately(atRate: 1)
+        XCTAssertTrue(bridge.activate(ticket))
+        let advancing = await until {
+            (bridge.displayedFramePosition(for: ticket) ?? 0) > startPosition + 0.1
+        }
+        XCTAssertTrue(advancing)
+        XCTAssertTrue(bridge.isFrameFeedRunning)
+        let before = bridge.submittedFrameCount
+        let picture = try XCTUnwrap(bridge.displayedFramePosition(for: ticket))
+        let position = try XCTUnwrap(bridge.timebasePositionSeconds)
+        var immediatePulls = 0
+        bridge.onDebugWholeFrame = { if case .entered = $0 { immediatePulls += 1 } }
+        // These calls run on the main actor without a display refresh between
+        // them. Progress and PiP/scene state updates must not run the decoder.
+        for _ in 0..<8 {
+            bridge.updatePlayback(positionSeconds: position, durationSeconds: 6, isPlaying: true)
+            bridge.resumeFrameFeed()
+        }
+        bridge.onDebugWholeFrame = nil
+        XCTAssertEqual(immediatePulls, 0, "An active frame timer exclusively owns steady video pulls")
+        let continued = await until {
+            bridge.submittedFrameCount >= before + 8
+                && (bridge.displayedFramePosition(for: ticket) ?? 0) > picture + 0.1
+        }
+        XCTAssertTrue(continued, "Decoded HD frames must still reach the visible layer")
+    }
+
     func testForegroundFeedDoesNotDropEveryOtherFrameOfSixtyFPSVideo() async throws {
         for trial in 0..<6 {
             let fixture = try await PresentedVideo.make()
