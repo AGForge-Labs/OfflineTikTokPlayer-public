@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only streaming quality
+run-name: Owner-only smooth picture
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +48,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 113be8cf2b35021a1d4ae090cd61d0bd9a539baa
+          ref: 28bf19eefec7485defd37bc448f63dcb32797295
           fetch-depth: 2
           path: candidate
           persist-credentials: false
@@ -79,7 +79,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 113be8cf2b35021a1d4ae090cd61d0bd9a539baa
+          ref: 28bf19eefec7485defd37bc448f63dcb32797295
           fetch-depth: 2
           path: candidate
           persist-credentials: false

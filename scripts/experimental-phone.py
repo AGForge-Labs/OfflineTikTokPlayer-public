@@ -10,31 +10,18 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "416618a3ddbbdc0340d7e578a9937bc6a256c598"
-SOURCE = "113be8cf2b35021a1d4ae090cd61d0bd9a539baa"
-APP_TREE = "5880c52d29ca00b3475f6e3fdf12239cf31a9b08"
-BASE_APP_TREE = "ed3b6376540dd4ead4cfad1b6c991cabf72e88ec"
+SOURCE_BASE = "113be8cf2b35021a1d4ae090cd61d0bd9a539baa"
+SOURCE = "28bf19eefec7485defd37bc448f63dcb32797295"
+APP_TREE = "b4743cd97f5e8ffaf621f3c97a49f492b118f9a4"
+BASE_APP_TREE = "5880c52d29ca00b3475f6e3fdf12239cf31a9b08"
 CORE_TREE = "f854789b2ca2a810bbe628122908281ed29f41d2"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
-    '.github/workflows/stream-quality.yml',
-    'ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift',
+    '.github/workflows/smooth-picture.yml',
+    'ios/OfflineTikTokPlayer/Playback/ContinuousPictureInPicture.swift',
     'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
-    'ios/OfflineTikTokPlayer/Playback/SpeakerAudioMix.swift',
-    'ios/OfflineTikTokPlayer/Services/OneDriveClient.swift',
-    'ios/OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests.swift',
-    'ios/PlayerCore/Sources/PlayerCore/Catalog.swift',
-    'ios/PlayerCore/Sources/PlayerCore/ContinuousPCMRenderer.swift',
-    'ios/PlayerCore/Sources/PlayerCore/PlaybackMediaSource.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/MeasuredSpeakerAudioTests.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/PlaybackMediaSourceTests.swift',
-    'pc-helper/offline_tiktok/catalog.py',
-    'pc-helper/offline_tiktok/quality_backfill.py',
-    'pc-helper/offline_tiktok/stream_quality.py',
-    'pc-helper/tests/test_quality_backfill.py',
-    'pc-helper/tests/test_stream_quality.py',
-    'shared/catalog.schema.json',
-    'tests/cloud-adapter/OneDriveClientTests.swift',
+    'ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift',
+    'ios/OfflineTikTokPlayerTests/VideoPresentationContinuityTests.swift',
 )
 REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -118,7 +105,7 @@ def validate_context(environment, event, *, signing=False, linux_preflight=False
     require(re.fullmatch(r"[1-9][0-9]{0,3}(?:\.(?:0|[1-9][0-9]?)){0,2}", build) is not None,
             "An Apple-checked increasing build number is required.")
     numbers = tuple(map(int, build.split("."))) + (0,) * (3 - len(build.split(".")))
-    require(numbers > (31, 1, 0), "The quality build must follow 31.1; Apple must still confirm the actual latest version.")
+    require(numbers > (32, 1, 0), "Apple must confirm this build follows the shipped 32.1 and every newer version.")
     require(not environment.get("APPLE_PRIVATE_DELIVERY"), "The private aggregate secret is not used here.")
     if signing:
         require(environment.get("RELEASE_ENVIRONMENT") == "release", "The existing protected release environment is required.")
@@ -247,8 +234,9 @@ NATIVE_PROOFS = (
     (42925893598, "d278ea838fca7c7e5105aade87d7aa7db1438ac5", ".github/workflows/stalled-video-recovery.yml", "codex/stalled-video-recovery"),
     (42961684284, "6d13bb9960510a10f73f757be38e21721206699d", ".github/workflows/stalled-video-recovery.yml", "codex/picture-freeze-recovery"),
     (43318289392, "fb5fb3efbaef7ca8a3f70561eb466f564b61620f", ".github/workflows/stalled-video-recovery.yml", "codex/stream-start-recovery"),
-    (43550382812, SOURCE_BASE, ".github/workflows/tiktok-post-links.yml", "codex/tiktok-post-links"),
-    (43578692517, SOURCE, ".github/workflows/stream-quality.yml", "codex/stream-quality"),
+    (43550382812, "416618a3ddbbdc0340d7e578a9937bc6a256c598", ".github/workflows/tiktok-post-links.yml", "codex/tiktok-post-links"),
+    (43578692517, SOURCE_BASE, ".github/workflows/stream-quality.yml", "codex/stream-quality"),
+    (43671735898, SOURCE, ".github/workflows/smooth-picture.yml", "codex/smooth-picture"),
 )
 
 
