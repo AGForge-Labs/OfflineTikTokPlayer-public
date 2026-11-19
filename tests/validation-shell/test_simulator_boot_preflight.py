@@ -198,7 +198,7 @@ class SimulatorBootPreflightTests(unittest.TestCase):
             with patch.object(MODULE, "prepare_simulator", return_value=result) as prepare:
                 with contextlib.redirect_stdout(output):
                     self.assertEqual(MODULE.main(arguments), 1)
-                prepare.assert_called_once_with(None)
+                prepare.assert_called_once_with(None, hosted_inventory=False)
             self.assertEqual(json.loads(output.getvalue()), result)
             self.assertNotIn("PRIVATE", output.getvalue())
 
@@ -209,6 +209,33 @@ class SimulatorBootPreflightTests(unittest.TestCase):
         self.assertEqual(result["finalStateCode"], 1)
         self.assertEqual(result["identityChecksPassed"], 2)
         self.assertEqual(result["elapsedMs"], 132000)
+        self.assertEqual(runner.call_count, 4)
+
+    def test_hosted_boot_reads_only_booted_devices_and_allows_a_slow_first_reply(self):
+        clock = Clock()
+        runner = self.runner([(0, inventory('Shutdown'), 1), (0, b'', 1),
+                              (0, b'', 145), (0, inventory(), 85)], clock)
+        result = MODULE.prepare_simulator(UDID, run=runner, monotonic=clock, hosted_inventory=True)
+        self.assertEqual(result['statusCode'], 0)
+        self.assertEqual(result['identityChecksPassed'], 2)
+        self.assertEqual(result['finalQueryRetries'], 0)
+        self.assertEqual(runner.call_args_list[-1].args[0], ['xcrun', 'simctl', 'list', 'devices', 'booted', '--json'])
+        self.assertEqual(runner.call_args_list[-1].kwargs['timeout'], 120)
+
+    def test_hosted_inventory_cannot_accept_a_different_or_shutdown_device(self):
+        for payload, code in [(inventory(udid=OTHER), 4), (inventory('Shutdown'), 7)]:
+            with self.subTest(code=code):
+                clock = Clock()
+                runner = self.runner([(0, inventory(), 1), (0, b'', 15), (0, payload, 75)], clock)
+                result = MODULE.prepare_simulator(UDID, run=runner, monotonic=clock, hosted_inventory=True)
+                self.assertEqual(result['statusCode'], code)
+
+    def test_hosted_inventory_ends_at_the_shared_deadline_if_both_reads_stall(self):
+        clock = Clock()
+        runner = self.runner([(0, inventory(), 1), (0, b'', 135), (0, b'', 150), (0, b'', 150)], clock)
+        result = MODULE.prepare_simulator(UDID, run=runner, monotonic=clock, hosted_inventory=True)
+        self.assertEqual((result['statusCode'], result['stageCode'], result['finalQueryTimeouts']), (10, 5, 2))
+        self.assertEqual(result['elapsedMs'], 360000)
         self.assertEqual(runner.call_count, 4)
 
     def test_only_one_final_query_timeout_can_retry_within_the_original_budget(self):

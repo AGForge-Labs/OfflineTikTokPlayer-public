@@ -10,6 +10,7 @@ import uuid
 
 
 BUDGET_SECONDS = 240
+HOSTED_INVENTORY_SECONDS = 120
 MAX_QUERY_BYTES = 262144
 STATES = {"Booted": 1, "Shutdown": 2}
 
@@ -29,11 +30,12 @@ def canonical_uuid(value):
     return str(parsed).upper()
 
 
-def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotonic):
+def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotonic, hosted_inventory=False):
     """Return fixed numeric/boolean evidence; raw native output never escapes."""
     started = monotonic()
     deadline = started + BUDGET_SECONDS
-    result = {"schema": 1, "statusCode": 0, "stageCode": 1, "budgetSeconds": BUDGET_SECONDS,
+    total_budget = BUDGET_SECONDS + (HOSTED_INVENTORY_SECONDS if hosted_inventory else 0)
+    result = {"schema": 1, "statusCode": 0, "stageCode": 1, "budgetSeconds": total_budget,
               "initialStateCode": 0, "finalStateCode": 0, "identityChecksPassed": 0,
               "bootRequested": False, "bootReturnCode": -1, "waitReturnCode": -1,
               "lastQueryReturnCode": -1, "queryCount": 0, "elapsedMs": 0,
@@ -50,13 +52,14 @@ def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotoni
             raise PreflightError(10)
         return completed.returncode
 
-    def query(wanted):
+    def query(wanted, *, booted_only=False):
         result["queryCount"] += 1
         result["lastQueryReturnCode"] = -1
         # A temporary stream avoids unbounded Python PIPE accumulation. It is
         # closed on every path; only a bounded query read is parsed or retained.
         with tempfile.TemporaryFile() as stream:
-            code = command(["list", "devices", "--json"], stdout=stream, maximum=60)
+            arguments = ["list", "devices", "booted", "--json"] if booted_only else ["list", "devices", "--json"]
+            code = command(arguments, stdout=stream, maximum=HOSTED_INVENTORY_SECONDS if booted_only else 60)
             result["lastQueryReturnCode"] = code
             if code:
                 raise PreflightError(2)
@@ -117,8 +120,11 @@ def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotoni
         if result["waitReturnCode"]:
             raise PreflightError(9)
         result["stageCode"] = 5
+        # On a shared Mac, a full CoreSimulator inventory can still be slow
+        # after bootstatus succeeds. Only the final state read gets extra time.
+        deadline = started + total_budget
         try:
-            result["finalStateCode"] = query(wanted)
+            result["finalStateCode"] = query(wanted, booted_only=hosted_inventory)
         except subprocess.TimeoutExpired:
             result["finalQueryTimeouts"] = 1
             # A successful bootstatus can precede a transient inventory timeout.
@@ -128,7 +134,7 @@ def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotoni
                 raise
             result["finalQueryRetries"] = 1
             try:
-                result["finalStateCode"] = query(wanted)
+                result["finalStateCode"] = query(wanted, booted_only=hosted_inventory)
             except subprocess.TimeoutExpired:
                 result["finalQueryTimeouts"] = 2
                 raise
@@ -153,8 +159,11 @@ def prepare_simulator(identifier, *, run=subprocess.run, monotonic=time.monotoni
 
 def main(argv=None):
     arguments = sys.argv[1:] if argv is None else argv
+    hosted = arguments[-1:] == ["--hosted-inventory"]
+    if hosted:
+        arguments = arguments[:-1]
     identifier = arguments[1] if len(arguments) == 2 and arguments[0] == "--udid" else None
-    result = prepare_simulator(identifier)
+    result = prepare_simulator(identifier, hosted_inventory=hosted)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0 if result["statusCode"] == 0 else 1
 
