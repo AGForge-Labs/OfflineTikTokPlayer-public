@@ -9444,6 +9444,9 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         try await withOwnedNaturalFixture(buffer: buffer,
             seekVideo: { player, time, callback in completion.seek(player, time, callback) },
             additionalCleanupAcknowledged: { completion.cleanupAcknowledged }) { fixture, audio, service, screen in
+            #if targetEnvironment(simulator)
+            try await screen.prepareCompositorForMotionCapture()
+            #endif
             service.isInteractingWithFeed = false
             service.debugInitialLoadPhaseEnabled = true
             service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -13955,6 +13958,25 @@ private final class SelectionVideoScreen {
         window.rootViewController = nil
         previousKeyWindow?.makeKey()
     }
+
+    #if targetEnvironment(simulator)
+    /// Prime the real host screenshot path before starting the nonrepeating test clip.
+    /// The measured captures still have to show B moving within the original 29-second window.
+    func prepareCompositorForMotionCapture() async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 45
+        var consecutiveReady = 0
+        while consecutiveReady < 2 {
+            let start = ProcessInfo.processInfo.systemUptime
+            let snapshot = try await HostCompositorCapture.image(in: window, deadline: deadline)
+            guard let image = snapshot.cgImage, image.width > 0, image.height > 0 else {
+                throw SelectionVideoTestFailure.capture
+            }
+            let seconds = ProcessInfo.processInfo.systemUptime - start
+            consecutiveReady = seconds <= 4 ? consecutiveReady + 1 : 0
+            print("SelectionCompositorWarmup seconds=\(seconds) consecutiveReady=\(consecutiveReady)")
+        }
+    }
+    #endif
 
     func capture(label: String, test: XCTestCase) async throws -> SelectionVideoPixels {
         let before = captureState()

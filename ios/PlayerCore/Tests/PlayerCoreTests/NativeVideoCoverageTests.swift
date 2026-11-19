@@ -3,9 +3,12 @@ import XCTest
 
 final class NativeVideoCoverageTests: XCTestCase {
     func testOrdinarySubframeAudioTailsDoNotForceVideoThroughACompositor() {
-        for (end, asset, frame) in [(24.424424, 24.427007, 1.0 / 29.97),
-                                    (6965.0 / 60, 1161.0 / 10, 1.0 / 60),
-                                    (15.0, 15.020998, 1.0 / 30)] {
+        let timelines: [(Double, Double, Double)] = [
+            (24.424424, 24.427007, 1.0 / 29.97),
+            (6965.0 / 60, 1161.0 / 10, 1.0 / 60),
+            (15.0, 15.020998, 1.0 / 30)
+        ]
+        for (end, asset, frame) in timelines {
             XCTAssertTrue(NativeVideoCoverage.allowsNativePresentation(start: 0, end: end,
                 assetDuration: asset, frameDuration: frame), "Preserve the full audio tail and native video range")
         }
