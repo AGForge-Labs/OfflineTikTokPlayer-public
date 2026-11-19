@@ -1,0 +1,65 @@
+name: Finish an uploaded owner TestFlight build
+on:
+  workflow_dispatch:
+    inputs:
+      expected_control_commit:
+        description: Reviewed commit on main
+        required: true
+        type: string
+      build_number:
+        description: Version of the uploaded internal build
+        required: true
+        type: string
+      apple_build_id:
+        description: Apple build ID from the read-only build lookup
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: public-testflight-release
+  cancel-in-progress: false
+jobs:
+  confirm-owner-access:
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+      github.repository == 'Galaxybigbird/OfflineTikTokPlayer-public' && github.repository_id == '1424911966' &&
+      !github.event.repository.private && github.actor_id == '105477711' &&
+      github.triggering_actor == 'Galaxybigbird' && github.run_attempt == 1 &&
+      github.sha == inputs.expected_control_commit
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Confirm access to this build in the existing Owner group
+        env:
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          APPLE_BUILD_ID: ${{ inputs.apple_build_id }}
+          APP_STORE_CONNECT_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_KEY_BASE64 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ vars.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ vars.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          python3 -B - <<'PY'
+          import json, os, runpy, tempfile, urllib.error, uuid
+          from pathlib import Path
+
+          owner = runpy.run_path("scripts/apple-owner-runner.py")
+          lookup = runpy.run_path("scripts/apple-build-info.py")
+          version = os.environ["BUILD_NUMBER"]
+          owner["number"](version)
+          build_id = str(uuid.UUID(os.environ["APPLE_BUILD_ID"]))
+          config = lookup["key_configuration"](os.environ)
+          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as private:
+              try:
+                  client = owner["Apple"](config, Path(private))
+                  receipt = owner["finish_existing"](client, version, build_id)
+              except ValueError as error:
+                  cause = error.__context__
+                  status = "HTTP " + str(cause.code) if isinstance(cause, urllib.error.HTTPError) else "validation"
+                  raise SystemExit("Owner delivery check stopped (" + status + ").") from None
+          print("Apple owner delivery: " + json.dumps(receipt, sort_keys=True))
+          PY

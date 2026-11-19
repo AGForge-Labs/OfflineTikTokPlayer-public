@@ -118,6 +118,22 @@ class AppleOwnerTests(unittest.TestCase):
         owner.finish(apple, '21.1', seconds=0)
         self.assertEqual(len(apple.posts), 1)
 
+    def test_finish_existing_upload_requires_apple_id_and_version_before_assignment(self):
+        apple = FakeApple()
+        for version, build_id in [('21.1', 'another-build'), ('20.1', 'synthetic-build')]:
+            with self.subTest(version=version, build_id=build_id), self.assertRaises(ValueError):
+                owner.finish_existing(apple, version, build_id)
+            self.assertEqual(apple.posts, [])
+        apple.builds['data'][0]['attributes']['processingState'] = 'PROCESSING'
+        with self.assertRaises(ValueError):
+            owner.finish_existing(apple, '21.1', 'synthetic-build')
+        self.assertEqual(apple.posts, [])
+        apple.builds['data'][0]['attributes']['processingState'] = 'VALID'
+        first = owner.finish_existing(apple, '21.1', 'synthetic-build')
+        self.assertTrue(first['onlyApprovedOwner'] and first['assigned'])
+        self.assertEqual(owner.finish_existing(apple, '21.1', 'synthetic-build'), first)
+        self.assertEqual(len(apple.posts), 1)
+
     def test_processing_missing_external_expired_or_failed_build_never_assigns(self):
         for change in ({'processingState': 'PROCESSING'}, {'processingState': 'FAILED'},
                        {'buildAudienceType': 'APP_STORE'}, {'expired': True}):

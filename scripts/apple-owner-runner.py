@@ -123,11 +123,12 @@ def before_upload(apple, version):
     require(all(number(item["attributes"]["version"]) < proposed for item in builds(apple)))
 
 
-def finish(apple, version, *, seconds=180, monotonic=time.monotonic, sleep=time.sleep):
+def finish(apple, version, *, seconds=180, monotonic=time.monotonic, sleep=time.sleep, expected_build_id=None):
     deadline = monotonic() + seconds
     while True:
         candidate = next((item for item in builds(apple) if item["attributes"]["version"] == version), None)
         if candidate:
+            require(expected_build_id is None or candidate['id'] == expected_build_id)
             attrs = candidate["attributes"]
             require(attrs.get("buildAudienceType") == "INTERNAL_ONLY" and attrs.get("expired") is False)
             require(attrs["processingState"] in ("PROCESSING", "VALID"))
@@ -144,3 +145,10 @@ def finish(apple, version, *, seconds=180, monotonic=time.monotonic, sleep=time.
         if monotonic() >= deadline:
             return dict(version=version, state="PROCESSING" if candidate else "NOT_RECEIVED", assigned=False)
         sleep(min(15, max(0, deadline - monotonic())))
+
+
+def finish_existing(apple, version, build_id):
+    require(isinstance(build_id, str) and build_id)
+    result = finish(apple, version, expected_build_id=build_id, seconds=0)
+    require(result.get('assigned') is True)
+    return result

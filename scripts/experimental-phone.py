@@ -351,11 +351,11 @@ def main():
         directory = Path(temporary)
         directory.chmod(0o700)
         apple_owner = load_module("apple_owner", ROOT / "scripts/apple-owner-runner.py")
-        apple = apple_owner.Apple(configuration, directory)
-        apple_owner.before_upload(apple, build)
+        apple_owner.before_upload(apple_owner.Apple(configuration, directory), build)
         upload_with_receipt(helper, configuration, directory, build, receipt)
         receipt.write_text(json.dumps({"phase": "apple-processing", "reason": None}))
-        delivery = apple_owner.finish(apple, build)
+        # The archive and upload can outlive the ten-minute Apple API token.
+        delivery = apple_owner.finish(apple_owner.Apple(configuration, directory), build)
         receipt.write_text(json.dumps({"phase": "complete", "reason": None, "delivery": delivery}))
 
 
