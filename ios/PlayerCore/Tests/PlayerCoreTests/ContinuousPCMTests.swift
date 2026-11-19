@@ -2,6 +2,72 @@ import XCTest
 @testable import PlayerCore
 
 final class ContinuousPCMTests: XCTestCase {
+    func testRepeatOneSmoothsAHardStereoCutWithoutChangingDurationOrTheCleanChannel() {
+        let frames = 4096
+        let renderer = ContinuousPCMRenderer(channels: 2, prefixFrames: frames, ringFrames: 16, smoothLoopJoins: true)
+        var source = [Float]()
+        for index in 0..<frames {
+            // The left channel cuts from +0.6 to -0.6. The right channel is a continuous tone.
+            source.append(index < frames / 2 ? -0.6 : 0.6)
+            source.append(0.4 * Float(sin(Double(index) * 2 * .pi / 64)))
+        }
+        prepare(renderer, slot: 0, token: 1, samples: source)
+        renderer.setSuccessor(token: 1, for: 1)
+        renderer.select(token: 1)
+        renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: frames), source)
+        for iteration in 0..<4 {
+            // Split the correction at different positions inside the incoming callback sequence.
+            let prefix = render(renderer, frames: iteration.isMultiple(of: 2) ? 1 : 65)
+            let loop = prefix + render(renderer, frames: frames - prefix.count / 2)
+            var previous = Float(0.6)
+            var largestStep = Float.zero
+            for index in 0..<128 {
+                let current = loop[2 * index]
+                largestStep = max(largestStep, abs(current - previous))
+                previous = current
+            }
+            print("PCM_LOOP_EDGE iteration=\(iteration) largestStep=\(largestStep)")
+            XCTAssertLessThan(largestStep, 0.04, "A hard cut must not become a one-sample impulse")
+            XCTAssertEqual(Array(loop.dropFirst(2 * 128)), Array(source.dropFirst(2 * 128)))
+            XCTAssertTrue((0..<frames).allSatisfy { loop[2 * $0 + 1] == source[2 * $0 + 1] })
+            XCTAssertEqual(renderer.snapshot.frame, Int64(frames))
+            XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+        }
+        renderer.select(token: 1)
+        XCTAssertEqual(render(renderer, frames: 128), Array(source.prefix(256)), "An explicit restart owns its own sound")
+    }
+
+    func testStreamedTailCanRepairTheNextLoopWithoutChangingSkipOrReusedSlotAudio() {
+        let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 128, ringFrames: 32, smoothLoopJoins: true)
+        let source = renderer.source(at: 0)
+        let prefix = Array(repeating: Float(-0.5), count: 128)
+        XCTAssertTrue(prefix.withUnsafeBufferPointer { source.prepare(token: 1, totalFrames: 225, prefix: $0) })
+        let epoch = source.streamRequest.epoch
+        XCTAssertTrue(source.beginStream(epoch: epoch))
+        renderer.setSuccessor(token: 1, for: 1)
+        renderer.select(token: 1)
+        renderer.setPlaying(true)
+        XCTAssertEqual(render(renderer, frames: 128), prefix)
+        for count in [32, 32, 32, 1] {
+            let tail = Array(repeating: Float(0.5), count: count)
+            XCTAssertEqual(tail.withUnsafeBufferPointer { source.append(interleaved: $0, epoch: epoch) }, count)
+            XCTAssertEqual(render(renderer, frames: count), tail)
+        }
+        let head = render(renderer, frames: 3)
+        XCTAssertGreaterThan(head[0], 0.48, "The last packet can contain only one frame")
+        prepare(renderer, slot: 1, token: 2, samples: Array(repeating: -0.25, count: 128))
+        renderer.select(token: 2)
+        XCTAssertEqual(render(renderer, frames: 3), [-0.25, -0.25, -0.25])
+        XCTAssertTrue(renderer.setSuccessor(token: 0, for: 1))
+        XCTAssertTrue(renderer.retireSource(at: 0))
+        prepare(renderer, slot: 0, token: 3, samples: Array(repeating: 0.125, count: 128))
+        renderer.setSuccessor(token: 3, for: 3)
+        renderer.select(token: 3)
+        XCTAssertEqual(render(renderer, frames: 260), Array(repeating: 0.125, count: 260))
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+
     // A boundary that waits for a callback, trims the tail or inserts a zero fails this test.
     func testBoundaryCopiesTailAndHeadInTheSameRenderRequest() {
         let renderer = ContinuousPCMRenderer(channels: 1, prefixFrames: 8, ringFrames: 8)
