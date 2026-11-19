@@ -74,7 +74,7 @@ def validate_public_workflow(config):
     """Allow only this task's standard, public, unsigned simulator validation."""
     expected_trigger = {"push": {"branches": ["fix/playback-continuity", "fix/continuous-pcm-playback", "fix/selected-video-regression", "fix/ui-shell-dismissal-sync"],
         "paths": ["ios/**", "scripts/**", "tests/apple-playback/**", "tests/validation-shell/**", ".github/workflows/playback-validation.yml"]}}
-    public_guard = "${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}"
+    public_guard = "${{ github.repository == 'Galaxybigbird/OfflineTikTokPlayer-public' && github.event.repository.private == false }}"
     job = config.get("jobs", {}).get("ios", {})
     if set(config) != {"name", "on", "permissions", "jobs"} or config.get("on") != expected_trigger:
         raise ValueError("Public playback validation must be scoped to its reviewed branch.")
@@ -135,7 +135,7 @@ def validate_public_release_workflow(config):
         check(set(validation) == {"if", "runs-on", "timeout-minutes", "steps"})
         check(set(release) == {"needs", "if", "environment", "runs-on", "timeout-minutes", "env", "steps"})
         gate = ("github.event_name == 'workflow_dispatch' && inputs.authorize_upload && "
-                "github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private && "
+                "github.repository == 'Galaxybigbird/OfflineTikTokPlayer-public' && !github.event.repository.private && "
                 "github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' && "
                 "github.ref == 'refs/heads/main' && github.run_attempt == 1")
         check(" ".join(validation["if"].split()) == gate)

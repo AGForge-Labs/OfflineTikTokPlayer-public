@@ -1,6 +1,6 @@
 # Public source to private TestFlight
 
-Release integration preparation only; no signing or upload has occurred. Every `ios/` blob is preserved from software-accepted `7da8c8f10bdb7f5b02bba7a1ca02498b74dd714b`, whose unsigned run [39410213569](https://github.com/AGForge-Labs/OfflineTikTokPlayer-public/actions/runs/39410213569) passed 83 core, 90 native and one UI test, plus eight launcher and 16 evidence regressions. This does not establish physical iPhone/OnTrac acceptance. Player 13.1 failed device acceptance and remains withdrawn from Owner; 12.1 remains offered.
+Release integration preparation only; no signing or upload has occurred. Every `ios/` blob is preserved from software-accepted `7da8c8f10bdb7f5b02bba7a1ca02498b74dd714b`, whose unsigned run [39410213569](https://github.com/Galaxybigbird/OfflineTikTokPlayer-public/actions/runs/39410213569) passed 83 core, 90 native and one UI test, plus eight launcher and 16 evidence regressions. This does not establish physical iPhone/OnTrac acceptance. Player 13.1 failed device acceptance and remains withdrawn from Owner; 12.1 remains offered.
 
 ## Release contract
 
@@ -22,7 +22,7 @@ Existing app identifiers, team, entitlements, App Group/keychain access and on-d
 
 Do not configure credential access on general migration approval. Before activation, present the exact environment, names/types below, access scope, protections and risks together for action-time approval.
 
-Target: `AGForge-Labs/OfflineTikTokPlayer-public`, environment `release`. Required protections: only the `main` branch may deploy (no tags), required reviewer `Galaxybigbird`, administrator bypass disabled. The sole owner can review their own deliberate dispatch; add an independently authorized reviewer before enabling prevention of self-review. Repository/organization signing secrets must not bypass this environment.
+Target: `Galaxybigbird/OfflineTikTokPlayer-public`, environment `release`. Required protections: only the `main` branch may deploy (no tags), required reviewer `Galaxybigbird`, administrator bypass disabled. The sole owner can review their own deliberate dispatch; add an independently authorized reviewer before enabling prevention of self-review. Repository/organization signing secrets must not bypass this environment.
 
 | Environment secret | Existing material/type |
 | --- | --- |

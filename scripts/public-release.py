@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 
-REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
+REPOSITORY = "Galaxybigbird/OfflineTikTokPlayer-public"
 ROOT = Path(__file__).resolve().parents[1]
 SECRETS = ("APPLE_PRIVATE_DELIVERY", "APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
            "APPLE_PROVISIONING_PROFILE_BASE64", "APPLE_SHARE_PROVISIONING_PROFILE_BASE64",

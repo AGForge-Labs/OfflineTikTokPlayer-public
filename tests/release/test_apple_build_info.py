@@ -30,14 +30,14 @@ def owner():
 def context():
     sha = "a" * 40
     return dict(GITHUB_ACTIONS="true", RUNNER_OS="Linux", RUNNER_ENVIRONMENT="github-hosted",
-                GITHUB_REPOSITORY="AGForge-Labs/OfflineTikTokPlayer-public", GITHUB_REF="refs/heads/main",
+                GITHUB_REPOSITORY="Galaxybigbird/OfflineTikTokPlayer-public", GITHUB_REF="refs/heads/main",
                 GITHUB_EVENT_NAME="workflow_dispatch", GITHUB_ACTOR_ID="105477711",
                 GITHUB_TRIGGERING_ACTOR="Galaxybigbird", GITHUB_RUN_ATTEMPT="1",
-                GITHUB_WORKFLOW_REF="AGForge-Labs/OfflineTikTokPlayer-public/.github/workflows/apple-build-info.yml@refs/heads/main",
+                GITHUB_WORKFLOW_REF="Galaxybigbird/OfflineTikTokPlayer-public/.github/workflows/apple-build-info.yml@refs/heads/main",
                 GITHUB_SHA=sha, GITHUB_WORKFLOW_SHA=sha, EXPECTED_CONTROL_COMMIT=sha, LOOKUP_AUTHORIZED="true")
 
 
-EVENT = dict(repository=dict(full_name="AGForge-Labs/OfflineTikTokPlayer-public", private=False))
+EVENT = dict(repository=dict(full_name="Galaxybigbird/OfflineTikTokPlayer-public", private=False))
 
 
 @pytest.mark.parametrize("key,value", [("GITHUB_ACTOR_ID", "1"), ("GITHUB_REF", "refs/heads/other"),

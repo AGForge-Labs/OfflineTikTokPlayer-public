@@ -25,7 +25,7 @@ SOURCE_CHANGES = (
     'ios/PlayerCore/Sources/PlayerCore/VideoImageProgress.swift',
     'ios/PlayerCore/Tests/PlayerCoreTests/VideoImageProgressTests.swift',
 )
-REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
+REPOSITORY = "Galaxybigbird/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
            "APPLE_PROVISIONING_PROFILE_BASE64", "APP_STORE_CONNECT_KEY_BASE64")
 ROOT = Path(__file__).resolve().parents[1]

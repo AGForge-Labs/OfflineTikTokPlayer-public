@@ -30,7 +30,7 @@ jobs:
   release-preflight:
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.authorize_experimental_upload &&
-      github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private &&
+      github.repository == 'Galaxybigbird/OfflineTikTokPlayer-public' && !github.event.repository.private &&
       github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' &&
       github.ref == 'refs/heads/main' && github.run_attempt == 1
     permissions:
@@ -60,7 +60,7 @@ jobs:
     needs: release-preflight
     if: >-
       github.event_name == 'workflow_dispatch' && inputs.authorize_experimental_upload &&
-      github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && !github.event.repository.private &&
+      github.repository == 'Galaxybigbird/OfflineTikTokPlayer-public' && !github.event.repository.private &&
       github.actor_id == '105477711' && github.triggering_actor == 'Galaxybigbird' &&
       github.ref == 'refs/heads/main' && github.run_attempt == 1
     env:

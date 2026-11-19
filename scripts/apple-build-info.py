@@ -14,7 +14,7 @@ import urllib.error
 import uuid
 
 APP = "6824156409"
-REPOSITORY = "AGForge-Labs/OfflineTikTokPlayer-public"
+REPOSITORY = "Galaxybigbird/OfflineTikTokPlayer-public"
 ROOT = Path(__file__).resolve().parents[1]
 CERTIFICATE_INPUTS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
                       "APPLE_PROVISIONING_PROFILE_BASE64", "APPLE_PRIVATE_DELIVERY")
