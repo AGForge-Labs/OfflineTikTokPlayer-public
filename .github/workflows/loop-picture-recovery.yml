@@ -1,7 +1,7 @@
-name: iPhone picture during loops and switching
+name: iPhone loop audio and video frame pacing
 on:
   push:
-    branches: [codex/verified-loop-picture]
+    branches: [codex/playback-boundaries]
 permissions:
   contents: read
 jobs:
@@ -14,25 +14,11 @@ jobs:
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Exercise the shipped recovery limit and verify the change
+      - name: Check project, Swift syntax and playback core
         run: |
           set -euo pipefail
-          shipped=28bf19eefec7485defd37bc448f63dcb32797295
-          test "$(git rev-parse HEAD^)" = "$shipped"
-          recovery=ios/PlayerCore/Sources/PlayerCore/VideoImageProgress.swift
-          trap 'git restore --source=HEAD -- "$recovery"' EXIT
-          git restore --source="$shipped" -- "$recovery"
-          mkdir -p artifacts/loop-picture
-          if swift test --jobs 1 --package-path ios/PlayerCore --scratch-path artifacts/swift-build \
-              --filter VideoImageProgressTests.testARepairThatDisplaysNothingAllowsOneMoreAttemptAfterTheGracePeriod \
-              2>&1 | tee artifacts/loop-picture/shipped-limit.log; then
-            echo 'The shipped recovery limit unexpectedly allowed a backed-off second attempt.'
-            exit 1
-          fi
-          grep -E 'VideoImageProgressTests\.swift:.*testARepairThatDisplaysNothingAllowsOneMoreAttemptAfterTheGracePeriod.*XCTAssertTrue failed' artifacts/loop-picture/shipped-limit.log
-          git restore --source=HEAD -- "$recovery"
           python3 -B scripts/generate-ios-project.py --check
-          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{ContinuousPictureInPicture,PlaybackService}.swift ios/OfflineTikTokPlayerTests/{PictureRecoveryTests,VideoPresentationContinuityTests}.swift
+          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture}.swift ios/OfflineTikTokPlayerTests/{ContinuousAudioPlayerTests,VideoPresentationContinuityTests}.swift
           bash scripts/test-core.sh
           bash scripts/test-native-cloud.sh
   simulator:
@@ -48,11 +34,6 @@ jobs:
       - name: Verify loop and switch sequences with the simulator compositor
         run: |
           set -euo pipefail
-          # Run 43701487888 reproduced both faults in 33.1. The production
-          # source and test fixtures below are identical to the comparison.
-          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayer)" = b43cc02e9c07519b4167b7c858c694f21f9c196d
-          test "$(git rev-parse HEAD:ios/PlayerCore)" = 58f68c2009389313025ce253acec28c003565ebf
-          test "$(git rev-parse HEAD:ios/OfflineTikTokPlayerTests)" = 215e507cb1d7b5da6adef01d2f166143eb55727f
           udid="$(python3 -B scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
           work=artifacts/loop-picture
@@ -70,10 +51,15 @@ jobs:
           native=OfflineTikTokPlayerTests/NativeStreamingPlaybackTests
           selection=OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests
           regressions=(
+            "$video/testLateVideoPreparationStartsPacingOnlyAfterTheSourceIsKnown"
+            "OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testActualAudioGraphSmoothsOnlyTheHardLoopEdge"
             "$recovery/testPictureStarvedAcrossShortLoopsRecoversWhileAudioKeepsLooping"
             "$video/testPlayingPictureClockKeepsItsAnchorAcrossAStalledImageFlush"
           )
           controls=(
+            "OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testNative44100StereoAACPreservesCompleteSRCThroughLoopsAndRewind"
+            "OfflineTikTokPlayerTests/ContinuousPCMDecoderTests/testDecoderPreservesLeadingAndTrailingSourceSilenceAndTheLastFrame"
+            "OfflineTikTokPlayerTests/MeasuredAudioIntegrationTests/testMasteredNativeAudioDoesNotLoadOrAttachAnotherTap"
             "$recovery/testRepeatedLoopsAndRapidReversalsKeepDisplayingTheCurrentVideo"
             "$recovery/testRepeatedDecoderStopsRecoverDisplayedFramesWithoutInterruptingAudio"
             "$recovery/testNativeAudioOwnerRecoversAgainAfterPauseWithoutSeekingTheAudiblePlayer"

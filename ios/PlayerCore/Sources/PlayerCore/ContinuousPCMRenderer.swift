@@ -13,6 +13,13 @@ public final class ContinuousPCMSource: @unchecked Sendable {
     public let ringCapacityFrames: Int
     private let prefix: UnsafeMutablePointer<Float>
     private let ring: UnsafeMutablePointer<Float>
+    private let maxLoopHeadFrames: Int
+    // The serial producer publishes the edge measurements once per preparation.
+    // Only an actual repeat visit may use them. The archived prefix stays intact.
+    private let measuredLoopEnd = Atomic<Int64>(0)
+    private var loopTail = SIMD8<Float>.zero
+    private var discontinuousChannels: UInt8 = 0
+    private var loopHeadFramesForVisit = 0
     private let readyToken = Atomic<Int>(0)
     // Single-attempt ownership claim: 0 idle, 1 renderer, 2 preparation/retirement.
     // This is never waited on by the audio thread. A failed retirement changes nothing.
@@ -32,8 +39,9 @@ public final class ContinuousPCMSource: @unchecked Sendable {
     fileprivate var renderedEpoch = 0
     private var warmNextVisitToken = 0
 
-    fileprivate init(channels: Int, prefixFrames: Int, ringFrames: Int) {
+    fileprivate init(channels: Int, prefixFrames: Int, ringFrames: Int, loopHeadFrames: Int) {
         self.channels = channels
+        maxLoopHeadFrames = min(prefixFrames, loopHeadFrames)
         prefixCapacityFrames = prefixFrames; ringCapacityFrames = ringFrames
         prefix = .allocate(capacity: prefixFrames * channels)
         ring = .allocate(capacity: ringFrames * channels)
@@ -87,6 +95,9 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         guard access.compareExchange(expected: 0, desired: 2, ordering: .acquiringAndReleasing).exchanged else { return false }
         defer { access.store(0, ordering: .releasing) }
         let frames = samples.count / channels
+        measuredLoopEnd.store(0, ordering: .releasing)
+        discontinuousChannels = 0
+        loopHeadFramesForVisit = 0
         normalizationGainBits.store(Double.nan.bitPattern, ordering: .releasing)
         warmNextVisitToken = 0
         if let base = samples.baseAddress { prefix.update(from: base, count: samples.count) }
@@ -98,6 +109,7 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         writePosition.store(Int64(frames), ordering: .releasing)
         requestStart.store(Int64(frames), ordering: .sequentiallyConsistent)
         requestEpoch.store(2, ordering: .sequentiallyConsistent)
+        if Int64(frames) == totalFrames { measureLoopJoin(end: totalFrames, streamStart: totalFrames) }
         readyToken.store(token, ordering: .sequentiallyConsistent)
         return true
     }
@@ -134,14 +146,47 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         // A restart can be requested while this bounded copy is in progress.
         // Its epoch remains uncommitted; none of this old data can be consumed.
         guard epoch == requestEpoch.load(ordering: .sequentiallyConsistent) else { return 0 }
-        writePosition.store(written + Int64(frames), ordering: .releasing)
+        let end = written + Int64(frames)
+        if end == totalFrames { measureLoopJoin(end: end, streamStart: requestStart.load(ordering: .acquiring)) }
+        writePosition.store(end, ordering: .releasing)
         return frames
     }
 
     public func finishStream(totalFrames: Int64, epoch: Int) {
         guard token > 0, epoch == requestEpoch.load(ordering: .sequentiallyConsistent),
               epoch == committedEpoch.load(ordering: .acquiring), totalFrames > 0 else { return }
+        if writePosition.load(ordering: .acquiring) == totalFrames {
+            measureLoopJoin(end: totalFrames, streamStart: requestStart.load(ordering: .acquiring))
+        }
         count.store(totalFrames, ordering: .releasing)
+    }
+
+    private func measureLoopJoin(end: Int64, streamStart: Int64) {
+        guard maxLoopHeadFrames >= 4, end >= 16, measuredLoopEnd.load(ordering: .relaxed) == 0 else { return }
+        let pinned = Int64(prefixCount.load(ordering: .acquiring))
+        let edge = min(Int64(6), pinned)
+        // The producer still owns these ring bytes. A seek straight to the last
+        // packet may leave too little contiguous history to classify the join.
+        guard edge >= 2, end <= pinned || max(pinned, end - edge) >= max(streamStart, end - Int64(ringCapacityFrames)) else { return }
+        func sample(_ frame: Int64, _ channel: Int) -> Float {
+            if frame < pinned { return prefix[Int(frame) * channels + channel] }
+            return ring[Int(frame % Int64(ringCapacityFrames)) * channels + channel]
+        }
+        for channel in 0..<channels {
+            let tail = sample(end - 1, channel)
+            let jump = abs(tail - prefix[channel])
+            var localStep: Float = 0
+            for n in 1..<edge {
+                localStep = max(localStep, abs(sample(n, channel) - sample(n - 1, channel)),
+                                abs(sample(end - n, channel) - sample(end - n - 1, channel)))
+            }
+            // Preserve ordinary waveform slopes and already quiet joins.
+            if jump.isFinite, localStep.isFinite, jump > max(0.015625, 1.5 * localStep) {
+                loopTail[channel] = tail
+                discontinuousChannels |= UInt8(1) << channel
+            }
+        }
+        measuredLoopEnd.store(end, ordering: .releasing)
     }
 
     fileprivate func invalidate(canRetire: () -> Bool) -> Bool {
@@ -192,7 +237,14 @@ public final class ContinuousPCMSource: @unchecked Sendable {
 
     fileprivate func release() { access.store(0, ordering: .releasing) }
 
-    fileprivate func restart(token: Int, frame: Int64) {
+    fileprivate func restart(token: Int, frame: Int64, repeatingNaturally: Bool = false) {
+        loopHeadFramesForVisit = 0
+        if repeatingNaturally, frame == 0, maxLoopHeadFrames > 0 {
+            let end = measuredLoopEnd.load(ordering: .acquiring)
+            if end > 0, end == totalFrames, discontinuousChannels != 0 {
+                loopHeadFramesForVisit = Int(min(Int64(maxLoopHeadFrames), end / 4))
+            }
+        }
         // A brand-new source may already have a full decode-ahead ring. Preserve it
         // for the initial visit. An outgoing retained source can prepare this same
         // head while its neighbour plays; consume that preparation once on return.
@@ -223,9 +275,20 @@ public final class ContinuousPCMSource: @unchecked Sendable {
         requestEpoch.store(renderedEpoch, ordering: .sequentiallyConsistent)
     }
 
+    private func copyPrefixFrame(_ frame: Int, into output: UnsafeMutablePointer<Float>) {
+        output.update(from: prefix.advanced(by: frame * channels), count: channels)
+        guard frame < loopHeadFramesForVisit else { return }
+        let t = Float(frame + 1) / Float(loopHeadFramesForVisit)
+        let weight = t * t * (3 - 2 * t)
+        for channel in 0..<channels where discontinuousChannels & (UInt8(1) << channel) != 0 {
+            let tail = loopTail[channel]
+            output[channel] = (1 - weight) * tail + weight * output[channel]
+        }
+    }
+
     fileprivate func copyFrame(_ frame: Int64, into output: UnsafeMutablePointer<Float>) -> Bool {
         if frame < Int64(prefixCount.load(ordering: .relaxed)) {
-            output.update(from: prefix.advanced(by: Int(frame) * channels), count: channels)
+            copyPrefixFrame(Int(frame), into: output)
             return true
         }
         guard committedEpoch.load(ordering: .acquiring) == renderedEpoch,
@@ -244,7 +307,7 @@ public final class ContinuousPCMSource: @unchecked Sendable {
                                token: Int, visit: Int64) -> Bool {
         let prefixFrames = prefixCount.load(ordering: .relaxed)
         if frame < Int64(prefixFrames) {
-            output.update(from: prefix.advanced(by: Int(frame) * channels), count: channels)
+            copyPrefixFrame(Int(frame), into: output)
             return true
         }
         let epoch = committedEpoch.load(ordering: .acquiring)
@@ -396,6 +459,7 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
     #if DEBUG
     public init(sampleRate: Double = 48_000, channels: Int = 2,
                 prefixFrames: Int = 96_000, ringFrames: Int = 192_000,
+                smoothLoopJoins: Bool = false,
                 debugRenderAccounting: DebugRenderAccountingRecorder? = nil,
                 debugFirstFailure: DebugFirstFailureRecorder? = nil) {
         precondition(sampleRate.isFinite && sampleRate > 0 && (1...8).contains(channels))
@@ -404,21 +468,23 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
         self.debugFirstFailure = debugFirstFailure
         self.sampleRate = sampleRate; self.channels = channels
         retainedPCMMemoryBytes = 3 * (prefixFrames + ringFrames) * channels * MemoryLayout<Float>.stride
-        first = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
-        second = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
-        third = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
+        let head = smoothLoopJoins ? Int((min(sampleRate, 192_000) * 0.002).rounded()) : 0
+        first = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames, loopHeadFrames: head)
+        second = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames, loopHeadFrames: head)
+        third = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames, loopHeadFrames: head)
         speaker = SpeakerAudioProcessor(sampleRate: sampleRate, channels: channels, enabled: true)
     }
     #else
     public init(sampleRate: Double = 48_000, channels: Int = 2,
-                prefixFrames: Int = 96_000, ringFrames: Int = 192_000) {
+                prefixFrames: Int = 96_000, ringFrames: Int = 192_000, smoothLoopJoins: Bool = false) {
         precondition(sampleRate.isFinite && sampleRate > 0 && (1...8).contains(channels))
         precondition(prefixFrames > 0 && ringFrames > 0)
         self.sampleRate = sampleRate; self.channels = channels
         retainedPCMMemoryBytes = 3 * (prefixFrames + ringFrames) * channels * MemoryLayout<Float>.stride
-        first = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
-        second = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
-        third = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames)
+        let head = smoothLoopJoins ? Int((min(sampleRate, 192_000) * 0.002).rounded()) : 0
+        first = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames, loopHeadFrames: head)
+        second = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames, loopHeadFrames: head)
+        third = ContinuousPCMSource(channels: channels, prefixFrames: prefixFrames, ringFrames: ringFrames, loopHeadFrames: head)
         speaker = SpeakerAudioProcessor(sampleRate: sampleRate, channels: channels, enabled: true)
     }
     #endif
@@ -587,7 +653,7 @@ public final class ContinuousPCMRenderer: @unchecked Sendable {
                     let next = source.successor.load(ordering: .acquiring)
                     if next == activeToken {
                         cursor = 0; visit &+= 1; ended = false
-                        source.restart(token: next, frame: 0)
+                        source.restart(token: next, frame: 0, repeatingNaturally: true)
                         source.release()
                         continue
                     }

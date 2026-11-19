@@ -6,6 +6,55 @@ import Synchronization
 
 @MainActor
 final class ContinuousAudioPlayerTests: XCTestCase {
+    func testActualAudioGraphSmoothsOnlyTheHardLoopEdge() async throws {
+        let audio = ContinuousAudioPlayer()
+        addTeardownBlock { @MainActor in
+            audio.suspend()
+            audio.graph.engine.stop()
+            let closed = await withCheckedContinuation { continuation in
+                audio.debugShutdown { continuation.resume(returning: $0) }
+            }
+            XCTAssertTrue(closed)
+        }
+        let frames = 2048
+        var stereo = [Float]()
+        for i in 0..<frames {
+            stereo.append(i < frames / 2 ? -0.6 : 0.6)
+            stereo.append(0.125)
+        }
+        let renderer = audio.renderer
+        XCTAssertTrue(stereo.withUnsafeBufferPointer {
+            renderer.source(at: 0).prepare(token: 1, totalFrames: Int64(frames), prefix: $0)
+        })
+        renderer.setSuccessor(token: 1, for: 1)
+        renderer.select(token: 1)
+        renderer.setPlaying(true)
+        let graph = audio.graph
+        try graph.engine.enableManualRenderingMode(.offline, format: graph.format, maximumFrameCount: 257)
+        try graph.engine.start()
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: graph.format, frameCapacity: 257))
+        var left = [Float](), right = [Float]()
+        while left.count < frames * 3 {
+            let requested = AVAudioFrameCount(min(257, frames * 3 - left.count))
+            let result = try graph.engine.renderOffline(requested, to: buffer)
+            guard result == .success, buffer.frameLength == requested else {
+                XCTFail("The audio graph must render every requested frame")
+                return
+            }
+            let channels = try XCTUnwrap(buffer.floatChannelData)
+            left.append(contentsOf: UnsafeBufferPointer(start: channels[0], count: Int(requested)))
+            right.append(contentsOf: UnsafeBufferPointer(start: channels[1], count: Int(requested)))
+        }
+        for boundary in [frames, 2 * frames] {
+            let jump = (boundary..<(boundary + 128)).map { abs(left[$0] - left[$0 - 1]) }.max()!
+            XCTAssertLessThan(jump, 0.04)
+            XCTAssertEqual(left[boundary + 128], left[128], accuracy: 0.00001)
+        }
+        XCTAssertEqual(left[128], -0.6, accuracy: 0.00001)
+        XCTAssertTrue(right.allSatisfy { abs($0 - 0.125) < 0.00001 })
+        XCTAssertEqual(renderer.snapshot.underrunFrames, 0)
+    }
+
     func testPresentationClockBoundaryContainsHeldGraphCallAndPendingReentry() async throws {
         #if DEBUG
         try await withManualAnchorControl("CAP-clock-boundary") { audio, sample in
