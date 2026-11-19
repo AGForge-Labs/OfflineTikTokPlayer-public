@@ -114,6 +114,21 @@ final class VideoPresentationContinuityTests: XCTestCase {
         #endif
     }
 
+    func testLateVideoPreparationStartsPacingOnlyAfterTheSourceIsKnown() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-motion-1080", withExtension: "mp4"))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let fixture = PresentedVideo(url: url, scene: scene)
+        let bridge = fixture.bridge, item = fixture.item, player = fixture.player
+        defer { fixture.close() }
+        let ticket = try XCTUnwrap(bridge.setCurrentItem(item))
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0, durationSeconds: 6, isPlaying: true))
+        XCTAssertTrue(bridge.activate(ticket))
+        XCTAssertFalse(bridge.isFrameFeedRunning, "A default-rate timer must not win the race against source preparation")
+        player.playImmediately(atRate: 1)
+        let ready = await until { bridge.isFrameFeedRunning && bridge.submittedFrameCount >= 4 }
+        XCTAssertTrue(ready, "Late source installation must start the actual frame feed")
+    }
+
     func testRunningDisplayLinkOwnsVideoPullsDuringProgressAndPresentationUpdates() async throws {
         let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080")
         defer { fixture.close() }
@@ -444,7 +459,7 @@ private final class PresentedVideo {
     private var resource: ContinuousPictureInPicture.PreparedVideoResource?
     var usedNativeGeometry: Bool { resource?.debugUsesNativeGeometry ?? false }
 
-    private init(url: URL, scene: UIWindowScene) {
+    fileprivate init(url: URL, scene: UIWindowScene) {
         self.url = url
         item = AVPlayerItem(url: url)
         player = AVPlayer(playerItem: item)
