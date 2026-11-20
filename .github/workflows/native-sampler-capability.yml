@@ -1,0 +1,41 @@
+name: Public native sampler capability
+on:
+  push:
+    branches: [diagnostic/native-sampler-capability]
+    paths: ['.github/workflows/native-sampler-capability.yml']
+permissions: {}
+jobs:
+  documentation:
+    if: ${{ github.repository == 'AGForge-Labs/OfflineTikTokPlayer-public' && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 3
+    steps:
+      - name: Read installed sampler documentation only
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          # No checkout, target PID, application, media, credentials or profile.
+          # This diagnostic cannot establish playback acceptance.
+          environment = dict(os.environ, PAGER='cat', MANPAGER='cat', MANWIDTH='100')
+          available = False
+          for command in (['/usr/bin/sample', '-h'], ['/usr/bin/man', 'sample']):
+              try:
+                  result = subprocess.run(command, capture_output=True, timeout=10, env=environment)
+                  data = result.stdout + result.stderr
+                  if len(data) > 32_768:
+                      raise RuntimeError('Installed tool documentation exceeded its output bound')
+                  text = re.sub(r'.\x08', '', data.decode('utf-8', errors='replace'))
+                  print('SamplerDocumentation command=' + command[0] + ' returnCode=' + str(result.returncode)
+                        + ' bytes=' + str(len(data)), flush=True)
+                  print(text, flush=True)
+                  useful = ('usage:' in text.lower() and 'sample' in text.lower()) or (
+                      result.returncode == 0 and 'SAMPLE' in text and 'NAME' in text)
+                  available = available or useful
+              except subprocess.TimeoutExpired:
+                  print('SamplerDocumentation command=' + command[0] + ' status=timeout', flush=True)
+          sys.exit(0 if available else 1)
+          PY

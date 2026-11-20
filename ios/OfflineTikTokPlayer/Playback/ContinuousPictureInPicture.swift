@@ -29,6 +29,7 @@ final class ContinuousPictureInPicture: NSObject {
     let displayLayer = AVSampleBufferDisplayLayer()
     private(set) var controller: AVPictureInPictureController?
     private(set) var submittedFrameCount: UInt64 = 0
+    private(set) var frameEpoch: UInt64 = 0
     private(set) var lastFramePositionSeconds: Double?
     private(set) var lastCopiedFramePositionSeconds: Double?
     private(set) var pausedFutureFrameRejectionCount: UInt64 = 0
@@ -74,6 +75,16 @@ final class ContinuousPictureInPicture: NSObject {
         return seconds.isFinite ? seconds : nil
     }
 
+    /// Only a submitted, display-ready frame owned by this item and epoch can
+    /// justify preserving presentation. Copy attempts and lifetime counts cannot.
+    func currentSubmittedPresentation(for item: AVPlayerItem) -> (frame: Double, timebase: Double)? {
+        guard !invalidated, currentItem === item, frameFeedEnabled,
+              playbackState.read().isPlaying, activeSeekTicket == nil,
+              displayLayer.status != .failed, displayLayer.isReadyForDisplay,
+              let frame = lastFramePositionSeconds, let timebase = timebasePositionSeconds else { return nil }
+        return (frame, timebase)
+    }
+
     override init() {
         super.init()
         displayLayer.videoGravity = .resizeAspect
@@ -108,16 +119,18 @@ final class ContinuousPictureInPicture: NSObject {
         ]
     }
 
-    /// Exactly one item output is attached at a time; this never prepares additional video items.
+    /// Prepared outputs belong to the existing bounded item window. Only the
+    /// selected output is pulled; no frame history or extra player is created.
     func setCurrentItem(_ item: AVPlayerItem?) {
         guard !invalidated, currentItem !== item else { return }
         preparationTask?.cancel()
         preparationTask = nil
         stopFrameTimer()
         itemGeneration &+= 1
+        frameEpoch &+= 1
         activeSeekTicket = nil
         let generation = itemGeneration
-        if let videoOutput { currentItem?.remove(videoOutput) }
+        if let videoOutput, !(videoOutput is PreparedVideoOutput) { currentItem?.remove(videoOutput) }
         restoreOriginalComposition()
         currentItem = item
         videoOutput = nil
@@ -130,17 +143,23 @@ final class ContinuousPictureInPicture: NSObject {
         lastCopiedFramePositionSeconds = nil
         guard let item else { stopFrameTimer(); return }
         originalComposition = item.videoComposition
+        if let prepared = item.outputs.first(where: { $0 is PreparedVideoOutput }) as? AVPlayerItemVideoOutput {
+            orientationPrepared = true
+            useOutput(prepared)
+            onEvent?(.sourcePrepared, nil)
+            return
+        }
         let existingComposition = item.videoComposition
         preparationTask = Task { [weak self, weak item] in
             guard let item else { return }
             do {
-                let composition: AVVideoComposition
+                let composition: AVVideoComposition?
                 if let existingComposition { composition = existingComposition }
-                else { composition = try await Self.makeVideoComposition(for: item.asset) }
+                else { composition = try await Self.videoCompositionIfNeeded(for: item.asset) }
                 try Task.checkCancellation()
                 guard let self, !self.invalidated, self.itemGeneration == generation,
                       self.currentItem === item else { return }
-                if existingComposition == nil {
+                if existingComposition == nil, let composition {
                     item.videoComposition = composition
                     self.installedComposition = composition
                 }
@@ -163,9 +182,59 @@ final class ContinuousPictureInPicture: NSObject {
         // The AVPlayer can continue to render its ordinary inline layer underneath this layer.
         output.suppressesPlayerRendering = false
         item.add(output)
+        useOutput(output)
+    }
+
+    private func useOutput(_ output: AVPlayerItemVideoOutput) {
         videoOutput = output
         renderFrame()
         if frameFeedEnabled && playbackState.read().isPlaying { startFrameTimer() }
+    }
+
+    /// Call only after this item's geometry is prepared and before it enters
+    /// AVQueuePlayer. Item ownership bounds lifetime to the existing buffer.
+    @discardableResult
+    static func prepareVideoOutput(for item: AVPlayerItem) -> AVPlayerItemVideoOutput {
+        if let existing = preparedVideoOutput(for: item) { return existing }
+        let output = PreparedVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ])
+        output.suppressesPlayerRendering = false
+        item.add(output)
+        return output
+    }
+
+    static func preparedVideoOutput(for item: AVPlayerItem) -> AVPlayerItemVideoOutput? {
+        item.outputs.first(where: { $0 is PreparedVideoOutput }) as? AVPlayerItemVideoOutput
+    }
+
+    private final class PreparedVideoOutput: AVPlayerItemVideoOutput {}
+
+    /// Avoid inserting a compositor when decoded pixels already have ordinary
+    /// presentation geometry. Conservatively normalize rotation, mirroring,
+    /// aperture changes and non-square pixels through the existing path.
+    static func videoCompositionIfNeeded(for asset: AVAsset) async throws -> AVVideoComposition? {
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw NSError(domain: AVFoundationErrorDomain, code: -1)
+        }
+        let transform = try await track.load(.preferredTransform)
+        if transform.isIdentity {
+            let size = try await track.load(.naturalSize)
+            let descriptions = try await track.load(.formatDescriptions)
+            let ordinary = !descriptions.isEmpty && descriptions.allSatisfy { description in
+                let coded = CMVideoFormatDescriptionGetDimensions(description)
+                let dimensions = CGSize(width: CGFloat(coded.width), height: CGFloat(coded.height))
+                let presented = CMVideoFormatDescriptionGetPresentationDimensions(description,
+                    usePixelAspectRatio: true, useCleanAperture: true)
+                let aperture = CMVideoFormatDescriptionGetCleanAperture(description, originIsAtTopLeft: true)
+                return coded.width > 0 && coded.height > 0 && size == dimensions && presented == dimensions
+                    && aperture == CGRect(origin: .zero, size: dimensions)
+            }
+            try Task.checkCancellation()
+            if ordinary { return nil }
+        }
+        return try await makeVideoComposition(for: asset)
     }
 
     /// Normalize the preferred source transform into actual output pixels. A layer-only transform
@@ -233,6 +302,7 @@ final class ContinuousPictureInPicture: NSObject {
 
     /// A seek starts a new frame epoch, including the image held by a paused timebase.
     func flushForSeek() {
+        frameEpoch &+= 1
         displayLayer.flushAndRemoveImage()
         lastEnqueuedTime = .invalid
         lastFramePositionSeconds = nil
@@ -271,6 +341,9 @@ final class ContinuousPictureInPicture: NSObject {
     func invalidate() {
         guard !invalidated else { return }
         invalidated = true
+        frameEpoch &+= 1
+        lastFramePositionSeconds = nil
+        lastCopiedFramePositionSeconds = nil
         activeSeekTicket = nil
         preparationTask?.cancel()
         preparationTask = nil
@@ -321,6 +394,9 @@ final class ContinuousPictureInPicture: NSObject {
                 onEvent?(.frameFailed, (displayLayer.error as NSError?)?.code)
                 hasReportedFrameFailure = true
             }
+            frameEpoch &+= 1
+            lastFramePositionSeconds = nil
+            lastCopiedFramePositionSeconds = nil
             displayLayer.flushAndRemoveImage()
             lastEnqueuedTime = .invalid
         }

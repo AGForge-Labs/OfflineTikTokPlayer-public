@@ -4,6 +4,42 @@ import AVFoundation
 /// The second item is prepared while the current item plays, never after a swipe.
 @MainActor
 final class PlaybackBuffer {
+    enum NativePauseOwner: Int, Sendable { case service = 1, buffer = 2 }
+    enum NativePauseReason: Int, Sendable {
+        case queueAdvanceMismatch = 1, pauseRequested = 2, scrollQueueExhausted = 3, coldReplacement = 4
+        case engineRestartFailed = 5, audioSessionActivationFailed = 6, foregroundInterrupted = 7
+        case interruptionBegan = 8, presentationVideoDisabled = 9
+        case recoverMissingCurrent = 101, previousAdoption = 102
+    }
+    struct NativePauseEvent: Sendable {
+        let owner: NativePauseOwner
+        let reason: NativePauseReason
+        // Each owner has its own command namespace. Once saturated, this is no
+        // longer a unique command ID; the explicit flag preserves that limit.
+        let commandID: UInt64
+        let commandIDSaturated: Bool
+        let entryUptime: Double
+        let returnUptime: Double
+        // Buffer callbacks cannot learn service identity before the native call.
+        let entryGeneration: Int?
+    }
+    enum DiagnosticAction: Int, Sendable {
+        case offscreenSeekBegin = 0, offscreenSeekNativeCompletion = 1, offscreenSeekObserved = 2
+        case cancelPendingSeeks = 3, previousAdoptionBegin = 4, previousAdoptionObserved = 5
+    }
+    enum DiagnosticReason: Int, Sendable {
+        case none = 0, retainPrevious = 1, replace = 2, discardPrevious = 3, stagePrevious = 4
+    }
+    struct DiagnosticEvent: Sendable {
+        let action: DiagnosticAction
+        let reason: DiagnosticReason
+        let operationID: UInt64
+        // Native completion time can precede MainActor delivery. Identity is
+        // measured only at actor observation, never on the native callback.
+        let actionUptime: Double
+        let targetIsCurrent: Bool?
+        let finished: Bool?
+    }
     struct Prepared {
         let mediaID: String
         let item: AVPlayerItem
@@ -17,6 +53,13 @@ final class PlaybackBuffer {
     private var active: Prepared?
     private var previous: Prepared?
     private var observation: NSKeyValueObservation?
+    var onDiagnosticEvent: ((DiagnosticEvent) -> Void)?
+    private var diagnosticOperationID: UInt64 = 0
+    #if DEBUG
+    var debugNativePlayerTraceEnabled = false
+    var onNativePauseDiagnostic: ((NativePauseEvent) -> Void)?
+    private(set) var debugNativePlayerPauseCount: UInt64 = 0
+    #endif
     var didAdvance: ((Prepared) -> Void)?
     var automaticAdvancementEnabled = true { didSet { updateEndAction() } }
     var usesExternalClock = false { didSet { updateEndAction() } }
@@ -53,7 +96,7 @@ final class PlaybackBuffer {
 
     private func retainPrevious(before prepared: Prepared) {
         if let active, active.mediaID != prepared.mediaID {
-            previous?.item.cancelPendingSeeks()
+            cancelPreviousSeeks(reason: .retainPrevious)
             previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal, needsRewind: true)
         }
     }
@@ -62,15 +105,77 @@ final class PlaybackBuffer {
         guard let previous, previous.needsRewind, previous.item.status == .readyToPlay,
               previous.item !== player.currentItem else { return }
         let item = previous.item
+        let operationID = beginDiagnostic(.offscreenSeekBegin, targetIsCurrent: false)
         // Rewind off-screen, not on the Previous button's critical path. Weak
         // captures and cancellation on eviction bound preparation to one item.
         item.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
-            Task { @MainActor in
-                guard let self, let item, finished, self.previous?.item === item,
-                      self.player.currentItem !== item, abs(item.currentTime().seconds) < 0.005 else { return }
+            let nativeCompletionUptime = operationID.map { _ in ProcessInfo.processInfo.systemUptime }
+            Task { @MainActor [weak self, weak item] in
+                guard let self else { return }
+                self.recordDiagnostic(.offscreenSeekNativeCompletion, operationID: operationID,
+                    actionUptime: nativeCompletionUptime, finished: finished)
+                guard let item else { return }
+                var observedCurrent: Bool?
+                if operationID != nil, self.onDiagnosticEvent != nil {
+                    observedCurrent = self.player.currentItem === item
+                    self.recordDiagnostic(.offscreenSeekObserved, operationID: operationID,
+                        targetIsCurrent: observedCurrent, finished: finished)
+                }
+                guard finished, self.previous?.item === item else { return }
+                // Reuse the optional diagnostic identity read; with observation
+                // disabled this keeps the original short-circuited native reads.
+                guard !(observedCurrent ?? (self.player.currentItem === item)),
+                      abs(item.currentTime().seconds) < 0.005 else { return }
                 self.previous?.needsRewind = false
             }
         }
+    }
+
+    /// IDs identify commands, not items. A cancellation has its own ID because
+    /// it can affect multiple pending rewind IDs; their completions stay paired.
+    private func beginDiagnostic(_ action: DiagnosticAction, reason: DiagnosticReason = .none,
+                                 targetIsCurrent: Bool?) -> UInt64? {
+        guard onDiagnosticEvent != nil else { return nil }
+        diagnosticOperationID &+= 1
+        let operationID = diagnosticOperationID
+        recordDiagnostic(action, operationID: operationID, reason: reason, targetIsCurrent: targetIsCurrent)
+        return operationID
+    }
+
+    private func recordDiagnostic(_ action: DiagnosticAction, operationID: UInt64?,
+                                  reason: DiagnosticReason = .none, actionUptime: Double? = nil,
+                                  targetIsCurrent: Bool? = nil, finished: Bool? = nil) {
+        guard let operationID, let observer = onDiagnosticEvent else { return }
+        observer(DiagnosticEvent(action: action, reason: reason, operationID: operationID,
+            actionUptime: actionUptime ?? ProcessInfo.processInfo.systemUptime,
+            targetIsCurrent: targetIsCurrent, finished: finished))
+    }
+
+    private func cancelPreviousSeeks(reason: DiagnosticReason) {
+        guard let item = previous?.item else { return }
+        if onDiagnosticEvent != nil {
+            _ = beginDiagnostic(.cancelPendingSeeks, reason: reason, targetIsCurrent: player.currentItem === item)
+        }
+        item.cancelPendingSeeks()
+    }
+
+    private func pauseNativePlayer(reason: NativePauseReason) {
+        #if DEBUG
+        if debugNativePlayerTraceEnabled, let observer = onNativePauseDiagnostic {
+            let increment = debugNativePlayerPauseCount.addingReportingOverflow(1)
+            debugNativePlayerPauseCount = increment.overflow ? .max : increment.partialValue
+            let commandID = debugNativePlayerPauseCount
+            let entry = ProcessInfo.processInfo.systemUptime
+            player.pause()
+            let returned = ProcessInfo.processInfo.systemUptime
+            // Publish only after the real call. The interval includes existing
+            // synchronous callbacks/descheduling, not just SDK execution time.
+            observer(NativePauseEvent(owner: .buffer, reason: reason, commandID: commandID,
+                commandIDSaturated: increment.overflow, entryUptime: entry, returnUptime: returned, entryGeneration: nil))
+            return
+        }
+        #endif
+        player.pause()
     }
 
     /// KVO may be delivered after a swipe. Always reconcile actual object identity.
@@ -91,7 +196,7 @@ final class PlaybackBuffer {
             prepared = Prepared(mediaID: last.mediaID, item: last.item, isLocal: last.isLocal,
                                 needsRewind: repeating, reachedEnd: !repeating)
             next = nil
-            player.pause()
+            pauseNativePlayer(reason: .recoverMissingCurrent)
             player.insert(last.item, after: nil)
         } else { return }
         active = prepared; loopReserve = nil; updateEndAction()
@@ -101,7 +206,7 @@ final class PlaybackBuffer {
 
     func replace(with item: AVPlayerItem?, mediaID: String? = nil, isLocal: Bool = true) {
         if let active, active.item !== item {
-            previous?.item.cancelPendingSeeks()
+            cancelPreviousSeeks(reason: .replace)
             previous = Prepared(mediaID: active.mediaID, item: active.item, isLocal: active.isLocal, needsRewind: true)
         }
         active = item.flatMap { item in mediaID.map { Prepared(mediaID: $0, item: item, isLocal: isLocal) } }
@@ -118,10 +223,10 @@ final class PlaybackBuffer {
         updateEndAction()
     }
 
-    func discardPrevious() { previous?.item.cancelPendingSeeks(); previous = nil }
+    func discardPrevious() { cancelPreviousSeeks(reason: .discardPrevious); previous = nil }
     func stagePrevious(_ prepared: Prepared) {
         guard previous?.mediaID != prepared.mediaID else { return }
-        previous?.item.cancelPendingSeeks()
+        cancelPreviousSeeks(reason: .stagePrevious)
         previous = prepared
     }
 
@@ -155,9 +260,15 @@ final class PlaybackBuffer {
     func advance(to mediaID: String, allowRemote: Bool = true) -> Prepared? {
         if !hasPrepared(mediaID), let prepared = previous, prepared.mediaID == mediaID, prepared.item.status != .failed,
            prepared.isLocal || allowRemote {
-            player.pause()
+            let operationID = onDiagnosticEvent == nil ? nil
+                : beginDiagnostic(.previousAdoptionBegin, targetIsCurrent: player.currentItem === prepared.item)
+            pauseNativePlayer(reason: .previousAdoption)
             previous = nil
             replace(with: prepared.item, mediaID: mediaID, isLocal: prepared.isLocal)
+            if operationID != nil, onDiagnosticEvent != nil {
+                recordDiagnostic(.previousAdoptionObserved, operationID: operationID,
+                    targetIsCurrent: player.currentItem === prepared.item)
+            }
             return prepared
         }
         guard let prepared = next, prepared.mediaID == mediaID, prepared.item.status != .failed,
