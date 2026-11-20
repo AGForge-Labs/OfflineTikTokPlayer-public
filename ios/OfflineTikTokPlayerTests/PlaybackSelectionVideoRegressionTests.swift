@@ -7057,7 +7057,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let screen = try SelectionVideoScreen(service: service)
         defer { service.pause(); screen.close() }
 
-        service.restore()
+        #if DEBUG
+        service.debugRestorePausedBookmark()
+        #else
+        throw XCTSkip("The paused-seek fixture requires a Debug test host.")
+        #endif
         try await require({ !service.isLoading && abs(service.player.currentTime().seconds - 0.4) < 0.04 },
                           "The real Saved B item must finish restoring to 0.4 seconds")
         assertSelection(service, fixture: fixture, id: fixture.bID)
@@ -9103,7 +9107,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             blockedAtStart = service?.videoFrameAcquisitionBlockedCount
         }
 
-        service.restore()
+        #if DEBUG
+        service.debugRestorePausedBookmark()
+        #else
+        throw XCTSkip("The paused-seek fixture requires a Debug test host.")
+        #endif
         try await require({ scheduler.isHoldingCompletion && scheduler.nativeFinished == true
             && abs(service.player.currentTime().seconds - 0.4) < 0.04 },
                           "The real AVPlayer seek must finish while its service callback remains held")

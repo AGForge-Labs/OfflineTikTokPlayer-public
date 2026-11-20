@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import PlayerCore
 import Synchronization
 @testable import OfflineTikTokPlayer
 
@@ -45,19 +46,21 @@ final class AudioOnlyContinuityTests: XCTestCase {
         XCTAssertEqual(service.queue.currentID, fixture.bID)
         service.pause()
         try await until(service: service, audio: audio, stage: "persist-pause-engine") { !service.audioEngineRunning }
-        service.persist()
         let position = service.clock.position
-        // Simulate a relaunch by closing the original owner before restoring.
-        // Keep its fixture files until the restored owner has also finished.
+        // A test-owned bookmark exercises paused PCM setup without making the app resume a prior session.
+        try AppFiles.save(PlaybackBookmark(queue: service.queue, position: position), to: fixture.bookmark)
         try await fixture.closePlayback(service)
         let restoredAudio = ContinuousAudioPlayer()
         let restored = makeService(audio: restoredAudio)
         XCTAssertTrue(restored.isAudioOnly)
         XCTAssertTrue(restored.surface.isHidden)
+        XCTAssertNil(restored.queue.currentID, "The audio-only preference outlives the selected clip.")
         #if DEBUG
         restored.debugInitialLoadPhaseEnabled = true
+        restored.debugRestorePausedBookmark()
+        #else
+        throw XCTSkip("The paused-seek fixture requires a Debug test host.")
         #endif
-        restored.restore()
         // Paused restoration publishes ownership/position without starting the
         // engine merely to consume a command. The fresh render cursor stays zero.
         try await until(service: restored, audio: restoredAudio, stage: "restore-paused-ownership") { restoredAudio.selectedID == fixture.bID && restoredAudio.entry(for: fixture.bID) != nil }
