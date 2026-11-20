@@ -27,6 +27,13 @@ final class ContinuousAudioPlayer {
     }
     deinit { decoder.shutdown(); graph.engine.stop() }
     var isSelected: Bool { selectedID != nil }
+
+    #if DEBUG
+    func debugShutdown(_ completion: @escaping @Sendable (Bool) -> Void) {
+        decoder.shutdown()
+        decoder.debugAfterShutdown(completion)
+    }
+    #endif
     var preparedCount: Int { entries.count }
     var snapshot: ContinuousPCMRenderer.Snapshot { renderer.snapshot }
     var currentEntry: Entry? { entries.values.first { $0.token == renderer.snapshot.token } }

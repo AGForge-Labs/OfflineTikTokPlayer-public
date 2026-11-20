@@ -190,6 +190,14 @@ final class ContinuousPCMDecoder: @unchecked Sendable {
         }
     }
 
+    #if DEBUG
+    /// Observe queued shutdown completion without deleting a fixture under an
+    /// outstanding native read. This does not prove SDK-internal quiescence.
+    func debugAfterShutdown(_ completion: @escaping @Sendable (Bool) -> Void) {
+        worker.async { [self] in completion(stopped) }
+    }
+    #endif
+
     private func pump() {
         guard !stopped else { return }
         autoreleasepool {
