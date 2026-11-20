@@ -51,6 +51,66 @@ final class NativeMediaTests: XCTestCase {
         }
     }
 
+    func testOffscreenRewindCompletesForItsPromotedQueueEntryOnly() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
+        for (promoteImmediately, restageDuringCompletion) in [(true, false), (false, false), (false, true)] {
+            let buffer = PlaybackBuffer(), a = AVPlayerItem(url: url), b = AVPlayerItem(url: url)
+            buffer.usesExternalClock = true; buffer.automaticAdvancementEnabled = false
+            defer {
+                buffer.onDebugPreviousRewindDelivery = nil
+                buffer.onDebugPreviousRewindRead = nil; buffer.onDebugPreviousRewindCompletion = nil
+                buffer.player.pause(); buffer.replace(with: nil); buffer.discardPrevious()
+            }
+            XCTAssertTrue(buffer.replace(with: a, mediaID: "A"))
+            buffer.player.playImmediately(atRate: 1)
+            let readyDeadline = Date().addingTimeInterval(5)
+            while a.currentTime().seconds < 0.1, Date() < readyDeadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertGreaterThanOrEqual(a.currentTime().seconds, 0.1)
+            buffer.player.pause()
+            XCTAssertTrue(buffer.stage(.init(mediaID: "B", item: b, isLocal: true), after: "A"))
+            XCTAssertNotNil(buffer.advance(to: "B"))
+            let issued = buffer.debugPreviousRevision
+            @MainActor func promote() {
+                XCTAssertTrue(buffer.promotePreviousToNext(mediaID: "A", after: "B"))
+                XCTAssertNil(buffer.previousMediaID)
+            }
+            if promoteImmediately {
+                // The repeat-one navigation path can race the actual native seek.
+                promote()
+            } else {
+                // Deliver the real successful seek after its item has transferred, independent of SDK timing.
+                buffer.onDebugPreviousRewindDelivery = { if $0 == issued { promote() } }
+            }
+            var result: (finished: Bool, credited: Bool)?
+            buffer.onDebugPreviousRewindCompletion = { revision, finished, credited in
+                if revision == issued { result = (finished, credited) }
+            }
+            var restaged = false
+            if restageDuringCompletion {
+                buffer.onDebugPreviousRewindRead = {
+                    buffer.onDebugPreviousRewindRead = nil
+                    buffer.discardNext()
+                    restaged = buffer.stage(.init(mediaID: "A", item: a, isLocal: true, needsRewind: true), after: "B")
+                }
+            }
+            let rewindDeadline = Date().addingTimeInterval(5)
+            while result == nil, Date() < rewindDeadline { try await Task.sleep(for: .milliseconds(10)) }
+            let completion = try XCTUnwrap(result)
+            if !promoteImmediately { XCTAssertTrue(completion.finished, "The native offscreen seek must really finish") }
+            XCTAssertEqual(restaged, restageDuringCompletion)
+            let atZero = abs(a.currentTime().seconds) < 0.005
+            if !promoteImmediately && !restageDuringCompletion { XCTAssertTrue(atZero) }
+            let ownsZero = !restageDuringCompletion && completion.finished && atZero
+            XCTAssertEqual(completion.credited, ownsZero)
+            XCTAssertTrue(buffer.player.currentItem === b)
+            let adopted = try XCTUnwrap(buffer.advance(to: "A"))
+            XCTAssertTrue(adopted.item === a)
+            XCTAssertEqual(adopted.needsRewind, !ownsZero)
+            XCTAssertEqual(adopted.completedPreviousZeroRewind, ownsZero)
+            XCTAssertLessThanOrEqual(buffer.retainedItemCount, 2)
+        }
+    }
+
     func testOldNativeRewindCompletionCannotCreditSameItemNewRetainedVisit() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-video", withExtension: "mp4"))
         let buffer = PlaybackBuffer(), a = AVPlayerItem(url: url), b = AVPlayerItem(url: url)

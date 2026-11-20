@@ -11,7 +11,6 @@ struct OfflineTikTokPlayerApp: App {
         WindowGroup {
             RootView().environment(model).preferredColorScheme(.dark)
                 .tint(.cyan)
-                .task { model.playback.restore() }
                 .task(id: scenePhase == .active && model.network.isConnected) {
                     guard scenePhase == .active, model.network.isConnected, model.account.hasSavedConnection else { return }
                     await model.library.refresh(silently: true)
@@ -19,7 +18,6 @@ struct OfflineTikTokPlayerApp: App {
                 .onOpenURL { url in _ = MSALPublicClientApplication.handleMSALResponse(url, sourceApplication: nil) }
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .active { model.playback.enteredForeground() }
-                    else { model.playback.persist() }
                 }
         }
     }
