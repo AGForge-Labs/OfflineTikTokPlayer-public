@@ -10,6 +10,48 @@ import UIKit
 
 @MainActor
 final class ContinuousPictureInPictureTests: XCTestCase {
+    func testSwitchingFrameRatesRequestsAdaptiveTimingForEachSelectedClip() async throws {
+        let bridge = ContinuousPictureInPicture()
+        defer { bridge.invalidate() }
+        // Durations are in 600ths of a second. Include a variable-rate clip
+        // with one 120 fps interval, then switch back to a 25 fps clip.
+        let intervals: [[Int64]] = [[25, 25, 25, 25], [24, 24, 24, 24], [20, 20, 20, 20],
+                                    [12, 12, 12, 12], [10, 10, 10, 10], [5, 5, 5, 5],
+                                    [20, 20, 5, 35, 20], [24, 24, 24, 24]]
+        for durations in intervals {
+            var tick: Int64 = 0
+            let times = durations.map { duration in
+                defer { tick += duration }
+                return CMTime(value: tick, timescale: 600)
+            }
+            let end = CMTime(value: tick, timescale: 600)
+            let url = try await makeAsymmetricVideo(transform: .identity, frameCount: times.count,
+                                                    presentationTimes: times, endTime: end)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let asset = AVURLAsset(url: url)
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            let track = try XCTUnwrap(tracks.first)
+            let nominal = try await track.load(.nominalFrameRate)
+            XCTAssertGreaterThan(nominal, 0)
+            let item = AVPlayerItem(asset: asset)
+            let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+            let resource = try XCTUnwrap(plan.install())
+            defer { bridge.setCurrentItem(nil); resource.retire() }
+            let ticket = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+            XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0, durationSeconds: end.seconds, isPlaying: true))
+            XCTAssertTrue(bridge.activate(ticket))
+            // Inspect the installed UIKit link in the test build so the shipping
+            // video renderer can be byte-compared with the previous release.
+            let link = try XCTUnwrap(Mirror(reflecting: bridge).descendant("displayLink", "some") as? CADisplayLink)
+            let range = link.preferredFrameRateRange
+            let target = min(120, max(60, nominal))
+            XCTAssertEqual(range.minimum, min(nominal, target), accuracy: 0.1, "Wrong minimum for \(durations)")
+            XCTAssertEqual(range.maximum, target, accuracy: 0.1, "Wrong ceiling for \(durations)")
+            XCTAssertEqual(range.preferred, target, accuracy: 0.1)
+            print("ADAPTIVE_VIDEO nominal=\(nominal) min=\(range.minimum) max=\(range.maximum) preferred=\(range.preferred)")
+        }
+    }
+
     func testPausedPCMFrameTimelineMatchesTheNativeVideoSeekGrid() throws {
         let bridge = ContinuousPictureInPicture()
         defer { bridge.invalidate() }
