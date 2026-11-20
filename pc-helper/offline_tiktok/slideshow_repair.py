@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+from time import sleep
 from urllib.parse import quote, urlparse
 import zipfile
 
@@ -189,6 +190,16 @@ class SlideshowRepair:
             row["audioLoudness"] = entry["audioLoudness"]
         return True
 
+    def _confirm_upload(self, ref, path):
+        # OneDrive can acknowledge a content upload before its read replica
+        # returns the matching hash. Re-read the same immutable item ID.
+        for delay in (0, 1, 3, 8):
+            if delay:
+                sleep(delay)
+            if self.graph.verify_file(ref, path):
+                return True
+        return False
+
     def _upload(self, pending, drive, root):
         folder = None
         for item_id, entry in pending.items():
@@ -197,14 +208,14 @@ class SlideshowRepair:
                 raise ValueError("Prepared photo rendition changed")
             if entry.get("uploaded"):
                 ref = AssetRef.decode(entry["uploaded"])
-                if ref.drive_id == drive and self.graph.verify_file(ref, path):
+                if ref.drive_id == drive and self._confirm_upload(ref, path):
                     continue
             folder = folder or self.graph.folder("media", drive, root)
             ref = self.graph.upload_file(path, entry["sha256"] + ".mp4", drive, folder)
             ref.validate()
             if (ref.drive_id != drive or ref.sha256 != entry["sha256"] or ref.byte_size != entry["byteSize"]
                     or ref.item_id in (entry["oldAsset"]["itemId"], entry["original"]["itemId"])
-                    or not self.graph.verify_file(ref, path)):
+                    or not self._confirm_upload(ref, path)):
                 raise ValueError("Replacement photo upload failed verification")
             entry["uploaded"] = ref.wire()
             self._save()

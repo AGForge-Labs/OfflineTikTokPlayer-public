@@ -150,3 +150,29 @@ def test_archive_rejects_missing_or_duplicate_originals(tmp_path):
         archive.writestr("image-000002.png", b"gap")
     with zipfile.ZipFile(path) as archive, pytest.raises(ValueError, match="order"):
         archive_images(archive)
+
+
+def test_delayed_onedrive_metadata_rechecks_the_same_upload(tmp_path, monkeypatch):
+    from offline_tiktok import slideshow_repair
+    store = LibraryStore(tmp_path / "library.sqlite")
+    graph = PrivateDrive(b"{}")
+    checks = []
+    pauses = []
+    original_check = graph.verify_file
+    def verify(asset, path):
+        checks.append(asset.item_id)
+        return len(checks) >= 3 and original_check(asset, path)
+    monkeypatch.setattr(graph, "verify_file", verify)
+    monkeypatch.setattr(slideshow_repair, "sleep", pauses.append, raising=False)
+    source = tmp_path / "new.mp4"
+    source.write_bytes(b"synthetic corrected slideshow")
+    repair = slideshow_repair.SlideshowRepair(store, tmp_path, tmp_path / "repair", None, graph=graph)
+    entry = dict(playback=str(source), sha256=checksum(source), byteSize=source.stat().st_size,
+                 oldAsset={"itemId":"old"}, original={"itemId":"original"}, uploaded=None)
+    repair.entries["1"] = entry
+    try:
+        repair._upload(repair.entries, "drive", "root")
+        assert len(set(checks)) == 1 and len(checks) == 3 and len(pauses) == 2
+        assert graph.upload_count == 1 and entry["uploaded"]["sha256"] == checksum(source)
+    finally:
+        store.close()
