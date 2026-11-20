@@ -60,7 +60,8 @@ def test_unsupported_video_gets_a_compatible_copy_without_destroying_original(tm
     assert source.read_bytes() == before
 
 
-def test_slideshow_contains_all_images_and_entire_soundtrack(tmp_path):
+@pytest.mark.parametrize("sound_length,expected_length", [(2, 6.6), (9, 9)])
+def test_photo_carousel_timing_and_forward_wrap_are_independent_of_music(tmp_path, sound_length, expected_length):
     from PIL import Image
     images = []
     for index, color in enumerate(("red", "blue")):
@@ -68,17 +69,30 @@ def test_slideshow_contains_all_images_and_entire_soundtrack(tmp_path):
         Image.new("RGB", (160, 240), color).save(image)
         images.append(image)
     audio = tmp_path / "song.m4a"
-    run_ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac", audio)
+    run_ffmpeg("-f", "lavfi", "-i", f"sine=frequency=440:duration={sound_length}", "-c:a", "aac", audio)
     output = MediaTools().slideshow(images, audio, tmp_path / "slideshow.mp4")
     details = MediaTools().probe(output)
     assert details["video_codec"] == "h264"
-    assert details["audio_codec"] == "aac"
-    assert abs(details["duration"] - 2) < 0.15
-    for position, dominant in ((0.3, 0), (1.5, 2)):
-        pixel = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(position), "-i", str(output),
-                                "-frames:v", "1", "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-                               check=True, capture_output=True).stdout
-        assert pixel[dominant] > pixel[2 if dominant == 0 else 0] + 100
+    assert details["audio_codec"] in ("aac", "alac")
+    assert abs(details["duration"] - expected_length) < .09
+    frames = subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-vf", "scale=8:2",
+                             "-pix_fmt", "rgb24", "-f", "rawvideo", "-"], check=True, capture_output=True).stdout
+    def colors(seconds):
+        start = round(seconds * 30) * 48
+        row = frames[start:start + 24]
+        return tuple("R" if row[i] > row[i + 2] else "B" for i in (0, 21))
+    assert colors(2.4) == ("R", "R")
+    assert colors(2.8) == ("R", "B")
+    assert colors(3.4) == ("B", "B")
+    assert colors(5.7) == ("B", "B")
+    assert colors(6.1) == ("B", "R")
+    if sound_length == 9:
+        assert colors(7.8) == ("R", "R")
+    # A short soundtrack continues through the last photo's hold.
+    samples = subprocess.run(["ffmpeg", "-v", "error", "-ss", "5.4", "-i", str(output), "-t", "0.2",
+                              "-map", "0:a", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"],
+                             capture_output=True, check=True).stdout
+    assert len(samples) >= 3000 and any(samples)
 
 
 def test_silent_photo_post_has_a_bounded_playable_duration(tmp_path):
@@ -87,6 +101,34 @@ def test_silent_photo_post_has_a_bounded_playable_duration(tmp_path):
     Image.new("RGB", (160, 240), "red").save(image)
     output = MediaTools().slideshow([image], None, tmp_path / "silent.mp4")
     assert abs(MediaTools().probe(output)["duration"] - 5) < 0.15
+
+
+def test_native_photo_rendition_keeps_authored_video_packets_and_its_separate_soundtrack(tmp_path):
+    from PIL import Image
+    import zipfile
+    from offline_tiktok.photo import render_archive
+    native = tmp_path / "native.mp4"
+    audio = tmp_path / "audio.m4a"
+    run_ffmpeg("-f", "lavfi", "-i", "testsrc2=s=96x96:r=12:d=1.5", "-c:v", "libx264", native)
+    run_ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:duration=0.6", "-c:a", "aac", audio)
+    image = tmp_path / "frame.png"
+    Image.new("RGB", (32, 32), "red").save(image)
+    original = tmp_path / "photo.zip"
+    with zipfile.ZipFile(original, "w") as archive:
+        archive.write(image, "image-000000.png")
+        archive.write(image, "image-000001.png")
+        archive.write(native, "native-video.mp4")
+        archive.write(audio, "audio.m4a")
+    source_digest = hashlib.sha256(original.read_bytes()).hexdigest()
+    result = render_archive(MediaTools(), original, tmp_path / "play.mp4")
+    info = MediaTools().probe(result)
+    assert info["audio_codec"] and abs(info["duration"] - 1.5) < .08
+    def video_packets(path):
+        return subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_packets",
+                               "-show_data_hash", "sha256", "-show_entries", "packet=pts_time,duration_time,data_hash",
+                               "-of", "csv", str(path)], capture_output=True, check=True).stdout
+    assert video_packets(native) == video_packets(result)
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == source_digest
 
 
 def test_reserved_color_metadata_still_produces_artwork_without_changing_video(tmp_path):

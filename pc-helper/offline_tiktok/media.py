@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from fractions import Fraction
@@ -72,44 +72,8 @@ class MediaTools:
         return output
 
     def slideshow(self, images, audio, output):
-        from PIL import Image, ImageOps
-        images = [Path(image) for image in images]
-        if not images:
-            raise ValueError("Photo post contains no images")
-        output = Path(output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        frames = output.parent / "render-frames"
-        frames.mkdir(exist_ok=True)
-        dimensions = []
-        for source in images:
-            with Image.open(source) as image:
-                dimensions.append(ImageOps.exif_transpose(image).size)
-        width = max(w for w, h in dimensions)
-        height = max(h for w, h in dimensions)
-        width += width % 2
-        height += height % 2
-        duration = self.probe(audio)["duration"] if audio else 5.0 * len(images)
-        interval = duration / len(images)
-        entries = ["ffconcat version 1.0"]
-        for index, source in enumerate(images):
-            frame = frames / f"{index:06}.png"
-            with Image.open(source) as image:
-                image = ImageOps.exif_transpose(image).convert("RGB")
-                ImageOps.pad(image, (width, height), color="black", method=Image.Resampling.LANCZOS).save(frame)
-            # Relative filenames avoid quoting arbitrary user paths inside concat syntax.
-            entries += [f"file 'render-frames/{frame.name}'", f"duration {interval:.9f}"]
-        entries.append(f"file 'render-frames/{len(images)-1:06}.png'")
-        listing = output.parent / "frames.ffconcat"
-        listing.write_text("\n".join(entries) + "\n", encoding="utf-8")
-        args = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "1", "-i", str(listing)]
-        if audio:
-            args += ["-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", "-c:a",
-                     "copy" if self.probe(audio)["audio_codec"] in ("aac", "alac") else "alac"]
-        args += ["-t", f"{duration:.9f}", "-vf", "fps=30", "-c:v", "libx264", "-crf", "16", "-preset", "medium",
-                 "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
-        self._run(args)
-        self.probe(output)
-        return output
+        from .photo import render_carousel
+        return render_carousel(self, list(images), audio, output)
 
     def thumbnail(self, video, output):
         output = Path(output)
@@ -199,6 +163,10 @@ class MediaDownloader:
             item, Path(directory) / "source-quality-v1", cookies)
 
     def _photo(self, item, directory, cookies):
+        from .photo import NATIVE_MEMBER, cached_photo
+        original = directory / "original-photo.zip"
+        if original.is_file():
+            return original, cached_photo(self.tools, original)
         import gallery_dl.config
         from gallery_dl.job import DataJob
         import httpx
@@ -207,15 +175,31 @@ class MediaDownloader:
         job.run()
         if job.exception:
             raise RuntimeError("TikTok could not expose the photo post; check sign-in and retry") from job.exception
+        posts = [post for post in job.data_post if str(post.get("id")) == item.id]
+        if len(posts) != 1:
+            raise ValueError("TikTok did not identify the expected photo post")
+        post = posts[0]
+        linear = replace(item, kind="video", source_url=item.source_url.replace("/photo/", "/video/", 1))
+        if post.get("post_type") == "video" and not post.get("imagePost"):
+            native = self._video(linear, directory, cookies)
+            playback = self.tools.compatible(native)
+            item.kind, item.source_url = linear.kind, linear.source_url
+            return native, playback
         images, audio = [], None
+        expected = (post.get("imagePost") or {}).get("images", [])
         source_dir = directory / "source"
         source_dir.mkdir(exist_ok=True)
         with httpx.Client(follow_redirects=True, timeout=60) as client:
             for url, metadata in zip(job.data_urls, job.data_meta):
                 self._check()
                 kind = metadata.get("type")
-                if kind not in ("image", "audio"):
+                if str(metadata.get("id")) != item.id or kind not in ("image", "audio"):
                     continue
+                if kind == "image":
+                    index = len(images)
+                    if (index >= len(expected) or str(metadata.get("num")) != str(index + 1)
+                            or url not in expected[index].get("imageURL", {}).get("urlList", [])):
+                        raise ValueError("TikTok returned a different image order for this post")
                 extension = metadata.get("extension", "jpg" if kind == "image" else "mp3")
                 if not re.fullmatch(r"[a-zA-Z0-9]{1,8}", extension):
                     raise ValueError("Unsupported photo asset extension")
@@ -232,9 +216,28 @@ class MediaDownloader:
                     images.append(target)
                 else:
                     audio = target
-        playback = self.tools.slideshow(images, audio, directory / "slideshow.mp4")
-        original = directory / "original-photo.zip"
-        with zipfile.ZipFile(original, "w", compression=zipfile.ZIP_STORED) as archive:
+        if not images or len(images) != len(expected):
+            raise ValueError("TikTok returned an incomplete photo sequence")
+        if (post.get("music") or {}).get("playUrl") and audio is None:
+            raise ValueError("TikTok did not supply this photo post's soundtrack")
+        native = None
+        video = post.get("video") or {}
+        if ((video.get("playAddr") or video.get("downloadAddr")) and
+                all(isinstance(video.get(key), (int, float)) and video[key] > 0 for key in ("duration", "width", "height"))):
+            # Image posts normally have a zero-duration video placeholder.
+            # Accept a real rendition only through the existing ID- and
+            # stream-verified video downloader. Keep its authored PTS intact.
+            try:
+                candidate = self._video(linear, directory, cookies)
+                if self.tools.probe(candidate)["video_codec"]:
+                    native = candidate
+            except (ValueError, RuntimeError):
+                pass
+        partial_zip = original.with_suffix(".part.zip")
+        with zipfile.ZipFile(partial_zip, "w", compression=zipfile.ZIP_STORED) as archive:
             for path in images + ([audio] if audio else []):
                 archive.write(path, arcname=path.name)
-        return original, playback
+            if native is not None:
+                archive.write(native, arcname=NATIVE_MEMBER)
+        partial_zip.replace(original)
+        return original, cached_photo(self.tools, original)

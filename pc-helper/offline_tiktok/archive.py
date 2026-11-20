@@ -2,6 +2,7 @@
 import argparse
 import json
 import threading
+import zipfile
 from pathlib import Path
 from .browser import TikTokBrowser
 from .media import MediaDownloader, MediaTools, Acquisition
@@ -38,7 +39,22 @@ class CachedDownloader:
                 pass
             return self.fallback.acquire(item, cookies)
         originals = [path for path in directory.glob("original.*") if path.stem == "original" and path.suffix.lower() in (".mp4", ".mkv", ".mov", ".webm", ".m4v")]
-        if item.kind == "slideshow": originals = [directory / "original-photo.zip"]
+        if item.kind == "slideshow":
+            from .photo import cached_photo
+            originals = [directory / "original-photo.zip"]
+            original = originals[0]
+            if (measurement.get("status") == "measured" and original.is_file()
+                    and original.stat().st_size == measurement.get("originalBytes")):
+                try:
+                    playback = cached_photo(self.tools, original)
+                    details = self.tools.probe(playback)
+                    artwork = directory / "artwork.jpg"
+                    if not artwork.exists(): self.tools.thumbnail(playback, artwork)
+                    return Acquisition(original, playback, artwork, details["duration"])
+                except (zipfile.BadZipFile, ValueError, OSError, RuntimeError):
+                    # A legacy measured playback remains usable if its photo
+                    # originals cannot be opened on this machine.
+                    pass
         for original in originals:
             playbacks = [directory / "slideshow.mp4"] if item.kind == "slideshow" else [original, original.with_name(original.stem + ".iphone.mp4")]
             for playback in playbacks:
