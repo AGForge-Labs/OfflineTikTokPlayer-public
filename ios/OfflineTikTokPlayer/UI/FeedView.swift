@@ -154,7 +154,7 @@ struct SeekBar: View {
                     }
                 }
             HStack {
-                Text(time(displayedPosition))
+                Text(time(displayedPosition)).accessibilityIdentifier("playback.elapsed")
                 Spacer()
                 Text(time(playback.clock.duration))
             }.font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.8))

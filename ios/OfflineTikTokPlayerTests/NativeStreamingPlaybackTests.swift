@@ -181,6 +181,17 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         // Registered after fixture.own: XCTest runs this before its awaited
         // playback close, including failures before cache release.
         addTeardownBlock { await gate.cancel(); session.invalidateAndCancel() }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let oldKey = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let host = UIViewController()
+        window.rootViewController = host
+        window.windowLevel = .alert + 1
+        window.makeKeyAndVisible()
+        service.surface.frame = host.view.bounds
+        host.view.addSubview(service.surface)
+        host.view.layoutIfNeeded()
+        defer { window.isHidden = true; window.rootViewController = nil; oldKey?.makeKey() }
         try await until { fixture.downloads.network.isConnected }
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -195,6 +206,45 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         let initialHTTP = server.snapshot()
         XCTAssertGreaterThan(initialHTTP.requests, 0)
         XCTAssertGreaterThan(initialHTTP.ranges, 0, "The actual AVPlayer must exercise seekable HTTP ranges")
+        try await until { service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.15 }
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        let held = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+        let lastPrimaryPTS = try XCTUnwrap(service.videoFramePositionSeconds)
+        let alternate = service.debugAlternateFrameCount
+        let faultStart = ContinuousClock.now
+        service.debugWithholdItemOutput = true
+        while ContinuousClock.now - faultStart < .milliseconds(500),
+              service.debugAlternateFrameCount < alternate + 2 || (service.debugDisplayedVideoPositionSeconds ?? 0) <= held {
+            try await Task.sleep(for: .milliseconds(8))
+        }
+        let hold = ContinuousClock.now - faultStart
+        // This file is 24 fps, but its blue marker only moves every three frames.
+        // Observe a different marker on the displayed surface while the fault is
+        // still active: two different PTS can both describe the same picture.
+        var firstAlternateMarker: CGPoint?, changedMarker: CGPoint?
+        while ContinuousClock.now - faultStart < .milliseconds(500) {
+            if let displayed = service.debugDisplayedVideoPositionSeconds, displayed > lastPrimaryPTS,
+               let marker = layer.sampleBufferRenderer.displayedPixelBuffer().flatMap(httpFixtureMarker) {
+                if let firstAlternateMarker {
+                    if abs(marker.x - firstAlternateMarker.x) >= 6 || abs(marker.y - firstAlternateMarker.y) >= 6 {
+                        changedMarker = marker
+                        break
+                    }
+                } else { firstAlternateMarker = marker }
+            }
+            try await Task.sleep(for: .milliseconds(8))
+        }
+        let visibleHold = ContinuousClock.now - faultStart
+        service.debugWithholdItemOutput = false
+        XCTAssertGreaterThanOrEqual(service.debugAlternateFrameCount - alternate, 2)
+        XCTAssertGreaterThan(try XCTUnwrap(service.debugDisplayedVideoPositionSeconds), held)
+        XCTAssertLessThan(hold, .milliseconds(500))
+        XCTAssertNotNil(changedMarker, "The blue marker in the displayed HTTP video must actually move")
+        XCTAssertLessThan(visibleHold, .milliseconds(500))
+        XCTAssertTrue(service.player.currentItem === remoteItem)
+        XCTAssertFalse(service.player.isMuted)
+        XCTAssertGreaterThan(service.player.currentTime().seconds, held)
+        print("HTTP_PICTURE_BRIDGE gap=\(hold) visibleMotion=\(visibleHold) changedPixels=\(changedMarker != nil) advancingAlternateFrames=\(service.debugAlternateFrameCount - alternate) permanentDownloads=\(fixture.downloads.readyIDs.count)")
         try await until { service.player.items().count == 2 }
         let stagedNext = try XCTUnwrap(service.player.items().dropFirst().first)
         XCTAssertEqual((stagedNext.asset as? AVURLAsset)?.url.lastPathComponent, "b.mp4")
@@ -264,6 +314,41 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         let finalHTTP = server.snapshot()
         print("HTTPPlaybackBoundary schema=1 requests=\(finalHTTP.requests) rangeResponses=\(finalHTTP.ranges) bytes=\(finalHTTP.bytes) realHTTP=true verifiedTemporaryFiles=2 savedCopies=0 warmedPCMNextPrevious=true repeatSameToken=true sameEngine=true nativeToPCMExactAudioJoin=false physicalOutput=unverified")
         try await fixture.closePlayback(service)
+    }
+
+    /// The generated 160×96 clip moves a blue 16×24 marker between four rows.
+    /// Sample the center line of each row directly, without a color conversion.
+    private func httpFixtureMarker(_ pixel: CVPixelBuffer) -> CGPoint? {
+        guard CVPixelBufferGetWidth(pixel) == 160, CVPixelBufferGetHeight(pixel) == 96,
+              CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+        let isBlue: (Int, Int) -> Bool
+        switch CVPixelBufferGetPixelFormatType(pixel) {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            guard CVPixelBufferGetPlaneCount(pixel) == 2,
+                  let address = CVPixelBufferGetBaseAddressOfPlane(pixel, 1) else { return nil }
+            let bytes = address.assumingMemoryBound(to: UInt8.self)
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1)
+            isBlue = { x, y in
+                let offset = y / 2 * stride + x / 2 * 2
+                return Int(bytes[offset]) > Int(bytes[offset + 1]) + 60
+            }
+        case kCVPixelFormatType_32BGRA:
+            guard let address = CVPixelBufferGetBaseAddress(pixel) else { return nil }
+            let bytes = address.assumingMemoryBound(to: UInt8.self)
+            let stride = CVPixelBufferGetBytesPerRow(pixel)
+            isBlue = { x, y in
+                let offset = y * stride + x * 4
+                return Int(bytes[offset]) > max(Int(bytes[offset + 1]), Int(bytes[offset + 2])) + 60
+            }
+        default: return nil
+        }
+        for y in stride(from: 12, to: 96, by: 24) {
+            var sum = 0, count = 0
+            for x in stride(from: 1, to: 160, by: 2) where isBlue(x, y) { sum += x; count += 1 }
+            if (6...10).contains(count) { return CGPoint(x: Double(sum) / Double(count), y: Double(y)) }
+        }
+        return nil
     }
 
     private func makeStreamService(_ fixture: SelectionVideoFixture) async throws -> PlaybackService {
