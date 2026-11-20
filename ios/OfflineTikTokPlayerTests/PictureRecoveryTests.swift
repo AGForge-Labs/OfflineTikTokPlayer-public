@@ -113,7 +113,7 @@ final class PictureRecoveryTests: XCTestCase {
         let firstOwnerBefore = service.debugAlignedVideoPollState
         let firstAudioBefore = service.audioSnapshot
         let imageReadStart = DispatchTime.now().uptimeNanoseconds
-        var firstPixel: CVPixelBuffer? = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())
+        let oldPicture = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer().flatMap(sampledHDPicture))
         let imageReadEnd = DispatchTime.now().uptimeNanoseconds
         assertPictureOwner(firstOwnerBefore, service.debugAlignedVideoPollState)
         XCTAssertEqual(service.audioSnapshot.token, firstAudioBefore.token)
@@ -150,20 +150,13 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertEqual(service.queue.currentID, fixture.mediaID)
         let secondOwnerBefore = service.debugAlignedVideoPollState
         let secondGetterStart = DispatchTime.now().uptimeNanoseconds
-        var secondPixel: CVPixelBuffer? = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())
+        let newPicture = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer().flatMap(sampledHDPicture))
         let secondGetterEnd = DispatchTime.now().uptimeNanoseconds
         assertPictureOwner(secondOwnerBefore, service.debugAlignedVideoPollState)
         XCTAssertEqual(service.audioSnapshot.token, after.token)
         XCTAssertEqual(service.audioSnapshot.visit, after.visit)
         XCTAssertEqual(service.queue.currentID, fixture.mediaID)
         service.pause()
-        // Retain at most two actual display buffers. Cold image conversion must not
-        // block the playing graph, exhaust the six-second clip or starve its producer.
-        let conversionStart = DispatchTime.now().uptimeNanoseconds
-        let oldPicture = try XCTUnwrap(smallPicture(try XCTUnwrap(firstPixel)))
-        let newPicture = try XCTUnwrap(smallPicture(try XCTUnwrap(secondPixel)))
-        firstPixel = nil; secondPixel = nil
-        let conversionEnd = DispatchTime.now().uptimeNanoseconds
         let elapsed = Double(end - start) / 1_000_000_000
         let fps = Double(delivered) / elapsed, gapMs = Double(maximumGap) / 1_000_000
         print("PRODUCTION_HD deliveredFPS=\(fps) maximumGapMs=\(gapMs) maximumEnqueueMs=\(Double(maximumEnqueue) / 1_000_000) audioAdvanced=\(after.frame - before.frame) underrunsAdded=\(after.underrunFrames - before.underrunFrames) actualPictureChanged=\(oldPicture != newPicture)")
@@ -173,7 +166,7 @@ final class PictureRecoveryTests: XCTestCase {
             print("PRODUCTION_HD_SOURCE firstObservedEntryNs=\(v.0) returnNs=\(v.1) output=\(v.2) seek=\(v.3) revision=\(v.4)")
         }
         print("PRODUCTION_HD_HOST schema=1 processID=\(ProcessInfo.processInfo.processIdentifier) moduleNonce=\(Self.hostModuleNonce) explicitActivation=\(actualSessionActivation)")
-        print("PRODUCTION_HD_READBACK firstGetterNs=[\(imageReadStart),\(imageReadEnd)] secondGetterNs=[\(secondGetterStart),\(secondGetterEnd)] conversionNs=[\(conversionStart),\(conversionEnd)] pausedBeforeConversion=true maximumRetainedBuffers=2 buffersReleased=true")
+        print("PRODUCTION_HD_READBACK firstNs=[\(imageReadStart),\(imageReadEnd)] secondNs=[\(secondGetterStart),\(secondGetterEnd)] buffersRetainedDuringMeasurement=0")
         for v in positions {
             print("PRODUCTION_HD_POSITION entryNs=\(v.entryNs) returnNs=\(v.returnNs) position=\(v.position) raw=\(v.rawItemTimebasePosition ?? -1) effectiveRate=\(v.itemTimebaseEffectiveRate ?? -1) request=\(v.request) generation=\(v.returnGeneration) owned=\(v.observedItemMatches && v.presentationUnchanged)")
         }
@@ -208,6 +201,33 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertEqual(before.frame.ticket, after.frame.ticket); XCTAssertEqual(before.frame.output, after.frame.output)
         XCTAssertEqual(before.frame.imageEpoch, after.frame.imageEpoch)
         XCTAssertEqual(before.frame.seekSerial, after.frame.seekSerial)
+    }
+    // Sample actual output on either side of the observation window. Keeping
+    // a simulator decoder surface alive across this window can alter its timing.
+    private func sampledHDPicture(_ pixel: CVPixelBuffer) -> Data? {
+        let format = CVPixelBufferGetPixelFormatType(pixel)
+        let planar = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        guard planar || format == kCVPixelFormatType_32BGRA else { return smallPicture(pixel) }
+        guard CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+        var sample = Data()
+        sample.reserveCapacity(48 * 32 * 4)
+        for plane in 0..<(planar ? 2 : 1) {
+            let address = planar ? CVPixelBufferGetBaseAddressOfPlane(pixel, plane) : CVPixelBufferGetBaseAddress(pixel)
+            let width = planar ? CVPixelBufferGetWidthOfPlane(pixel, plane) : CVPixelBufferGetWidth(pixel)
+            let height = planar ? CVPixelBufferGetHeightOfPlane(pixel, plane) : CVPixelBufferGetHeight(pixel)
+            let stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(pixel, plane) : CVPixelBufferGetBytesPerRow(pixel)
+            let bytesPerPixel = planar ? (plane == 0 ? 1 : 2) : 4
+            guard let address, width > 0, height > 0, stride >= width * bytesPerPixel else { return nil }
+            let bytes = address.assumingMemoryBound(to: UInt8.self)
+            for y in 0..<32 {
+                let row = y * height / 32 * stride
+                for x in 0..<48 {
+                    sample.append(bytes.advanced(by: row + (x * width / 48) * bytesPerPixel), count: bytesPerPixel)
+                }
+            }
+        }
+        return sample
     }
     private func smallPicture(_ pixel: CVPixelBuffer) -> Data? {
         let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
@@ -284,7 +304,7 @@ final class PictureRecoveryTests: XCTestCase {
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until {
             service.isVideoReady && service.debugDisplayedVideoPositionSeconds != nil
-                && service.audioSnapshot.frame > 9_600
+                && service.audioSnapshot.frame > 55_200
         }
         let before = service.audioSnapshot
         let item = try XCTUnwrap(service.player.currentItem)
@@ -380,6 +400,12 @@ final class PictureRecoveryTests: XCTestCase {
                 && service.hasRetainedVideoFrame && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.1
         }
 
+        let navigationStart = DispatchTime.now().uptimeNanoseconds
+        var seekIssues: [(UInt64, PlaybackService.DebugVideoSeekStamp)] = []
+        var seekReturns: [UInt64: UInt64] = [:]
+        service.onDebugVideoSeekStamp = { seekIssues.append((DispatchTime.now().uptimeNanoseconds, $0)) }
+        service.onDebugVideoSeekCompletionTerminal = { seekReturns[$0.nativeSeekTicket] = DispatchTime.now().uptimeNanoseconds }
+        defer { service.onDebugVideoSeekStamp = nil; service.onDebugVideoSeekCompletionTerminal = nil }
         service.handlePiPSkip(10) {}
         try await until {
             service.queue.currentID == fixture.otherID && service.isVideoReady
@@ -388,6 +414,20 @@ final class PictureRecoveryTests: XCTestCase {
         let before = service.audioSnapshot
         let submittedBefore = service.submittedVideoFrameCount
         let start = ContinuousClock.now
+        var stages = [Int](repeating: 0, count: ContinuousPictureInPicture.DebugWholeFrameStage.enqueued.rawValue + 1)
+        var previousTick = DispatchTime.now().uptimeNanoseconds
+        let measuredStart = previousTick
+        var tickGap = CadenceSpan()
+        let heartbeat = CadenceHeartbeat(start: previousTick)
+        service.onDebugCPPWholeFrame = { stamp in
+            switch stamp.event {
+            case .entered(let entry):
+                tickGap.record(start: previousTick, end: entry.entryNs)
+                previousTick = entry.entryNs
+            case .returned(let span):
+                stages[span.stage.rawValue] += 1
+            }
+        }
         var lastChange = start
         var largestGap = Duration.zero
         var displayed = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
@@ -405,7 +445,14 @@ final class PictureRecoveryTests: XCTestCase {
             }
         }
         largestGap = max(largestGap, ContinuousClock.now - lastChange)
-        print("AFTER_LOOP_HD distinctFrames=\(distinctFrames) submitted=\(service.submittedVideoFrameCount - submittedBefore) largestGap=\(largestGap) underruns=\(service.audioSnapshot.underrunFrames - before.underrunFrames)")
+        service.onDebugCPPWholeFrame = nil
+        let background = heartbeat.stop(end: DispatchTime.now().uptimeNanoseconds)
+        print("AFTER_LOOP_SEEKS navigationNs=\(navigationStart) measuredFromNs=\(measuredStart) issued=\(seekIssues.count)")
+        for (issued, seek) in seekIssues {
+            print("AFTER_LOOP_SEEK issuedNs=\(issued) completedNs=\(seekReturns[seek.nativeSeekTicket] ?? 0) reason=\(seek.reason) target=\(seek.requestedPosition) nativeAtDrift=\(seek.ordinaryDriftVideoPositionSeconds ?? .nan) visit=\(seek.cachedAudioVisit)")
+        }
+        print("AFTER_LOOP_SCHEDULING displayTickGapMs=\(tickGap.milliseconds) backgroundGapMs=\(background.maximum.milliseconds) stages=\(stages)")
+        print("AFTER_LOOP_HD distinctFrames=\(distinctFrames) submitted=\(service.submittedVideoFrameCount - submittedBefore) largestGap=\(largestGap) underruns=\(service.audioSnapshot.underrunFrames - before.underrunFrames) alternate=\(service.debugAlternateFrameCount)")
         XCTAssertGreaterThanOrEqual(distinctFrames, 31, "HD playback must keep moving after loop and switch churn")
         XCTAssertLessThan(largestGap, .milliseconds(200), "A good average must not hide a freeze")
         let after = service.audioSnapshot
@@ -524,6 +571,162 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertGreaterThan(service.audioSnapshot.frame, before.frame + 48_000)
     }
 
+    func testMissingItemSamplesUseOriginalLocalFramesWhileAudioAdvances() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-60", firstDuration: 6)
+        let service = fixture.service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { (service.debugDisplayedVideoPositionSeconds ?? 0) >= 0.2 && service.isVideoReady }
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        let original = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer().flatMap(fixturePictureBytes))
+        let before = service.audioSnapshot
+        let startPosition = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+        let alternate = service.debugAlternateFrameCount
+        let item = try XCTUnwrap(service.player.currentItem)
+        service.debugWithholdItemOutput = true
+        defer { service.debugWithholdItemOutput = false }
+        let start = ContinuousClock.now
+        var first: Duration?
+        var changes = 0
+        var last = startPosition
+        while ContinuousClock.now - start < .milliseconds(750) {
+            if let position = service.debugDisplayedVideoPositionSeconds, position > last,
+               service.debugAlternateFrameCount > alternate {
+                if first == nil { first = ContinuousClock.now - start }
+                changes += 1
+                last = position
+            }
+            try await Task.sleep(for: .milliseconds(8))
+        }
+        let shown = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())
+        XCTAssertNotEqual(try XCTUnwrap(fixturePictureBytes(shown)), original)
+        XCTAssertLessThan(try XCTUnwrap(first), .milliseconds(500))
+        XCTAssertGreaterThan(changes, 8)
+        XCTAssertTrue(service.player.currentItem === item)
+        XCTAssertEqual(service.audioSnapshot.visit, before.visit)
+        XCTAssertGreaterThan(service.audioSnapshot.frame - before.frame, 24_000)
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, before.underrunFrames)
+        print("LOCAL_PICTURE_BRIDGE changedFrames=\(changes) first=\(String(describing: first)) underrunsAdded=\(service.audioSnapshot.underrunFrames - before.underrunFrames)")
+    }
+
+    func testMovingPictureRecoversBeforeHalfASecondWhileAudioAdvances() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-60", firstDuration: 6)
+        let service = fixture.service
+        // Exercise reconnection when the queue output also has no frame.
+        // The adjacent moving-pixel test covers the working queue output.
+        service.debugWithholdQueueOutput = true
+        defer { service.debugWithholdQueueOutput = false }
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        try await until { service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.3 }
+        let item = try XCTUnwrap(service.player.currentItem)
+        let visit = service.audioSnapshot
+        for attempt in 1...2 {
+            let preceding = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+            try await until { (service.debugDisplayedVideoPositionSeconds ?? 0) > preceding }
+            let oldOutput = try XCTUnwrap(item.outputs.first)
+            let held = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+            let heldPixel = try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())
+            var oldPulls = 0
+            var detected: UInt64?, published: UInt64?, copied: UInt64?, enqueued: UInt64?
+            var reason: PlaybackService.DebugPictureHoldCause?
+            service.onDebugPictureHoldDetected = { cause in
+                if detected == nil { detected = DispatchTime.now().uptimeNanoseconds; reason = cause }
+            }
+            service.onDebugVideoTapPublished = { if published == nil { published = DispatchTime.now().uptimeNanoseconds } }
+            service.onDebugCPPWholeFrame = { stamp in
+                guard case .returned(let span) = stamp.event, let output = span.entry.state.output,
+                      output != ObjectIdentifier(oldOutput) else { return }
+                if copied == nil, span.copied == true { copied = span.returnNs }
+                if enqueued == nil, span.enqueueCalled == true { enqueued = span.returnNs }
+            }
+            let before = service.audioSnapshot
+            let startNs = DispatchTime.now().uptimeNanoseconds
+            let start = ContinuousClock.now
+            // First withhold acquisition from this tap. The second time detach
+            // the real SDK producer. A replacement works without a timed release.
+            service.shouldDebugAcquireVideoFrame = { receipt in
+                if receipt.output == ObjectIdentifier(oldOutput) { oldPulls += 1; return attempt == 2 }
+                return true
+            }
+            if attempt == 2 {
+                item.remove(oldOutput)
+                XCTAssertFalse(item.outputs.contains { $0 === oldOutput })
+            }
+            var resumedPixel: CVPixelBuffer?
+            var resumed = held
+            var audioKeptPlaying = true
+            while ContinuousClock.now - start < .seconds(3) {
+                audioKeptPlaying = audioKeptPlaying && service.wantsToPlay && service.audioEngineRunning
+                if enqueued != nil, let pts = service.debugDisplayedVideoPositionSeconds,
+                   pts > held, let pixel = layer.sampleBufferRenderer.displayedPixelBuffer() {
+                    resumed = pts
+                    resumedPixel = pixel
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(8))
+            }
+            let elapsed = ContinuousClock.now - start
+            service.shouldDebugAcquireVideoFrame = nil
+            service.onDebugPictureHoldDetected = nil
+            service.onDebugVideoTapPublished = nil
+            service.onDebugCPPWholeFrame = nil
+            let after = service.audioSnapshot
+            let heldMS = Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15
+            // Keep the two actual renderer surfaces alive; CPU readback for the
+            // independent pixel comparison cannot lengthen either measured gap.
+            let sameFormat = resumedPixel.map { CVPixelBufferGetPixelFormatType($0) == CVPixelBufferGetPixelFormatType(heldPixel) } ?? false
+            let readPicture = sameFormat ? fixturePictureBytes : smallPicture
+            let heldBytes = try XCTUnwrap(readPicture(heldPixel))
+            let changedPixels = resumedPixel.flatMap(readPicture).map { $0 != heldBytes } ?? false
+            func milliseconds(_ event: UInt64?) -> Double { event.map { Double($0 - startNs) / 1e6 } ?? -1 }
+            print("HELD_PICTURE attempt=\(attempt) gapMS=\(heldMS) reason=\(reason?.rawValue ?? "none") detectedMS=\(milliseconds(detected)) publishedMS=\(milliseconds(published)) copiedMS=\(milliseconds(copied)) enqueuedMS=\(milliseconds(enqueued)) oldPTS=\(held) resumedPTS=\(resumed) oldPulls=\(oldPulls) changedPixels=\(changedPixels) audioFrames=\(after.frame - before.frame) underrunsAdded=\(after.underrunFrames - before.underrunFrames)")
+            XCTAssertEqual(reason, attempt == 2 ? .detachedOutput : .overdueSourceFrame)
+            XCTAssertNotNil(resumedPixel)
+            XCTAssertNotNil(detected)
+            XCTAssertNotNil(published)
+            XCTAssertNotNil(copied)
+            XCTAssertNotNil(enqueued)
+            XCTAssertGreaterThan(oldPulls, 1)
+            XCTAssertTrue(changedPixels)
+            XCTAssertLessThan(elapsed, .milliseconds(500), "Unexpected held picture exceeded half a second")
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertEqual(item.outputs.count, 1)
+            XCTAssertFalse(item.outputs.first === oldOutput)
+            XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+            XCTAssertTrue(audioKeptPlaying)
+            XCTAssertGreaterThan(after.frame - before.frame, Int64(heldMS * 48 * 0.75))
+            XCTAssertEqual(after.token, visit.token)
+            XCTAssertEqual(after.visit, visit.visit)
+            XCTAssertEqual(after.selectionVersion, visit.selectionVersion)
+            XCTAssertEqual(after.underrunFrames, visit.underrunFrames)
+            guard changedPixels, elapsed < .milliseconds(500) else { return }
+            if attempt == 1 {
+                try await until { (service.debugDisplayedVideoPositionSeconds ?? 0) > resumed + 2.0 }
+            }
+        }
+    }
+
+    private func fixturePictureBytes(_ pixel: CVPixelBuffer) -> Data? {
+        let format = CVPixelBufferGetPixelFormatType(pixel)
+        let yuv = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        guard yuv || format == kCVPixelFormatType_32BGRA else { return smallPicture(pixel) }
+        guard CVPixelBufferGetWidth(pixel) == 128, CVPixelBufferGetHeight(pixel) == 192,
+              CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return nil }
+        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+        var result = Data()
+        for plane in 0..<(yuv ? 2 : 1) {
+            let width = yuv ? CVPixelBufferGetWidthOfPlane(pixel, plane) * (plane == 0 ? 1 : 2) : 128 * 4
+            let height = yuv ? CVPixelBufferGetHeightOfPlane(pixel, plane) : 192
+            let stride = yuv ? CVPixelBufferGetBytesPerRowOfPlane(pixel, plane) : CVPixelBufferGetBytesPerRow(pixel)
+            let address = yuv ? CVPixelBufferGetBaseAddressOfPlane(pixel, plane) : CVPixelBufferGetBaseAddress(pixel)
+            guard let address, width > 0, stride >= width else { return nil }
+            for row in 0..<height {
+                result.append(address.advanced(by: row * stride).assumingMemoryBound(to: UInt8.self), count: width)
+            }
+        }
+        return result
+    }
+
     func testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit() async throws {
         let fixture = try await PictureRecoveryFixture(test: self)
         let service = fixture.service
@@ -543,6 +746,7 @@ final class PictureRecoveryTests: XCTestCase {
         try await until {
             repairs > 0 && service.submittedVideoFrameCount >= framesBefore + 4
                 && (service.videoFramePositionSeconds ?? 0) > nativeBefore + 0.5
+                && service.audioSnapshot.frame > before.frame + 48_000
         }
         let after = service.audioSnapshot
         XCTAssertEqual(repairs, 1)
@@ -568,6 +772,7 @@ final class PictureRecoveryTests: XCTestCase {
             service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.25
         }
         let item = try XCTUnwrap(service.player.currentItem)
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
         let audio = service.audioSnapshot
         for attempt in 1...2 {
             let held = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
@@ -575,9 +780,11 @@ final class PictureRecoveryTests: XCTestCase {
             let audible = service.audioSnapshot.frame
             let native = item.currentTime().seconds
             service.shouldDebugAcquireVideoFrame = { _ in false }
+            try await until { service.audioSnapshot.frame > audible + 3_840 }
+            let still = try XCTUnwrap(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())))
             try await until { service.audioSnapshot.frame > audible + 24_000 }
             XCTAssertGreaterThan(item.currentTime().seconds, native + 0.25)
-            XCTAssertLessThanOrEqual(try XCTUnwrap(service.debugDisplayedVideoPositionSeconds), held + 0.08)
+            XCTAssertEqual(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())), still)
             try await until { item.outputs.first !== output }
             service.shouldDebugAcquireVideoFrame = nil
             try await until {
@@ -616,20 +823,19 @@ final class PictureRecoveryTests: XCTestCase {
             object: item, queue: .main) { _ in MainActor.assumeIsolated { jumps.value += 1 } }
         defer { NotificationCenter.default.removeObserver(observer) }
         var repairs = 0
-        service.onDebugVideoOutputRecovery = {
-            repairs += 1
-            service.shouldDebugAcquireVideoFrame = nil
-        }
+        service.onDebugVideoOutputRecovery = { repairs += 1 }
         // A tap changes AVFoundation's audio graph. Preserve an uninstrumented
         // control so the observer cannot accidentally hide the original fault.
         let controlFrames = service.submittedVideoFrameCount
         var controlClock = NativeClockContinuityProbe()
-        service.shouldDebugAcquireVideoFrame = { _ in false }
+        let firstOutput = ObjectIdentifier(audibleOutput)
+        service.shouldDebugAcquireVideoFrame = { $0.output != firstOutput }
         try await until {
             controlClock.sample(item)
             return repairs == 1 && service.submittedVideoFrameCount >= controlFrames + 4 && service.isVideoReady
         }
         print("NATIVE_AUDIO_UNINSTRUMENTED timeJumpNotifications=\(jumps.value) completedAudioSeeks=\(completedAudioSeeks) clockSamples=\(controlClock.samples) definiteClockJumpSeconds=\(controlClock.maximumDefiniteJump) minimumEffectiveRate=\(controlClock.minimumRate)")
+        service.shouldDebugAcquireVideoFrame = nil
         XCTAssertEqual(jumps.value, 0)
         XCTAssertEqual(completedAudioSeeks, 0)
         XCTAssertGreaterThan(controlClock.samples, 4)
@@ -644,28 +850,82 @@ final class PictureRecoveryTests: XCTestCase {
         try await until { service.isVideoReady && service.player.rate > 0 }
         let audioProbe = try await NativeAudioContinuityProbe.attach(to: item)
         try await until { audioProbe.totalFrames.load(ordering: .relaxed) >= 48_000 }
+        var clockPreservingRepairs = 0
         for attempt in 2...3 {
             let pictureItem = try XCTUnwrap(service.debugVideoPresentationItem)
             XCTAssertFalse(pictureItem === item)
-            let output = try XCTUnwrap(pictureItem.outputs.first)
+            let output = try XCTUnwrap(pictureItem.outputs.compactMap { $0 as? AVPlayerItemVideoOutput }.first)
             let before = service.player.currentTime().seconds
             let frames = service.submittedVideoFrameCount
+            let alternate = service.debugAlternateFrameCount
+            let oldPicture = service.debugDisplayedVideoPositionSeconds
+            var phase = "audioProbeEpoch", blockedPulls = 0
+            var faultStart: UInt64?, detected: UInt64?, published: UInt64?, moved: UInt64?
+            var seekAtDetection: UInt64?, seekAtPublication: UInt64?
+            var cause: PlaybackService.DebugPictureHoldCause?
+            service.onDebugPictureHoldDetected = {
+                guard faultStart != nil, detected == nil else { return }
+                detected = DispatchTime.now().uptimeNanoseconds; cause = $0
+                seekAtDetection = service.debugAlignedVideoPollState.frame.seekSerial
+            }
+            service.onDebugVideoTapPublished = {
+                guard faultStart != nil, published == nil else { return }
+                published = DispatchTime.now().uptimeNanoseconds
+                seekAtPublication = service.debugAlignedVideoPollState.frame.seekSerial
+            }
             jumps.value = 0
             let epoch = audioProbe.beginWindow()
+            defer {
+                func elapsedMS(_ event: UInt64?) -> Double {
+                    guard let event, let faultStart, event >= faultStart else { return -1 }
+                    return Double(event - faultStart) / 1e6
+                }
+                let attached = pictureItem.outputs.contains { $0 === output }
+                print("NATIVE_PICTURE_RETRY attempt=\(attempt) phase=\(phase) probeEpoch=\(audioProbe.observedEpoch.load(ordering: .acquiring))/\(epoch)"
+                    + " repairs=\(repairs) hold=\(cause?.rawValue ?? "none") detectedMS=\(elapsedMS(detected)) publishedMS=\(elapsedMS(published)) movedMS=\(elapsedMS(moved))"
+                    + " seekAtDetection=\(String(describing: seekAtDetection)) seekAtPublication=\(String(describing: seekAtPublication))"
+                    + " blockedPulls=\(blockedPulls) oldTapAttached=\(attached) isolated=\(service.debugVideoPresentationItem === pictureItem)"
+                    + " frames=\(service.submittedVideoFrameCount - frames) alternate=\(service.debugAlternateFrameCount - alternate)"
+                    + " oldPTS=\(oldPicture ?? .nan) shownPTS=\(service.debugDisplayedVideoPositionSeconds ?? .nan) ready=\(service.isVideoReady) audioAdvance=\(service.player.currentTime().seconds - before)")
+                service.shouldDebugAcquireVideoFrame = nil
+                service.onDebugPictureHoldDetected = nil; service.onDebugVideoTapPublished = nil
+            }
             try await until { audioProbe.observedEpoch.load(ordering: .acquiring) == epoch }
+            if attempt == 2 {
+                phase = "awaitingAlignedIsolatedClock"
+                let audioClock = try XCTUnwrap(item.timebase), videoClock = try XCTUnwrap(pictureItem.timebase)
+                try await until {
+                    CMTimebaseGetEffectiveRate(audioClock) > 0 && CMTimebaseGetEffectiveRate(videoClock) > 0
+                        && abs(CMTimebaseGetTime(audioClock).seconds - CMTimebaseGetTime(videoClock).seconds) < 0.040
+                }
+            }
             var nativeClock = NativeClockContinuityProbe()
-            // Detach the real SDK producer; do not release an application-side
-            // acquisition gate when the repair reports completion.
+            // A working alternate source can mask the missing item tap. Exclude that exact old
+            // output receipt and let the real replacement acquire frames without a callback release.
+            let oldOutput = ObjectIdentifier(output)
+            service.shouldDebugAcquireVideoFrame = {
+                if $0.output == oldOutput { blockedPulls += 1; return false }
+                return true
+            }
+            phase = "restoringDetachedOutput"; faultStart = DispatchTime.now().uptimeNanoseconds
             pictureItem.remove(output)
+            XCTAssertFalse(pictureItem.outputs.contains { $0 === output })
             try await until {
                 nativeClock.sample(item)
-                return repairs == attempt && service.submittedVideoFrameCount >= frames + 4 && service.isVideoReady
+                if moved == nil, published != nil, let position = service.debugDisplayedVideoPositionSeconds,
+                   position > (oldPicture ?? -1) { moved = DispatchTime.now().uptimeNanoseconds }
+                return repairs == attempt && moved != nil && service.submittedVideoFrameCount >= frames + 4 && service.isVideoReady
+                    && service.player.currentTime().seconds > before + 1
             }
             XCTAssertTrue(service.player.currentItem === item)
             XCTAssertTrue(item.outputs.first === audibleOutput)
             XCTAssertTrue(service.debugVideoPresentationItem === pictureItem)
             XCTAssertEqual(pictureItem.outputs.count, 1)
             XCTAssertFalse(pictureItem.outputs.first === output)
+            if let seekAtDetection, let seekAtPublication, seekAtDetection == seekAtPublication {
+                XCTAssertEqual(cause, .detachedOutput)
+                clockPreservingRepairs += 1
+            }
             XCTAssertGreaterThan(service.player.currentTime().seconds, before + 1)
             XCTAssertEqual(jumps.value, 0, "Replacing a picture output must not seek the streamed/native audio clock")
             print("NATIVE_AUDIO_CONTINUITY attempt=\(attempt) timeJumpNotifications=\(jumps.value) completedAudioSeeks=\(completedAudioSeeks) windowFrames=\(audioProbe.windowFrames.load(ordering: .relaxed)) sourceGapFrames=\(audioProbe.gapFrames.load(ordering: .relaxed)) sourceOverlapFrames=\(audioProbe.overlapFrames.load(ordering: .relaxed)) zeroReturns=\(audioProbe.zeroReturns.load(ordering: .relaxed)) maximumSilentFrames=\(audioProbe.maximumSilentFrames.load(ordering: .relaxed)) readErrors=\(audioProbe.readErrors.load(ordering: .relaxed)) supportedPCM=\(audioProbe.supported.load(ordering: .relaxed)) clockSamples=\(nativeClock.samples) definiteClockJumpSeconds=\(nativeClock.maximumDefiniteJump) minimumEffectiveRate=\(nativeClock.minimumRate)")
@@ -685,13 +945,16 @@ final class PictureRecoveryTests: XCTestCase {
             XCTAssertTrue(service.wantsToPlay)
             XCTAssertNil(service.message)
             if attempt == 2 {
+                phase = "resumingAfterSecondRepair"
                 let stoppedAt = service.player.currentTime().seconds
                 service.pause()
                 try await Task.sleep(for: .milliseconds(100))
                 service.play()
                 try await until { service.isVideoReady && service.player.currentTime().seconds > stoppedAt + 0.25 }
             }
+            phase = "complete"
         }
+        XCTAssertGreaterThan(clockPreservingRepairs, 0, "A running isolated decoder must replace a disconnected tap without flushing and seeking its clock")
     }
 
     func testPauseAndAudioOnlyPreventPictureRepair() async throws {

@@ -2,6 +2,84 @@ import XCTest
 @testable import PlayerCore
 
 final class VideoImageProgressTests: XCTestCase {
+    func testSourceTimingIsOnlyRequestedForARepeatedImageInTheSameEpoch() {
+        var watch = VideoImageProgress()
+        for tick in 1...12 {
+            XCTAssertFalse(watch.isRepeatedDisplayedFrame(Double(tick) / 24, imageEpoch: 1))
+        }
+        XCTAssertTrue(watch.isRepeatedDisplayedFrame(0.5, imageEpoch: 1))
+        XCTAssertFalse(watch.isRepeatedDisplayedFrame(0.5, imageEpoch: 2))
+        XCTAssertTrue(watch.isRepeatedDisplayedFrame(0.5, imageEpoch: 2))
+        XCTAssertFalse(watch.isRepeatedDisplayedFrame(nil, imageEpoch: 2))
+        XCTAssertFalse(watch.isRepeatedDisplayedFrame(0.5, imageEpoch: 2))
+    }
+
+    func testDistinctConfirmedHoldCanRecoverAfterMovingPicturesResume() {
+        var watch = VideoImageProgress()
+        XCTAssertFalse(watch.shouldRecover(now: 0, playbackPosition: 0.33, displayedPosition: 0.33))
+        XCTAssertTrue(watch.shouldRecover(now: 0.14, playbackPosition: 0.47, displayedPosition: 0.33,
+            followingFrame: .after(1.0 / 60)))
+        // Recovery exposes two newer real pictures. The second one then holds
+        // while its authored successor and the same PCM visit advance.
+        XCTAssertFalse(watch.shouldRecover(now: 0.40, playbackPosition: 0.73, displayedPosition: 0.40))
+        XCTAssertFalse(watch.shouldRecover(now: 0.67, playbackPosition: 1.00, displayedPosition: 0.96))
+        var longFrame = watch
+        XCTAssertFalse(longFrame.shouldRecover(now: 0.83, playbackPosition: 1.16, displayedPosition: 0.96,
+            followingFrame: .after(2)), "An authored hold still protects this same surface")
+        XCTAssertTrue(watch.shouldRecover(now: 0.90, playbackPosition: 1.23, displayedPosition: 0.96,
+            followingFrame: .after(1.0 / 60)))
+        XCTAssertEqual(watch.repairAttempts, 1, "This is a fresh failure, not a failed retry that should seek the decoder")
+        XCTAssertFalse(watch.shouldRecover(now: 1.18, playbackPosition: 1.51, displayedPosition: 0.96,
+            followingFrame: .after(1.0 / 60)), "The same held image must not open a repair loop")
+    }
+
+    func testAlreadyOverdueSourceFrameCanRecoverAtTheSecondLatePoll() {
+        var watch = VideoImageProgress()
+        XCTAssertFalse(watch.shouldRecover(now: 1.0, playbackPosition: 1.0, displayedPosition: 1.0))
+        // In the first late poll we finally observe the held frame and ask the
+        // asset for its real successor, which is already due at 1.10 seconds.
+        XCTAssertFalse(watch.shouldRecover(now: 1.18, playbackPosition: 1.18, displayedPosition: 1.08))
+        XCTAssertTrue(watch.shouldRecover(now: 1.25, playbackPosition: 1.25, displayedPosition: 1.08,
+            followingFrame: .after(0.02)))
+        XCTAssertFalse(watch.shouldRecover(now: 1.35, playbackPosition: 1.35, displayedPosition: 1.08,
+            followingFrame: .after(0.02)))
+    }
+
+    func testMovingPictureWithADueSourceSampleRecoversBeforeHalfASecond() {
+        var progress = VideoImageProgress()
+        var repairs = [Double]()
+        // At 1 second the output keeps showing frame 60. The asset contains
+        // frame 61 one sixtieth later and the audible PCM position keeps moving.
+        for tick in 0...88 {
+            let now = Double(tick) / 60
+            let displayed = min(1, now)
+            if progress.shouldRecover(now: now, playbackPosition: now, displayedPosition: displayed,
+                                      followingFrame: .after(1.0 / 60)) {
+                repairs.append(now)
+            }
+        }
+        XCTAssertEqual(repairs.count, 1)
+        if let first = repairs.first {
+            XCTAssertGreaterThan(first, 1.05, "Normal decoder and display jitter must have time to settle")
+            XCTAssertLessThan(first, 1.35, "Leave time to deliver a different image before half a second")
+        }
+    }
+
+    func testAuthoredSparseAndFinalFramesStayOnScreenWhileAudioAdvances() {
+        var progress = VideoImageProgress()
+        for tick in 0...150 {
+            let now = Double(tick) / 30
+            let atEnd = now >= 2.75
+            XCTAssertFalse(progress.shouldRecover(now: now, playbackPosition: now,
+                displayedPosition: atEnd ? 2.75 : 0, followingFrame: atEnd ? .end : .after(2.75)))
+        }
+        var stopped = VideoImageProgress()
+        for tick in 0...60 {
+            XCTAssertFalse(stopped.shouldRecover(now: Double(tick) / 30, playbackPosition: 4,
+                displayedPosition: 3.5, followingFrame: .after(1.0 / 30)))
+        }
+    }
+
     func testAdvancingClockWithoutIncomingPicturesRequestsOneBoundedRepair() {
         var progress = VideoImageProgress()
         XCTAssertFalse(progress.shouldRecover(now: 0, playbackPosition: 0.2, displayedPosition: 0.2))

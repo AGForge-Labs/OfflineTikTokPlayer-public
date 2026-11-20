@@ -192,6 +192,51 @@ final class VideoPresentationContinuityTests: XCTestCase {
         }
     }
 
+    func testRendererDrainsStaleQueuedFramesWhileTheCurrentVideoKeepsPlaying() async throws {
+        let fixture = try await PresentedVideo.make()
+        defer { fixture.close() }
+        let bridge = fixture.bridge
+        let ticket = try XCTUnwrap(bridge.debugAlignedPollState.ticket)
+        let position = fixture.player.currentTime().seconds
+        XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: position, durationSeconds: 6, isPlaying: true))
+        fixture.player.playImmediately(atRate: 1)
+        XCTAssertTrue(bridge.activate(ticket))
+        let moving = await until { (bridge.displayedFramePosition(for: ticket) ?? 0) > position + 0.12 }
+        XCTAssertTrue(moving)
+
+        let renderer = bridge.displayLayer.sampleBufferRenderer
+        let held = try XCTUnwrap(bridge.displayedFramePosition(for: ticket))
+        // Leave pending pictures on the wrong future timeline. Normal clock
+        // advance cannot empty this real renderer queue during the test.
+        try fillFutureQueue(renderer)
+        XCTAssertFalse(renderer.isReadyForMoreMediaData)
+        let deadline = ContinuousClock.now + .milliseconds(500)
+        var latest = held
+        while ContinuousClock.now < deadline, latest <= held + 0.06 {
+            try await Task.sleep(for: .milliseconds(8))
+            latest = bridge.displayedFramePosition(for: ticket) ?? held
+        }
+        XCTAssertGreaterThan(latest, held + 0.06, "A new due frame must replace the held picture within half a second")
+        XCTAssertTrue(fixture.player.currentItem === fixture.item)
+        XCTAssertEqual(fixture.player.rate, 1)
+    }
+
+    private func fillFutureQueue(_ renderer: AVSampleBufferVideoRenderer) throws {
+        let image = try XCTUnwrap(renderer.displayedPixelBuffer())
+        var format: CMVideoFormatDescription?
+        XCTAssertEqual(CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+            imageBuffer: image, formatDescriptionOut: &format), noErr)
+        let description = try XCTUnwrap(format)
+        for index in 0..<120 where renderer.isReadyForMoreMediaData {
+            var time = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 60),
+                presentationTimeStamp: CMTime(value: 1800 + Int64(index), timescale: 60), decodeTimeStamp: .invalid)
+            var sample: CMSampleBuffer?
+            XCTAssertEqual(CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
+                imageBuffer: image, formatDescription: description, sampleTiming: &time, sampleBufferOut: &sample), noErr)
+            renderer.enqueue(try XCTUnwrap(sample))
+        }
+    }
+
     func testFullResolutionVideoKeepsItsCadenceAfterStarting() async throws {
         for trial in 0..<3 {
             let fixture = try await PresentedVideo.make(resourceName: "test-motion-1080")
