@@ -181,6 +181,17 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         // Registered after fixture.own: XCTest runs this before its awaited
         // playback close, including failures before cache release.
         addTeardownBlock { await gate.cancel(); session.invalidateAndCancel() }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let oldKey = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        let host = UIViewController()
+        window.rootViewController = host
+        window.windowLevel = .alert + 1
+        window.makeKeyAndVisible()
+        service.surface.frame = host.view.bounds
+        host.view.addSubview(service.surface)
+        host.view.layoutIfNeeded()
+        defer { window.isHidden = true; window.rootViewController = nil; oldKey?.makeKey() }
         try await until { fixture.downloads.network.isConnected }
         service.isInteractingWithFeed = true
         service.start(playlistIDs: [fixture.playlist], at: fixture.aID)
@@ -195,6 +206,24 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         let initialHTTP = server.snapshot()
         XCTAssertGreaterThan(initialHTTP.requests, 0)
         XCTAssertGreaterThan(initialHTTP.ranges, 0, "The actual AVPlayer must exercise seekable HTTP ranges")
+        try await until { service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.15 }
+        let held = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+        let alternate = service.debugAlternateFrameCount
+        let faultStart = ContinuousClock.now
+        service.debugWithholdItemOutput = true
+        while ContinuousClock.now - faultStart < .milliseconds(500),
+              service.debugAlternateFrameCount < alternate + 2 || (service.debugDisplayedVideoPositionSeconds ?? 0) <= held {
+            try await Task.sleep(for: .milliseconds(8))
+        }
+        let hold = ContinuousClock.now - faultStart
+        service.debugWithholdItemOutput = false
+        XCTAssertGreaterThanOrEqual(service.debugAlternateFrameCount - alternate, 2)
+        XCTAssertGreaterThan(try XCTUnwrap(service.debugDisplayedVideoPositionSeconds), held)
+        XCTAssertLessThan(hold, .milliseconds(500))
+        XCTAssertTrue(service.player.currentItem === remoteItem)
+        XCTAssertFalse(service.player.isMuted)
+        XCTAssertGreaterThan(service.player.currentTime().seconds, held)
+        print("HTTP_PICTURE_BRIDGE gap=\(hold) advancingAlternateFrames=\(service.debugAlternateFrameCount - alternate) permanentDownloads=\(fixture.downloads.readyIDs.count)")
         try await until { service.player.items().count == 2 }
         let stagedNext = try XCTUnwrap(service.player.items().dropFirst().first)
         XCTAssertEqual((stagedNext.asset as? AVURLAsset)?.url.lastPathComponent, "b.mp4")

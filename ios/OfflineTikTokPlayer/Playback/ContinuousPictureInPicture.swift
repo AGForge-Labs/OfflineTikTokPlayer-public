@@ -90,6 +90,9 @@ final class ContinuousPictureInPicture: NSObject {
     private var surfaceProof = FrameSurfaces()
     private var imageEpochSaturated = false
     private var submittedReceipt: CurrentFrameReceipt?
+    private var inspectedFramePosition: Double?
+    private var followingSourceFrame: VideoImageProgress.NextSourceFrame?
+    private var sourceTimingTasks: [UInt64: Task<Void, Never>] = [:]
     private var readinessMutationDepth = 0
     private var readinessUpdatePending = false
     /// Invalidation is immediate. Stable delivery is coalesced across nested CPP
@@ -109,6 +112,9 @@ final class ContinuousPictureInPicture: NSObject {
     @discardableResult
     private func invalidateCurrentFrameProof() -> UInt64 {
         submittedReceipt = nil
+        sourceTimingTasks[imageEpoch]?.cancel()
+        inspectedFramePosition = nil
+        followingSourceFrame = nil
         surfaceProof = FrameSurfaces()
         if imageEpoch == .max { imageEpochSaturated = true }
         else { imageEpoch += 1 }
@@ -145,6 +151,66 @@ final class ContinuousPictureInPicture: NSObject {
               position.isFinite, currentFrameReceipt(for: ticket) == receipt else { return nil }
         return position
     }
+    /// Look up timing only for a picture that is already late. A healthy render
+    /// tick never reads a sample cursor or waits for file/network metadata.
+    func followingFrame(after displayed: Double, for timeline: ActiveTimelineReceipt,
+        readTiming: @escaping @Sendable (Double, AVAsset, CMPersistentTrackID?) async -> VideoImageProgress.NextSourceFrame?
+            = { await ContinuousPictureInPicture.sourceFrameAfter($0, in: $1, timingTrackID: $2) }
+    ) -> VideoImageProgress.NextSourceFrame? {
+        guard activeTimelineReceipt(for: timeline.ticket) == timeline else { return nil }
+        if inspectedFramePosition == displayed, let followingSourceFrame { return followingSourceFrame }
+        // Leave room for a new epoch while one cancelled HTTP lookup drains.
+        // Rapid scrolling cannot accumulate more than two SDK reads.
+        guard sourceTimingTasks[timeline.imageEpoch] == nil, sourceTimingTasks.count < 2,
+              let resource = currentResource, ProcessInfo.processInfo.systemUptime >= resource.nextTimingRead,
+              let asset = resource.item?.asset, currentResource === resource,
+              activeTimelineReceipt(for: timeline.ticket) == timeline else { return nil }
+        let timingTrackID = resource.timingTrackID
+        inspectedFramePosition = displayed
+        followingSourceFrame = nil
+        sourceTimingTasks[timeline.imageEpoch] = Task.detached(priority: .userInitiated) { [weak self] in
+            let next = await readTiming(displayed, asset, timingTrackID)
+            await self?.finishSourceTiming(next, for: timeline)
+        }
+        return nil
+    }
+
+    private func finishSourceTiming(_ next: VideoImageProgress.NextSourceFrame?, for timeline: ActiveTimelineReceipt) {
+        sourceTimingTasks[timeline.imageEpoch] = nil
+        guard activeTimelineReceipt(for: timeline.ticket) == timeline else { return }
+        followingSourceFrame = next
+        if next == nil { currentResource?.nextTimingRead = ProcessInfo.processInfo.systemUptime + 3 }
+    }
+
+    nonisolated static func sourceFrameAfter(_ displayed: Double, in asset: AVAsset, timingTrackID: CMPersistentTrackID?) async -> VideoImageProgress.NextSourceFrame? {
+        guard displayed.isFinite, displayed >= 0, timingTrackID != kCMPersistentTrackID_Invalid,
+              let tracks = try? await asset.loadTracks(withMediaType: .video) else { return nil }
+        let track: AVAssetTrack?
+        if let timingTrackID { track = tracks.first { $0.trackID == timingTrackID } }
+        else { track = tracks.count == 1 ? tracks.first : nil }
+        guard let track, !Task.isCancelled, (try? await track.load(.canProvideSampleCursors)) == true,
+              let segments = try? await track.load(.segments), !Task.isCancelled else { return nil }
+        // Cursor timestamps are in source media time. Map the displayed item
+        // time through its edit, including the offset used for reordered H.264.
+        let time = CMTime(seconds: displayed, preferredTimescale: 1_000_000_000)
+        guard let segment = segments.first(where: { !$0.isEmpty && CMTimeRangeContainsTime($0.timeMapping.target, time: time) }) else { return nil }
+        let map = segment.timeMapping
+        guard map.source.isValid, map.target.isValid,
+              CMTimeCompare(map.source.duration, map.target.duration) == 0 else { return nil }
+        let sourceTime = CMTimeAdd(map.source.start, CMTimeSubtract(time, map.target.start))
+        // Round-trip Double timestamps may fall just before the source tick.
+        let tolerance = CMTime(value: 1, timescale: 48_000)
+        guard let cursor = track.makeSampleCursor(presentationTimeStamp: CMTimeAdd(sourceTime, tolerance)) else { return nil }
+        let first = cursor.presentationTimeStamp
+        guard first.isNumeric, abs(CMTimeSubtract(first, sourceTime).seconds) <= tolerance.seconds,
+              !Task.isCancelled else { return nil }
+        let steps = cursor.stepInPresentationOrder(byCount: 1)
+        if steps == 0 { return segment === segments.last ? .end : nil }
+        let next = cursor.presentationTimeStamp
+        guard steps == 1, next.isNumeric, CMTimeCompare(next, first) > 0,
+              CMTimeRangeContainsTime(map.source, time: next) else { return nil }
+        return .after(CMTimeSubtract(next, first).seconds)
+    }
     /// Cached proof only. A completed paused seek may still await its first image.
     func activeTimelineReceipt(for ticket: PresentationTicket) -> ActiveTimelineReceipt? {
         guard owns(ticket), presentationActive, frameFeedEnabled,
@@ -160,6 +226,17 @@ final class ContinuousPictureInPicture: NSObject {
         }
         return receipt
     }
+    /// A real SDK detachment makes this output incapable of supplying another
+    /// frame even when its last image or the decoder's timeline still survives.
+    func isOutputDetached(for timeline: ActiveTimelineReceipt) -> Bool {
+        guard activeTimelineReceipt(for: timeline.ticket) == timeline,
+              let resource = currentResource, let item = resource.item,
+              let output = videoOutput, resource.output === output else { return false }
+        let attached = item.outputs.contains { $0 === output }
+        return !attached && currentResource === resource && resource.item === item && resource.output === output
+            && activeTimelineReceipt(for: timeline.ticket) == timeline
+    }
+
     private func ownsFramePull(_ receipt: CurrentFrameReceipt) -> Bool {
         owns(receipt.ticket) && presentationActive && frameFeedEnabled
             && installedTimeline == receipt.ticket && activeSeekTicket == nil
@@ -183,6 +260,8 @@ final class ContinuousPictureInPicture: NSObject {
         fileprivate(set) var isAttached = false
         fileprivate var preferredFrameRate: Float = 60
         fileprivate var sourceFrameRate: Float = 30
+        fileprivate var timingTrackID: CMPersistentTrackID?
+        fileprivate var nextTimingRead = 0.0
         private(set) var isRetired = false
         private(set) var isBorrowed = false
         fileprivate var originalComposition: AVVideoComposition?
@@ -363,6 +442,7 @@ final class ContinuousPictureInPicture: NSObject {
                   item.videoComposition === original else { return nil }
             let resource = PreparedVideoResource(item: item)
             let cadence = composition.frameDuration.seconds
+            resource.timingTrackID = composition.sourceTrackIDForFrameTiming
             guard ifEligible() else { resource.retire(); return nil }
             if cadence.isFinite, cadence > 0 {
                 resource.preferredFrameRate = Float(min(120, max(60, 1 / cadence)))
@@ -497,6 +577,8 @@ final class ContinuousPictureInPicture: NSObject {
     // Timing-only test gate. A refusal leaves the same active timeline/epoch intact.
     // Nil adds no SDK read, clock, task, counter or Release behavior.
     var shouldDebugAcquireFrame: (@MainActor (CurrentFrameReceipt) -> Bool)?
+    var debugWithholdItemOutput = false
+    private(set) var debugAlternateFrameCount: UInt64 = 0
     enum DebugNativePullStage: Int, CaseIterable, Sendable {
         case availability = 0, copy = 1, enqueue = 2
     }
@@ -513,6 +595,7 @@ final class ContinuousPictureInPicture: NSObject {
     }
     // Separate from legacy point stamps and their capacity/masks.
     var onDebugNativePullStamp: (@MainActor (DebugNativePullStamp) -> Void)?
+    var onDebugTapPublished: (() -> Void)?
     var onDebugImageRemovalCompleted: (@MainActor @Sendable (Int, UInt64) -> Void)?
     var debugImageRemovalOwner: (revision: Int, epoch: UInt64) { (presentationRevision, imageEpoch) }
     enum DebugWholeFrameStage: Int, Sendable {
@@ -750,6 +833,14 @@ final class ContinuousPictureInPicture: NSObject {
     private var formatWidth = 0
     private var formatHeight = 0
     private var formatPixelType: OSType = 0
+    private var formatFromAlternate = false
+    private var localFrames: LocalVideoFrameReader?
+    private var streamingFrames: StreamingVideoFrames?
+    private var lastReaderTime = CMTime.invalid
+    private var lastSelectionTime: CFTimeInterval?
+    private var primeAfterSwitch = false
+    private var alternateAttempted = false
+    private var nativeFramesHealthySince: CFTimeInterval?
     private var lastEnqueuedTime = CMTime.invalid
     private var hasReportedFrameFailure = false
     private var invalidated = false
@@ -840,6 +931,12 @@ final class ContinuousPictureInPicture: NSObject {
     @discardableResult
     func setCurrentItem(_ item: AVPlayerItem?, preparedVideo: PreparedVideoResource? = nil) -> PresentationTicket? {
         guard !invalidated else { return nil }
+        cancelLocalReader()
+        if let item, currentItem !== item {
+            let now = CACurrentMediaTime()
+            primeAfterSwitch = lastSelectionTime.map { now - $0 <= 2 } ?? false
+            lastSelectionTime = now
+        }
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
         presentationRevision &+= 1
@@ -966,6 +1063,7 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     private func releaseCurrentResource() {
+        cancelLocalReader()
         cancelIsolatedPreparation()
         let isolated = isolatedVideo
         let resource = currentResource, owned = currentResourceOwned
@@ -1274,7 +1372,43 @@ final class ContinuousPictureInPicture: NSObject {
                 && activeSeekTicket == seek && seekTicket == seek && ifEligible()
         }
         guard eligible() else { return false }
-        return resource.rebuildOutput(ifEligible: eligible) { self.videoOutput = $0 }
+        return resource.rebuildOutput(ifEligible: eligible, publish: publishReplacementOutput)
+    }
+
+    private func publishReplacementOutput(_ replacement: AVPlayerItemVideoOutput) {
+        videoOutput = replacement
+        #if DEBUG
+        onDebugTapPublished?()
+        #endif
+    }
+
+    /// The decoder and the display clock are still running. Changing only its
+    /// tap preserves the on-screen image and the renderer's warm presentation queue.
+    func replaceStarvedOutput(for timeline: ActiveTimelineReceipt, ifEligible: () -> Bool) -> Bool {
+        guard activeTimelineReceipt(for: timeline.ticket) == timeline, let resource = currentResource else { return false }
+        beginReadinessUpdates()
+        defer { endReadinessUpdates() }
+        var expectedEpoch = timeline.imageEpoch
+        func eligible() -> Bool {
+            owns(timeline.ticket) && presentationActive && frameFeedEnabled && currentResource === resource
+                && installedTimeline == timeline.ticket && activeSeekTicket == nil && seekTicket == timeline.seekSerial
+                && imageEpoch == expectedEpoch && !imageEpochSaturated && playbackState.read().isPlaying && ifEligible()
+        }
+        guard eligible(), expectedEpoch < .max else { return false }
+        let floor = lastEnqueuedTime
+        let replaced = resource.rebuildOutput(ifEligible: eligible) { replacement in
+            expectedEpoch += 1
+            self.videoOutput = replacement
+            _ = self.invalidateCurrentFrameProof()
+            guard eligible() else { return }
+            self.lastEnqueuedTime = floor
+            #if DEBUG
+            self.onDebugTapPublished?()
+            #endif
+        }
+        guard replaced, eligible() else { return false }
+        renderFrame(targetHostTime: CACurrentMediaTime())
+        return eligible()
     }
 
     /// Restore a starved output in either audio mode without seeking AVPlayer.
@@ -1289,7 +1423,7 @@ final class ContinuousPictureInPicture: NSObject {
                 && activeSeekTicket == barrier && seekTicket == barrier
         }
         guard eligible() else { return false }
-        let rebuilt = resource.rebuildOutput(ifEligible: eligible) { self.videoOutput = $0 }
+        let rebuilt = resource.rebuildOutput(ifEligible: eligible, publish: publishReplacementOutput)
         guard rebuilt, eligible() else { return false }
         completeSeek(barrier)
         guard owns(ticket), currentResource === resource, activeSeekTicket == nil else { return false }
@@ -1302,6 +1436,7 @@ final class ContinuousPictureInPicture: NSObject {
     /// Call when video is intentionally disabled, even if audio remains active.
     func suspendFrameFeed() {
         guard frameFeedEnabled else { return }
+        cancelLocalReader()
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
         frameFeedEnabled = false
@@ -1326,11 +1461,13 @@ final class ContinuousPictureInPicture: NSObject {
     /// Test teardown must await the cancelled metadata/composition owner as well.
     func debugInvalidateAndCapturePreparation() -> Task<Void, Never>? {
         let owned = preparationTask
+        let timing = Array(sourceTimingTasks.values)
         invalidate()
         let preparations = Array(pendingIsolatedPreparations.values)
         let drains = Array(pendingRecoveryDrains.values)
         return Task { [self] in
             await owned?.value
+            for task in timing { await task.value }
             for task in preparations { await task.value }
             for task in drains { await task.value }
             // A cancelled preparation may have closed its decoder while being joined.
@@ -1342,6 +1479,9 @@ final class ContinuousPictureInPicture: NSObject {
     /// Release on the control thread. No audio session or audio renderer is touched.
     func invalidate() {
         guard !invalidated else { return }
+        cancelLocalReader()
+        streamingFrames?.cancel()
+        streamingFrames = nil
         beginReadinessUpdates()
         defer { endReadinessUpdates() }
         invalidated = true
@@ -1410,6 +1550,55 @@ final class ContinuousPictureInPicture: NSObject {
         displayLink = nil
         frameTimer?.invalidate()
         frameTimer = nil
+    }
+
+    func prepareStreamingFrames(on player: AVPlayer) {
+        // Installing an output on an already playing item can cause AVFoundation
+        // to reselect its media channels. Install it before the first stream.
+        guard streamingFrames == nil, player.currentItem == nil else { return }
+        streamingFrames = StreamingVideoFrames(player: player)
+    }
+
+    private func cancelLocalReader() {
+        localFrames?.cancel()
+        localFrames = nil
+        lastReaderTime = .invalid
+        alternateAttempted = false
+        nativeFramesHealthySince = nil
+    }
+
+    /// A verified local asset can supply its original frames independently of
+    /// the queue player's decoder. On a live URL the alternate output belongs
+    /// to the queue player, whose sample identifies the actual source item.
+    private func alternateFrame(at time: CMTime, hostTime: CFTimeInterval,
+                                missingItemFrame: Bool, for receipt: CurrentFrameReceipt)
+        -> (pixel: CVPixelBuffer, position: CMTime)? {
+        guard time.isNumeric else { return nil }
+        if lastReaderTime.isNumeric {
+            let delta = CMTimeSubtract(time, lastReaderTime).seconds
+            if delta < -0.015 || delta > 0.35 { cancelLocalReader() }
+        }
+        let late = missingItemFrame && (lastEnqueuedTime.isNumeric
+            ? CMTimeSubtract(time, lastEnqueuedTime).seconds >= 0.100 : time.seconds >= 0.100)
+        if localFrames == nil, !alternateAttempted {
+            guard primeAfterSwitch || late,
+                  let resource = currentResource, let item = resource.item,
+                  let asset = item.asset as? AVURLAsset, ownsFramePull(receipt) else { return nil }
+            // Do not start decoders for every intermediate page in a fast swipe.
+            if primeAfterSwitch, let selected = lastSelectionTime, CACurrentMediaTime() - selected < 0.045 { return nil }
+            if asset.url.isFileURL {
+                guard format != nil, formatPixelType != 0 else { return nil }
+                localFrames = LocalVideoFrameReader(asset: asset, composition: resource.installedComposition,
+                    pixelFormat: formatPixelType, start: time)
+            }
+            alternateAttempted = true
+        }
+        lastReaderTime = time
+        if let localFrames { return localFrames.frame(at: time) }
+        guard missingItemFrame, let streamingFrames, let item = currentResource?.item,
+              item === currentItem, (item.asset as? AVURLAsset)?.url.isFileURL == false,
+              ownsFramePull(receipt) else { return nil }
+        return streamingFrames.frame(for: item, atHostTime: hostTime)
     }
 
     private func renderFrame(targetHostTime: CFTimeInterval? = nil) {
@@ -1509,7 +1698,8 @@ final class ContinuousPictureInPicture: NSObject {
         debugWholeStage = .layerStatus
         debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         #endif
-        let layerFailed = displayLayer.status == .failed
+        let renderer = displayLayer.sampleBufferRenderer
+        let layerFailed = renderer.status == .failed
         #if DEBUG
         if debugWholeEntry != nil {
             debugWholeStatus = .init(entryNs: debugWholeReadEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
@@ -1524,7 +1714,7 @@ final class ContinuousPictureInPicture: NSObject {
             #endif
             // Discard credit before any observer or SDK flush can reenter.
             let shouldReport = !hasReportedFrameFailure
-            let errorCode = shouldReport ? (displayLayer.error as NSError?)?.code : nil
+            let errorCode = shouldReport ? (renderer.error as NSError?)?.code : nil
             guard ownsFramePull(pullReceipt) else { return }
             let recoveryEpoch = pullReceipt.imageEpoch.addingReportingOverflow(1)
             flushForSeek()
@@ -1540,19 +1730,23 @@ final class ContinuousPictureInPicture: NSObject {
             }
             return // The next pull must capture the new image epoch.
         }
-        // Respect platform backpressure. No app-owned pixel-buffer queue or decoded-frame history.
+        // This is a real-time display link. A full queue must still admit a
+        // replacement for an image that has already missed its presentation time.
         #if DEBUG
         debugWholeStage = .backpressure
         debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
-        let readyForMore = displayLayer.isReadyForMoreMediaData
+        #endif
+        let readyForMore = renderer.isReadyForMoreMediaData
+        #if DEBUG
         if debugWholeEntry != nil {
             debugWholeBackpressure = .init(entryNs: debugWholeReadEntry, returnNs: DispatchTime.now().uptimeNanoseconds)
             debugWholeReadyForMore = readyForMore
         }
-        guard readyForMore else { return }
+        #endif
+        let playing = playbackState.read().isPlaying
+        guard readyForMore || (playing && targetHostTime != nil) else { return }
+        #if DEBUG
         debugWholeStage = .ownerAfterBackpressure
-        #else
-        guard displayLayer.isReadyForMoreMediaData else { return }
         #endif
         guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
@@ -1560,8 +1754,10 @@ final class ContinuousPictureInPicture: NSObject {
         debugWholeReadEntry = debugWholeEntry == nil ? 0 : DispatchTime.now().uptimeNanoseconds
         #endif
         let presentationTime = CMTimebaseGetTime(timebase)
+        if !readyForMore, lastEnqueuedTime.isNumeric,
+           CMTimeSubtract(presentationTime, lastEnqueuedTime).seconds < 1.0 / 60 { return }
         var requestedTime = presentationTime
-        if playbackState.read().isPlaying, let targetHostTime {
+        if readyForMore, playing, let targetHostTime {
             // Ask the native decoder for its next display deadline. Pulling from
             // the independently anchored audio clock can repeatedly miss the
             // decoder's frame boundary even with 60 display callbacks per second.
@@ -1609,35 +1805,75 @@ final class ContinuousPictureInPicture: NSObject {
         guard ownsFramePull(pullReceipt) else { return }
         #if DEBUG
         debugWholeStage = .availability
-        let hasNew = debugNativePull(.availability, sourceTicket: debugEnqueueTicket,
-            sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
-            videoOutput.hasNewPixelBuffer(forItemTime: requestedTime)
+        #endif
+        func hasDecodedFrame(at time: CMTime) -> Bool {
+            #if DEBUG
+            return debugNativePull(.availability, sourceTicket: debugEnqueueTicket,
+                sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
+                videoOutput.hasNewPixelBuffer(forItemTime: time)
+            }
+            #else
+            return videoOutput.hasNewPixelBuffer(forItemTime: time)
+            #endif
         }
+        var hasNew = hasDecodedFrame(at: requestedTime)
+        if !hasNew, presentationTime.isNumeric, CMTimeSubtract(requestedTime, presentationTime).seconds >= 0.004,
+           (!lastEnqueuedTime.isNumeric || CMTimeCompare(lastEnqueuedTime, presentationTime) < 0),
+           ownsFramePull(pullReceipt) {
+            // The upcoming vsync can be ahead of the decoder. A frame due at
+            // the audible playhead can still be presented on this refresh.
+            requestedTime = presentationTime
+            hasNew = hasDecodedFrame(at: presentationTime)
+        }
+        #if DEBUG
+        if debugWithholdItemOutput { hasNew = false }
+        #endif
+        if !hasNew { nativeFramesHealthySince = nil }
+        var alternate: (pixel: CVPixelBuffer, position: CMTime)?
+        if playing, let host = targetHostTime, ownsFramePull(pullReceipt),
+           primeAfterSwitch || !hasNew || localFrames != nil {
+            if let frame = alternateFrame(at: presentationTime, hostTime: host,
+                                          missingItemFrame: !hasNew, for: pullReceipt),
+               frame.position.isNumeric, (!lastEnqueuedTime.isNumeric || CMTimeCompare(frame.position, lastEnqueuedTime) > 0) {
+                alternate = frame
+            }
+        }
+        #if DEBUG
         debugWholeAvailability = hasNew
         debugWholeStage = .availabilityGuard
         debugTraceRender(hasNew ? .hasNewTrue : .hasNewFalse, requested: requestedTime, sourceTicket: debugSourceTicket)
-        guard hasNew else { return }
-        #else
-        guard videoOutput.hasNewPixelBuffer(forItemTime: requestedTime) else { return }
         #endif
+        guard hasNew || alternate != nil else { return }
         #if DEBUG
         debugWholeStage = .ownerBeforeCopy
         #endif
         guard ownsFramePull(pullReceipt) else { return }
         var displayTime = CMTime.invalid
+        var copied: CVPixelBuffer? = nil
+        if hasNew {
         #if DEBUG
-        debugWholeStage = .copy
-        let copied = debugNativePull(.copy, sourceTicket: debugEnqueueTicket,
-            sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
-            videoOutput.copyPixelBuffer(forItemTime: requestedTime, itemTimeForDisplay: &displayTime)
+            debugWholeStage = .copy
+            copied = debugNativePull(.copy, sourceTicket: debugEnqueueTicket,
+                sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
+                videoOutput.copyPixelBuffer(forItemTime: requestedTime, itemTimeForDisplay: &displayTime)
+            }
+        #else
+            copied = videoOutput.copyPixelBuffer(forItemTime: requestedTime, itemTimeForDisplay: &displayTime)
+        #endif
         }
+        var usedAlternate = false
+        if let alternate, copied == nil || !displayTime.isNumeric || CMTimeCompare(alternate.position, displayTime) > 0 {
+            displayTime = alternate.position
+            copied = alternate.pixel
+            usedAlternate = true
+        }
+        #if DEBUG
         debugWholeCopied = copied != nil
         debugWholeStage = .copyGuard
+        #endif
         guard let pixel = copied else { return }
+        #if DEBUG
         let debugAlignedAfterCopy = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
-        #else
-        guard let pixel = videoOutput.copyPixelBuffer(forItemTime: requestedTime,
-                                                      itemTimeForDisplay: &displayTime) else { return }
         #endif
         #if DEBUG
         debugWholeStage = .ownerAfterCopy
@@ -1678,14 +1914,16 @@ final class ContinuousPictureInPicture: NSObject {
         #if DEBUG
         debugWholeStage = .leadGuard
         #endif
-        guard lead.isFinite, lead <= 1.0 / 30 else { return }
+        guard lead.isFinite, lead <= (readyForMore ? 1.0 / 30 : 0) else { return }
         #if DEBUG
         debugWholeStage = .formatCreation
         #endif
         let width = CVPixelBufferGetWidth(pixel)
         let height = CVPixelBufferGetHeight(pixel)
         let pixelType = CVPixelBufferGetPixelFormatType(pixel)
-        if format == nil || width != formatWidth || height != formatHeight || pixelType != formatPixelType {
+        let colorChanged = formatFromAlternate != usedAlternate
+            && format.map { !CMVideoFormatDescriptionMatchesImageBuffer($0, imageBuffer: pixel) } == true
+        if format == nil || width != formatWidth || height != formatHeight || pixelType != formatPixelType || colorChanged {
             var createdFormat: CMVideoFormatDescription?
             let status = CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
                                                                       imageBuffer: pixel,
@@ -1697,6 +1935,7 @@ final class ContinuousPictureInPicture: NSObject {
             formatHeight = height
             formatPixelType = pixelType
         }
+        formatFromAlternate = usedAlternate
         #if DEBUG
         debugWholeStage = .formatGuard
         #endif
@@ -1717,6 +1956,14 @@ final class ContinuousPictureInPicture: NSObject {
         debugWholeStage = .sampleGuard
         #endif
         guard status == noErr, let sample else { reportFrameFailure(status); return }
+        // Present a decoded frame that is already due on the sound clock. With
+        // DisplayImmediately the renderer replaces pending stale pictures. A
+        // future sample keeps its original PTS and waits for its own deadline.
+        if playing, lead <= 0, let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
+            let dictionary = Unmanaged<CFMutableDictionary>.fromOpaque(CFArrayGetValueAtIndex(attachments, 0)).takeUnretainedValue()
+            CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
         #if DEBUG
         let debugAlignedBeforeEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         #endif
@@ -1728,12 +1975,12 @@ final class ContinuousPictureInPicture: NSObject {
         debugWholeStage = .enqueue
         debugNativePull(.enqueue, sourceTicket: debugEnqueueTicket,
             sourceNativeSeekTicket: debugPullSeekTicket, output: videoOutput) {
-            displayLayer.enqueue(sample)
+            renderer.enqueue(sample)
         }
         let debugAlignedAfterEnqueue = debugAlignedContext.map { debugAlignedOwnerMatches($0) } ?? false
         let debugAlignedEnqueuedNs = debugAlignedContext == nil ? nil : DispatchTime.now().uptimeNanoseconds
         #else
-        displayLayer.enqueue(sample)
+        renderer.enqueue(sample)
         #endif
         #if DEBUG
         debugWholeEnqueueCalled = true
@@ -1747,6 +1994,16 @@ final class ContinuousPictureInPicture: NSObject {
         lastEnqueuedTime = displayTime
         lastFramePositionSeconds = CMTimeGetSeconds(displayTime)
         submittedFrameCount &+= 1
+        #if DEBUG
+        if usedAlternate { debugAlternateFrameCount &+= 1 }
+        #endif
+        if localFrames != nil, let host = targetHostTime {
+            if usedAlternate { nativeFramesHealthySince = nil }
+            else if let since = nativeFramesHealthySince, host - since >= 0.5 {
+                primeAfterSwitch = false
+                cancelLocalReader()
+            } else if nativeFramesHealthySince == nil { nativeFramesHealthySince = host }
+        }
         if submittedReceipt != pullReceipt {
             submittedReceipt = pullReceipt
             readinessUpdatePending = true

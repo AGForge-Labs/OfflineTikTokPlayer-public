@@ -7,6 +7,34 @@ import PlayerCore
 
 @MainActor
 final class PlaybackContinuityTests: XCTestCase {
+    func testPlaybackAcrossFiveSecondsAndForegroundLeavesLegacyQueueUntouched() async throws {
+        let fixture = try await SelectionVideoFixture(test: self)
+        defer { fixture.remove() }
+        let oldIDs = [fixture.aID] + (0..<2_100).map { "old-\($0)" }
+        let oldQueue = PlaybackQueue(ids: oldIDs, startAt: fixture.aID, shuffle: true)
+        let legacy = try JSONEncoder().encode(PlaybackBookmark(queue: oldQueue, position: 18))
+        try legacy.write(to: fixture.bookmark)
+        let service = fixture.service()
+        XCTAssertNil(service.queue.currentID)
+        service.start(playlistIDs: [fixture.playlist], at: fixture.bID)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while service.clock.position < 5.5, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertGreaterThanOrEqual(service.clock.position, 5.5)
+        XCTAssertTrue(try Data(contentsOf: fixture.bookmark) == legacy,
+                      "Selecting and ticking a large legacy queue must leave its checkpoint alone.")
+        let before = service.clock.position
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        service.enteredForeground()
+        XCTAssertEqual(service.queue.currentID, fixture.bID)
+        XCTAssertTrue(service.wantsToPlay)
+        try await until { service.clock.position > before + 0.1 }
+        service.pause()
+        XCTAssertTrue(try Data(contentsOf: fixture.bookmark) == legacy,
+                      "Backgrounding, resuming and pausing must leave the retired checkpoint alone.")
+    }
+
     func testAudioSeekCompletesWithoutWaitingForMutedVideoAndPauseWins() async throws {
         let fixture = try await ServiceFixture()
         defer { fixture.remove() }
@@ -153,7 +181,11 @@ final class PlaybackContinuityTests: XCTestCase {
         let service = PlaybackService(library: fixture.library, downloads: fixture.downloads, cloud: fixture.cloud,
             bookmarkURL: fixture.bookmark, activateSession: {})
         defer { service.pause() }
-        service.restore()
+        #if DEBUG
+        service.debugRestorePausedBookmark()
+        #else
+        throw XCTSkip("The paused-seek fixture requires a Debug test host.")
+        #endif
         try await until { !service.isLoading && abs(service.player.currentTime().seconds - 0.4) < 0.04 }
         XCTAssertFalse(service.wantsToPlay)
         service.seek(0.8)
@@ -250,7 +282,8 @@ final class PlaybackContinuityTests: XCTestCase {
         service.enteredForeground()
         service.handleInterruption(began: false, shouldResume: true)
         XCTAssertEqual(activations, 2)
-        service.persist(); service.enteredForeground()
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        service.enteredForeground()
         XCTAssertTrue(service.wantsToPlay, "A normal background/foreground cycle must preserve playback")
         XCTAssertEqual(activations, 2)
         service.handleInterruption(began: true); service.pause()

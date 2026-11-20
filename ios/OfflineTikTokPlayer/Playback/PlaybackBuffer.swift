@@ -21,7 +21,10 @@ final class PlaybackBuffer {
         }
     }
     let player = AVQueuePlayer()
-    private var next: Prepared?
+    private var promotedRewindRevision: UInt64?
+    private var next: Prepared? {
+        didSet { promotedRewindRevision = nil }
+    }
     private var loopReserve: Prepared?
     private var active: Prepared?
     private var previousRevision: UInt64 = 0
@@ -39,6 +42,7 @@ final class PlaybackBuffer {
     var debugPreviousNeedsRewind: Bool? { previous?.needsRewind }
     var debugPreviousCompletedZeroRewind: Bool? { previous?.completedPreviousZeroRewind }
     var debugPreviousRevision: UInt64 { previousRevision }
+    var onDebugPreviousRewindDelivery: (@MainActor (UInt64) -> Void)?
     var onDebugPreviousRewindCompletion: (@MainActor (UInt64, Bool, Bool) -> Void)?
     var onDebugPreviousRewindRead: (@MainActor () -> Void)?
     var debugQueuedPreviousAdvance: Bool?
@@ -160,6 +164,9 @@ final class PlaybackBuffer {
         item.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak item] finished in
             Task { @MainActor in
                 guard let self, let item else { return }
+                #if DEBUG
+                self.onDebugPreviousRewindDelivery?(rewindRevision)
+                #endif
                 let accepted = self.completePreviousRewind(item, revision: rewindRevision, finished: finished)
                 #if DEBUG
                 self.onDebugPreviousRewindCompletion?(rewindRevision, finished, accepted)
@@ -169,19 +176,25 @@ final class PlaybackBuffer {
     }
 
     private func completePreviousRewind(_ item: AVPlayerItem, revision: UInt64, finished: Bool) -> Bool {
-        guard finished, revision < .max, previousRevision == revision,
-              previous?.item === item, previous?.needsRewind == true else { return false }
+        @MainActor func pendingEntry() -> Prepared? {
+            if previousRevision == revision { return previous }
+            if promotedRewindRevision == revision { return next }
+            return nil
+        }
+        guard finished, revision < .max, let candidate = pendingEntry(), candidate.item === item,
+              candidate.needsRewind else { return false }
         let position = item.currentTime().seconds
         let current = player.currentItem
         #if DEBUG
         onDebugPreviousRewindRead?()
         #endif
-        guard previousRevision == revision, var committed = previous,
-              committed.item === item, committed.needsRewind, current !== item,
-              position.isFinite, abs(position) < 0.005 else { return false }
+        guard current !== item, position.isFinite, abs(position) < 0.005 else { return false }
+        let promoted = promotedRewindRevision == revision
+        if promoted, player.items().dropFirst().first !== item { return false }
+        guard var committed = pendingEntry(), sameOwner(committed, candidate), committed.needsRewind else { return false }
         committed.needsRewind = false
         committed.completedPreviousZeroRewind = true
-        previous = committed
+        if promoted { next = committed } else { previous = committed }
         return true
     }
 
@@ -296,6 +309,9 @@ final class PlaybackBuffer {
         // Destination ownership precedes source removal and all insertion notifications.
         // Copy the live Prepared value: a completed rewind must not become pending again.
         next = committed
+        // The offscreen seek can finish after this item has moved into the queue.
+        // Any subsequent write to next revokes this exact visit's completion.
+        if committed.needsRewind { promotedRewindRevision = previousRevision }
         previous = nil
         player.insert(committed.item, after: current)
         updateEndAction()
