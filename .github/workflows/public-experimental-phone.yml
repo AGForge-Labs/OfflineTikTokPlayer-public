@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only adaptive video playback repair
+run-name: Owner-only held picture and cold launch repair
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +48,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 05c050661162801d911254582f94d7f778ad4b76
+          ref: 7d30dccbdaf8d909c1076c26e300f79bff3192ad
           fetch-depth: 2
           path: candidate
           persist-credentials: false
@@ -79,7 +79,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 05c050661162801d911254582f94d7f778ad4b76
+          ref: 7d30dccbdaf8d909c1076c26e300f79bff3192ad
           fetch-depth: 2
           path: candidate
           persist-credentials: false
