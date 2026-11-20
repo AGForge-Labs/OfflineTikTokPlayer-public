@@ -3,6 +3,11 @@ import Foundation
 /// A held picture can trigger one repair. Continued loss of all current
 /// images permits one more attempt. Moving pictures rearm recovery.
 public struct VideoImageProgress {
+    public enum NextSourceFrame: Equatable, Sendable {
+        /// Time from the held frame to its actual successor in presentation order.
+        case after(Double)
+        case end
+    }
     private var since: Double?
     private var playbackAtProgress = 0.0
     private var previousPlayback = 0.0
@@ -16,7 +21,7 @@ public struct VideoImageProgress {
         grace = graceSeconds.isFinite ? min(30, max(1.5, graceSeconds)) : 3
     }
     public mutating func shouldRecover(now: Double, playbackPosition: Double,
-                                       displayedPosition: Double?) -> Bool {
+                                       displayedPosition: Double?, followingFrame: NextSourceFrame? = nil) -> Bool {
         guard now.isFinite, playbackPosition.isFinite, playbackPosition >= 0,
               displayedPosition.map({ $0.isFinite && $0 >= 0 }) ?? true else {
             let used = repairAttempts
@@ -45,9 +50,19 @@ public struct VideoImageProgress {
             latestImage = displayedPosition
             since = now; playbackAtProgress = playbackPosition
         }
-        guard let since, now - since >= grace,
-              playbackPosition - playbackAtProgress >= 0.5,
-              playbackPosition - latestImage >= 0.5 else { return false }
+        var wait = grace
+        var clockAdvance = 0.5
+        if let displayedPosition, let followingFrame {
+            guard case .after(let interval) = followingFrame, interval.isFinite, interval > 0,
+                  playbackPosition - displayedPosition >= interval + 0.080 else { return false }
+            // A source sample is already overdue. Allow a few ordinary render
+            // ticks for it to arrive, then leave time to replace a starved tap.
+            wait = 0.12
+            clockAdvance = 0.080
+        }
+        guard let since, now - since >= wait,
+              playbackPosition - playbackAtProgress >= clockAdvance,
+              playbackPosition - latestImage >= clockAdvance else { return false }
         if repairAttempts > 0 {
             // A legitimately long frame remains present. A failed repair that
             // never gets a current image may retry after another full window.

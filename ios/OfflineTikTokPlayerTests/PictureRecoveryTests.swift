@@ -284,7 +284,7 @@ final class PictureRecoveryTests: XCTestCase {
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until {
             service.isVideoReady && service.debugDisplayedVideoPositionSeconds != nil
-                && service.audioSnapshot.frame > 9_600
+                && service.audioSnapshot.frame > 55_200
         }
         let before = service.audioSnapshot
         let item = try XCTUnwrap(service.player.currentItem)
@@ -524,6 +524,70 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertGreaterThan(service.audioSnapshot.frame, before.frame + 48_000)
     }
 
+    func testMovingPictureRecoversBeforeHalfASecondWhileAudioAdvances() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-motion-60", firstDuration: 6)
+        let service = fixture.service
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
+        try await until { service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.3 }
+        let item = try XCTUnwrap(service.player.currentItem)
+        let visit = service.audioSnapshot
+        // Warm the independent RGB readback before measuring the first hold.
+        _ = try XCTUnwrap(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())))
+        for attempt in 1...2 {
+            let preceding = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+            try await until { (service.debugDisplayedVideoPositionSeconds ?? 0) > preceding }
+            let oldOutput = try XCTUnwrap(item.outputs.first)
+            let held = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
+            let before = service.audioSnapshot
+            let oldPicture = try XCTUnwrap(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())))
+            var oldPulls = 0
+            let start = ContinuousClock.now
+            // First withhold acquisition from this tap. The second time detach
+            // the real SDK producer. A replacement works without a timed release.
+            service.shouldDebugAcquireVideoFrame = { receipt in
+                if receipt.output == ObjectIdentifier(oldOutput) { oldPulls += 1; return attempt == 2 }
+                return true
+            }
+            if attempt == 2 { item.remove(oldOutput) }
+            var changedPixels = false
+            var resumed = held
+            var audioKeptPlaying = true
+            while ContinuousClock.now - start < .seconds(3) {
+                audioKeptPlaying = audioKeptPlaying && service.wantsToPlay && service.audioEngineRunning
+                if let replacement = item.outputs.first, replacement !== oldOutput, let pts = service.debugDisplayedVideoPositionSeconds,
+                   pts > held, let pixel = layer.sampleBufferRenderer.displayedPixelBuffer(),
+                   let picture = smallPicture(pixel), picture != oldPicture {
+                    resumed = pts
+                    changedPixels = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(8))
+            }
+            let elapsed = ContinuousClock.now - start
+            service.shouldDebugAcquireVideoFrame = nil
+            let after = service.audioSnapshot
+            let heldMS = Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15
+            print("HELD_PICTURE attempt=\(attempt) gapMS=\(heldMS) oldPTS=\(held) resumedPTS=\(resumed) oldPulls=\(oldPulls) changedPixels=\(changedPixels) audioFrames=\(after.frame - before.frame) underrunsAdded=\(after.underrunFrames - before.underrunFrames)")
+            XCTAssertGreaterThan(oldPulls, 1)
+            XCTAssertTrue(changedPixels)
+            XCTAssertLessThan(elapsed, .milliseconds(500), "Unexpected held picture exceeded half a second")
+            XCTAssertTrue(service.player.currentItem === item)
+            XCTAssertEqual(item.outputs.count, 1)
+            XCTAssertEqual(service.queue.currentID, fixture.mediaID)
+            XCTAssertTrue(audioKeptPlaying)
+            XCTAssertGreaterThan(after.frame - before.frame, Int64(heldMS * 48 * 0.75))
+            XCTAssertEqual(after.token, visit.token)
+            XCTAssertEqual(after.visit, visit.visit)
+            XCTAssertEqual(after.selectionVersion, visit.selectionVersion)
+            XCTAssertEqual(after.underrunFrames, visit.underrunFrames)
+            guard changedPixels, elapsed < .milliseconds(500) else { return }
+            if attempt == 1 {
+                try await until { (service.debugDisplayedVideoPositionSeconds ?? 0) > resumed + 2.0 }
+            }
+        }
+    }
+
     func testAdvancingNativeClockWithNoNewPicturesRepairsVideoWithoutChangingPCMVisit() async throws {
         let fixture = try await PictureRecoveryFixture(test: self)
         let service = fixture.service
@@ -543,6 +607,7 @@ final class PictureRecoveryTests: XCTestCase {
         try await until {
             repairs > 0 && service.submittedVideoFrameCount >= framesBefore + 4
                 && (service.videoFramePositionSeconds ?? 0) > nativeBefore + 0.5
+                && service.audioSnapshot.frame > before.frame + 48_000
         }
         let after = service.audioSnapshot
         XCTAssertEqual(repairs, 1)
@@ -568,6 +633,7 @@ final class PictureRecoveryTests: XCTestCase {
             service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.25
         }
         let item = try XCTUnwrap(service.player.currentItem)
+        let layer = try XCTUnwrap(service.surface.layer.sublayers?.compactMap { $0 as? AVSampleBufferDisplayLayer }.first)
         let audio = service.audioSnapshot
         for attempt in 1...2 {
             let held = try XCTUnwrap(service.debugDisplayedVideoPositionSeconds)
@@ -575,9 +641,11 @@ final class PictureRecoveryTests: XCTestCase {
             let audible = service.audioSnapshot.frame
             let native = item.currentTime().seconds
             service.shouldDebugAcquireVideoFrame = { _ in false }
+            try await until { service.audioSnapshot.frame > audible + 3_840 }
+            let still = try XCTUnwrap(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())))
             try await until { service.audioSnapshot.frame > audible + 24_000 }
             XCTAssertGreaterThan(item.currentTime().seconds, native + 0.25)
-            XCTAssertLessThanOrEqual(try XCTUnwrap(service.debugDisplayedVideoPositionSeconds), held + 0.08)
+            XCTAssertEqual(smallPicture(try XCTUnwrap(layer.sampleBufferRenderer.displayedPixelBuffer())), still)
             try await until { item.outputs.first !== output }
             service.shouldDebugAcquireVideoFrame = nil
             try await until {
@@ -660,6 +728,7 @@ final class PictureRecoveryTests: XCTestCase {
             try await until {
                 nativeClock.sample(item)
                 return repairs == attempt && service.submittedVideoFrameCount >= frames + 4 && service.isVideoReady
+                    && service.player.currentTime().seconds > before + 1
             }
             XCTAssertTrue(service.player.currentItem === item)
             XCTAssertTrue(item.outputs.first === audibleOutput)

@@ -2,6 +2,41 @@ import XCTest
 @testable import PlayerCore
 
 final class VideoImageProgressTests: XCTestCase {
+    func testMovingPictureWithADueSourceSampleRecoversBeforeHalfASecond() {
+        var progress = VideoImageProgress()
+        var repairs = [Double]()
+        // At 1 second the output keeps showing frame 60. The asset contains
+        // frame 61 one sixtieth later and the audible PCM position keeps moving.
+        for tick in 0...88 {
+            let now = Double(tick) / 60
+            let displayed = min(1, now)
+            if progress.shouldRecover(now: now, playbackPosition: now, displayedPosition: displayed,
+                                      followingFrame: .after(1.0 / 60)) {
+                repairs.append(now)
+            }
+        }
+        XCTAssertEqual(repairs.count, 1)
+        if let first = repairs.first {
+            XCTAssertGreaterThan(first, 1.05, "Normal decoder and display jitter must have time to settle")
+            XCTAssertLessThan(first, 1.35, "Leave time to deliver a different image before half a second")
+        }
+    }
+
+    func testAuthoredSparseAndFinalFramesStayOnScreenWhileAudioAdvances() {
+        var progress = VideoImageProgress()
+        for tick in 0...150 {
+            let now = Double(tick) / 30
+            let atEnd = now >= 2.75
+            XCTAssertFalse(progress.shouldRecover(now: now, playbackPosition: now,
+                displayedPosition: atEnd ? 2.75 : 0, followingFrame: atEnd ? .end : .after(2.75)))
+        }
+        var stopped = VideoImageProgress()
+        for tick in 0...60 {
+            XCTAssertFalse(stopped.shouldRecover(now: Double(tick) / 30, playbackPosition: 4,
+                displayedPosition: 3.5, followingFrame: .after(1.0 / 30)))
+        }
+    }
+
     func testAdvancingClockWithoutIncomingPicturesRequestsOneBoundedRepair() {
         var progress = VideoImageProgress()
         XCTAssertFalse(progress.shouldRecover(now: 0, playbackPosition: 0.2, displayedPosition: 0.2))

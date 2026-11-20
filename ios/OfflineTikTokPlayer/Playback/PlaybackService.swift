@@ -617,8 +617,10 @@ final class PlaybackService: NSObject {
     @ObservationIgnored private var enhancedItems = NSHashTable<AVPlayerItem>.weakObjects()
     @ObservationIgnored private var endedDuringScroll = false
     @ObservationIgnored private var reachedPreparedEnd = false
-    @ObservationIgnored private var lastBookmark = Date.distantPast
-    private let bookmarkURL: URL
+    @ObservationIgnored private var lastNowPlayingUpdate = Date.distantPast
+    #if DEBUG
+    private let fixtureBookmarkURL: URL?
+    #endif
     @ObservationIgnored private let preferences: UserDefaults
     @ObservationIgnored private let activateSession: () throws -> Void
 
@@ -627,7 +629,7 @@ final class PlaybackService: NSObject {
     var nextID: String? { feedWindow.next?.mediaID }
 
     init(library: LibraryRepository, downloads: OfflineDownloads, cloud: OneDriveClient,
-         bookmarkURL: URL = AppFiles.root.appendingPathComponent("playback.json"),
+         bookmarkURL: URL? = nil,
          activateSession: @escaping () throws -> Void = { try AVAudioSession.sharedInstance().setActive(true) },
          buffer: PlaybackBuffer? = nil, continuousAudio: ContinuousAudioPlayer? = nil,
          speakerAudio: SpeakerAudioController? = nil,
@@ -644,7 +646,10 @@ final class PlaybackService: NSObject {
          preparePCM: PreparePCM? = nil) {
         self.library = library; self.downloads = downloads; self.cloud = cloud
         self.continuousAudio = continuousAudio ?? ContinuousAudioPlayer()
-        self.bookmarkURL = bookmarkURL; self.activateSession = activateSession
+        #if DEBUG
+        self.fixtureBookmarkURL = bookmarkURL
+        #endif
+        self.activateSession = activateSession
         self.buffer = buffer ?? PlaybackBuffer()
         self.speakerAudio = speakerAudio ?? SpeakerAudioController()
         self.audioRoutes = audioRoutes; self.seekPlayer = seekPlayer
@@ -739,13 +744,16 @@ final class PlaybackService: NSObject {
         return enabled ? delay : 33
     }
 
-    func restore() {
-        beginAudioCommand()
-        guard queue.currentID == nil, let data = try? Data(contentsOf: bookmarkURL),
+    #if DEBUG
+    /// Native seek/frame tests can explicitly seed a paused selection in their own fixture.
+    func debugRestorePausedBookmark() {
+        guard let fixtureBookmarkURL, queue.currentID == nil, let data = try? Data(contentsOf: fixtureBookmarkURL),
               let bookmark = try? PlaybackBookmark.restore(data, availableIDs: Set(library.catalog.queue(playlistIDs: [], localIDs: downloads.readyIDs))) else { return }
+        beginAudioCommand()
         queue = bookmark.queue; intent.pause()
         loadCurrent(position: bookmark.position)
     }
+    #endif
 
     func start(playlistIDs: [String], at mediaID: String? = nil, shuffle: Bool = false, offlineOnly: Bool = false,
                within itemIDs: [String]? = nil) {
@@ -789,7 +797,7 @@ final class PlaybackService: NSObject {
             prepareUpcoming()
             if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { armStallRecovery() }
         }
-        persist(); updateNowPlaying()
+        updateNowPlaying()
     }
     func pause() {
         beginAudioCommand()
@@ -803,7 +811,7 @@ final class PlaybackService: NSObject {
         continuousAudio.suspend()
         continuousPiP.updatePlayback(positionSeconds: clock.position, durationSeconds: clock.duration, isPlaying: false)
         cancelStallRecovery()
-        player.pause(); persist(); updateNowPlaying()
+        player.pause(); updateNowPlaying()
     }
 
     #if DEBUG
@@ -896,8 +904,8 @@ final class PlaybackService: NSObject {
         else if endedDuringScroll { next(explicit: false) }
     }
 
-    func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming(); persist() }
-    func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming(); persist() }
+    func setShuffle(_ enabled: Bool) { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.setShuffle(enabled); prepareUpcoming() }
+    func cycleRepeat() { sampleContinuousAudio(handleEnd: false); buffer.synchronize(); queue.repeatMode = queue.repeatMode.next; prepareUpcoming() }
     func seek(_ seconds: Double) {
         beginAudioCommand()
         imageProgressOwner = nil
@@ -935,7 +943,7 @@ final class PlaybackService: NSObject {
                 #endif
                 completePiPSkip()
             }
-            persist(); updateNowPlaying()
+            updateNowPlaying()
             return
         }
         guard let item = player.currentItem, item === observedItem,
@@ -956,10 +964,10 @@ final class PlaybackService: NSObject {
                     self.resumeContinuousAudio()
                     if self.videoAllowed { self.player.playImmediately(atRate: 1) }
                 }
-                self.persist(); self.updateNowPlaying()
+                self.updateNowPlaying()
             }
         }
-        persist(); updateNowPlaying()
+        updateNowPlaying()
     }
 
     private func loadCurrent(position: Double = 0, forceRemote: Bool = false, adopting: PlaybackBuffer.Prepared? = nil,
@@ -1038,7 +1046,7 @@ final class PlaybackService: NSObject {
                 guard generation == request, queue.currentID == id else { return }
                 currentIsLocal = prepared.isLocal; audioLoadingID = nil
                 observeCurrent(prepared.item, position: position, request: request, rewind: prepared.needsRewind)
-                prepareUpcoming(); persist()
+                prepareUpcoming()
                 return
             }
         }
@@ -1161,7 +1169,7 @@ final class PlaybackService: NSObject {
                     self.debugMarkInitialLoadPhase(.observedCurrent, request: request)
                     #endif
                     self.prepareUpcoming()
-                    self.persist(); return
+                    return
                 } catch is CancellationError { return }
                 catch ContinuousPCMDecoder.Failure.cancelled {
                     guard self.generation == request, !Task.isCancelled else { return }
@@ -1285,10 +1293,10 @@ final class PlaybackService: NSObject {
                 guard self.clock.completeSeek(seek, actualPosition: item.currentTime().seconds) else { return }
                 if finished { self.recordPlaybackEvent("seekCompleted") }
                 self.restoreNativePresentation()
-                self.persist(); self.completePiPSkip()
+                self.completePiPSkip()
             }
         }
-        persist(); updateNowPlaying()
+        updateNowPlaying()
     }
 
     /// Keep the muted player's selected audio track available to its native
@@ -2302,7 +2310,7 @@ final class PlaybackService: NSObject {
             #endif
         }
         recoverMissingVideoImages()
-        if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
+        if Date().timeIntervalSince(lastNowPlayingUpdate) > 5 { updateNowPlaying() }
     }
 
     #if DEBUG
@@ -2337,7 +2345,7 @@ final class PlaybackService: NSObject {
         }
         if historyGeneration != generation, intent.canPlay, position >= 0.05, player.rate > 0,
            let id = queue.currentID { recordPlayed(id) }
-        if Date().timeIntervalSince(lastBookmark) > 5 { persist(); updateNowPlaying() }
+        if Date().timeIntervalSince(lastNowPlayingUpdate) > 5 { updateNowPlaying() }
     }
 
     private func recordPlayed(_ id: String) {
@@ -2445,7 +2453,11 @@ final class PlaybackService: NSObject {
         guard syncingVideoGeneration != generation, nativeSeekTicket == nil,
               let timeline = continuousPiP.activeTimelineReceipt(for: presentation.ticket) else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastImageProgressCheck >= 0.25 else { return }
+        let itemPosition = pcm ? Double(sample.frame) / 48_000 : clock.position
+        let submittedIsLate = continuousPiP.lastFramePositionSeconds.map { itemPosition - $0 >= 0.080 } ?? false
+        // Keep ordinary compositor reads infrequent. A stopped picture tap can
+        // be recognized from its cached PTS without touching the display layer.
+        guard now - lastImageProgressCheck >= (submittedIsLate ? 0.050 : 0.25) else { return }
         lastImageProgressCheck = now
         guard player.currentItem === item else { return }
         let position: Double
@@ -2464,7 +2476,15 @@ final class PlaybackService: NSObject {
             guard rate.isFinite, rate > 0 else { return }
             position = CMTimebaseGetTime(timebase).seconds
         }
-        let displayed = continuousPiP.displayedFramePosition(for: presentation.ticket).map { loopOffset + $0 }
+        let itemImage = continuousPiP.displayedFramePosition(for: presentation.ticket)
+        let displayed = itemImage.map { loopOffset + $0 }
+        var following: VideoImageProgress.NextSourceFrame?
+        if let itemImage, let displayed, position - displayed >= 0.080 {
+            following = continuousPiP.followingFrame(after: itemImage, for: timeline)
+            // A photo post can intentionally keep a slide for the whole audio
+            // track. An unknown source schedule grants no permission to replace it.
+            if following == nil && current?.kind == .slideshow { return }
+        }
         func ownsPicture() -> Bool {
             guard player.currentItem === item, generation == owner.request, observedItem === item,
                   intent.canPlay, videoAllowed, videoPresentation?.ticket == presentation.ticket,
@@ -2476,7 +2496,8 @@ final class PlaybackService: NSObject {
                 && !continuousAudio.isSelectionPending(in: fresh)
         }
         guard ownsPicture(),
-              imageProgress.shouldRecover(now: now, playbackPosition: position, displayedPosition: displayed) else { return }
+              imageProgress.shouldRecover(now: now, playbackPosition: position,
+                displayedPosition: displayed, followingFrame: following) else { return }
         if !pcm {
             continuousPiP.recoverFrameFeedIsolatingNativeAudio(for: presentation.ticket, ifEligible: { [weak self, weak item] in
                 guard let self, let item else { return false }
@@ -3044,12 +3065,6 @@ final class PlaybackService: NSObject {
         if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() }
     }
 
-    func persist() {
-        lastBookmark = Date()
-        do { try AppFiles.save(PlaybackBookmark(queue: queue, position: clock.position), to: bookmarkURL) }
-        catch { message = "Could not save your playback position." }
-    }
-
     private func recoverAfterAudioMediaServicesReset() {
         beginAudioCommand()
         let command = audioCommand, request = generation, mediaID = queue.currentID
@@ -3151,7 +3166,7 @@ final class PlaybackService: NSObject {
             transferInitialClockBinding(retainActivation: true)
             intent.interruptionBegan(); initialPollWindow.withdraw(request: generation); cancelStallRecovery()
             continuousAudio.suspend()
-            player.pause(); persist()
+            player.pause()
         } else if intent.interruptionEnded(shouldResume: shouldResume) {
             activateAudio()
             guard audioCommand == command else { return }
@@ -3464,6 +3479,7 @@ final class PlaybackService: NSObject {
     }
 
     private func updateNowPlaying() {
+        lastNowPlayingUpdate = Date()
         guard let item = current else { MPNowPlayingInfoCenter.default().nowPlayingInfo = nil; return }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = [
             MPMediaItemPropertyTitle: item.title, MPMediaItemPropertyArtist: item.creator,

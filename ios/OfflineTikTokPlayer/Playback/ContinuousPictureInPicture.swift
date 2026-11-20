@@ -90,6 +90,9 @@ final class ContinuousPictureInPicture: NSObject {
     private var surfaceProof = FrameSurfaces()
     private var imageEpochSaturated = false
     private var submittedReceipt: CurrentFrameReceipt?
+    private var inspectedFramePosition: Double?
+    private var followingSourceFrame: VideoImageProgress.NextSourceFrame?
+    private var sourceTimingTasks: [UInt64: Task<Void, Never>] = [:]
     private var readinessMutationDepth = 0
     private var readinessUpdatePending = false
     /// Invalidation is immediate. Stable delivery is coalesced across nested CPP
@@ -109,6 +112,9 @@ final class ContinuousPictureInPicture: NSObject {
     @discardableResult
     private func invalidateCurrentFrameProof() -> UInt64 {
         submittedReceipt = nil
+        sourceTimingTasks[imageEpoch]?.cancel()
+        inspectedFramePosition = nil
+        followingSourceFrame = nil
         surfaceProof = FrameSurfaces()
         if imageEpoch == .max { imageEpochSaturated = true }
         else { imageEpoch += 1 }
@@ -144,6 +150,66 @@ final class ContinuousPictureInPicture: NSObject {
               let position = receipt.displayedPosition(in: displayLayer),
               position.isFinite, currentFrameReceipt(for: ticket) == receipt else { return nil }
         return position
+    }
+    /// Look up timing only for a picture that is already late. A healthy render
+    /// tick never reads a sample cursor or waits for file/network metadata.
+    func followingFrame(after displayed: Double, for timeline: ActiveTimelineReceipt,
+        readTiming: @escaping @Sendable (Double, AVAsset, CMPersistentTrackID?) async -> VideoImageProgress.NextSourceFrame?
+            = { await ContinuousPictureInPicture.sourceFrameAfter($0, in: $1, timingTrackID: $2) }
+    ) -> VideoImageProgress.NextSourceFrame? {
+        guard activeTimelineReceipt(for: timeline.ticket) == timeline else { return nil }
+        if inspectedFramePosition == displayed, let followingSourceFrame { return followingSourceFrame }
+        // Leave room for a new epoch while one cancelled HTTP lookup drains.
+        // Rapid scrolling cannot accumulate more than two SDK reads.
+        guard sourceTimingTasks[timeline.imageEpoch] == nil, sourceTimingTasks.count < 2,
+              let resource = currentResource, ProcessInfo.processInfo.systemUptime >= resource.nextTimingRead,
+              let asset = resource.item?.asset, currentResource === resource,
+              activeTimelineReceipt(for: timeline.ticket) == timeline else { return nil }
+        let timingTrackID = resource.timingTrackID
+        inspectedFramePosition = displayed
+        followingSourceFrame = nil
+        sourceTimingTasks[timeline.imageEpoch] = Task.detached(priority: .userInitiated) { [weak self] in
+            let next = await readTiming(displayed, asset, timingTrackID)
+            await self?.finishSourceTiming(next, for: timeline)
+        }
+        return nil
+    }
+
+    private func finishSourceTiming(_ next: VideoImageProgress.NextSourceFrame?, for timeline: ActiveTimelineReceipt) {
+        sourceTimingTasks[timeline.imageEpoch] = nil
+        guard activeTimelineReceipt(for: timeline.ticket) == timeline else { return }
+        followingSourceFrame = next
+        if next == nil { currentResource?.nextTimingRead = ProcessInfo.processInfo.systemUptime + 3 }
+    }
+
+    nonisolated static func sourceFrameAfter(_ displayed: Double, in asset: AVAsset, timingTrackID: CMPersistentTrackID?) async -> VideoImageProgress.NextSourceFrame? {
+        guard displayed.isFinite, displayed >= 0, timingTrackID != kCMPersistentTrackID_Invalid,
+              let tracks = try? await asset.loadTracks(withMediaType: .video) else { return nil }
+        let track: AVAssetTrack?
+        if let timingTrackID { track = tracks.first { $0.trackID == timingTrackID } }
+        else { track = tracks.count == 1 ? tracks.first : nil }
+        guard let track, !Task.isCancelled, (try? await track.load(.canProvideSampleCursors)) == true,
+              let segments = try? await track.load(.segments), !Task.isCancelled else { return nil }
+        // Cursor timestamps are in source media time. Map the displayed item
+        // time through its edit, including the offset used for reordered H.264.
+        let time = CMTime(seconds: displayed, preferredTimescale: 1_000_000_000)
+        guard let segment = segments.first(where: { !$0.isEmpty && CMTimeRangeContainsTime($0.timeMapping.target, time: time) }) else { return nil }
+        let map = segment.timeMapping
+        guard map.source.isValid, map.target.isValid,
+              CMTimeCompare(map.source.duration, map.target.duration) == 0 else { return nil }
+        let sourceTime = CMTimeAdd(map.source.start, CMTimeSubtract(time, map.target.start))
+        // Round-trip Double timestamps may fall just before the source tick.
+        let tolerance = CMTime(value: 1, timescale: 48_000)
+        guard let cursor = track.makeSampleCursor(presentationTimeStamp: CMTimeAdd(sourceTime, tolerance)) else { return nil }
+        let first = cursor.presentationTimeStamp
+        guard first.isNumeric, abs(CMTimeSubtract(first, sourceTime).seconds) <= tolerance.seconds,
+              !Task.isCancelled else { return nil }
+        let steps = cursor.stepInPresentationOrder(byCount: 1)
+        if steps == 0 { return segment === segments.last ? .end : nil }
+        let next = cursor.presentationTimeStamp
+        guard steps == 1, next.isNumeric, CMTimeCompare(next, first) > 0,
+              CMTimeRangeContainsTime(map.source, time: next) else { return nil }
+        return .after(CMTimeSubtract(next, first).seconds)
     }
     /// Cached proof only. A completed paused seek may still await its first image.
     func activeTimelineReceipt(for ticket: PresentationTicket) -> ActiveTimelineReceipt? {
@@ -183,6 +249,8 @@ final class ContinuousPictureInPicture: NSObject {
         fileprivate(set) var isAttached = false
         fileprivate var preferredFrameRate: Float = 60
         fileprivate var sourceFrameRate: Float = 30
+        fileprivate var timingTrackID: CMPersistentTrackID?
+        fileprivate var nextTimingRead = 0.0
         private(set) var isRetired = false
         private(set) var isBorrowed = false
         fileprivate var originalComposition: AVVideoComposition?
@@ -363,6 +431,7 @@ final class ContinuousPictureInPicture: NSObject {
                   item.videoComposition === original else { return nil }
             let resource = PreparedVideoResource(item: item)
             let cadence = composition.frameDuration.seconds
+            resource.timingTrackID = composition.sourceTrackIDForFrameTiming
             guard ifEligible() else { resource.retire(); return nil }
             if cadence.isFinite, cadence > 0 {
                 resource.preferredFrameRate = Float(min(120, max(60, 1 / cadence)))
@@ -1326,11 +1395,13 @@ final class ContinuousPictureInPicture: NSObject {
     /// Test teardown must await the cancelled metadata/composition owner as well.
     func debugInvalidateAndCapturePreparation() -> Task<Void, Never>? {
         let owned = preparationTask
+        let timing = Array(sourceTimingTasks.values)
         invalidate()
         let preparations = Array(pendingIsolatedPreparations.values)
         let drains = Array(pendingRecoveryDrains.values)
         return Task { [self] in
             await owned?.value
+            for task in timing { await task.value }
             for task in preparations { await task.value }
             for task in drains { await task.value }
             // A cancelled preparation may have closed its decoder while being joined.
