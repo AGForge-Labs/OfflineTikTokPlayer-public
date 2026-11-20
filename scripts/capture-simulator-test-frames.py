@@ -56,7 +56,7 @@ def locate(requested_udid):
     return None
 
 
-def resolve_destination(destination):
+def resolve_destination(destination, *, hosted_inventory=False):
     """Resolve a supported xcodebuild destination without booting or launching anything."""
     fields = {}
     for entry in destination.split(","):
@@ -74,7 +74,15 @@ def resolve_destination(destination):
         if not re.fullmatch(r"\d+(?:\.\d+)*", wanted_os):
             raise ValueError("Simulator OS must be a numeric version or latest")
         wanted_version = tuple(int(part) for part in wanted_os.split("."))
-    listing = run("list", "devices", "available", "--json", timeout=60)
+    query = ("list", "devices", "available", "--json")
+    try:
+        listing = run(*query, timeout=60)
+    except subprocess.TimeoutExpired:
+        if not hosted_inventory:
+            raise
+        # A new hosted runner may still be starting CoreSimulator. Retry the
+        # same read once before any simulator boot, build or test is attempted.
+        listing = run(*query, timeout=120)
     if listing.returncode:
         raise ValueError("Could not list available iOS Simulators")
     candidates = []
@@ -169,10 +177,11 @@ def main():
     mode.add_argument("--udid", help="Exact test Simulator UUID; waits for this device to boot")
     mode.add_argument("--resolve-destination", help="Print only the exact available Simulator UUID and exit")
     parser.add_argument("--lifetime", type=float, default=1200)
+    parser.add_argument("--hosted-inventory", action="store_true")
     arguments = parser.parse_args()
     if arguments.resolve_destination:
         try:
-            print(resolve_destination(arguments.resolve_destination))
+            print(resolve_destination(arguments.resolve_destination, hosted_inventory=arguments.hosted_inventory))
         except (OSError, ValueError, TypeError, KeyError, subprocess.TimeoutExpired) as error:
             parser.error(str(error))
         return 0

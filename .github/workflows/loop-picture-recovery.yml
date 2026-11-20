@@ -1,7 +1,7 @@
-name: Verify restored iPhone video timing and loop audio
+name: Verify held video frames, loop audio and cold launch
 on:
   push:
-    branches: [codex/restore-video-queue]
+    branches: [codex/continuous-picture-verification]
 permissions:
   contents: read
 jobs:
@@ -14,23 +14,26 @@ jobs:
         with:
           fetch-depth: 3
           persist-credentials: false
-      - name: Verify the shipped video and audio baselines and reproduce the old timing request
+      - name: Reproduce the shipped half-second blind spot and check the audio baseline
         run: |
           set -euo pipefail
-          old_video=566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36
-          old_audio=c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf
-          audio_player=ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift
-          audio_renderer=ios/PlayerCore/Sources/PlayerCore/ContinuousPCMRenderer.swift
-          git diff --exit-code "$old_video" HEAD -- ios/OfflineTikTokPlayer ios/PlayerCore/Sources ":(exclude)$audio_player" ":(exclude)$audio_renderer" ':(exclude)ios/OfflineTikTokPlayer/Playback/PlaybackService.swift'
-          git diff --exit-code "$old_audio" HEAD -- "$audio_player" "$audio_renderer"
-          probe="$RUNNER_TEMP/previous-display-policy.swift"
-          git show "$old_audio:ios/PlayerCore/Sources/PlayerCore/VideoFrameRequest.swift" > "$probe"
+          shipped=05c050661162801d911254582f94d7f778ad4b76
+          git diff --exit-code "$shipped" HEAD -- ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift ios/PlayerCore/Sources/PlayerCore/{ContinuousPCMRenderer,VideoFrameRequest}.swift
+          probe="$RUNNER_TEMP/shipped-picture-progress.swift"
+          git show "$shipped:ios/PlayerCore/Sources/PlayerCore/VideoImageProgress.swift" > "$probe"
           cat >> "$probe" <<'SWIFT'
-          for fps in [25.0, 50.0] {
-              let requested = VideoFrameRequest.displayRate(source: fps, maximum: 120)
-              precondition(requested == 120)
-              print("35.1 control: \(fps) fps source requested \(requested) Hz on ProMotion")
+          var watch = VideoImageProgress()
+          var firstIntervention: Double?
+          for tick in 0...240 {
+              let t = Double(tick) / 60
+              let elapsed = t - 1
+              if watch.shouldRecover(now: t, playbackPosition: t, displayedPosition: min(1, t)) {
+                  firstIntervention = elapsed
+                  break
+              }
           }
+          guard let delay = firstIntervention, delay >= 1.5 else { fatalError("Expected the shipped held-picture behavior") }
+          print("36.1 old code: soundtrack advanced while picture held, first intervention after", delay, "seconds")
           SWIFT
           swift "$probe"
       - name: Check project, Swift syntax and playback core
@@ -38,14 +41,15 @@ jobs:
           set -euo pipefail
           python3 -B scripts/generate-ios-project.py --check
           python3 -B tests/validation-shell/test_simulator_boot_preflight.py
-          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture}.swift ios/OfflineTikTokPlayerTests/{ContinuousAudioPlayerTests,ContinuousPictureInPictureTests,PlaybackSelectionVideoRegressionTests,VideoPresentationContinuityTests}.swift
+          python3 -B tests/validation-shell/test_simulator_destination_resolution.py
+          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/App/{AppModel,OfflineTikTokPlayerApp}.swift ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture,LocalVideoFrameReader,PlaybackBuffer,PlaybackService,StreamingVideoFrames}.swift ios/OfflineTikTokPlayerTests/{AudioOnlyContinuityTests,ContinuousAudioPlayerTests,ContinuousPictureInPictureTests,LocalVideoFrameReaderTests,NativeMediaTests,NativeStreamingPlaybackTests,PictureRecoveryTests,PlaybackContinuityTests,PlaybackSelectionVideoRegressionTests,StreamingVideoFramesTests,VideoPresentationContinuityTests}.swift ios/OfflineTikTokPlayerUITests/PlayerShellTests.swift
           bash scripts/test-core.sh
           bash scripts/test-native-cloud.sh
   simulator:
     if: github.repository == 'Galaxybigbird/OfflineTikTokPlayer-public' && !github.event.repository.private
     needs: portable
     runs-on: macos-26
-    timeout-minutes: 27
+    timeout-minutes: 32
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -54,7 +58,7 @@ jobs:
       - name: Verify loop and switch sequences with the simulator compositor
         run: |
           set -euo pipefail
-          udid="$(python3 -B scripts/capture-simulator-test-frames.py --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
+          udid="$(python3 -B scripts/capture-simulator-test-frames.py --hosted-inventory --resolve-destination 'platform=iOS Simulator,name=iPhone 17 Pro Max')"
           [[ "$udid" =~ ^[0-9a-fA-F-]{36}$ ]]
           work=artifacts/loop-picture
           mkdir -p "$work"
@@ -63,6 +67,7 @@ jobs:
             if [ -n "$capture_pid" ]; then
               kill "$capture_pid" 2>/dev/null || true
               wait "$capture_pid" 2>/dev/null || true
+              capture_pid=''
             fi
           }
           trap cleanup_capture EXIT
@@ -71,10 +76,22 @@ jobs:
           native=OfflineTikTokPlayerTests/NativeStreamingPlaybackTests
           selection=OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests
           regressions=(
+            "OfflineTikTokPlayerTests/PlaybackContinuityTests/testPlaybackAcrossFiveSecondsAndForegroundLeavesLegacyQueueUntouched"
+            "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testAuthoredLongVFRFrameRemainsCurrentUntilItsNextRealSample"
+            "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testUnresponsiveTimingReadLetsNextSelectionProbeOnce"
             "$video/testColdSelectionStartsTheDisplayClockAndShowsFramesWhenTheSourceArrives"
             "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testSwitchingFrameRatesRequestsAdaptiveTimingForEachSelectedClip"
             "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testZeroBasedVFRNativeComparisonPreservesEveryImportedFrameAndTimestamp"
             "OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testActualAudioGraphSmoothsOnlyTheHardLoopEdge"
+            "$recovery/testMovingPictureRecoversBeforeHalfASecondWhileAudioAdvances"
+            "$recovery/testMissingItemSamplesUseOriginalLocalFramesWhileAudioAdvances"
+            "OfflineTikTokPlayerTests/LocalVideoFrameReaderTests/testImportedMotionReturnsNewestDueOriginalFrameAndCancels"
+            "OfflineTikTokPlayerTests/LocalVideoFrameReaderTests/testAuthoredVariableFrameRemainsCurrentUntilItsSuccessor"
+            "OfflineTikTokPlayerTests/LocalVideoFrameReaderTests/testReplacementAppliesTheInstalledCompositionAndKeepsItsPixelFormat"
+            "OfflineTikTokPlayerTests/StreamingVideoFramesTests/testLoopbackFramesFollowTheCurrentQueueItemWithoutAnItemVideoOutput"
+            "OfflineTikTokPlayerTests/StreamingVideoFramesTests/testACancelledOrReplacedOutputCannotDetachAnotherOwner"
+            "OfflineTikTokPlayerTests/NativeMediaTests/testOffscreenRewindCompletesForItsPromotedQueueEntryOnly"
+            "$video/testRendererDrainsStaleQueuedFramesWhileTheCurrentVideoKeepsPlaying"
             "$recovery/testPictureStarvedAcrossShortLoopsRecoversWhileAudioKeepsLooping"
             "$recovery/testSingleClipPCMLoopsKeepJustTheActiveVideo"
             "$recovery/testNativeAudioRepeatKeepsItsFullLengthMovieQueued"
@@ -114,12 +131,13 @@ jobs:
             return 1
           }
           build_cases() {
-            xcodebuild build-for-testing -project ios/OfflineTikTokPlayer.xcodeproj -scheme OfflineTikTokPlayer \
+            local phase="$1" project="${2:-ios/OfflineTikTokPlayer.xcodeproj}" derived="${3:-$work/Derived}"
+            xcodebuild build-for-testing -project "$project" -scheme OfflineTikTokPlayer \
               -configuration Debug -destination "platform=iOS Simulator,id=$udid" \
-              -derivedDataPath "$work/Derived" -jobs 2 CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$1-build.log"
-            local plans=("$work/Derived/Build/Products/"*.xctestrun)
-            test "${#plans[@]}" = 1
-            test -f "${plans[0]}"
+              -derivedDataPath "$derived" -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/$work/Derived/SourcePackages" \
+              -jobs 2 CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$work/$phase-build.log" || return
+            local plans=("$derived/Build/Products/"*.xctestrun)
+            test "${#plans[@]}" = 1 && test -f "${plans[0]}" || return
             plan="${plans[0]}"
           }
           run_cases() {
@@ -146,7 +164,7 @@ jobs:
               cleanup_capture
               xcrun simctl shutdown "$udid" || return
               boot_simulator || return
-              start_capture || return
+              if [[ "$phase" == Fixed ]]; then start_capture || return; fi
               status=0
               run_once || status=$?
             fi
@@ -176,17 +194,23 @@ jobs:
           print(Path(report).stem, result, len(selectors))
           PY
           }
+          run_checked() {
+            local phase="$1"
+            shift
+            run_cases "$phase" "$@" && check_cases "$phase" Passed "$@"
+          }
           boot_simulator
           build_cases Fixed
           start_capture
-          fixed_status=0
-          run_cases Fixed "${regressions[@]}" "${controls[@]}" || fixed_status=$?
-          if (( fixed_status == 0 )); then check_cases Fixed Passed "${regressions[@]}" "${controls[@]}"; fi
+          gate_status=0
+          run_checked Fixed "${regressions[@]}" "${controls[@]}" || gate_status=1
+          cleanup_capture
           cadence=(
             "$recovery/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
             "$video/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames"
             "$video/testFullResolutionVideoKeepsItsCadenceAfterStarting"
           )
-          run_cases Cadence "${cadence[@]}"
-          check_cases Cadence Passed "${cadence[@]}"
-          exit "$fixed_status"
+          run_checked Cadence "${cadence[@]}" || gate_status=1
+          lifecycle=OfflineTikTokPlayerUITests/PlayerShellTests/testColdLaunchClearsSelectionAndBackgroundReturnKeepsIt
+          run_checked Lifecycle "$lifecycle" || gate_status=1
+          exit "$gate_status"

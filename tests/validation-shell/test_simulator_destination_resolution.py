@@ -58,6 +58,17 @@ class SimulatorDestinationResolutionTests(unittest.TestCase):
         self.assertEqual(failure.exception.timeout, 60)
         self.assertEqual(len(self.calls), 1)
 
+    def test_hosted_inventory_retries_a_slow_read_of_the_same_device_once(self):
+        with self.backend(duration=61):
+            self.assertEqual(self.module.resolve_destination(DESTINATION, hosted_inventory=True), IDENTIFIER)
+        self.assertEqual([c[1] for c in self.calls], [60, 120])
+        self.assertEqual(self.calls[0][0], self.calls[1][0])
+
+    def test_hosted_inventory_remains_bounded_when_the_service_is_unavailable(self):
+        with self.backend(duration=121), self.assertRaises(subprocess.TimeoutExpired):
+            self.module.resolve_destination(DESTINATION, hosted_inventory=True)
+        self.assertEqual([c[1] for c in self.calls], [60, 120])
+
     def test_existing_shared_deadline_still_caps_bootstrap_query(self):
         self.module.DEADLINE = 1007.5
         with self.backend(duration=8), self.assertRaises(subprocess.TimeoutExpired) as failure:
