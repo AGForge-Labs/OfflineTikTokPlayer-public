@@ -10,26 +10,22 @@ import re
 import subprocess
 import sys
 import tempfile
-SOURCE_BASE = "566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36"
-SOURCE = "c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf"
-APP_TREE = "d7fe15d9c15a8f0d2183318825c516e084361645"
-BASE_APP_TREE = "b43cc02e9c07519b4167b7c858c694f21f9c196d"
-CORE_TREE = "ccebe7d5f5c5db2dffc89d809013e80499a0a830"
+SOURCE_BASE = "c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf"
+SOURCE = "05c050661162801d911254582f94d7f778ad4b76"
+APP_TREE = "94f651f8755c62b875738636887d48725c25da4f"
+BASE_APP_TREE = "d7fe15d9c15a8f0d2183318825c516e084361645"
+CORE_TREE = "efb2da2710963c4528d93ae7932b1edd0332d6dc"
 SIGNER_SHA = "ead74c3e3ca0938bdff58d4f09448ece01ac790388fda946bdc2e986f33d2e14"
 SOURCE_CHANGES = (
     '.github/workflows/loop-picture-recovery.yml',
-    'ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift',
     'ios/OfflineTikTokPlayer/Playback/ContinuousPictureInPicture.swift',
-    'ios/OfflineTikTokPlayerTests/ContinuousAudioPlayerTests.swift',
-    'ios/OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests.swift',
+    'ios/OfflineTikTokPlayer/Playback/PlaybackService.swift',
+    'ios/OfflineTikTokPlayerTests/ContinuousPictureInPictureTests.swift',
+    'ios/OfflineTikTokPlayerTests/NativeStreamingPlaybackTests.swift',
+    'ios/OfflineTikTokPlayerTests/PictureRecoveryTests.swift',
     'ios/OfflineTikTokPlayerTests/VideoPresentationContinuityTests.swift',
-    'ios/PlayerCore/Sources/PlayerCore/ContinuousPCMRenderer.swift',
     'ios/PlayerCore/Sources/PlayerCore/VideoFrameRequest.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/ContinuousPCMTests.swift',
-    'ios/PlayerCore/Tests/PlayerCoreTests/NativeVideoCoverageTests.swift',
     'ios/PlayerCore/Tests/PlayerCoreTests/VideoFrameRequestTests.swift',
-    'scripts/ensure-simulator-booted.py',
-    'tests/validation-shell/test_simulator_boot_preflight.py',
 )
 REPOSITORY = "Galaxybigbird/OfflineTikTokPlayer-public"
 SECRETS = ("APPLE_CERTIFICATE_BASE64", "APPLE_CERTIFICATE_PASSWORD",
@@ -113,7 +109,7 @@ def validate_context(environment, event, *, signing=False, linux_preflight=False
     require(re.fullmatch(r"[1-9][0-9]{0,3}(?:\.(?:0|[1-9][0-9]?)){0,2}", build) is not None,
             "An Apple-checked increasing build number is required.")
     numbers = tuple(map(int, build.split("."))) + (0,) * (3 - len(build.split(".")))
-    require(numbers > (34, 1, 0), "Apple must confirm this build follows 34.1 and every newer version.")
+    require(numbers > (35, 1, 0), "Apple must confirm this build follows 35.1 and every newer version.")
     require(not environment.get("APPLE_PRIVATE_DELIVERY"), "The private aggregate secret is not used here.")
     if signing:
         require(environment.get("RELEASE_ENVIRONMENT") == "release", "The existing protected release environment is required.")
@@ -245,8 +241,9 @@ NATIVE_PROOFS = (
     (43550382812, "416618a3ddbbdc0340d7e578a9937bc6a256c598", ".github/workflows/tiktok-post-links.yml", "codex/tiktok-post-links"),
     (43578692517, "113be8cf2b35021a1d4ae090cd61d0bd9a539baa", ".github/workflows/stream-quality.yml", "codex/stream-quality"),
     (43671735898, "28bf19eefec7485defd37bc448f63dcb32797295", ".github/workflows/smooth-picture.yml", "codex/smooth-picture"),
-    (43703259303, SOURCE_BASE, ".github/workflows/loop-picture-recovery.yml", "codex/verified-loop-picture"),
-    (44491036531, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/personal-playback-verified"),
+    (43703259303, "566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36", ".github/workflows/loop-picture-recovery.yml", "codex/verified-loop-picture"),
+    (44491036531, SOURCE_BASE, ".github/workflows/loop-picture-recovery.yml", "codex/personal-playback-verified"),
+    (44679911846, SOURCE, ".github/workflows/loop-picture-recovery.yml", "codex/restore-video-queue"),
 )
 
 

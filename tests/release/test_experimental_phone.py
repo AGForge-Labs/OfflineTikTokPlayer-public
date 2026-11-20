@@ -89,12 +89,12 @@ class ExperimentalPhoneTests(unittest.TestCase):
                         GITHUB_TRIGGERING_ACTOR="Galaxybigbird", GITHUB_RUN_ATTEMPT="1",
                         GITHUB_WORKFLOW_REF=phone.REPOSITORY + "/.github/workflows/public-experimental-phone.yml@refs/heads/main",
                         GITHUB_SHA=self.sha, GITHUB_WORKFLOW_SHA=self.sha, EXPECTED_CONTROL_COMMIT=self.sha,
-                        EXPERIMENTAL_PHONE_AUTHORIZED="true", EXPERIMENTAL_BUILD_NUMBER="35.1",
+                        EXPERIMENTAL_PHONE_AUTHORIZED="true", EXPERIMENTAL_BUILD_NUMBER="36.1",
                         RELEASE_PREFLIGHT_RESULT="success")
         self.event = {"repository": {"full_name": phone.REPOSITORY, "private": False}}
 
     def test_exact_public_owner_main_workflow_and_first_attempt_are_required(self):
-        self.assertEqual(phone.validate_context(self.env, self.event), "35.1")
+        self.assertEqual(phone.validate_context(self.env, self.event), "36.1")
         for key in self.env:
             env = dict(self.env, **{key: "wrong"})
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -109,8 +109,8 @@ class ExperimentalPhoneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             phone.validate_context(self.env, self.event, signing=True)
         signing = dict(self.env, RELEASE_ENVIRONMENT="release")
-        self.assertEqual(phone.validate_context(signing, self.event, signing=True), "35.1")
-        for value in ("", "34.1", "33.1", "32.1", "31.1", "23.1", "22.1", "20.01", "$(command)", "10000.1"):
+        self.assertEqual(phone.validate_context(signing, self.event, signing=True), "36.1")
+        for value in ("", "35.1", "34.1", "33.1", "32.1", "31.1", "23.1", "22.1", "20.01", "$(command)", "10000.1"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 phone.validate_context(dict(signing, EXPERIMENTAL_BUILD_NUMBER=value), self.event, signing=True)
         with self.assertRaises(ValueError):
@@ -119,7 +119,7 @@ class ExperimentalPhoneTests(unittest.TestCase):
     def test_linux_preflight_keeps_owner_pins_and_refuses_apple_inputs(self):
         preflight = dict(self.env, RUNNER_OS="Linux")
         preflight.pop("RELEASE_PREFLIGHT_RESULT")
-        self.assertEqual(phone.validate_context(preflight, self.event, linux_preflight=True), "35.1")
+        self.assertEqual(phone.validate_context(preflight, self.event, linux_preflight=True), "36.1")
         for env in (self.env, dict(preflight, APP_STORE_CONNECT_KEY_BASE64="unexpected"),
                     dict(preflight, GITHUB_TRIGGERING_ACTOR="another-owner")):
             with self.subTest(env=env), self.assertRaises(ValueError):

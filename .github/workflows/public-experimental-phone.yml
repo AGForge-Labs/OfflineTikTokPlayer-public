@@ -1,5 +1,5 @@
 name: Experimental owner phone build
-run-name: Owner-only video pacing and loop audio update
+run-name: Owner-only adaptive video playback repair
 on:
   workflow_dispatch:
     inputs:
@@ -48,7 +48,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf
+          ref: 05c050661162801d911254582f94d7f778ad4b76
           fetch-depth: 2
           path: candidate
           persist-credentials: false
@@ -79,7 +79,7 @@ jobs:
       - name: Read frozen playback candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf
+          ref: 05c050661162801d911254582f94d7f778ad4b76
           fetch-depth: 2
           path: candidate
           persist-credentials: false
