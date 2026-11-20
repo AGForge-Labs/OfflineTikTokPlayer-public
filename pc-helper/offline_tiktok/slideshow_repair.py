@@ -14,6 +14,7 @@ import zipfile
 
 from .catalog import AssetRef
 from .cost_audit import atomic_json
+from .graph import MediaVerificationInterrupted
 from .instance import HelperInstance
 from .media import MediaTools
 from .photo import NATIVE_MEMBER, PHOTO_RENDER, archive_images, render_archive
@@ -193,11 +194,16 @@ class SlideshowRepair:
     def _confirm_upload(self, ref, path):
         # OneDrive can acknowledge a content upload before its read replica
         # returns the matching hash. Re-read the same immutable item ID.
-        for delay in (0, 1, 3, 8):
+        delays = (0, 1, 3, 8)
+        for attempt, delay in enumerate(delays, start=1):
             if delay:
                 sleep(delay)
-            if self.graph.verify_file(ref, path):
-                return True
+            try:
+                if self.graph.verify_file(ref, path):
+                    return True
+            except MediaVerificationInterrupted:
+                if attempt == len(delays):
+                    raise
         return False
 
     def _upload(self, pending, drive, root):

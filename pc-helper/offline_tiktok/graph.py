@@ -17,6 +17,10 @@ class StorageFull(RuntimeError):
     pass
 
 
+class MediaVerificationInterrupted(RuntimeError):
+    pass
+
+
 class GraphClient:
     base = "https://graph.microsoft.com/v1.0"
     chunk_size = 10 * 1024 * 1024
@@ -131,7 +135,7 @@ class GraphClient:
                         return False
                     digest.update(chunk)
         except httpx.HTTPError:
-            raise RuntimeError("OneDrive repair verification was interrupted; resume to retry") from None
+            raise MediaVerificationInterrupted("OneDrive repair verification was interrupted; resume to retry") from None
         return size == asset.byte_size and digest.hexdigest() == asset.sha256
 
     def upload_file(self, source, destination, drive_id, root_id, *, force_chunked=False):

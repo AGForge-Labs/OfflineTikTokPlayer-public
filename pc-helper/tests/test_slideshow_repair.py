@@ -154,6 +154,7 @@ def test_archive_rejects_missing_or_duplicate_originals(tmp_path):
 
 def test_delayed_onedrive_metadata_rechecks_the_same_upload(tmp_path, monkeypatch):
     from offline_tiktok import slideshow_repair
+    from offline_tiktok.graph import MediaVerificationInterrupted
     store = LibraryStore(tmp_path / "library.sqlite")
     graph = PrivateDrive(b"{}")
     checks = []
@@ -161,6 +162,8 @@ def test_delayed_onedrive_metadata_rechecks_the_same_upload(tmp_path, monkeypatc
     original_check = graph.verify_file
     def verify(asset, path):
         checks.append(asset.item_id)
+        if len(checks) == 1:
+            raise MediaVerificationInterrupted("Transient read interrupted")
         return len(checks) >= 3 and original_check(asset, path)
     monkeypatch.setattr(graph, "verify_file", verify)
     monkeypatch.setattr(slideshow_repair, "sleep", pauses.append, raising=False)
