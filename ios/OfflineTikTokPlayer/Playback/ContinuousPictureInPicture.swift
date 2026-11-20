@@ -181,8 +181,8 @@ final class ContinuousPictureInPicture: NSObject {
         private(set) weak var item: AVPlayerItem?
         fileprivate(set) var output: AVPlayerItemVideoOutput?
         fileprivate(set) var isAttached = false
-        fileprivate var peakFrameRate: Float = 30
-        fileprivate var nominalFrameRate: Float = 30
+        fileprivate var preferredFrameRate: Float = 60
+        fileprivate var sourceFrameRate: Float = 30
         private(set) var isRetired = false
         private(set) var isBorrowed = false
         fileprivate var originalComposition: AVVideoComposition?
@@ -305,17 +305,16 @@ final class ContinuousPictureInPicture: NSObject {
         fileprivate weak var nativeAsset: AVURLAsset?
         fileprivate var nativeGeometry: NativeVideoGeometry?
         private var usesNativeGeometry = false
-        private var peakFrameRate: Float = 30
-        private var nominalFrameRate: Float = 30
+        private var nativeFrameRate: Float = 60
+        private var sourceFrameRate: Float = 30
         fileprivate init(item: AVPlayerItem, original: AVVideoComposition?, composition: AVVideoComposition) {
             self.item = item; self.original = original; self.composition = composition
         }
-        fileprivate init(item: AVPlayerItem, asset: AVURLAsset, nativeGeometry: NativeVideoGeometry,
-                         nominalFrameRate: Float, peakFrameRate: Float) {
+        fileprivate init(item: AVPlayerItem, asset: AVURLAsset, nativeGeometry: NativeVideoGeometry, frameRate: Float = 60) {
             self.item = item; nativeAsset = asset; self.nativeGeometry = nativeGeometry
             usesNativeGeometry = true
-            self.nominalFrameRate = nominalFrameRate.isFinite && nominalFrameRate > 0 ? nominalFrameRate : 30
-            self.peakFrameRate = peakFrameRate
+            sourceFrameRate = frameRate.isFinite && frameRate > 0 ? frameRate : 30
+            nativeFrameRate = min(120, max(60, sourceFrameRate))
         }
         private func installNative(ifEligible: () -> Bool) -> PreparedVideoResource? {
             guard !consumed else { return nil }
@@ -324,8 +323,8 @@ final class ContinuousPictureInPicture: NSObject {
             guard let item, let asset = nativeAsset, nativeGeometry != nil,
                   ifEligible(), item.asset === asset, item.videoComposition == nil else { return nil }
             let resource = PreparedVideoResource(item: item)
-            resource.peakFrameRate = peakFrameRate
-            resource.nominalFrameRate = nominalFrameRate
+            resource.preferredFrameRate = nativeFrameRate
+            resource.sourceFrameRate = sourceFrameRate
             #if DEBUG
             resource.debugNativeGeometry = nativeGeometry; resource.debugUsesNativeGeometry = true
             #endif
@@ -366,8 +365,8 @@ final class ContinuousPictureInPicture: NSObject {
             let cadence = composition.frameDuration.seconds
             guard ifEligible() else { resource.retire(); return nil }
             if cadence.isFinite, cadence > 0 {
-                resource.nominalFrameRate = Float(1 / cadence)
-                resource.peakFrameRate = resource.nominalFrameRate
+                resource.preferredFrameRate = Float(min(120, max(60, 1 / cadence)))
+                resource.sourceFrameRate = Float(1 / cadence)
             }
             #if DEBUG
             resource.debugNativeGeometry = nativeGeometry
@@ -465,9 +464,7 @@ final class ContinuousPictureInPicture: NSObject {
         }
         let fps = try await track.load(.nominalFrameRate)
         try Task.checkCancellation()
-        let rate = VideoFrameRequest.sourceRate(nominal: Double(fps), minimumFrameDuration: minimumFrameDuration.seconds)
-        return VideoResourcePreparation(item: item, asset: asset, nativeGeometry: geometry,
-                                       nominalFrameRate: fps, peakFrameRate: Float(rate))
+        return VideoResourcePreparation(item: item, asset: asset, nativeGeometry: geometry, frameRate: fps)
     }
     #if DEBUG
     enum DebugNativeGeometryFailure: Error { case unqualified }
@@ -785,8 +782,7 @@ final class ContinuousPictureInPicture: NSObject {
     var isFrameFeedRunning: Bool { frameTimer != nil || displayLink != nil }
     var isVideoReadyForDisplay: Bool { displayLayer.isReadyForDisplay }
     var imageRecoveryGraceSeconds: Double {
-        // A short burst of fast frames must not shorten the grace for an authored still.
-        let rate = Double(currentResource?.nominalFrameRate ?? 30)
+        let rate = Double(currentResource?.sourceFrameRate ?? 30)
         return rate.isFinite && rate > 0 ? min(30, max(1.5, 3 / rate)) : 3
     }
     var requestedPositionSeconds: Double { playbackState.read().position }
@@ -1387,21 +1383,20 @@ final class ContinuousPictureInPicture: NSObject {
     }
 
     private func startFrameTimer() {
-        guard presentationActive, activeSeekTicket == nil, frameTimer == nil, displayLink == nil,
-              let resource = currentResource, videoOutput != nil else { return }
+        guard presentationActive, activeSeekTicket == nil, frameTimer == nil, displayLink == nil else { return }
+        let rate = currentResource?.preferredFrameRate ?? 60
         if UIApplication.shared.applicationState != .background {
             let link = CADisplayLink(target: displayTarget, selector: #selector(DisplayTarget.tick(_:)))
-            let sourceRate = resource.peakFrameRate
-            let screen = (displayLayer.superlayer?.delegate as? UIView)?.window?.windowScene?.screen ?? UIScreen.main
-            let rate = Float(VideoFrameRequest.displayRate(source: Double(sourceRate), maximum: screen.maximumFramesPerSecond))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+            // Keep the lower hint at the source cadence: a 60 fps clip must not
+            // invite 30 Hz pulls. Lower-rate content can still adapt accordingly.
+            let sourceRate = currentResource?.sourceFrameRate ?? 30
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: min(rate, max(1, sourceRate)), maximum: rate, preferred: rate)
             link.add(to: .main, forMode: .common)
             displayLink = link
             return
         }
         // Display links stop while background PiP is active. Keep its pulls at
         // the same source cadence using a single main-runloop timer.
-        let rate = min(120, max(60, resource.peakFrameRate))
         let timer = Timer(timeInterval: 1.0 / Double(rate), repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.renderFrame(targetHostTime: CACurrentMediaTime()) }
         }

@@ -1,7 +1,7 @@
-name: iPhone loop audio and video frame pacing
+name: Verify restored iPhone video timing and loop audio
 on:
   push:
-    branches: [codex/personal-playback-verified]
+    branches: [codex/restore-video-queue]
 permissions:
   contents: read
 jobs:
@@ -12,14 +12,33 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
+      - name: Verify the shipped video and audio baselines and reproduce the old timing request
+        run: |
+          set -euo pipefail
+          old_video=566e1a1aaf5b8d7f6e643cbb52c9d0e51cb77a36
+          old_audio=c5f91b1e6d8a08e3ca80dadd786ed63ee6208aaf
+          audio_player=ios/OfflineTikTokPlayer/Playback/ContinuousAudioPlayer.swift
+          audio_renderer=ios/PlayerCore/Sources/PlayerCore/ContinuousPCMRenderer.swift
+          git diff --exit-code "$old_video" HEAD -- ios/OfflineTikTokPlayer ios/PlayerCore/Sources ":(exclude)$audio_player" ":(exclude)$audio_renderer" ':(exclude)ios/OfflineTikTokPlayer/Playback/PlaybackService.swift'
+          git diff --exit-code "$old_audio" HEAD -- "$audio_player" "$audio_renderer"
+          probe="$RUNNER_TEMP/previous-display-policy.swift"
+          git show "$old_audio:ios/PlayerCore/Sources/PlayerCore/VideoFrameRequest.swift" > "$probe"
+          cat >> "$probe" <<'SWIFT'
+          for fps in [25.0, 50.0] {
+              let requested = VideoFrameRequest.displayRate(source: fps, maximum: 120)
+              precondition(requested == 120)
+              print("35.1 control: \(fps) fps source requested \(requested) Hz on ProMotion")
+          }
+          SWIFT
+          swift "$probe"
       - name: Check project, Swift syntax and playback core
         run: |
           set -euo pipefail
           python3 -B scripts/generate-ios-project.py --check
           python3 -B tests/validation-shell/test_simulator_boot_preflight.py
-          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture}.swift ios/OfflineTikTokPlayerTests/{ContinuousAudioPlayerTests,PlaybackSelectionVideoRegressionTests,VideoPresentationContinuityTests}.swift
+          swiftc -frontend -parse -D DEBUG ios/OfflineTikTokPlayer/Playback/{ContinuousAudioPlayer,ContinuousPictureInPicture}.swift ios/OfflineTikTokPlayerTests/{ContinuousAudioPlayerTests,ContinuousPictureInPictureTests,PlaybackSelectionVideoRegressionTests,VideoPresentationContinuityTests}.swift
           bash scripts/test-core.sh
           bash scripts/test-native-cloud.sh
   simulator:
@@ -52,9 +71,13 @@ jobs:
           native=OfflineTikTokPlayerTests/NativeStreamingPlaybackTests
           selection=OfflineTikTokPlayerTests/PlaybackSelectionVideoRegressionTests
           regressions=(
-            "$video/testLateVideoPreparationStartsPacingOnlyAfterTheSourceIsKnown"
+            "$video/testColdSelectionStartsTheDisplayClockAndShowsFramesWhenTheSourceArrives"
+            "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testSwitchingFrameRatesRequestsAdaptiveTimingForEachSelectedClip"
+            "OfflineTikTokPlayerTests/ContinuousPictureInPictureTests/testZeroBasedVFRNativeComparisonPreservesEveryImportedFrameAndTimestamp"
             "OfflineTikTokPlayerTests/ContinuousAudioPlayerTests/testActualAudioGraphSmoothsOnlyTheHardLoopEdge"
             "$recovery/testPictureStarvedAcrossShortLoopsRecoversWhileAudioKeepsLooping"
+            "$recovery/testSingleClipPCMLoopsKeepJustTheActiveVideo"
+            "$recovery/testNativeAudioRepeatKeepsItsFullLengthMovieQueued"
             "$video/testPlayingPictureClockKeepsItsAnchorAcrossAStalledImageFlush"
           )
           controls=(
@@ -156,11 +179,14 @@ jobs:
           boot_simulator
           build_cases Fixed
           start_capture
-          run_cases Fixed "${regressions[@]}" "${controls[@]}"
-          check_cases Fixed Passed "${regressions[@]}" "${controls[@]}"
+          fixed_status=0
+          run_cases Fixed "${regressions[@]}" "${controls[@]}" || fixed_status=$?
+          if (( fixed_status == 0 )); then check_cases Fixed Passed "${regressions[@]}" "${controls[@]}"; fi
           cadence=(
             "$recovery/testFullResolutionProductionPlaybackKeepsVideoAndAudioMoving"
             "$video/testNativeClockLeadInsideDriftToleranceStillProducesDisplayableFrames"
+            "$video/testFullResolutionVideoKeepsItsCadenceAfterStarting"
           )
           run_cases Cadence "${cadence[@]}"
           check_cases Cadence Passed "${cadence[@]}"
+          exit "$fixed_status"

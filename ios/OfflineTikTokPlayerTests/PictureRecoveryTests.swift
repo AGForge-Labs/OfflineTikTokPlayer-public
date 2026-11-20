@@ -187,8 +187,8 @@ final class PictureRecoveryTests: XCTestCase {
             print("PRODUCTION_HD_SEEK_END observedNs=\(time) request=\(v.request) ticket=\(v.nativeSeekTicket)")
         }
         XCTAssertEqual(depth, 0); XCTAssertFalse(overflow); XCTAssertFalse(background.overflow)
-        XCTAssertGreaterThan(fps, 50, "The actual service must deliver the full-resolution 60fps source")
-        XCTAssertLessThan(gapMs, 100, "The actual audio clock must not hide a long video delivery gap")
+        XCTAssertGreaterThanOrEqual(fps, 55, "The 60 fps service must sustain at least 55 delivered frames per second")
+        XCTAssertLessThan(gapMs, 50, "An uninterrupted 60 fps clip must not miss three frame intervals in succession")
         XCTAssertEqual(invalidOwners, 0)
         XCTAssertEqual(after.token, before.token); XCTAssertEqual(after.visit, before.visit)
         XCTAssertGreaterThanOrEqual(after.frame - before.frame, Int64(elapsed * 48_000 * 0.85),
@@ -312,6 +312,33 @@ final class PictureRecoveryTests: XCTestCase {
         XCTAssertEqual(after.underrunFrames, before.underrunFrames)
     }
 
+    func testSingleClipPCMLoopsKeepJustTheActiveVideo() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-video", firstDuration: 1.2)
+        let service = fixture.service
+        service.cycleRepeat(); service.cycleRepeat()
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID, within: [fixture.mediaID])
+        try await until { service.isVideoReady && service.audioSnapshot.frame > 4_800 }
+        let active = try XCTUnwrap(service.player.currentItem)
+        let before = service.audioSnapshot
+        try await until { service.audioSnapshot.visit > before.visit }
+        XCTAssertTrue(service.player.currentItem === active)
+        XCTAssertEqual(service.player.items().count, 1)
+        XCTAssertEqual(service.audioSnapshot.underrunFrames, before.underrunFrames)
+    }
+
+    func testNativeAudioRepeatKeepsItsFullLengthMovieQueued() async throws {
+        let fixture = try await PictureRecoveryFixture(test: self, nativeAudio: true)
+        let service = fixture.service
+        service.cycleRepeat(); service.cycleRepeat()
+        service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
+        try await until { !service.player.isMuted && service.clock.position > 0.1 && service.player.items().count == 2 }
+        let active = try XCTUnwrap(service.player.currentItem)
+        let queued = try XCTUnwrap(service.player.items().last)
+        XCTAssertFalse(active === queued)
+        let activeURL = try XCTUnwrap((active.asset as? AVURLAsset)?.url)
+        XCTAssertEqual((queued.asset as? AVURLAsset)?.url, activeURL)
+    }
+
     func testRepeatedLoopsAndRapidReversalsKeepDisplayingTheCurrentVideo() async throws {
         let fixture = try await PictureRecoveryFixture(test: self, firstResourceName: "test-video", firstDuration: 1.2,
             otherResourceName: "test-motion-1080", otherDuration: 6)
@@ -319,6 +346,12 @@ final class PictureRecoveryTests: XCTestCase {
         service.cycleRepeat(); service.cycleRepeat()
         service.start(playlistIDs: [fixture.playlist], at: fixture.mediaID)
         try await until { service.isVideoReady && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.1 }
+        try await until { service.player.items().count == 2 }
+        let repeatingItem = try XCTUnwrap(service.player.currentItem)
+        let preparedNext = try XCTUnwrap(service.player.items().dropFirst().first)
+        let currentURL = try XCTUnwrap((repeatingItem.asset as? AVURLAsset)?.url)
+        let nextURL = try XCTUnwrap((preparedNext.asset as? AVURLAsset)?.url)
+        XCTAssertNotEqual(nextURL, currentURL, "PCM loops on the active decoder. Its queued item must be the other video.")
         var audio = service.audioSnapshot
         for loop in 0..<4 {
             let previous = audio
@@ -332,9 +365,12 @@ final class PictureRecoveryTests: XCTestCase {
             XCTAssertEqual(audio.token, previous.token, "Audio owner during loop \(loop + 1)")
             XCTAssertEqual(audio.selectionVersion, previous.selectionVersion)
             XCTAssertEqual(audio.underrunFrames, previous.underrunFrames)
+            XCTAssertTrue(service.player.currentItem === repeatingItem)
+            XCTAssertTrue(service.player.items().dropFirst().first === preparedNext, "Looping must preserve the prepared next decoder")
         }
-        for _ in 0..<5 {
+        for reversal in 0..<5 {
             service.next()
+            if reversal == 0 { XCTAssertTrue(service.player.currentItem === preparedNext) }
             try await Task.sleep(for: .milliseconds(22))
             service.previous()
             try await Task.sleep(for: .milliseconds(17))
@@ -350,6 +386,7 @@ final class PictureRecoveryTests: XCTestCase {
                 && service.hasRetainedVideoFrame && (service.debugDisplayedVideoPositionSeconds ?? 0) > 0.15
         }
         let before = service.audioSnapshot
+        let submittedBefore = service.submittedVideoFrameCount
         let start = ContinuousClock.now
         var lastChange = start
         var largestGap = Duration.zero
@@ -368,7 +405,7 @@ final class PictureRecoveryTests: XCTestCase {
             }
         }
         largestGap = max(largestGap, ContinuousClock.now - lastChange)
-        print("AFTER_LOOP_HD distinctFrames=\(distinctFrames) largestGap=\(largestGap)")
+        print("AFTER_LOOP_HD distinctFrames=\(distinctFrames) submitted=\(service.submittedVideoFrameCount - submittedBefore) largestGap=\(largestGap) underruns=\(service.audioSnapshot.underrunFrames - before.underrunFrames)")
         XCTAssertGreaterThanOrEqual(distinctFrames, 31, "HD playback must keep moving after loop and switch churn")
         XCTAssertLessThan(largestGap, .milliseconds(200), "A good average must not hide a freeze")
         let after = service.audioSnapshot

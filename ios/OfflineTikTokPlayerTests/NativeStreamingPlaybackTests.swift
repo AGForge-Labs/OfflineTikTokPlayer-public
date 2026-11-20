@@ -195,6 +195,9 @@ final class NativeStreamingPlaybackTests: XCTestCase {
         let initialHTTP = server.snapshot()
         XCTAssertGreaterThan(initialHTTP.requests, 0)
         XCTAssertGreaterThan(initialHTTP.ranges, 0, "The actual AVPlayer must exercise seekable HTTP ranges")
+        try await until { service.player.items().count == 2 }
+        let stagedNext = try XCTUnwrap(service.player.items().dropFirst().first)
+        XCTAssertEqual((stagedNext.asset as? AVURLAsset)?.url.lastPathComponent, "b.mp4")
         let nativeBeforeWarm = service.player.currentTime().seconds
         await gate.release()
         try await until { service.preparedAudioCount == 2 }
@@ -209,12 +212,14 @@ final class NativeStreamingPlaybackTests: XCTestCase {
             XCTAssertEqual(hash.size, record.asset?.byteSize)
         }
         XCTAssertTrue(service.player.currentItem === remoteItem, "Warming must preserve the advancing native stream")
+        XCTAssertTrue(service.player.items().dropFirst().first === stagedNext, "Caching the current clip must not evict the next video")
         XCTAssertFalse(service.audioEngineRunning)
         XCTAssertTrue(fixture.downloads.readyIDs.isEmpty)
 
         service.next()
         let b = try XCTUnwrap(audio.entry(for: fixture.bID))
         try await until { service.audioSnapshot.token == b.token && service.audioSnapshot.frame > 0 && !service.isLoading }
+        XCTAssertTrue(service.player.currentItem === stagedNext, "The next selection must reuse its prepared video")
         XCTAssertTrue(service.player.isMuted, "Prepared PCM must be the sole audible owner")
         XCTAssertTrue(service.audioEngineRunning)
         let engine = ObjectIdentifier(audio.graph.engine)

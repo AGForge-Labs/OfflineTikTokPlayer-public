@@ -114,7 +114,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
         #endif
     }
 
-    func testLateVideoPreparationStartsPacingOnlyAfterTheSourceIsKnown() async throws {
+    func testColdSelectionStartsTheDisplayClockAndShowsFramesWhenTheSourceArrives() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-motion-1080", withExtension: "mp4"))
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let fixture = PresentedVideo(url: url, scene: scene)
@@ -123,7 +123,7 @@ final class VideoPresentationContinuityTests: XCTestCase {
         let ticket = try XCTUnwrap(bridge.setCurrentItem(item))
         XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 0, durationSeconds: 6, isPlaying: true))
         XCTAssertTrue(bridge.activate(ticket))
-        XCTAssertFalse(bridge.isFrameFeedRunning, "A default-rate timer must not win the race against source preparation")
+        XCTAssertTrue(bridge.isFrameFeedRunning, "A selected playing clip needs its display clock while the first video output prepares")
         player.automaticallyWaitsToMinimizeStalling = false
         player.playImmediately(atRate: 1)
         let ready = await until {

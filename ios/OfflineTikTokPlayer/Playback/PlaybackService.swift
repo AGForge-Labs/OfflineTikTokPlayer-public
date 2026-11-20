@@ -1866,15 +1866,22 @@ final class PlaybackService: NSObject {
         }
         let active = current
         let previous = previousID.flatMap { library.catalog.mediaByID[$0] }
-        let successor = naturalID.flatMap { library.catalog.mediaByID[$0] }
         let explicitSuccessor = nextID.flatMap { library.catalog.mediaByID[$0] }
+        // The PCM clock loops by seeking the active video. Only native audio consumes
+        // a second copy of the current AVPlayerItem at that boundary.
+        let loopsOnActiveVideo = active != nil && naturalID == active?.id && !usesNativeAudio
+            && continuousAudio.isSelected && continuousAudio.selectedID == active?.id
+        let videoSuccessorID = loopsOnActiveVideo ? upcoming.first?.id : naturalID
+        let successor = videoSuccessorID.flatMap { library.catalog.mediaByID[$0] }
+        // With two clips, Previous and explicit Next can be the same decoder.
+        let separatePrevious = loopsOnActiveVideo && previous?.id == videoSuccessorID ? nil : previous
         let pcmIDs = Set([active?.id, previous?.id, nextID].compactMap { $0 })
         continuousAudio.setWindow(pcmIDs.subtracting(nativeAudioFallbackIDs))
         updateAudioSuccessor()
-        if buffer.nextMediaID != naturalID { buffer.discardNext() }
+        if buffer.nextMediaID != videoSuccessorID { buffer.discardNext() }
         guard generation == request, warmRevision == revision else { return }
         if let successor, let currentID = active?.id,
-           buffer.previousMediaID == successor.id, buffer.previousMediaID != previous?.id {
+           buffer.previousMediaID == successor.id, buffer.previousMediaID != separatePrevious?.id {
             let allowRemote = downloads.network.isConnected && !downloads.readyIDs.contains(successor.id)
             buffer.promotePreviousToNext(mediaID: successor.id, after: currentID, allowRemote: allowRemote,
                 ifEligible: { self.generation == request && self.warmRevision == revision })
@@ -1905,7 +1912,7 @@ final class PlaybackService: NSObject {
                 }
                 guard !Task.isCancelled, self.generation == request, self.warmRevision == revision else { return }
             }
-            async let previousPreparation: Void = self.preparePrevious(previous, request: request, revision: revision)
+            async let previousPreparation: Void = self.preparePrevious(separatePrevious, request: request, revision: revision)
             // Resolve and enqueue the next AVPlayerItem before waiting for any full-file transfer.
             if let next = successor, !self.buffer.hasPrepared(next.id) {
                 let preparedSource = await self.warmSource(next, allowRemote: self.downloads.network.isConnected)
@@ -1948,8 +1955,10 @@ final class PlaybackService: NSObject {
                         guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
                         let mastered = item.hasMasteredAudio(for: asset)
                         await self.prepareWarmAudio(id: item.id, url: url, normalizationGainDB: item.normalizationGainDB, mastered: mastered)
+                        guard !Task.isCancelled, self.warmRevision == revision, self.generation == request else { return }
                         self.updateAudioSuccessor()
-                        // Keep the prepared decoder. Promote the file now only for an offline handoff.
+                        // Other neighbors share the file/PCM cache, never the single forward video slot.
+                        guard item.id == videoSuccessorID else { continue }
                         let requireLocal = !self.downloads.network.isConnected
                         if requireLocal || !self.buffer.hasPrepared(item.id) {
                             let playerItem = self.makePlayerItem(item, url: url, mastered: mastered, enhanced: asset != item.asset)
@@ -2263,7 +2272,9 @@ final class PlaybackService: NSObject {
                     synchronizeVideoToAudio(force: true)
                     #endif
                 }
-                prepareUpcoming()
+                // A seek or a natural wrap within the same clip keeps its existing
+                // neighbor preparation, including a transfer that is still in flight.
+                if changedSource { prepareUpcoming() }
             }
         }
         clock.sample(position: Double(sample.frame) / 48_000)
