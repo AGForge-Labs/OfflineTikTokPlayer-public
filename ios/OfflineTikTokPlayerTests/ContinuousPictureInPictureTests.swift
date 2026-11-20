@@ -2,6 +2,7 @@ import XCTest
 import AVFoundation
 import CoreVideo
 import CryptoKit
+import PlayerCore
 #if DEBUG
 import CoreFoundation
 #endif
@@ -481,6 +482,89 @@ final class ContinuousPictureInPictureTests: XCTestCase {
         XCTAssertTrue(item.videoComposition === installedComposition)
         XCTAssertTrue(resource.isAttached); XCTAssertFalse(resource.isRetired)
         print("NativeGeometryVideoDecode schema=1 nativeFrames=\(native.count) composedFrames=\(composed.count) activeBytesPerReader=\(native.bytes) nativePTSHash=\(native.ptsHash) composedPTSHash=\(composed.ptsHash) nativePixelHash=\(native.pixelHash) composedPixelHash=\(composed.pixelHash) nativeLastFrameHash=\(native.lastFrameHash) composedLastFrameHash=\(composed.lastFrameHash) completeEOF=true scope=full-source-video-decode playbackEvidence=false latencyEvidence=false")
+    }
+
+    func testUnresponsiveTimingReadLetsNextSelectionProbeOnce() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "test-motion-60", withExtension: "mp4"))
+        let bridge = ContinuousPictureInPicture()
+        let first = AVPlayerItem(url: url), next = AVPlayerItem(url: url)
+        let oldRead = PendingFrameTiming(), currentRead = PendingFrameTiming()
+        var resources: [ContinuousPictureInPicture.PreparedVideoResource] = []
+        defer {
+            oldRead.finish(nil); currentRead.finish(nil)
+            bridge.invalidate()
+            for resource in resources { resource.retire() }
+        }
+        func select(_ item: AVPlayerItem) async throws -> ContinuousPictureInPicture.ActiveTimelineReceipt {
+            let plan = try await ContinuousPictureInPicture.prepareVideoResource(for: item)
+            let resource = try XCTUnwrap(plan.install())
+            resources.append(resource)
+            let ticket = try XCTUnwrap(bridge.setCurrentItem(item, preparedVideo: resource))
+            XCTAssertTrue(bridge.installTimeline(ticket, positionSeconds: 1, durationSeconds: 6, isPlaying: false))
+            XCTAssertTrue(bridge.activate(ticket))
+            return try XCTUnwrap(bridge.activeTimelineReceipt(for: ticket))
+        }
+        let a = try await select(first)
+        XCTAssertNil(bridge.followingFrame(after: 1, for: a) { _, _, _ in await oldRead.read() })
+        let startedA = await waitForPresentation { oldRead.calls == 1 }
+        XCTAssertTrue(startedA)
+        let b = try await select(next)
+        XCTAssertNil(bridge.followingFrame(after: 1, for: b) { _, _, _ in await currentRead.read() })
+        let startedB = await waitForPresentation { currentRead.calls == 1 }
+        XCTAssertTrue(startedB, "A canceled SDK read still draining must not hold the next selection")
+        oldRead.finish(.end)
+        for _ in 0..<10 {
+            XCTAssertNil(bridge.followingFrame(after: 1, for: b) { _, _, _ in await currentRead.read() })
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(currentRead.calls, 1, "A stale completion must neither clear nor credit the new lookup")
+        currentRead.finish(nil)
+        for tick in 1...15 {
+            XCTAssertNil(bridge.followingFrame(after: 1 + Double(tick) / 60, for: b) { _, _, _ in await currentRead.read() })
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(currentRead.calls, 1, "An unavailable source cursor must not be reopened for every delayed frame")
+    }
+
+    @MainActor private final class PendingFrameTiming {
+        private(set) var calls = 0
+        private var finished = false
+        private var result: VideoImageProgress.NextSourceFrame?
+        private var waits: [CheckedContinuation<VideoImageProgress.NextSourceFrame?, Never>] = []
+        func read() async -> VideoImageProgress.NextSourceFrame? {
+            calls += 1
+            if finished { return result }
+            return await withCheckedContinuation { waits.append($0) }
+        }
+        func finish(_ answer: VideoImageProgress.NextSourceFrame?) {
+            finished = true
+            result = answer
+            for waiter in waits { waiter.resume(returning: answer) }
+            waits.removeAll()
+        }
+    }
+
+    func testAuthoredLongVFRFrameRemainsCurrentUntilItsNextRealSample() async throws {
+        let times = [0, 1, 2, 62, 63].map { CMTime(value: Int64($0), timescale: 30) }
+        let url = try await makeAsymmetricVideo(transform: .identity, frameCount: times.count,
+            presentationTimes: times, endTime: CMTime(value: 64, timescale: 30))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = AVURLAsset(url: url)
+        let held = times[2].seconds
+        let following = await ContinuousPictureInPicture.sourceFrameAfter(held, in: asset, timingTrackID: nil)
+        guard case .after(let duration)? = following else {
+            XCTFail("The real sample cursor must find the following image in presentation order")
+            return
+        }
+        XCTAssertEqual(duration, 2, accuracy: 1.0 / 48_000)
+        var progress = VideoImageProgress()
+        for tick in 0..<120 {
+            let audible = held + Double(tick) / 60
+            XCTAssertFalse(progress.shouldRecover(now: audible, playbackPosition: audible,
+                displayedPosition: held, followingFrame: following))
+        }
+        let last = await ContinuousPictureInPicture.sourceFrameAfter(times[4].seconds, in: asset, timingTrackID: nil)
+        XCTAssertEqual(last, .end)
     }
 
     func testZeroBasedVFRNativeComparisonPreservesEveryImportedFrameAndTimestamp() async throws {

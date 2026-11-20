@@ -7057,7 +7057,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         let screen = try SelectionVideoScreen(service: service)
         defer { service.pause(); screen.close() }
 
-        service.restore()
+        #if DEBUG
+        service.debugRestorePausedBookmark()
+        #else
+        throw XCTSkip("The paused-seek fixture requires a Debug test host.")
+        #endif
         try await require({ !service.isLoading && abs(service.player.currentTime().seconds - 0.4) < 0.04 },
                           "The real Saved B item must finish restoring to 0.4 seconds")
         assertSelection(service, fixture: fixture, id: fixture.bID)
@@ -9103,7 +9107,11 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             blockedAtStart = service?.videoFrameAcquisitionBlockedCount
         }
 
-        service.restore()
+        #if DEBUG
+        service.debugRestorePausedBookmark()
+        #else
+        throw XCTSkip("The paused-seek fixture requires a Debug test host.")
+        #endif
         try await require({ scheduler.isHoldingCompletion && scheduler.nativeFinished == true
             && abs(service.player.currentTime().seconds - 0.4) < 0.04 },
                           "The real AVPlayer seek must finish while its service callback remains held")
@@ -9383,8 +9391,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
                 guard before.visit < Int64.max else { XCTFail("The real next visit must remain representable"); throw SelectionVideoTestFailure.timeout }
                 var issuedCount = 0, issueOverflow = false
                 service.onDebugVideoSeekStamp = { stamp in
-                    completion.recordIssued(stamp)
-                    guard completion.matchesIssued(stamp) else { return }
+                    guard completion.recordIssued(stamp, audio: audio) else { return }
                     if issuedCount < 8 { issuedCount += 1 } else { issueOverflow = true }
                 }
                 service.onDebugVideoSeekCompletionTerminal = { [weak completion] terminal in completion?.recordTerminal(terminal) }
@@ -9495,8 +9502,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             var gateDeadline: Double?, blockedAttempts = 0
             var issued: PlaybackService.DebugVideoSeekStamp?, issuedCount = 0, issueOverflow = false
             service.onDebugVideoSeekStamp = { stamp in
-                completion.recordIssued(stamp)
-                guard completion.matchesIssued(stamp) else { return }
+                guard completion.recordIssued(stamp, audio: audio) else { return }
                 if issuedCount < 8 { issuedCount += 1; if issued == nil { issued = stamp } }
                 else { issueOverflow = true }
             }
@@ -9714,7 +9720,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
     @MainActor private final class NaturalCompletionSeekHold {
         private struct CommandTrace {
             let issued: PlaybackService.DebugVideoSeekStamp?
-            let target: Double?
+            let target: Double?, audiblePosition: Double?
             let playerMatches: Bool, numeric: Bool, lowerBoundMatches: Bool, upperBoundMatches: Bool
             let armed: Bool, intercepted: Bool, eligible: Bool
         }
@@ -9730,6 +9736,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
         private var armed = false, released = false, deliveryObserved = false
         private var callback: (@Sendable (Bool) -> Void)?
         private var issueForNextCommand: PlaybackService.DebugVideoSeekStamp?
+        private var audiblePositionAtIssue: Double?
         private var commandTrace: [CommandTrace] = []
         private var traceDropped = 0, traceSaturated = false
         private(set) var intercepted = false, overflow = false
@@ -9750,37 +9757,47 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             ownerBinding = OwnerBinding(request: request, generation: generation, aToken: aToken, visit: visit)
             armed = true
         }
-        func recordIssued(_ stamp: PlaybackService.DebugVideoSeekStamp) { issueForNextCommand = stamp }
-        // Shared by issuedCount and interception, before the real native seek.
-        // The existing 80 ms position allowance binds the actual source-visit target.
-        func matchesIssued(_ stamp: PlaybackService.DebugVideoSeekStamp) -> Bool {
+        func recordIssued(_ stamp: PlaybackService.DebugVideoSeekStamp, audio: ContinuousAudioPlayer) -> Bool {
+            issueForNextCommand = stamp
+            audiblePositionAtIssue = nil
             guard armed, let ownerBinding, stamp.force, stamp.reason == .sourceVisit,
                   stamp.request == ownerBinding.request, stamp.generation == ownerBinding.generation,
-                  stamp.cachedAudioToken == ownerBinding.aToken, stamp.cachedAudioVisit == ownerBinding.visit,
-                  stamp.requestedPosition.isFinite,
-                  abs(stamp.requestedPosition - minimumTarget) <= 0.080,
-                  stamp.requestedPosition < maximumTarget else { return false }
-            let quantized = CMTime(seconds: stamp.requestedPosition, preferredTimescale: 48_000)
-            return quantized.isNumeric && quantized.timescale == 48_000
-                && abs(quantized.seconds - minimumTarget) <= 0.080 && quantized.seconds < maximumTarget
+                  stamp.cachedAudioToken == ownerBinding.aToken, stamp.cachedAudioVisit == ownerBinding.visit else { return false }
+            let sample = audio.snapshot
+            guard sample.token == ownerBinding.aToken, sample.visit == ownerBinding.visit, !sample.ended,
+                  !audio.isSelectionPending(in: sample) else { return false }
+            // The source-visit correction targets the playing PCM clock. The requested
+            // scrub point can be behind it by the time the main actor issues the seek.
+            let position = audio.presentationPosition(at: CMClockGetTime(CMClockGetHostTimeClock()))
+            let current = audio.snapshot
+            guard current.token == sample.token, current.visit == sample.visit, current.selectionVersion == sample.selectionVersion,
+                  !current.ended, !audio.isSelectionPending(in: current), position.isFinite else { return false }
+            audiblePositionAtIssue = position
+            return matchesTarget(stamp.requestedPosition)
+        }
+        private func matchesTarget(_ target: Double) -> Bool {
+            guard let audiblePositionAtIssue, target.isFinite else { return false }
+            return target >= minimumTarget - 0.080 && target < maximumTarget
+                && abs(target - audiblePositionAtIssue) <= 0.080
         }
         func seek(_ player: AVPlayer, _ time: CMTime, _ completion: @escaping @Sendable (Bool) -> Void) {
             let issued = issueForNextCommand
             let quantized = issued.map { CMTime(seconds: $0.requestedPosition, preferredTimescale: 48_000) }
             let eligible = armed && !intercepted && expectedPlayer == ObjectIdentifier(player)
-                && issued.map { matchesIssued($0) } == true && time.isNumeric
+                && issued.map { matchesTarget($0.requestedPosition) } == true && time.isNumeric && matchesTarget(time.seconds)
                 && time.timescale == 48_000 && quantized?.isNumeric == true
                 && time.value == quantized?.value && time.epoch == quantized?.epoch
             let target = time.isNumeric ? time.seconds : nil
             if commandTrace.count < 8 {
-                commandTrace.append(CommandTrace(issued: issueForNextCommand, target: target,
+                commandTrace.append(CommandTrace(issued: issueForNextCommand, target: target, audiblePosition: audiblePositionAtIssue,
                     playerMatches: expectedPlayer == ObjectIdentifier(player), numeric: time.isNumeric,
-                    lowerBoundMatches: target.map { $0 >= minimumTarget } ?? false,
+                    lowerBoundMatches: target.map { $0 >= minimumTarget - 0.080 } ?? false,
                     upperBoundMatches: target.map { $0 < maximumTarget } ?? false,
                     armed: armed, intercepted: intercepted, eligible: eligible))
             } else if traceDropped < Int.max { traceDropped += 1 }
             else { traceSaturated = true }
             issueForNextCommand = nil
+            audiblePositionAtIssue = nil
             if armed, !intercepted, !eligible {
                 if rejectedCommands < 8 { rejectedCommands += 1 } else { overflow = true }
             }
@@ -9819,7 +9836,7 @@ final class PlaybackSelectionVideoRegressionTests: XCTestCase {
             print("NaturalSeekCompletionInjectionCoverage schema=1 retained=\(commandTrace.count) capacity=8 dropped=\(traceDropped) saturated=\(traceSaturated) minimumTarget=\(minimumTarget) maximumTarget=\(maximumTarget) targetAllowanceSeconds=0.080 interceptedRequest=\(interceptedStamp.map { String($0.request) } ?? "missing") interceptedNativeSeekTicket=\(interceptedStamp.map { String($0.nativeSeekTicket) } ?? "missing") terminalEvents=\(terminalEvents) deliveryObserved=\(deliveryObserved) callbackPending=\(callback != nil) deliveryScope=real-service-task-return interventionOwner=forced-source-visit playbackGuards=unchanged playbackAcceptance=false")
             for (index, command) in commandTrace.enumerated() {
                 let issue = command.issued
-                print("NaturalSeekCompletionInjection schema=1 index=\(index) issuePresent=\(issue != nil) issueReason=\(issue?.reason.rawValue ?? -1) issueRequest=\(issue?.request ?? -1) issueGeneration=\(issue?.generation ?? -1) issueSeekTicket=\(issue.map { String($0.nativeSeekTicket) } ?? "missing") issueTarget=\(issue.map { String($0.requestedPosition) } ?? "missing") issueForce=\(issue.map { String($0.force) } ?? "missing") issueCachedToken=\(issue.map { String($0.cachedAudioToken) } ?? "missing") issueCachedVisit=\(issue.map { String($0.cachedAudioVisit) } ?? "missing") nativeTarget=\(command.target.map { String($0) } ?? "missing") playerMatches=\(command.playerMatches) numeric=\(command.numeric) lowerBoundMatches=\(command.lowerBoundMatches) upperBoundMatches=\(command.upperBoundMatches) armed=\(command.armed) alreadyIntercepted=\(command.intercepted) eligible=\(command.eligible) playbackAcceptance=false")
+                print("NaturalSeekCompletionInjection schema=1 index=\(index) issuePresent=\(issue != nil) issueReason=\(issue?.reason.rawValue ?? -1) issueRequest=\(issue?.request ?? -1) issueGeneration=\(issue?.generation ?? -1) issueSeekTicket=\(issue.map { String($0.nativeSeekTicket) } ?? "missing") issueTarget=\(issue.map { String($0.requestedPosition) } ?? "missing") issueForce=\(issue.map { String($0.force) } ?? "missing") issueCachedToken=\(issue.map { String($0.cachedAudioToken) } ?? "missing") issueCachedVisit=\(issue.map { String($0.cachedAudioVisit) } ?? "missing") nativeTarget=\(command.target.map { String($0) } ?? "missing") audiblePositionAtIssue=\(command.audiblePosition.map { String($0) } ?? "missing") playerMatches=\(command.playerMatches) numeric=\(command.numeric) lowerBoundMatches=\(command.lowerBoundMatches) upperBoundMatches=\(command.upperBoundMatches) armed=\(command.armed) alreadyIntercepted=\(command.intercepted) eligible=\(command.eligible) playbackAcceptance=false")
             }
         }
     }
